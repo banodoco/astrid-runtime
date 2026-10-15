@@ -10,7 +10,7 @@ import subprocess
 import urllib.error
 import urllib.request
 
-from test_timeline_accept import fixture, fixture_prepare, http_server, wire, acceptance, IDENTITY, valid, count
+from test_timeline_accept import fixture, fixture_provider, http_server, wire, acceptance, IDENTITY, valid, count
 
 
 def test_actual_app_vite_proxy_to_runtime_commit(fixture, tmp_path):
@@ -18,7 +18,7 @@ def test_actual_app_vite_proxy_to_runtime_commit(fixture, tmp_path):
     app = Path(os.environ['ACCEPT_APP_ROOT'])
     vite_entry = Path(os.environ['ACCEPT_VITE_ENTRY'])
     assert app.is_dir() and vite_entry.is_file()
-    fixture_prepare(s, p)
+    fixture_provider(s, p)
     runtime, thread, api = http_server(s, tmp_path)
     env = dict(os.environ, ACCEPT_FIXTURE_TOKEN=api.credential,
                ACCEPT_FIXTURE_RUNTIME_PORT=str(runtime.server_port), ACCEPT_VITE_CACHE=str(tmp_path / 'vite-cache'))
@@ -66,7 +66,7 @@ def test_actual_app_vite_proxy_to_runtime_commit(fixture, tmp_path):
         print(json.dumps({'proxy': '/api/astrid/*', 'runtime_route': path.removeprefix('/api/astrid'),
                           'status': 200, 'replay_bytes_identical': True, 'changed_body_status': 400,
                           'authenticated_publisher': first['runtime_receipt']['publisher'], 'polling_ms': 30000,
-                          'producer': 'synthetic COMMIT preparation; real Vite and Runtime acceptance'}))
+                          'producer': 'synthetic registered Astrid provider; real Vite and Runtime acceptance'}))
     finally:
         proxy.terminate()
         stdout, stderr = proxy.communicate()

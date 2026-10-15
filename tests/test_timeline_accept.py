@@ -219,26 +219,33 @@ def test_stale_head_invalid_digest_and_narration_rollback(fixture):
         assert s.lookup_request(p, 'main', 'save-1') is None
 
 
-def fixture_prepare(s, p):
-    """Synthetic COMMIT producer, never claimed as shared semantic rebase proof."""
+def fixture_provider(s, p):
+    """Synthetic D provider; no claim of real semantic algorithm/installed origin."""
+    from runtime_protocol.contract_metadata import SCHEMA_DIGEST
     calls = []
-    def prepare(request, head):
-        calls.append(head['revision_id'])
-        if request['dry_run']:
-            result = result_template(request, digest(request))
-            result.update(status='preview', rebased_onto=head['revision_id'])
-            # Deliberately faulty producer writes are rolled back by Runtime.
-            s.store.conn.execute("UPDATE projects SET name='must-rollback' WHERE id=?", (p,))
-            return result
-        return acceptance(s, p, key=request['request_id'], request=request)
-    s.prepare_timeline_commit = prepare
+    class Provider:
+        interface_version = 1
+        contract_digest = SCHEMA_DIGEST
+        def commit(self, request, port):
+            head = port.head()
+            calls.append(head['revision_id'])
+            assert not hasattr(port, 'store') and not hasattr(port, 'service')
+            assert port.revision(request['base_revision_id'])['revision_id'] == request['base_revision_id']
+            if request['dry_run']:
+                result = result_template(request, digest(request))
+                result.update(status='preview', rebased_onto=head['revision_id'])
+                with pytest.raises(AuthorizationError):
+                    port.accept(acceptance(s, p, request=request))
+                return result
+            return port.accept(acceptance(s, p, key=request['request_id'], request=request))['stored_result']
+    s.register_timeline_commit_provider(Provider())
     return calls
 
 
 def test_dry_run_once_on_current_head_stores_and_reserves_nothing(fixture):
     s, p = fixture
     s.accept(acceptance(s, p, key='advance'), identity=IDENTITY)
-    calls = fixture_prepare(s, p)
+    calls = fixture_provider(s, p)
     request = wire(p, dry_run=True)
     before = s.store.conn.iterdump()
     before = '\n'.join(before)
@@ -264,7 +271,7 @@ def http_server(service, tmp_path):
 
 def test_runtime_http_contract_lost_response_retry_and_headers(fixture, tmp_path):
     s, p = fixture
-    calls = fixture_prepare(s, p)
+    calls = fixture_provider(s, p)
     server, thread, api = http_server(s, tmp_path)
     path = f'/astrid/v1/projects/{p}/timelines/main/commit'
     request = wire(p)
@@ -273,6 +280,13 @@ def test_runtime_http_contract_lost_response_retry_and_headers(fixture, tmp_path
         with pytest.raises(RuntimeError) as unauthorized:
             Api(api.endpoint, None).request('POST', path, request, headers=headers)
         assert unauthorized.value.status == 401
+        with pytest.raises(RuntimeError) as wrong_project:
+            api.request('POST', path.replace(p, 'foreign-project'), request, headers=headers)
+        assert wrong_project.value.status == 400
+        with pytest.raises(RuntimeError) as forged_actor:
+            api.request('POST', path, {**request, 'asserted_actor': {'kind': 'user', 'id': 'forged'}}, headers=headers)
+        assert forged_actor.value.status == 401
+        assert s.lookup_request(p, 'main', request['request_id']) is None
         with pytest.raises(RuntimeError) as mismatch:
             api.request('POST', path, request, headers={**headers, 'X-Astrid-Session': 'wrong'})
         assert mismatch.value.status == 400
@@ -376,3 +390,118 @@ def test_offline_compaction_preserves_commit_result_and_evidence(fixture):
         assert recovered.evidence(first['receipt']['evidence_digest']) == request['evidence']
     finally:
         recovered.close()
+
+
+def test_provider_registration_scope_and_dry_run_authority(fixture):
+    from runtime_protocol.contract_metadata import SCHEMA_DIGEST
+    s, p = fixture
+    class BadProvider:
+        interface_version = 2
+        contract_digest = SCHEMA_DIGEST
+        def commit(self, request, port): raise AssertionError('not admitted')
+    with pytest.raises(ValidationError):
+        s.register_timeline_commit_provider(BadProvider())
+    fixture_provider(s, p)
+    with pytest.raises(ConflictError):
+        s.register_timeline_commit_provider(BadProvider())
+    request = wire(p)
+    port = s._request_commit_port(request, IDENTITY)
+    prepared = acceptance(s, p, request=request)
+    for key, value in [('project_id', 'foreign'), ('request_id', 'foreign'), ('source', {'via': 'cli'}),
+                       ('asserted_actor', {'kind': 'script', 'id': 'forged'})]:
+        changed = copy.deepcopy(prepared)
+        changed[key] = value
+        with pytest.raises(AuthorizationError):
+            port.accept(changed)
+    with pytest.raises(TypeError):
+        port.head('foreign-project')
+    with pytest.raises(TypeError):
+        port.lookup_request('foreign-request')
+    original = port.revision('parent-1')
+    original['payload']['config']['modified-snapshot'] = True
+    assert 'modified-snapshot' not in port.revision('parent-1')['payload']['config']
+    dry = s._request_commit_port(wire(p, dry_run=True), IDENTITY)
+    with pytest.raises(AuthorizationError):
+        dry.accept(prepared)
+    assert s.lookup_request(p, 'main', request['request_id']) is None
+
+
+def test_provider_cannot_report_unstored_success_and_failure_is_unavailable(fixture):
+    from runtime_protocol.contract_metadata import SCHEMA_DIGEST
+    s, p = fixture
+    class Provider:
+        interface_version = 1
+        contract_digest = SCHEMA_DIGEST
+        def commit(self, request, port):
+            return acceptance(s, p, request=request)['result']
+    s.register_timeline_commit_provider(Provider())
+    with pytest.raises(ValidationError, match='without the stored'):
+        s.commit_timeline(p, 'main', wire(p), idempotency_key='save-1', identity=IDENTITY)
+    assert count(s, 'parent_composition_revisions') == 1
+
+
+def test_previous_publication_identity_is_stored_and_replayed(fixture):
+    s, p = fixture
+    head = s.head(p, 'main')
+    assert head['publication_id'] != head['revision_id']
+    request = acceptance(s, p)
+    first = s.accept(request, identity=IDENTITY)
+    assert first['previous_publication_id'] == head['publication_id']
+    assert first['publication_id'] != first['revision_id']
+    s.accept(acceptance(s, p, key='later'), identity=IDENTITY)
+    replay = s.accept(request, identity=IDENTITY)
+    assert replay['previous_publication_id'] == first['previous_publication_id']
+    assert replay['stored_result'] == first['stored_result']
+
+
+def test_runtime_http_semantic_provider_runs_outside_storage_mutex(fixture, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from runtime_protocol.contract_metadata import SCHEMA_DIGEST
+    s, p = fixture
+    class Provider:
+        interface_version = 1
+        contract_digest = SCHEMA_DIGEST
+        def commit(self, request, port):
+            with ThreadPoolExecutor(max_workers=1) as workers:
+                assert workers.submit(port.head).result(timeout=30)['revision_id'] == 'parent-1'
+            assert not s.store.conn.in_transaction
+            return port.accept(acceptance(s, p, request=request))['stored_result']
+    s.register_timeline_commit_provider(Provider())
+    server, thread, api = http_server(s, tmp_path)
+    request = wire(p)
+    try:
+        result = api.request('POST', f'/astrid/v1/projects/{p}/timelines/main/commit', request,
+                             headers={'Idempotency-Key': request['request_id'], 'X-Astrid-Session': request['session_id']})
+        assert result['status'] == 'accepted'
+    finally:
+        server.shutdown(); server.server_close(); thread.join()
+
+
+def test_provider_failure_and_replay_without_provider_after_restart(fixture):
+    from runtime_protocol.contract_metadata import SCHEMA_DIGEST
+    s, p = fixture
+    request = wire(p)
+    first = s.accept(acceptance(s, p, request=request), identity=IDENTITY)['stored_result']
+    root = s.store.root
+    s.close()
+    recovered = RuntimeService(root)
+    try:
+        assert recovered.commit_timeline(p, 'main', request, idempotency_key=request['request_id'], identity=IDENTITY) == first
+    finally:
+        recovered.close()
+    recovered = RuntimeService(root)
+    closed = []
+    class Provider:
+        interface_version = 1
+        contract_digest = SCHEMA_DIGEST
+        def commit(self, request, port): raise RuntimeError('fixture provider failed')
+        def close(self): closed.append(True)
+    recovered.register_timeline_commit_provider(Provider())
+    try:
+        failed = wire(p, key='provider-failed')
+        result = recovered.commit_timeline(p, 'main', failed, idempotency_key=failed['request_id'], identity=IDENTITY)
+        valid(result, 'CommitHttpUnavailable')
+        assert recovered.lookup_request(p, 'main', failed['request_id']) is None
+    finally:
+        recovered.close()
+    assert closed == [True]

@@ -15,6 +15,29 @@ from .errors import AuthorizationError, ConflictError, NotFoundError, Validation
 from .util import canonical_json, now
 
 KIND = "timeline.commit"
+PROVIDER_INTERFACE_VERSION = 1
+PROVIDER_FACTORY = "astrid.sdk.timeline.commit.create_runtime_commit_service"
+
+
+class RuntimeCommitPort:
+    """Request-bound capabilities for the explicitly installed semantic provider.
+
+    Only detached JSON snapshots and scoped callables cross this boundary.
+    There is no service, store, connection, or caller-selected authority field.
+    """
+    __slots__ = ("__lookup", "__head", "__revision", "__revisions", "__evidence", "__accept")
+
+    def __init__(self, *, lookup, head, revision, revisions, evidence, accept):
+        self.__lookup, self.__head, self.__revision = lookup, head, revision
+        self.__revisions, self.__evidence, self.__accept = revisions, evidence, accept
+
+    def lookup_request(self): return self.__lookup()
+    def head(self): return self.__head()
+    def revision(self, revision_id): return self.__revision(revision_id)
+    def revisions(self, options): return self.__revisions(options)
+    def evidence(self, evidence_digest): return self.__evidence(evidence_digest)
+    def accept(self, request): return self.__accept(request)
+
 
 
 def digest(value):
@@ -143,8 +166,14 @@ class TimelineCommitAcceptance:
             ).fetchone()
             if not row or row["revision_id"] is None:
                 raise NotFoundError("timeline has no committed composition head")
-            # Existing publication identity is the immutable parent revision.
-            return {"revision_id": row["revision_id"], "publication_id": row["revision_id"], "updated_at": row["updated_at"]}
+            publication = self.store.conn.execute(
+                "SELECT txn_id FROM command_idempotency WHERE command_kind='parent_composition.publish' "
+                "AND aggregate_id=? AND json_extract(result_json, '$.revision_id')=? ORDER BY rowid DESC LIMIT 1",
+                (timeline_id, row["revision_id"]),
+            ).fetchone()
+            if publication is None or not publication["txn_id"]:
+                raise NotFoundError("composition head has no publication receipt")
+            return {"revision_id": row["revision_id"], "publication_id": publication["txn_id"], "updated_at": row["updated_at"]}
 
     def evidence(self, evidence_digest):
         if not isinstance(evidence_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", evidence_digest):
@@ -242,7 +271,7 @@ class TimelineCommitAcceptance:
             with self.store._transaction():
                 found, saved = self._command_replay_state(KIND, aggregate, key, request["request_hash"], with_receipt=False)
                 if found:
-                    return self._accept_response(saved["result"], replayed=True)
+                    return self._accept_response(saved["result"], saved["previous_publication_id"], replayed=True)
                 project_id, timeline_id = request["project_id"], request["timeline_id"]
                 self.store.get_project(project_id)
                 head = self.head(project_id, timeline_id)
@@ -261,7 +290,7 @@ class TimelineCommitAcceptance:
                 if before["content_digest"] != self._revision_digest(before_payload):
                     raise ConflictError("composition head failed immutable verification")
                 publication = request["publication"]
-                revision_id = None
+                revision_id = publication_id = None
                 if publication is not None:
                     _object(publication, ("parent_composition", "shot_revisions", "internal_timeline_revisions"))
                     published = self.publish_parent_composition(project_id, timeline_id, {
@@ -269,6 +298,7 @@ class TimelineCommitAcceptance:
                         "expected_head": head["revision_id"],
                     }, idempotency_key="accept-" + digest([aggregate, key])[7:])
                     revision_id = published["data"]["revision_id"]
+                    publication_id = published["receipt"]["receipt_id"]
                 # Semantic document projection/digests belong to COMMIT, not
                 # to the storage envelope's immutable content_digest. The two
                 # representations need not be equal. Keep its exact document.
@@ -287,87 +317,139 @@ class TimelineCommitAcceptance:
                 if "asserted_actor" in request:
                     receipt["asserted_actor"] = request["asserted_actor"]
                     provenance["asserted_actor"] = request["asserted_actor"]
-                result.update(accepted_revision_id=revision_id, accepted_publication_id=revision_id,
+                result.update(accepted_revision_id=revision_id, accepted_publication_id=publication_id,
                               previous_revision_id=head["revision_id"], runtime_receipt=receipt,
                               provenance=provenance, evidence={"digest": evidence_digest})
                 summary = None if revision_id is None else dict(
-                    revision_id=revision_id, publication_id=revision_id,
+                    revision_id=revision_id, publication_id=publication_id,
                     previous_revision_id=head["revision_id"], previous_publication_id=head["publication_id"],
                     restored_from_revision_id=None, accepted_at=timestamp, source=request["source"],
                     asserted_actor=request.get("asserted_actor"), publisher=publisher,
                     label=request.get("label"), evidence_digest=evidence_digest)
                 self._command_record(KIND, aggregate, key, request["request_hash"],
                                      {"result": result, "evidence": evidence, "summary": summary,
-                                      "label": request.get("label"), "reason": request.get("reason")},
+                                      "label": request.get("label"), "reason": request.get("reason"),
+                                      "previous_publication_id": head["publication_id"]},
                                      project_id=project_id, with_receipt=False, created_at=timestamp)
             hook = getattr(self, "_after_timeline_commit", None)
             if hook is not None:
                 hook(copy.deepcopy(result))
-            return self._accept_response(result)
+            return self._accept_response(result, head["publication_id"])
 
     @staticmethod
-    def _accept_response(result, *, replayed=False):
+    def _accept_response(result, previous_publication_id, *, replayed=False):
         return dict(outcome="replayed" if replayed else result["status"],
                     revision_id=result["accepted_revision_id"], publication_id=result["accepted_publication_id"],
                     previous_revision_id=result["previous_revision_id"],
-                    previous_publication_id=result["previous_revision_id"], receipt=result["runtime_receipt"], stored_result=result)
+                    previous_publication_id=previous_publication_id, receipt=result["runtime_receipt"], stored_result=result)
+
+    def register_timeline_commit_provider(self, provider):
+        """Startup-only registration; A's closed launcher choice loads the factory."""
+        from .contract_metadata import SCHEMA_DIGEST
+        with self.store._mutex:
+            if getattr(self, "_timeline_commit_provider", None) is not None or getattr(self, "_timeline_commit_started", False):
+                raise ConflictError("timeline commit provider is already fixed for this service")
+            if (type(getattr(provider, "interface_version", None)) is not int
+                    or provider.interface_version != PROVIDER_INTERFACE_VERSION
+                    or getattr(provider, "contract_digest", None) != SCHEMA_DIGEST
+                    or not callable(getattr(provider, "commit", None))):
+                raise ValidationError("timeline commit provider interface/contract mismatch")
+            self._timeline_commit_provider = provider
+
+    def _request_commit_port(self, request, identity):
+        # Trusted code is composed in-process; scope is enforced at every call.
+        original, principal = copy.deepcopy(request), copy.deepcopy(identity)
+        project, timeline, key = original["project_id"], original["timeline_id"], original["request_id"]
+        request_hash = digest(original)
+
+        def read(call):
+            with self.store._mutex:
+                return json.loads(canonical_json(call()))
+
+        def evidence(evidence_digest):
+            def scoped():
+                row = self.store.conn.execute(
+                    "SELECT 1 FROM command_idempotency WHERE command_kind=? AND aggregate_id=? "
+                    "AND json_extract(result_json, '$.result.runtime_receipt.evidence_digest')=?",
+                    (KIND, self._commit_aggregate(project, timeline), evidence_digest),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError("evidence is outside the request timeline")
+                return self.evidence(evidence_digest)
+            return read(scoped)
+
+        def accept(prepared):
+            if original["dry_run"]:
+                raise AuthorizationError("dry-run port cannot accept or reserve a request")
+            if not isinstance(prepared, dict):
+                raise ValidationError("invalid prepared acceptance")
+            if (any(prepared.get(k) != original[k] for k in ("project_id", "timeline_id", "request_id", "source"))
+                    or prepared.get("request_hash") != request_hash
+                    or any(prepared.get(k) != original.get(k) for k in ("asserted_actor", "label", "reason"))
+                    or not isinstance(prepared.get("result"), dict)
+                    or prepared["result"].get("base_revision_id") != original["base_revision_id"]):
+                raise AuthorizationError("prepared acceptance changed captured request authority or identity")
+            return copy.deepcopy(self.accept(copy.deepcopy(prepared), identity=principal))
+
+        return RuntimeCommitPort(
+            lookup=lambda: read(lambda: self.lookup_request(project, timeline, key)),
+            head=lambda: read(lambda: self.head(project, timeline)),
+            revision=lambda revision_id: read(lambda: self.get_project_parent_composition_revision(project, timeline, revision_id)),
+            revisions=lambda options: read(lambda: self.revisions(project, timeline, copy.deepcopy(options))),
+            evidence=evidence, accept=accept,
+        )
 
     def commit_timeline(self, project_id, timeline_id, request, *, idempotency_key, identity):
-        """Single public route; shared COMMIT preparation is a required producer.
+        """Authenticate/replay, then call the registered Astrid algorithm once.
 
-        COMMIT supplies prepare_timeline_commit(request, head), returning either
-        one AcceptRequest or an uncommitted preview/conflict/refused CommitResult.
-        It must be read-only and perform the one shared rebase. No fallback writer.
+        D owns apply, compile, rebase and bounded StaleHead retries. No database
+        mutex or transaction spans semantic execution. The scoped port alone
+        supplies short reads and the authoritative atomic accept primitive.
         """
         validate_request(request)
         _publisher(identity, request.get("asserted_actor"))
         if (request["project_id"], request["timeline_id"], request["request_id"]) != (project_id, timeline_id, idempotency_key):
             raise ValidationError("commit path/header/body identities must match")
+        request = copy.deepcopy(request)
         request_hash = digest(request)
         with self.store._mutex:
             self._assert_mutation_admitted()
+            self._timeline_commit_started = True
             if not request["dry_run"]:
-                saved = self.lookup_request(project_id, timeline_id, idempotency_key)
-                if saved is not None:
-                    # Reuse the same ledger conflict and replay path before head.
-                    _, wrapper = self._command_replay_state(KIND, self._commit_aggregate(project_id, timeline_id),
-                                                            idempotency_key, request_hash, with_receipt=False)
+                found, wrapper = self._command_replay_state(KIND, self._commit_aggregate(project_id, timeline_id),
+                                                           idempotency_key, request_hash, with_receipt=False)
+                if found:
                     return wrapper["result"]
-            result = result_template(request, request_hash)
-            prepare = getattr(self, "prepare_timeline_commit", None)
-            if prepare is None:
-                result["error"] = dict(code="runtime_unavailable", message="Shared COMMIT producer is not integrated",
-                                       hint="No rebase or publication was attempted", next_action="Retry the original request after COMMIT integration")
-                return result
-            head = self.head(project_id, timeline_id)
-            # A savepoint is always rolled back, even if a faulty producer wrote.
-            # accept below owns the only durable transaction; dry runs reserve nothing.
-            self.store.conn.execute("SAVEPOINT timeline_commit_prepare")
-            try:
-                prepared = prepare(copy.deepcopy(request), copy.deepcopy(head))
-            finally:
-                self.store.conn.execute("ROLLBACK TO timeline_commit_prepare")
-                self.store.conn.execute("RELEASE timeline_commit_prepare")
-            if not isinstance(prepared, dict):
-                raise ValidationError("COMMIT preparation must return an object")
-            if "result" not in prepared:
-                _object(prepared, set(result_template(request, request_hash)))
-                if (any(prepared[k] is not None for k in ("accepted_revision_id", "accepted_publication_id",
-                                                           "previous_revision_id", "runtime_receipt"))
-                        or prepared.get("base_revision_id") != request["base_revision_id"]
-                        or prepared.get("status") not in ("preview", "conflict", "refused", "error")
-                        or prepared.get("request_hash") != request_hash or prepared.get("request_id") != idempotency_key
-                        or (prepared.get("status") == "preview" and not request["dry_run"])):
-                    raise ValidationError("invalid uncommitted COMMIT result")
-                return prepared
+            provider = getattr(self, "_timeline_commit_provider", None)
+        result = result_template(request, request_hash)
+        if provider is None:
+            result["error"] = dict(code="runtime_unavailable", message="Astrid commit provider is not registered",
+                                   hint="No semantic commit was attempted", next_action="Retry the original request after provider startup")
+            return result
+        port = self._request_commit_port(request, identity)
+        try:
+            prepared = provider.commit(copy.deepcopy(request), port)
+        except (ConnectionError, TimeoutError):
+            raise  # The transport may have lost an already durable response.
+        except Exception:
+            result["error"] = dict(code="runtime_unavailable", message="Astrid commit provider failed; outcome may be unknown",
+                                   hint="Acceptance may already be durable", next_action="Retry the original request id unchanged")
+            return result
+        if not isinstance(prepared, dict):
+            raise ValidationError("commit provider must return CommitResult")
+        _object(prepared, set(result_template(request, request_hash)))
+        if (prepared["request_id"] != idempotency_key or prepared["request_hash"] != request_hash
+                or prepared["base_revision_id"] != request["base_revision_id"]):
+            raise ValidationError("commit provider changed result identity")
+        if prepared["status"] in ("accepted", "no_change"):
             if request["dry_run"]:
-                raise ValidationError("dry run must return an uncommitted preview or conflict")
-            if any(prepared.get(k) != request[k] for k in ("project_id", "timeline_id", "request_id", "source")) or prepared.get("request_hash") != request_hash:
-                raise ValidationError("COMMIT preparation changed request identity")
-            if (prepared.get("expected_head_revision_id") != head["revision_id"]
-                    or not isinstance(prepared.get("result"), dict)
-                    or prepared["result"].get("base_revision_id") != request["base_revision_id"]):
-                raise ValidationError("COMMIT preparation changed base or prepared head")
-            if prepared.get("asserted_actor") != request.get("asserted_actor"):
-                raise ValidationError("COMMIT preparation changed asserted actor")
-            return self.accept(prepared, identity=identity)["stored_result"]
+                raise AuthorizationError("dry-run provider returned acceptance")
+            saved = self.lookup_request(project_id, timeline_id, idempotency_key)
+            if saved is None or saved["result"] != prepared:
+                raise ValidationError("provider reported acceptance without the stored Runtime result")
+        elif (prepared["status"] not in ("preview", "conflict", "refused", "error")
+              or (prepared["status"] == "preview" and not request["dry_run"])
+              or any(prepared[k] is not None for k in ("accepted_revision_id", "accepted_publication_id",
+                                                       "previous_revision_id", "runtime_receipt"))):
+            raise ValidationError("invalid uncommitted provider result")
+        return copy.deepcopy(prepared)

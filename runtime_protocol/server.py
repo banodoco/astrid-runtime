@@ -230,6 +230,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         else:
             self._send(500, error={"code": "internal_error", "message": "internal runtime error", "request_id": self._request_id()})
 
+    def _is_timeline_commit(self):
+        if not hasattr(self, "path"):
+            return False
+        path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
+        return (self.command == "POST" and len(path) == 7 and path[:3] == ["astrid", "v1", "projects"]
+                and path[4] == "timelines" and path[6] == "commit")
+
     def _timeline_commit(self, project_id, timeline_id):
         from .timeline_commit import digest, result_template
         from .errors import ValidationError
@@ -984,7 +991,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     # outside the SQLite mutex. Credential authentication and
                     # publication use CredentialStore's short internal lock.
                     self._local_worker_control()
-                elif self._is_remote_credential_control() or self._is_binary_io():
+                elif self._is_remote_credential_control() or self._is_binary_io() or self._is_timeline_commit():
                     # Both routes own short store sections. Transfer, hashing,
                     # and daemon actor ownership must stay outside this lock.
                     self._route()

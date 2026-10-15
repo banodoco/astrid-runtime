@@ -519,7 +519,14 @@ class RuntimeService(TimelineCommitAcceptance):
                 os.close(fd)
 
     def close(self):
-        self.store.close()
+        provider = getattr(self, "_timeline_commit_provider", None)
+        self._timeline_commit_provider = None
+        try:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+        finally:
+            self.store.close()
 
     def _local_claim_fence_path(self):
         return (self.support_root or self.store.root) / "local-execution-claim-fence.json"
@@ -1941,7 +1948,7 @@ class RuntimeService(TimelineCommitAcceptance):
         """Expose the canonical receipt facts committed with the mutation."""
         if row is None or row["txn_id"] is None:
             return None
-        result = command_result(row["result_json"], kind=row["command_kind"], created_at=None if row["command_kind"] in {"object.ingest", "media.import", "parent_composition.publish"} else row["created_at"], connection=self.store.conn)
+        result = command_result(row["result_json"], kind=row["command_kind"], created_at=None if row["command_kind"] in {"object.ingest", "media.import", "parent_composition.publish", "timeline.commit"} else row["created_at"], connection=self.store.conn)
         return {
             "receipt_id": row["txn_id"],
             "command_kind": row["command_kind"],
