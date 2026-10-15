@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
 import os
@@ -51,6 +52,11 @@ def _parser():
     start.add_argument("--bootstrap-token-file")
     start.add_argument("--admission-timeout", type=float, help="bounded startup integrity budget in seconds")
     start.add_argument("--worker-profile", help="absolute installed local Worker composition profile")
+    start.add_argument(
+        "--timeline-commit-provider",
+        choices=("astrid-v1",),
+        help="install the fixed Astrid timeline.commit provider before HTTP readiness",
+    )
     create = sub.add_parser("create", help="explicitly create one fresh canonical realm")
     create.add_argument("--root", required=True)
     create.add_argument("--display-name", default="Workspace")
@@ -311,6 +317,14 @@ def main(argv=None):
         print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
         return 0
     try:
+        timeline_commit_provider = None
+        if getattr(args, "timeline_commit_provider", None) == "astrid-v1":
+            from .timeline_commit import PROVIDER_FACTORY
+            module_name, factory_name = PROVIDER_FACTORY.rsplit(".", 1)
+            factory = getattr(importlib.import_module(module_name), factory_name)
+            timeline_commit_provider = factory()
+            if getattr(timeline_commit_provider, "provider_id", None) != "astrid-v1":
+                raise RuntimeErrorBase("configured Astrid timeline commit provider has the wrong identity")
         composition = None
         if getattr(args, "worker_profile", None):
             if not args.realm_id:
@@ -337,6 +351,7 @@ def main(argv=None):
             local_worker_profiles=composition.profiles if composition else None,
             local_worker_preparer=composition.preparer if composition else None,
             local_worker_inspector=composition.inspector if composition else None,
+            timeline_commit_provider=timeline_commit_provider,
         ).start()
     except KeyboardInterrupt:
         raise
@@ -346,7 +361,7 @@ def main(argv=None):
         error = exc.as_dict() if isinstance(exc, RuntimeErrorBase) else {"code": "startup_error", "message": str(exc)}
         print(json.dumps({"ok": False, "error": error}, sort_keys=True))
         return 1
-    print(json.dumps({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path), "worker_credential_file": str(daemon.worker_credential_path), "worker_actor": "astrid-pack-host", "worker_scopes": list(WORKER_SCOPES), "worker_profile_configured": bool(daemon.local_worker_profiles)}, sort_keys=True), flush=True)
+    print(json.dumps({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path), "worker_credential_file": str(daemon.worker_credential_path), "worker_actor": "astrid-pack-host", "worker_scopes": list(WORKER_SCOPES), "worker_profile_configured": bool(daemon.local_worker_profiles), "timeline_commit_provider": getattr(getattr(daemon.service, "_timeline_commit_provider", None), "provider_id", None)}, sort_keys=True), flush=True)
     stop = False
     def handle(*_):
         nonlocal stop
