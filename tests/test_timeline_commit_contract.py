@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 import pytest
 from jsonschema import Draft202012Validator
+from referencing import Registry, Resource
 import yaml
 
 from generators import generate
@@ -24,7 +25,9 @@ ROUTE = '/astrid/v1/projects/{project_id}/timelines/{timeline_id}/commit'
 
 
 def validator(definition):
-    return Draft202012Validator({'$schema': SCHEMA['$schema'], '$defs': SCHEMA['$defs'], '$ref': '#/$defs/' + definition})
+    opcall = generate.opcall_schema()
+    registry = Registry().with_resource(opcall['$id'], Resource.from_contents(opcall))
+    return Draft202012Validator({'$schema': SCHEMA['$schema'], '$defs': SCHEMA['$defs'], '$ref': '#/$defs/' + definition}, registry=registry)
 
 
 def value(case):
@@ -191,6 +194,9 @@ def test_product_copy_check_rejects_drift(tmp_path):
     app.mkdir(parents=True)
     for target, source in [(astrid / 'generated.py', 'packages/python/banodoco_workspace_client/generated.py'), (astrid / 'contract_metadata.py', 'packages/python/banodoco_workspace_client/contract_metadata.py'), (app / 'generated.ts', 'packages/typescript/src/generated.ts'), (app / 'generated-contract-metadata.ts', 'packages/typescript/src/contract-metadata.ts')]:
         target.write_bytes((ROOT / source).read_bytes())
+    opcall = astrid.parents[0] / 'schemas/change-contract/opcall.schema.json'
+    opcall.parent.mkdir(parents=True)
+    opcall.write_bytes(generate.OPCALL_SCHEMA.read_bytes())
     check = [sys.executable, str(ROOT / 'generators/generate.py'), '--check', '--astrid-root', str(astrid.parents[0]), '--app-root', str(app.parents[2])]
     assert subprocess.run(check, capture_output=True).returncode == 0
     for path in [astrid / 'generated.py', app / 'generated.ts']:

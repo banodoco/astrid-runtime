@@ -1,9 +1,9 @@
 {
   "artifacts": [
     {
-      "byte_length": 3325,
+      "byte_length": 3342,
       "path": "contract-metadata.ts",
-      "sha256": "5c38a5bab390f7d1488f8ca037872e45baeb79ba942c71c80102d53377a9efc5"
+      "sha256": "ede576b69f15dfe7c4867b9a8e3c4b834673ba91f85f9742733bf96b2d7196bc"
     },
     {
       "byte_length": 215,
@@ -46,14 +46,14 @@
       "sha256": "7dc2f5d3f82219b439f1c1147aa230f39e706a3c3b24a7d177efc1b975f543b9"
     },
     {
-      "byte_length": 22054,
+      "byte_length": 22071,
       "path": "generated.ts",
-      "sha256": "ecc1fe68640e465a362229daecf59851bbc54610d3d6eee4ca093b9e8e3e9205"
+      "sha256": "146c5e3c0e9fa058c49ed2ce1157334396ed24692467434edcb58df5197b6dc0"
     }
   ],
   "component_manifest_id": "GENERATOR-CONFORMANCE-ID",
   "component_manifest_sha256": "43db3374e0235750a3d0dd6590926cccba73e6e67de317573f86fd812cbcf082",
-  "contract_sha256": "9e50f09f295785b312a632d7fae998c073c334e32757791441811cb0510c468e",
+  "contract_sha256": "ab5dbe28df87e1182abd9d13e2ffc8217c70ddd2d68afdac81a1cb2f61cd5538",
   "generator": "GENERATOR-TYPESCRIPT-CONFORMANCE",
   "operations": [
     "addShotItem",
@@ -71,6 +71,7 @@
     "cancelTask",
     "checkpointAttempt",
     "claimTask",
+    "commitTimeline",
     "controlRemoteCredential",
     "createBackup",
     "createDocument",
@@ -193,7 +194,7 @@
     "updateTimeline"
   ],
   "protocol": "workspace.v1",
-  "schema_digest": "sha256:2170992517c98545d573222eef144580093e879fb3094b5bcb3f240008b5bb21",
-  "schema_manifest_sha256": "ef9b12f20ddcb5a1b5315c4d1180aa702b8a196ab9ba044b89a4564ddfc13d50",
+  "schema_digest": "sha256:cd87ac6ee5d4d2ee1723b0eec9fe19145136a0daef4fffa06c174a4df5f6f6cd",
+  "schema_manifest_sha256": "96eecd65eebf7b90a7460116eb84d7a3ff30b1cc82de4c9cdbb0407b11c79e1d",
   "schema_version": 1
 }

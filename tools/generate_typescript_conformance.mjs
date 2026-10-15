@@ -77,6 +77,14 @@ function runtimeSchemaDigest(contractPath, contractBytes, schemaPath, schemaMani
     dataLength.writeBigUInt64BE(BigInt(input.bytes.length));
     hash.update(nameLength).update(nameBytes).update(dataLength).update(input.bytes);
   }
+  // Same external single-source input and framing as the Python generator.
+  const opcallPath = argument("--opcall-schema", false) ?? process.env.ASTRID_OPCALL_SCHEMA ?? join(ROOT, "../Astrid/schemas/change-contract/opcall.schema.json");
+  const opcall = regular(opcallPath, "Astrid OpCall source");
+  const nameBytes = Buffer.from(JSON.parse(opcall.bytes.toString("utf8")).$id, "utf8");
+  if (nameBytes.toString() !== "https://astrid.local/schemas/change-contract/opcall.schema.json") throw new Error("unexpected OpCall source identity");
+  const nameLength = Buffer.alloc(4), dataLength = Buffer.alloc(8);
+  nameLength.writeUInt32BE(nameBytes.length); dataLength.writeBigUInt64BE(BigInt(opcall.bytes.length));
+  hash.update(nameLength).update(nameBytes).update(dataLength).update(opcall.bytes);
   return `sha256:${hash.digest("hex")}`;
 }
 

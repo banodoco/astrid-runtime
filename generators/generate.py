@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Mapping
@@ -57,6 +58,10 @@ def contract_digest(manifest_path: Path = MANIFEST) -> str:
         data = _regular(path, "contract input")
         h.update(len(relative).to_bytes(4, "big")); h.update(relative)
         h.update(len(data).to_bytes(8, "big")); h.update(data)
+    data = _regular(OPCALL_SCHEMA, "Astrid OpCall contract input")
+    logical = opcall_schema()["$id"].encode()
+    h.update(len(logical).to_bytes(4, "big")); h.update(logical)
+    h.update(len(data).to_bytes(8, "big")); h.update(data)
     return "sha256:" + h.hexdigest()
 
 
@@ -64,6 +69,26 @@ def operation_index(manifest_path: Path = MANIFEST) -> list[str]:
     manifest = json.loads(_regular(manifest_path, "schema manifest"))
     text = (ROOT / "contract" / manifest["openapi"]).read_text(encoding="utf-8")
     return [line.split(":", 1)[1].strip() for line in text.splitlines() if re.match(r"^\s+operationId:", line)]
+
+
+# One source, explicitly selected for isolated source tuples. No editable Runtime copy.
+OPCALL_SCHEMA = Path(os.environ.get("ASTRID_OPCALL_SCHEMA", str(ROOT.parent / "Astrid/schemas/change-contract/opcall.schema.json")))
+
+
+def opcall_schema() -> dict[str, Any]:
+    value = json.loads(_regular(OPCALL_SCHEMA, "Astrid OpCall schema (use --opcall-schema or --astrid-root)"))
+    if value.get("$id") != "https://astrid.local/schemas/change-contract/opcall.schema.json":
+        raise SystemExit("unexpected OpCall source identity")
+    # The bounded validator below implements this envelope only; refuse new schema
+    # constructs until its projection is extended and tested rather than ignore them.
+    if set(value["properties"]) != {"op", "select", "args", "version", "resolved"} or value["additionalProperties"] is not False:
+        raise SystemExit("OpCall validator projection needs an explicit update")
+    allowed = {"type", "description", "pattern", "items", "default", "additionalProperties"}
+    if any(set(field) - allowed for field in value["properties"].values()):
+        raise SystemExit("OpCall validator projection has an unsupported field constraint")
+    if value["properties"]["args"].get("additionalProperties") is not True or value["properties"]["resolved"].get("items") != {"type": "string"}:
+        raise SystemExit("OpCall opaque args or resolved projection needs an explicit update")
+    return value
 
 
 COMMIT_SCHEMA = ROOT / "contract" / "schemas" / "timeline-commit.json"
@@ -75,15 +100,15 @@ def commit_types(language: str) -> str:
     """Project structural types from the Runtime schema, never from generated output.
 
     JSON Schema conditionals remain validator-enforced. EditCommand and canonical
-    timeline documents are opaque boundaries owned by their existing contracts.
+    timeline documents remain opaque; OpCall comes from its existing Astrid schema.
     """
-    definitions = json.loads(_regular(COMMIT_SCHEMA, "timeline commit schema"))["$defs"]
+    definitions = {"EditCommand": opcall_schema(), **json.loads(_regular(COMMIT_SCHEMA, "timeline commit schema"))["$defs"]}
 
     lines: list[str] = []
 
     def expression(schema: Mapping[str, Any], name: str) -> str:
         if "$ref" in schema:
-            return schema["$ref"].rsplit("/", 1)[-1]
+            return "EditCommand" if schema["$ref"] == opcall_schema()["$id"] else schema["$ref"].rsplit("/", 1)[-1]
         if "allOf" in schema and "properties" not in schema:
             # allOf here refines a named structural type using JSON conditionals.
             return expression(schema["allOf"][0], name)
@@ -96,6 +121,8 @@ def commit_types(language: str) -> str:
             if union in schema:
                 return " | ".join(expression(v, name + str(i)) for i, v in enumerate(schema[union]))
         kind = schema.get("type")
+        if isinstance(kind, list):
+            return " | ".join(expression({**schema, "type": item}, name) for item in kind)
         if kind == "array":
             inner = expression(schema["items"], name + "Item")
             return f"Array<{inner}>" if language == "typescript" else f"list[{inner}]"
@@ -132,7 +159,96 @@ def commit_types(language: str) -> str:
         lines.append(f"  {name}({parameters}): Promise<{result}>;" if language == "typescript" else f"    def {name}(self, {parameters}) -> {result}: ...")
     if language == "typescript":
         lines.append("}")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n" + command_support(language)
+
+
+def command_support(language: str) -> str:
+    schema = opcall_schema()
+    if language == "python":
+        return "OPCALL_SCHEMA = " + repr(schema) + "\n" + PYTHON_COMMAND_VALIDATOR
+    return "export const OPCALL_SCHEMA = " + json.dumps(schema, ensure_ascii=False) + " as const;\n" + TYPESCRIPT_COMMAND_VALIDATOR
+
+
+PYTHON_COMMAND_VALIDATOR = r'''
+def validate_edit_command(value: Any) -> Mapping[str, Any]:
+    """Validate only the OpCall envelope; return the exact unmodified value."""
+    import math
+    import re
+    def finite_json(item):
+        if item is None or isinstance(item, (str, bool, int)):
+            return True
+        if isinstance(item, float):
+            return math.isfinite(item)
+        if isinstance(item, list):
+            return all(finite_json(v) for v in item)
+        if isinstance(item, dict):
+            return all(isinstance(k, str) and finite_json(v) for k, v in item.items())
+        return False
+    if not isinstance(value, dict):
+        raise ValueError("OpCall must be an object")
+    fields = OPCALL_SCHEMA["properties"]
+    if set(value) - set(fields) or not set(OPCALL_SCHEMA["required"]) <= set(value):
+        raise ValueError("OpCall missing or unknown field")
+    try:
+        valid_json = finite_json(value)
+    except RecursionError:
+        valid_json = False
+    if not valid_json:
+        raise ValueError("OpCall requires finite JSON values")
+    types = {"string": lambda v: isinstance(v, str), "null": lambda v: v is None,
+             "object": lambda v: isinstance(v, dict), "array": lambda v: isinstance(v, list)}
+    for key, item in value.items():
+        field = fields[key]
+        kinds = field["type"] if isinstance(field["type"], list) else [field["type"]]
+        if not any(types[kind](item) for kind in kinds):
+            raise ValueError("OpCall invalid " + key)
+        if "pattern" in field and re.search(field["pattern"], item) is None:
+            raise ValueError("OpCall invalid " + key)
+        if "items" in field and any(not types[field["items"]["type"]](v) for v in item):
+            raise ValueError("OpCall invalid " + key)
+    return value
+
+
+def validate_edit_command_bytes(raw: bytes) -> bytes:
+    """Validate without reserializing: whitespace, key order and UTF-8 survive."""
+    import json
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON field: " + key)
+            result[key] = value
+        return result
+    validate_edit_command(json.loads(raw, object_pairs_hook=unique_object))
+    return raw
+'''
+
+TYPESCRIPT_COMMAND_VALIDATOR = r'''
+export function validateEditCommand(value: unknown): EditCommand {
+  const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+  const seen = new Set<object>();
+  const finiteJson = (v: unknown): boolean => {
+    if (v === null || typeof v === "string" || typeof v === "boolean") return true;
+    if (typeof v === "number") return Number.isFinite(v);
+    if (typeof v !== "object" || seen.has(v)) return false;
+    seen.add(v);
+    const valid = Array.isArray(v) ? v.every(finiteJson) : object(v) && Object.values(v).every(finiteJson);
+    seen.delete(v);
+    return valid;
+  };
+  if (!object(value)) throw new TypeError("OpCall must be an object");
+  const fields = OPCALL_SCHEMA.properties as Record<string, { type: string | readonly string[]; pattern?: string; items?: { type: string } }>;
+  if (Object.keys(value).some(key => !(key in fields)) || OPCALL_SCHEMA.required.some(key => !(key in value))) throw new TypeError("OpCall missing or unknown field");
+  if (!finiteJson(value)) throw new TypeError("OpCall requires finite JSON values");
+  const types: Record<string, (v: unknown) => boolean> = { string: v => typeof v === "string", null: v => v === null, object, array: Array.isArray };
+  for (const [key, item] of Object.entries(value)) {
+    const field = fields[key];
+    const kinds = typeof field.type === "string" ? [field.type] : field.type;
+    if (!kinds.some(kind => types[kind](item)) || (field.pattern && !new RegExp(field.pattern).test(item as string)) || (field.items && (item as unknown[]).some(v => !types[field.items!.type](v)))) throw new TypeError("OpCall invalid " + key);
+  }
+  return value as EditCommand;
+}
+'''
 
 
 def commit_route() -> str:
@@ -284,6 +400,8 @@ def render(manifest_path: Path = MANIFEST, component_path: Path = COMPONENT_MANI
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    global OPCALL_SCHEMA
+    parser.add_argument("--opcall-schema", help="existing Astrid OpCall source, not a Runtime schema copy")
     parser.add_argument("--check", action="store_true", help="fail if generated metadata differs")
     parser.add_argument("--component-manifest", default=str(COMPONENT_MANIFEST))
     parser.add_argument("--python-output", default=str(PYTHON_CLIENT_OUTPUT), help="Python client output path (for isolated checks)")
@@ -291,7 +409,12 @@ def main() -> int:
     parser.add_argument("--astrid-root", help="sync/check only the existing Astrid generated client and metadata")
     parser.add_argument("--app-root", help="sync/check only the existing App generated client and metadata")
     args = parser.parse_args()
+    if args.opcall_schema:
+        OPCALL_SCHEMA = Path(args.opcall_schema).expanduser().resolve()
+    elif args.astrid_root:
+        OPCALL_SCHEMA = Path(args.astrid_root).expanduser().resolve() / "schemas/change-contract/opcall.schema.json"
     generated = render(component_path=Path(args.component_manifest).expanduser())
+    generated["runtime_protocol/edit_command.py"] = ('"""Generated from Astrid OpCall; no timing or edit execution."""\nfrom typing import Any, Mapping\n' + command_support("python"))
     generated["packages/python/banodoco_workspace_client/generated.py"] = render_python_client()
     generated["packages/typescript/src/generated.ts"] = render_typescript_client()
     products: dict[Path, str] = {}

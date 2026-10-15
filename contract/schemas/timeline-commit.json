@@ -10,9 +10,8 @@
       "description": "Opaque JSON; preserve unknown fields and explicit null losslessly. No TimelineConfig duplicate."
     },
     "CommitCommand": {
-      "type": "object",
-      "additionalProperties": true,
-      "description": "Opaque EditCommand boundary owned by CONTRACT-COMMAND (WS-SAVE 3.1). No handler, ABSENT sentinel, timing parser or editor payload is invented here."
+      "$ref": "https://astrid.local/schemas/change-contract/opcall.schema.json",
+      "description": "CONTRACT-COMMAND: the existing Astrid OpCall/EditCommand envelope; args remain opaque. External schema is supplied offline by the generator, never fetched from the network."
     },
     "CommitActor": {
       "type": "object",

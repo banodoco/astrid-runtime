@@ -1,0 +1,600 @@
+{
+  "fixture_id": "CONTRACT-COMMAND-001",
+  "provenance": "SYNTHETIC only: admitted D RUNNER OpCall envelope and existing timing rules. No observed App payload, X0 result, live service or acceptance evidence. Opaque $absent objects are values here; prior-value preconditions remain unresolved. Result prior-value {$absent:true} is a synthetic opaque witness, not implemented expect semantics; fixed hash strings are schema specimens, not calculated receipt hashes.",
+  "command_cases": [
+    {
+      "id": "CMD-EXECUTED",
+      "valid": true,
+      "value": {
+        "op": "clip.set",
+        "select": "c1.rocket",
+        "args": {
+          "opacity": 0.75
+        },
+        "version": "0.1.0",
+        "resolved": [
+          "c1.rocket"
+        ]
+      },
+      "raw": "{\n \"op\": \"clip.set\",\n \"select\": \"c1.rocket\",\n \"args\": {\n  \"opacity\": 0.75\n },\n \"version\": \"0.1.0\",\n \"resolved\": [\n  \"c1.rocket\"\n ]\n}\n",
+      "sha256": "8fee6c7b8ee7e02f7775949f54a116088077a25777fa103eada7886d03515246"
+    },
+    {
+      "id": "CMD-ABSENT",
+      "valid": true,
+      "value": {
+        "op": "clip.set",
+        "select": "c1.rocket",
+        "args": {}
+      },
+      "raw": "{\n \"op\": \"clip.set\",\n \"select\": \"c1.rocket\",\n \"args\": {}\n}\n",
+      "sha256": "61d2c7385792949b535ae79d3dcec9f8d9c7232d3b091e938309e2e19ae73537"
+    },
+    {
+      "id": "CMD-CLEAR",
+      "valid": true,
+      "value": {
+        "op": "clip.clear",
+        "select": "c1.rocket",
+        "args": {
+          "keys": [
+            "italicWord"
+          ]
+        }
+      },
+      "raw": "{\n \"op\": \"clip.clear\",\n \"select\": \"c1.rocket\",\n \"args\": {\n  \"keys\": [\n   \"italicWord\"\n  ]\n }\n}\n",
+      "sha256": "a377697fa0f3d45f6fda8c272351fcc250907407d9f9e9368b1b2cc6bc201836"
+    },
+    {
+      "id": "CMD-NULL",
+      "valid": true,
+      "value": {
+        "op": "clip.set",
+        "select": "c1.rocket",
+        "args": {
+          "italicWord": null
+        }
+      },
+      "raw": "{\n \"op\": \"clip.set\",\n \"select\": \"c1.rocket\",\n \"args\": {\n  \"italicWord\": null\n }\n}\n",
+      "sha256": "405a2320919c58ec8128ec2575a802feaad34ec465e7ea9170a69d869b5d4cf3"
+    },
+    {
+      "id": "CMD-OPAQUE",
+      "valid": true,
+      "value": {
+        "op": "extension.future-handler",
+        "select": null,
+        "args": {
+          "unknown:field": [
+            null,
+            false,
+            0,
+            {
+              "op": "clear"
+            },
+            {
+              "$absent": true
+            }
+          ],
+          "text": "héllo 世界"
+        }
+      },
+      "raw": "{\n \"op\": \"extension.future-handler\",\n \"select\": null,\n \"args\": {\n  \"unknown:field\": [\n   null,\n   false,\n   0,\n   {\n    \"op\": \"clear\"\n   },\n   {\n    \"$absent\": true\n   }\n  ],\n  \"text\": \"héllo 世界\"\n }\n}\n",
+      "sha256": "e01e2003b30b5189b22a646667a6a7557a15566b842820a72ebe364d6e1c36d8"
+    },
+    {
+      "id": "CMD-EXPLICIT-NULL-OUTPUT",
+      "valid": true,
+      "value": {
+        "op": "timeline.batch",
+        "select": null,
+        "args": {
+          "commands": []
+        },
+        "version": null,
+        "resolved": []
+      },
+      "raw": "{\n \"op\": \"timeline.batch\",\n \"select\": null,\n \"args\": {\n  \"commands\": []\n },\n \"version\": null,\n \"resolved\": []\n}\n",
+      "sha256": "e698eef66c5b70966418d7ee633baa1cbefce29eb75c292bbc45679fc34e49dd"
+    },
+    {
+      "id": "CMD-MISSING-op",
+      "valid": false,
+      "value": {
+        "select": "c1.rocket",
+        "args": {
+          "opacity": 0.75
+        },
+        "version": "0.1.0",
+        "resolved": [
+          "c1.rocket"
+        ]
+      }
+    },
+    {
+      "id": "CMD-MISSING-select",
+      "valid": false,
+      "value": {
+        "op": "clip.set",
+        "args": {
+          "opacity": 0.75
+        },
+        "version": "0.1.0",
+        "resolved": [
+          "c1.rocket"
+        ]
+      }
+    },
+    {
+      "id": "CMD-MISSING-args",
+      "valid": false,
+      "value": {
+        "op": "clip.set",
+        "select": "c1.rocket",
+        "version": "0.1.0",
+        "resolved": [
+          "c1.rocket"
+        ]
+      }
+    },
+    {
+      "id": "CMD-BAD-op",
+      "valid": false,
+      "value": {
+        "op": "bad op",
+        "select": "c1.rocket",
+        "args": {
+          "opacity": 0.75
+        },
+        "version": "0.1.0",
+        "resolved": [
+          "c1.rocket"
+        ]
+      }
+    },
+    {
+      "id": "CMD-BAD-select",
+      "valid": false,
+      "value": {
+        "op": "clip.set",
+        "select": 42,
+        "args": {
+          "opacity": 0.75
+        },
+        "version": "0.1.0",
+        "resolved": [
+          "c1.rocket"
+        ]
+      }
+    },
+    {
+      "id": "CMD-BAD-args",
+      "valid": false,
+      "value": {
+        "op": "clip.set",
+        "select": "c1.rocket",
+        "args": null,
+        "version": "0.1.0",
+        "resolved": [
+          "c1.rocket"
+        ]
+      }
+    },
+    {
+      "id": "CMD-BAD-version",
+      "valid": false,
+      "value": {
+        "op": "clip.set",
+        "select": "c1.rocket",
+        "args": {
+          "opacity": 0.75
+        },
+        "version": 1,
+        "resolved": [
+          "c1.rocket"
+        ]
+      }
+    },
+    {
+      "id": "CMD-BAD-resolved",
+      "valid": false,
+      "value": {
+        "op": "clip.set",
+        "select": "c1.rocket",
+        "args": {
+          "opacity": 0.75
+        },
+        "version": "0.1.0",
+        "resolved": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "CMD-LEGACY-NAME",
+      "valid": false,
+      "value": {
+        "select": "c1.rocket",
+        "args": {
+          "opacity": 0.75
+        },
+        "version": "0.1.0",
+        "resolved": [
+          "c1.rocket"
+        ],
+        "command": "clip.set"
+      }
+    },
+    {
+      "id": "CMD-UNKNOWN-FIELD",
+      "valid": false,
+      "value": {
+        "op": "clip.set",
+        "select": "c1.rocket",
+        "args": {
+          "opacity": 0.75
+        },
+        "version": "0.1.0",
+        "resolved": [
+          "c1.rocket"
+        ],
+        "extra": 1
+      }
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "EXCHANGE-PREVIEW",
+      "request": {
+        "api_version": 1,
+        "project_id": "project-contract",
+        "timeline_id": "timeline-contract",
+        "request_id": "intended-change-1",
+        "session_id": "session-contract",
+        "session_sequence": 7,
+        "base_revision_id": "revision-exact-7",
+        "base_publication_id": "publication-exact-7",
+        "scope": {
+          "target": "parent",
+          "complete": [],
+          "projection_version": 1
+        },
+        "change": {
+          "commands": [
+            {
+              "op": "clip.set",
+              "select": "c1.rocket",
+              "args": {
+                "opacity": 0.75
+              },
+              "version": "0.1.0",
+              "resolved": [
+                "c1.rocket"
+              ]
+            }
+          ]
+        },
+        "source": {
+          "via": "script",
+          "detail": "synthetic contract specimen; not observed App traffic"
+        },
+        "dry_run": true
+      },
+      "result": {
+        "status": "preview",
+        "request_id": "intended-change-1",
+        "request_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "base_revision_id": "revision-exact-7",
+        "accepted_revision_id": null,
+        "accepted_publication_id": null,
+        "previous_revision_id": null,
+        "rebased_onto": "revision-head-8",
+        "canonical_document": {
+          "opaque:future": {
+            "keep": [
+              null,
+              {
+                "unit": "frames",
+                "expression": "+9f"
+              }
+            ]
+          }
+        },
+        "projection_version": 1,
+        "document_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "id_map": {},
+        "change": {
+          "changes": [
+            "synthetic preview"
+          ],
+          "commands": [
+            {
+              "op": "clip.set",
+              "select": "c1.rocket",
+              "args": {
+                "opacity": 0.75
+              },
+              "version": "0.1.0",
+              "resolved": [
+                "c1.rocket"
+              ]
+            }
+          ],
+          "direct_writes": [
+            {
+              "id": "c1.rocket",
+              "path": "params.optional",
+              "before": {
+                "$absent": true
+              },
+              "after": null
+            }
+          ],
+          "consequences": [],
+          "affected": [
+            {
+              "start_s": 12.37,
+              "end_s": 12.67,
+              "reason": "synthetic affected interval in seconds"
+            }
+          ]
+        },
+        "conflicts": [],
+        "choices": [],
+        "provenance": null,
+        "evidence": null,
+        "schema_report": null,
+        "runtime_receipt": null,
+        "error": null
+      }
+    },
+    {
+      "id": "EXCHANGE-CONFLICT",
+      "request": {
+        "api_version": 1,
+        "project_id": "project-contract",
+        "timeline_id": "timeline-contract",
+        "request_id": "intended-change-1",
+        "session_id": "session-contract",
+        "session_sequence": 7,
+        "base_revision_id": "revision-exact-7",
+        "base_publication_id": "publication-exact-7",
+        "scope": {
+          "target": "parent",
+          "complete": [],
+          "projection_version": 1
+        },
+        "change": {
+          "commands": [
+            {
+              "op": "clip.set",
+              "select": "c1.rocket",
+              "args": {
+                "opacity": 0.75
+              },
+              "version": "0.1.0",
+              "resolved": [
+                "c1.rocket"
+              ]
+            }
+          ]
+        },
+        "source": {
+          "via": "script",
+          "detail": "synthetic contract specimen; not observed App traffic"
+        },
+        "dry_run": false
+      },
+      "result": {
+        "status": "conflict",
+        "request_id": "intended-change-1",
+        "request_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "base_revision_id": "revision-exact-7",
+        "accepted_revision_id": null,
+        "accepted_publication_id": null,
+        "previous_revision_id": null,
+        "rebased_onto": "revision-head-8",
+        "canonical_document": {
+          "opaque:future": {
+            "keep": [
+              null,
+              {
+                "unit": "frames",
+                "expression": "+9f"
+              }
+            ]
+          }
+        },
+        "projection_version": 1,
+        "document_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "id_map": {},
+        "change": {
+          "changes": [
+            "synthetic preview"
+          ],
+          "commands": [
+            {
+              "op": "clip.set",
+              "select": "c1.rocket",
+              "args": {
+                "opacity": 0.75
+              },
+              "version": "0.1.0",
+              "resolved": [
+                "c1.rocket"
+              ]
+            }
+          ],
+          "direct_writes": [
+            {
+              "id": "c1.rocket",
+              "path": "params.optional",
+              "before": {
+                "$absent": true
+              },
+              "after": null
+            }
+          ],
+          "consequences": [],
+          "affected": [
+            {
+              "start_s": 12.37,
+              "end_s": 12.67,
+              "reason": "synthetic affected interval in seconds"
+            }
+          ]
+        },
+        "conflicts": [
+          {
+            "id": "occurrence:O1/clip:c08-app",
+            "path": "intent.on",
+            "base": "\"viral\"",
+            "theirs": "\"viral\" +4f",
+            "ours": "\"viral\" +9f",
+            "kind": "same-property"
+          }
+        ],
+        "choices": [
+          {
+            "for": "occurrence:O1/clip:c08-app",
+            "options": [
+              {
+                "label": "Keep ours",
+                "commands": [
+                  {
+                    "args": {
+                      "intent.on": "\"viral\" +9f",
+                      "params.caption": {
+                        "op": "clear"
+                      }
+                    },
+                    "version": "1",
+                    "resolved": [
+                      "occurrence:O1/clip:c08-app"
+                    ],
+                    "op": "timeline.set",
+                    "select": "c08.app"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "provenance": null,
+        "evidence": null,
+        "schema_report": null,
+        "runtime_receipt": null,
+        "error": null
+      }
+    }
+  ],
+  "rounding": [
+    {
+      "id": "ROUND-0",
+      "value": 0,
+      "frame": 0,
+      "backend_positive_domain": true
+    },
+    {
+      "id": "ROUND-1",
+      "value": 0.49,
+      "frame": 0,
+      "backend_positive_domain": true
+    },
+    {
+      "id": "ROUND-2",
+      "value": 0.5,
+      "frame": 1,
+      "backend_positive_domain": true
+    },
+    {
+      "id": "ROUND-3",
+      "value": 1.5,
+      "frame": 2,
+      "backend_positive_domain": true
+    },
+    {
+      "id": "ROUND-4",
+      "value": 2.5,
+      "frame": 3,
+      "backend_positive_domain": true
+    },
+    {
+      "id": "ROUND-5",
+      "value": -0.5,
+      "frame": 0,
+      "backend_positive_domain": false
+    },
+    {
+      "id": "ROUND-6",
+      "value": -1.5,
+      "frame": -1,
+      "backend_positive_domain": false
+    },
+    {
+      "id": "ROUND-7",
+      "value": -1.6,
+      "frame": -2,
+      "backend_positive_domain": false
+    }
+  ],
+  "frames": [
+    {
+      "id": "FRAME-HALF",
+      "seconds": 0.05,
+      "fps": 30,
+      "frame": 2
+    },
+    {
+      "id": "FRAME-HALF-EVEN",
+      "seconds": 0.15,
+      "fps": 30,
+      "frame": 5
+    },
+    {
+      "id": "FRAME-CLOCK-24",
+      "seconds": 1.125,
+      "fps": 24,
+      "frame": 27
+    },
+    {
+      "id": "FRAME-CLOCK-NTSC",
+      "seconds": 1.001,
+      "fps": 29.97002997002997,
+      "frame": 30
+    }
+  ],
+  "anchors": [
+    {
+      "id": "ANCHOR-WORD",
+      "moment": "\"viral\" +9f",
+      "fps": 30,
+      "word_start": 1.25,
+      "word_end": 1.4,
+      "resolved_seconds": 1.55,
+      "frame": 46
+    },
+    {
+      "id": "ANCHOR-WORD-END",
+      "moment": "after \"viral\" -2f",
+      "fps": 24,
+      "word_start": 1,
+      "word_end": 1.5,
+      "resolved_seconds": 1.4166666666666667,
+      "frame": 34
+    }
+  ],
+  "dimensions": [
+    {
+      "id": "DIMENSION-HALF",
+      "width": 5,
+      "height": 9,
+      "scale": 0.5,
+      "even": false,
+      "expected": [
+        3,
+        5
+      ]
+    }
+  ]
+}
