@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import re
 
 from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError
@@ -25,12 +26,13 @@ class RuntimeCommitPort:
     Only detached JSON snapshots and scoped callables cross this boundary.
     There is no service, store, connection, or caller-selected authority field.
     """
-    __slots__ = ("__lookup", "__head", "__revision", "__revision_closure", "__revisions", "__evidence", "__accept")
+    __slots__ = ("__lookup", "__head", "__revision", "__revision_closure", "__revisions", "__evidence", "__accept", "__selected_media")
 
-    def __init__(self, *, lookup, head, revision, revision_closure, revisions, evidence, accept):
+    def __init__(self, *, lookup, head, revision, revision_closure, revisions, evidence, accept, selected_media):
         self.__lookup, self.__head, self.__revision = lookup, head, revision
         self.__revision_closure = revision_closure
         self.__revisions, self.__evidence, self.__accept = revisions, evidence, accept
+        self.__selected_media = selected_media
 
     def lookup_request(self): return self.__lookup()
     def head(self): return self.__head()
@@ -38,6 +40,7 @@ class RuntimeCommitPort:
     def revision_closure(self, revision_id): return self.__revision_closure(revision_id)
     def revisions(self, options): return self.__revisions(options)
     def evidence(self, evidence_digest): return self.__evidence(evidence_digest)
+    def selected_media(self, selection): return self.__selected_media(selection)
     def accept(self, request): return self.__accept(request)
 
 
@@ -57,6 +60,34 @@ def _object(value, required, optional=()):
 def _string(value):
     if not isinstance(value, str) or not value:
         raise ValidationError("commit identity must be a nonempty string")
+
+
+def _media_selection(value, *, require_digest=False):
+    fields = ("asset", "generation_id", "variant_id", "object_id")
+    _object(value, (*fields, "catalog_digest") if require_digest else fields,
+            () if require_digest else ("catalog_digest",))
+    for field in fields:
+        _string(value[field])
+    for field in ("object_id", "catalog_digest"):
+        if field in value:
+            _string(value[field])
+        if field in value and not re.fullmatch(r"sha256:[0-9a-f]{64}", value[field]):
+            raise ValidationError("selected media requires canonical sha256 identities")
+
+
+def _media_metadata(value):
+    """Retain authoring JSON, excluding presentation state and transport hints.
+
+    These fields are never consumed as media identity/timing. In particular a
+    primary change cannot silently reselect the explicitly named variant.
+    """
+    excluded = {"viewed_at", "is_viewed", "viewed", "is_primary", "thumbnail",
+                "local_path", "object_location", "url", "browser_url", "download_url"}
+    if isinstance(value, dict):
+        return {k: _media_metadata(v) for k, v in value.items() if k not in excluded}
+    if isinstance(value, list):
+        return [_media_metadata(v) for v in value]
+    return value
 
 
 def _source(value):
@@ -143,6 +174,75 @@ def result_template(request, request_hash):
 
 
 class TimelineCommitAcceptance:
+    def _selected_project_media(self, project_id, selection):
+        """Reconstruct one record from managed authority; caller owns the mutex.
+
+        This is also called within acceptance's BEGIN IMMEDIATE, never through
+        a cached catalog or a mutable primary-variant lookup. No CAS bytes or
+        locations cross the semantic port.
+        """
+        project = self.store.get_project(project_id)
+        if project["id"] != project_id or project["realm_id"] != self.realm["id"]:
+            raise AuthorizationError("selected media project is outside the request realm")
+        row = self.store.conn.execute(
+            "SELECT g.type, g.status, g.source_task_id, g.metadata_json AS generation_metadata, "
+            "v.variant_type, v.metadata_json AS variant_metadata, o.media_type, o.size, o.original_name "
+            "FROM generations g JOIN generation_variants v ON v.generation_id=g.id "
+            "JOIN objects o ON o.digest=v.object_id "
+            "JOIN project_objects po ON po.digest=o.digest AND po.project_id=g.project_id AND po.relation='managed' "
+            "WHERE g.project_id=? AND g.id=? AND v.id=? AND o.digest=?",
+            (project_id, selection["generation_id"], selection["variant_id"], selection["object_id"][7:]),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("selected media is not a managed project generation/variant/object")
+        if row["status"] != "completed":
+            raise ConflictError("selected media generation is not completed")
+        try:
+            generation_metadata = json.loads(row["generation_metadata"])
+            variant_metadata = json.loads(row["variant_metadata"])
+            if not isinstance(generation_metadata, dict) or not isinstance(variant_metadata, dict):
+                raise ValueError("metadata must be objects")
+            params = generation_metadata.get("params", {})
+            if not isinstance(params, dict):
+                raise ValueError("generation params must be an object")
+            entry = {"object_id": selection["object_id"], "media_type": row["media_type"],
+                     "size": row["size"], "filename": row["original_name"]}
+            if (not isinstance(entry["media_type"], str)
+                    or not entry["media_type"].startswith(("image/", "video/", "audio/"))
+                    or type(entry["size"]) is not int or entry["size"] <= 0):
+                raise ValueError("invalid media format or size")
+            if entry["filename"] is not None and (not isinstance(entry["filename"], str)
+                    or "/" in entry["filename"] or "\\" in entry["filename"]):
+                raise ValueError("media filename must not be a location")
+            for metadata in (params, variant_metadata):
+                for key in ("media_type", "mime_type"):
+                    if metadata.get(key) is not None and metadata[key] != entry["media_type"]:
+                        raise ValueError("contradictory media format metadata")
+                if metadata.get("size") is not None and metadata["size"] != entry["size"]:
+                    raise ValueError("contradictory media size metadata")
+                for key in ("duration_seconds", "width", "height"):
+                    value = metadata.get(key)
+                    if value is None:
+                        continue
+                    if (type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                            or (key != "duration_seconds" and type(value) is not int)):
+                        raise ValueError("invalid intrinsic media metadata")
+                    if key in entry and entry[key] != value:
+                        raise ValueError("contradictory intrinsic media metadata")
+                    entry[key] = value
+            record = {"realm_id": self.realm["id"], "project_id": project_id,
+                      **{k: selection[k] for k in ("asset", "generation_id", "variant_id", "object_id")},
+                      "generation": {"type": row["type"], "source_task_id": row["source_task_id"],
+                                     "metadata": _media_metadata(generation_metadata)},
+                      "variant": {"variant_type": row["variant_type"], "metadata": _media_metadata(variant_metadata)},
+                      "entry": entry}
+            record["catalog_digest"] = digest(record)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValidationError("invalid selected media metadata") from exc
+        if "catalog_digest" in selection and selection["catalog_digest"] != record["catalog_digest"]:
+            raise ConflictError("selected media catalog digest changed")
+        return record
+
     @staticmethod
     def _commit_aggregate(project_id, timeline_id):
         return canonical_json([project_id, timeline_id])
@@ -211,7 +311,7 @@ class TimelineCommitAcceptance:
                 values = values[index + 1:]
             return values[:limit]
 
-    def accept(self, request, *, identity):
+    def accept(self, request, *, identity, _selected_media=()):
         """Accept an internal COMMIT result. No HTTP caller can supply this template.
 
         A single outer transaction includes nested existing publication, evidence,
@@ -281,6 +381,24 @@ class TimelineCommitAcceptance:
                     raise NotFoundError("commit base revision not found")
                 if head["revision_id"] != request["expected_head_revision_id"]:
                     raise ConflictError("StaleHead", details={"code": "StaleHead", "current_head_revision_id": head["revision_id"]})
+                # Replay precedes these dependency checks. BEGIN IMMEDIATE and
+                # the same head CAS fence both membership and selected metadata.
+                recorded_selections = []
+                for command in evidence["commands"]:
+                    args = command.get("args")
+                    if command.get("op") == "timeline.add" and isinstance(args, dict) and "media" in args:
+                        _media_selection(args["media"], require_digest=True)
+                        recorded_selections.append(args["media"])
+                bound_selections = [{k: selected[k] for k in (
+                    "asset", "generation_id", "variant_id", "object_id", "catalog_digest"
+                )} for selected in _selected_media]
+                if (any(v not in bound_selections for v in recorded_selections)
+                        or any(v not in recorded_selections for v in bound_selections)):
+                    raise ValidationError("selected media dependencies must match recorded command evidence")
+                for selected in _selected_media:
+                    current = self._selected_project_media(project_id, selected)
+                    if current != selected:
+                        raise ConflictError("selected media changed before acceptance")
                 before = self.store.conn.execute("SELECT payload_json, content_digest FROM parent_composition_revisions WHERE id=? AND project_id=? AND timeline_id=?",
                                                  (head["revision_id"], project_id, timeline_id)).fetchone()
                 if before is None:
@@ -368,6 +486,30 @@ class TimelineCommitAcceptance:
         original, principal = copy.deepcopy(request), copy.deepcopy(identity)
         project, timeline, key = original["project_id"], original["timeline_id"], original["request_id"]
         request_hash = digest(original)
+        selections = []
+        for command in original["change"].get("commands", []):
+            if command.get("op") == "timeline.add" and isinstance(command.get("args"), dict) and "media" in command["args"]:
+                selection = command["args"]["media"]
+                _media_selection(selection, require_digest=True)
+                if selection not in selections:
+                    selections.append(copy.deepcopy(selection))
+        captured = {}
+
+        def selected_media(selection):
+            _media_selection(selection, require_digest=True)
+            if selection not in selections:
+                raise AuthorizationError("selected media is outside the captured request")
+            token = digest(selection)
+            with self.store._mutex:
+                _publisher(principal, original.get("asserted_actor"))
+                # Paired edits remain unavailable under the existing HTTP grant
+                # policy; the read cannot become a bypass through a trusted port.
+                if principal.get("connector_assertion") or principal.get("_paired_session"):
+                    raise AuthorizationError("project grant commit operation is unavailable")
+                self._assert_mutation_admitted()
+                if token not in captured:
+                    captured[token] = self._selected_project_media(project, selection)
+                return copy.deepcopy(captured[token])
 
         def read(call):
             with self.store._mutex:
@@ -475,7 +617,16 @@ class TimelineCommitAcceptance:
                     or not isinstance(prepared.get("result"), dict)
                     or prepared["result"].get("base_revision_id") != original["base_revision_id"]):
                 raise AuthorizationError("prepared acceptance changed captured request authority or identity")
-            return copy.deepcopy(self.accept(copy.deepcopy(prepared), identity=principal))
+            # Every declared selection must have been consumed by the semantic
+            # provider. Repeated reads/rebase use exactly that detached record.
+            dependencies = []
+            for selection in selections:
+                token = digest(selection)
+                if token not in captured:
+                    raise ValidationError("selected media must be read before acceptance")
+                dependencies.append(copy.deepcopy(captured[token]))
+            return copy.deepcopy(self.accept(copy.deepcopy(prepared), identity=principal,
+                                             _selected_media=dependencies))
 
         return RuntimeCommitPort(
             lookup=lambda: read(lambda: self.lookup_request(project, timeline, key)),
@@ -483,7 +634,7 @@ class TimelineCommitAcceptance:
             revision=lambda revision_id: read(lambda: self.get_project_parent_composition_revision(project, timeline, revision_id)),
             revision_closure=revision_closure,
             revisions=lambda options: read(lambda: self.revisions(project, timeline, copy.deepcopy(options))),
-            evidence=evidence, accept=accept,
+            evidence=evidence, accept=accept, selected_media=selected_media,
         )
 
     def commit_timeline(self, project_id, timeline_id, request, *, idempotency_key, identity):
