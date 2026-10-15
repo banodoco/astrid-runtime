@@ -79,15 +79,65 @@ def opcall_schema() -> dict[str, Any]:
     value = json.loads(_regular(OPCALL_SCHEMA, "Astrid OpCall schema (use --opcall-schema or --astrid-root)"))
     if value.get("$id") != "https://astrid.local/schemas/change-contract/opcall.schema.json":
         raise SystemExit("unexpected OpCall source identity")
-    # The bounded validator below implements this envelope only; refuse new schema
-    # constructs until its projection is extended and tested rather than ignore them.
-    if set(value["properties"]) != {"op", "select", "args", "version", "resolved"} or value["additionalProperties"] is not False:
-        raise SystemExit("OpCall validator projection needs an explicit update")
-    allowed = {"type", "description", "pattern", "items", "default", "additionalProperties"}
-    if any(set(field) - allowed for field in value["properties"].values()):
-        raise SystemExit("OpCall validator projection has an unsupported field constraint")
-    if value["properties"]["args"].get("additionalProperties") is not True or value["properties"]["resolved"].get("items") != {"type": "string"}:
-        raise SystemExit("OpCall opaque args or resolved projection needs an explicit update")
+    # Keep the projection fail-closed: these are the JSON Schema keywords the
+    # generated recursive validators implement. New keywords require a paired
+    # projection and conformance update rather than being silently ignored.
+    allowed = {
+        "$defs", "$id", "$ref", "$schema", "additionalProperties", "const",
+        "default", "description", "enum", "items", "oneOf", "pattern",
+        "properties", "required", "title", "type",
+    }
+
+    def check_keywords(schema: Any) -> None:
+        if not isinstance(schema, dict):
+            raise SystemExit("OpCall validator projection requires object schemas")
+        unsupported = set(schema) - allowed
+        if unsupported:
+            raise SystemExit("OpCall validator projection has unsupported keywords: " + ", ".join(sorted(unsupported)))
+        ref = schema.get("$ref")
+        if ref is not None:
+            if not isinstance(ref, str) or not ref.startswith("#/$defs/"):
+                raise SystemExit("OpCall validator projection supports only local $defs references")
+            if set(schema) != {"$ref"}:
+                raise SystemExit("OpCall validator projection does not support $ref siblings")
+        schema_types = {"object", "array", "string", "null", "boolean", "integer", "number"}
+        kinds = schema.get("type")
+        if kinds is not None and (not isinstance(kinds, (str, list)) or (isinstance(kinds, list) and any(kind not in schema_types for kind in kinds)) or (isinstance(kinds, str) and kinds not in schema_types)):
+            raise SystemExit("OpCall validator projection has an unsupported type")
+        if "pattern" in schema and not isinstance(schema["pattern"], str):
+            raise SystemExit("OpCall validator projection requires string patterns")
+        if "const" in schema and isinstance(schema["const"], (dict, list)):
+            raise SystemExit("OpCall validator projection supports scalar const values only")
+        if "enum" in schema and (not isinstance(schema["enum"], list) or any(isinstance(item, (dict, list)) for item in schema["enum"])):
+            raise SystemExit("OpCall validator projection supports scalar enum values only")
+        if "required" in schema and (not isinstance(schema["required"], list) or any(not isinstance(key, str) for key in schema["required"])):
+            raise SystemExit("OpCall validator projection requires string property names")
+        for mapping_keyword in ("$defs", "properties"):
+            mapping = schema.get(mapping_keyword, {})
+            if not isinstance(mapping, dict):
+                raise SystemExit("OpCall validator projection requires object " + mapping_keyword)
+            for child in mapping.values():
+                check_keywords(child)
+        items = schema.get("items")
+        if items is not None:
+            check_keywords(items)
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict):
+            check_keywords(additional)
+        elif additional is not None and not isinstance(additional, bool):
+            raise SystemExit("OpCall validator projection requires boolean or object additionalProperties")
+        if "oneOf" in schema:
+            alternatives = schema["oneOf"]
+            if not isinstance(alternatives, list):
+                raise SystemExit("OpCall validator projection requires a oneOf schema array")
+            for child in alternatives:
+                check_keywords(child)
+
+    check_keywords(value)
+    expected_properties = {"op", "select", "args", "version", "resolved", "expect", "bindings", "created", "authorship"}
+    required = set(value.get("required", []))
+    if value.get("type") != "object" or set(value.get("properties", {})) != expected_properties or not {"op", "select", "args"} <= required <= expected_properties or value.get("additionalProperties") is not False:
+        raise SystemExit("OpCall envelope projection needs an explicit update")
     return value
 
 
@@ -102,13 +152,24 @@ def commit_types(language: str) -> str:
     JSON Schema conditionals remain validator-enforced. EditCommand and canonical
     timeline documents remain opaque; OpCall comes from its existing Astrid schema.
     """
-    definitions = {"EditCommand": opcall_schema(), **json.loads(_regular(COMMIT_SCHEMA, "timeline commit schema"))["$defs"]}
+    opcall = opcall_schema()
+    opcall_definitions = {
+        "OpCall" + name[0].upper() + name[1:]: schema
+        for name, schema in opcall.get("$defs", {}).items()
+    }
+    definitions = {"EditCommand": opcall, **opcall_definitions, **json.loads(_regular(COMMIT_SCHEMA, "timeline commit schema"))["$defs"]}
 
     lines: list[str] = []
 
     def expression(schema: Mapping[str, Any], name: str) -> str:
         if "$ref" in schema:
-            return "EditCommand" if schema["$ref"] == opcall_schema()["$id"] else schema["$ref"].rsplit("/", 1)[-1]
+            if schema["$ref"] == opcall["$id"]:
+                return "EditCommand"
+            if schema["$ref"].startswith("#/$defs/"):
+                definition = schema["$ref"].rsplit("/", 1)[-1]
+                return ("OpCall" + definition[0].upper() + definition[1:]
+                        if definition in opcall.get("$defs", {}) else definition)
+            return schema["$ref"].rsplit("/", 1)[-1]
         if "allOf" in schema and "properties" not in schema:
             # allOf here refines a named structural type using JSON conditionals.
             return expression(schema["allOf"][0], name)
@@ -184,28 +245,79 @@ def validate_edit_command(value: Any) -> Mapping[str, Any]:
         if isinstance(item, dict):
             return all(isinstance(k, str) and finite_json(v) for k, v in item.items())
         return False
+
+    def matches_type(item, kind):
+        return {
+            "object": lambda: isinstance(item, dict),
+            "array": lambda: isinstance(item, list),
+            "string": lambda: isinstance(item, str),
+            "null": lambda: item is None,
+            "boolean": lambda: isinstance(item, bool),
+            "integer": lambda: isinstance(item, int) and not isinstance(item, bool),
+            "number": lambda: isinstance(item, (int, float)) and not isinstance(item, bool),
+        }.get(kind, lambda: False)()
+
+    def schema_valid(item, schema):
+        if not isinstance(schema, dict):
+            return False
+        ref = schema.get("$ref")
+        if ref is not None:
+            if not isinstance(ref, str) or not ref.startswith("#/"):
+                return False
+            target = OPCALL_SCHEMA
+            for part in ref[2:].split("/"):
+                part = part.replace("~1", "/").replace("~0", "~")
+                if not isinstance(target, dict) or part not in target:
+                    return False
+                target = target[part]
+            return schema_valid(item, target)
+
+        if "type" in schema:
+            kinds = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
+            if not any(matches_type(item, kind) for kind in kinds):
+                return False
+        if "const" in schema and item != schema["const"]:
+            return False
+        if "enum" in schema and item not in schema["enum"]:
+            return False
+        if "pattern" in schema and (not isinstance(item, str) or re.search(schema["pattern"], item) is None):
+            return False
+        if "oneOf" in schema:
+            alternatives = schema["oneOf"]
+            if not isinstance(alternatives, list) or sum(schema_valid(item, option) for option in alternatives) != 1:
+                return False
+
+        if isinstance(item, dict):
+            required = schema.get("required", [])
+            if not isinstance(required, list) or any(key not in item for key in required):
+                return False
+            properties = schema.get("properties", {})
+            if not isinstance(properties, dict):
+                return False
+            additional = schema.get("additionalProperties", True)
+            for key, child in item.items():
+                if key in properties:
+                    if not schema_valid(child, properties[key]):
+                        return False
+                elif additional is False:
+                    return False
+                elif isinstance(additional, dict) and not schema_valid(child, additional):
+                    return False
+        if isinstance(item, list) and "items" in schema:
+            if not all(schema_valid(child, schema["items"]) for child in item):
+                return False
+        return True
+
     if not isinstance(value, dict):
         raise ValueError("OpCall must be an object")
-    fields = OPCALL_SCHEMA["properties"]
-    if set(value) - set(fields) or not set(OPCALL_SCHEMA["required"]) <= set(value):
-        raise ValueError("OpCall missing or unknown field")
     try:
         valid_json = finite_json(value)
     except RecursionError:
         valid_json = False
     if not valid_json:
         raise ValueError("OpCall requires finite JSON values")
-    types = {"string": lambda v: isinstance(v, str), "null": lambda v: v is None,
-             "object": lambda v: isinstance(v, dict), "array": lambda v: isinstance(v, list)}
-    for key, item in value.items():
-        field = fields[key]
-        kinds = field["type"] if isinstance(field["type"], list) else [field["type"]]
-        if not any(types[kind](item) for kind in kinds):
-            raise ValueError("OpCall invalid " + key)
-        if "pattern" in field and re.search(field["pattern"], item) is None:
-            raise ValueError("OpCall invalid " + key)
-        if "items" in field and any(not types[field["items"]["type"]](v) for v in item):
-            raise ValueError("OpCall invalid " + key)
+    if not schema_valid(value, OPCALL_SCHEMA):
+        raise ValueError("OpCall schema violation")
     return value
 
 
@@ -236,16 +348,62 @@ export function validateEditCommand(value: unknown): EditCommand {
     seen.delete(v);
     return valid;
   };
+
+  const matchesType = (candidate: unknown, kind: string): boolean => {
+    if (kind === "object") return object(candidate);
+    if (kind === "array") return Array.isArray(candidate);
+    if (kind === "string") return typeof candidate === "string";
+    if (kind === "null") return candidate === null;
+    if (kind === "boolean") return typeof candidate === "boolean";
+    if (kind === "integer") return typeof candidate === "number" && Number.isInteger(candidate);
+    if (kind === "number") return typeof candidate === "number" && Number.isFinite(candidate);
+    return false;
+  };
+  const rootSchema = OPCALL_SCHEMA as unknown as Record<string, any>;
+  const schemaValid = (candidate: unknown, schema: Record<string, any>): boolean => {
+    if (typeof schema !== "object" || schema === null || Array.isArray(schema)) return false;
+    if (typeof schema.$ref === "string") {
+      if (!schema.$ref.startsWith("#/")) return false;
+      let target: any = rootSchema;
+      for (const part of schema.$ref.slice(2).split("/")) {
+        const key = part.replace(/~1/g, "/").replace(/~0/g, "~");
+        if (!object(target) || !(key in target)) return false;
+        target = target[key];
+      }
+      return schemaValid(candidate, target);
+    }
+    if (schema.type !== undefined) {
+      const kinds: string[] = Array.isArray(schema.type) ? schema.type : [schema.type];
+      if (!kinds.some(kind => matchesType(candidate, kind))) return false;
+    }
+    if (Object.prototype.hasOwnProperty.call(schema, "const") && candidate !== schema.const) return false;
+    if (Array.isArray(schema.enum) && !schema.enum.some((entry: unknown) => candidate === entry)) return false;
+    if (schema.pattern !== undefined && (typeof candidate !== "string" || !new RegExp(schema.pattern).test(candidate))) return false;
+    if (schema.oneOf !== undefined) {
+      if (!Array.isArray(schema.oneOf) || schema.oneOf.filter((option: Record<string, any>) => schemaValid(candidate, option)).length !== 1) return false;
+    }
+    if (object(candidate)) {
+      if (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.some((key: string) => !(key in candidate)))) return false;
+      const properties = schema.properties === undefined ? {} : schema.properties;
+      if (!object(properties)) return false;
+      const additional = schema.additionalProperties;
+      for (const [key, child] of Object.entries(candidate)) {
+        if (Object.prototype.hasOwnProperty.call(properties, key)) {
+          if (!schemaValid(child, properties[key])) return false;
+        } else if (additional === false) {
+          return false;
+        } else if (object(additional) && !schemaValid(child, additional)) {
+          return false;
+        }
+      }
+    }
+    if (Array.isArray(candidate) && schema.items !== undefined && !candidate.every(child => schemaValid(child, schema.items))) return false;
+    return true;
+  };
+
   if (!object(value)) throw new TypeError("OpCall must be an object");
-  const fields = OPCALL_SCHEMA.properties as Record<string, { type: string | readonly string[]; pattern?: string; items?: { type: string } }>;
-  if (Object.keys(value).some(key => !(key in fields)) || OPCALL_SCHEMA.required.some(key => !(key in value))) throw new TypeError("OpCall missing or unknown field");
   if (!finiteJson(value)) throw new TypeError("OpCall requires finite JSON values");
-  const types: Record<string, (v: unknown) => boolean> = { string: v => typeof v === "string", null: v => v === null, object, array: Array.isArray };
-  for (const [key, item] of Object.entries(value)) {
-    const field = fields[key];
-    const kinds = typeof field.type === "string" ? [field.type] : field.type;
-    if (!kinds.some(kind => types[kind](item)) || (field.pattern && !new RegExp(field.pattern).test(item as string)) || (field.items && (item as unknown[]).some(v => !types[field.items!.type](v)))) throw new TypeError("OpCall invalid " + key);
-  }
+  if (!schemaValid(value, rootSchema)) throw new TypeError("OpCall schema violation");
   return value as EditCommand;
 }
 '''

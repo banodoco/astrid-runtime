@@ -12,6 +12,11 @@ from runtime_protocol.edit_command import OPCALL_SCHEMA, validate_edit_command, 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = json.loads((ROOT / 'conformance/fixtures/edit-command-candidate.json').read_text())
+OPCALL_SCHEMA_FIXTURE_ROOT = ROOT / 'conformance/fixtures/opcall-schema'
+OPCALL_SCHEMA_FIXTURE_NAMES = {
+    'valid': {'opcall.spec-stagger.json', 'opcall.state-distinction.json'},
+    'invalid': {'opcall.unscoped-resolved-id.json', 'opcall.untagged-absent.json'},
+}
 
 
 def test_single_schema_projection_matches_source():
@@ -21,6 +26,30 @@ def test_single_schema_projection_matches_source():
     assert 'EditCommand = TypedDict' in generate.commit_types('python')
     assert 'CommitCommand = EditCommand' in generate.commit_types('python')
     assert 'export type CommitCommand = EditCommand' in generate.commit_types('typescript')
+
+
+@pytest.mark.parametrize(
+    ('validity', 'filename'),
+    [(validity, filename) for validity, filenames in OPCALL_SCHEMA_FIXTURE_NAMES.items() for filename in sorted(filenames)],
+    ids=lambda value: value,
+)
+def test_canonical_opcall_schema_fixture_cohort(validity, filename):
+    path = OPCALL_SCHEMA_FIXTURE_ROOT / validity / filename
+    fixture = json.loads(path.read_bytes())
+    instance = fixture['instance']
+    expected_valid = validity == 'valid'
+
+    assert Draft202012Validator(OPCALL_SCHEMA).is_valid(instance) is expected_valid
+    if expected_valid:
+        assert validate_edit_command(instance) is instance
+    else:
+        with pytest.raises(ValueError):
+            validate_edit_command(instance)
+
+
+def test_canonical_opcall_schema_fixture_map_is_complete():
+    for validity, expected_names in OPCALL_SCHEMA_FIXTURE_NAMES.items():
+        assert {path.name for path in (OPCALL_SCHEMA_FIXTURE_ROOT / validity).glob('opcall.*.json')} == expected_names
 
 
 @pytest.mark.parametrize('case', FIXTURE['command_cases'], ids=lambda c: c['id'])
@@ -54,7 +83,7 @@ def test_absence_null_clear_and_opaque_values_remain_distinct():
     assert len({json.dumps(validate_edit_command(v), sort_keys=True) for v in values}) == 4
     assert 'version' not in cases['CMD-ABSENT']
     assert cases['CMD-EXPLICIT-NULL-OUTPUT']['version'] is None
-    assert validate_edit_command(cases['CMD-EXECUTED'])['resolved'] == ['c1.rocket']
+    assert validate_edit_command(cases['CMD-EXECUTED'])['resolved'] == ['parent/clip:c1.rocket']
 
 
 @pytest.mark.parametrize('exchange', FIXTURE['exchanges'], ids=lambda c: c['id'])
