@@ -2259,7 +2259,6 @@ class RuntimeService(TimelineCommitAcceptance):
         defaults = {"tracks": [], "clips": [], "effects": [], "audio": [], "layout": {}, "registry": {}, "assets": []}
         for key, default in defaults.items():
             result.setdefault(key, default)
-        RuntimeService._validate_timeline_track_roles(result)
         effects = result["effects"]
         if not isinstance(effects, list):
             raise ValidationError("internal timeline effects must be a list")
@@ -2270,17 +2269,56 @@ class RuntimeService(TimelineCommitAcceptance):
 
     @staticmethod
     def _validate_timeline_track_roles(config):
+        """Return authored-schema role findings without blocking publication."""
         tracks = config.get("tracks", []) if isinstance(config, dict) else []
         if not isinstance(tracks, list):
-            return
-        for track in tracks:
+            return []
+        findings = []
+        for index, track in enumerate(tracks):
             if not isinstance(track, dict) or "role" not in track:
                 continue
             if track["role"] not in ("output", "source"):
-                raise ValidationError(
-                    "timeline track role must be 'output' or 'source'",
-                    details={"track_id": track.get("id"), "role": track["role"]},
-                )
+                findings.append({
+                    "path": f"/tracks/{index}/role",
+                    "code": "enum",
+                    "message": "timeline track role must be 'output' or 'source'",
+                })
+        return findings
+
+    @staticmethod
+    def _publication_schema_report(parent_payload, internal):
+        """Collect warning-only findings for the authored TimelineConfig projection.
+
+        Publication remains lossless for legacy config fields. The closed
+        top-level key set mirrors `contract/schemas/timeline-config.schema.json`;
+        the existing track-role check contributes enum findings at both
+        publication config and internal timeline payload locations.
+        """
+        findings = []
+        config = parent_payload.get("config", {})
+        allowed_config_keys = {
+            "theme", "clips", "tracks", "pinnedShotGroups", "theme_overrides",
+            "generation_defaults", "app", "output",
+        }
+        if isinstance(config, dict):
+            for key in sorted(config.keys() - allowed_config_keys):
+                escaped = str(key).replace("~", "~0").replace("/", "~1")
+                findings.append({
+                    "path": f"/parent_composition/config/{escaped}",
+                    "code": "additional_property",
+                    "message": f"timeline config contains unrecognized property {key!r}",
+                })
+        for finding in RuntimeService._validate_timeline_track_roles(config):
+            finding = dict(finding)
+            finding["path"] = "/parent_composition/config" + finding["path"]
+            findings.append(finding)
+        for value in internal.values():
+            path = value["timeline_id"]
+            for finding in RuntimeService._validate_timeline_track_roles(value["payload"]):
+                finding = dict(finding)
+                finding["path"] = f"/internal_timeline_revisions/{path}/payload" + finding["path"]
+                findings.append(finding)
+        return findings
 
     @staticmethod
     def _complete_shot_payload(payload, internal_revision_id):
@@ -2313,7 +2351,6 @@ class RuntimeService(TimelineCommitAcceptance):
             result.setdefault(key, default)
         if not isinstance(result["config"], dict) or not isinstance(result["registry"], dict):
             raise ValidationError("parent composition config and registry must be objects")
-        RuntimeService._validate_timeline_track_roles(result["config"])
         if not isinstance(result["clips"], list) or not isinstance(result["occurrences"], list):
             raise ValidationError("parent composition clips and occurrences must be lists")
         for clip in result["clips"]:
@@ -3100,6 +3137,7 @@ class RuntimeService(TimelineCommitAcceptance):
         if parent_source is None:
             raise ValidationError("parent_composition is required")
         parent_payload = self._complete_parent_payload(parent_source)
+        schema_report = self._publication_schema_report(parent_payload, internal)
         stored_head = self.get_project_parent_composition_revision(project["id"], timeline_id, current_head)["payload"] if current_head else None
         self._require_writable_composition(stored_head, parent_payload)
         occurrences = []
@@ -3336,6 +3374,7 @@ class RuntimeService(TimelineCommitAcceptance):
         event_id = self.store._append_timeline_event(timeline_id, "parent.composition.published", event_payload)
         event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
         result = {"project_id": project["id"], "timeline_id": timeline_id, "revision_id": parent_revision_id, "parent_revision_id": parent_revision_id, "content_digest": parent_digest, "payload": parent_payload, "old_head": expected_head, "new_head": parent_revision_id, "dependency_manifest": manifest, "content_digests": {"parent": parent_digest, **{item["revision_id"]: item["content_digest"] for item in manifest["shots"] + manifest["internal_timelines"]}, **{item["media_id"]: item["content_digest"] for item in manifest["media"]}}, "event_id": event_id, "created_at": timestamp}
+        result["schema_report"] = schema_report
         result["visual_seam_report"] = seam_report
         recorded = self._command_record("parent_composition.publish", timeline_id, idempotency_key, request_hash, result, project_id=project["id"], event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
         publication_id = recorded["receipt"]["receipt_id"]

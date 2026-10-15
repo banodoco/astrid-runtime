@@ -161,6 +161,7 @@ def test_parent_track_role_survives_immutable_publication_and_read(tmp_path):
     service, project_id = _service(tmp_path)
     try:
         body = _publication(project_id)
+        body["parent_composition"]["config"]["clips"] = []
         body["parent_composition"]["config"]["tracks"] = [
             {"id": "output", "kind": "visual", "label": "Output", "role": "output"},
             {"id": "source", "kind": "visual", "label": "Source", "role": "source"},
@@ -174,12 +175,14 @@ def test_parent_track_role_survives_immutable_publication_and_read(tmp_path):
         )
         assert reread["content_digest"] == published["data"]["content_digest"]
         assert reread["payload"]["config"]["tracks"] == body["parent_composition"]["config"]["tracks"]
+        assert published["data"]["schema_report"] == []
+        assert published["receipt"]["result"]["schema_report"] == []
     finally:
         service.close()
 
 
 @pytest.mark.parametrize("location", ["parent", "internal"])
-def test_invalid_track_role_is_rejected_when_publishing_timeline_payload(tmp_path, location):
+def test_invalid_track_role_is_reported_without_rejecting_publication(tmp_path, location):
     service, project_id = _service(tmp_path)
     try:
         body = _publication(project_id, parent_revision_id=f"invalid-role-{location}")
@@ -189,13 +192,39 @@ def test_invalid_track_role_is_rejected_when_publishing_timeline_payload(tmp_pat
         else:
             body["internal_timeline_revisions"][0]["payload"]["tracks"] = tracks
 
-        with pytest.raises(ValidationError, match="track role"):
-            service.publish_parent_composition(
-                project_id, "main", body, idempotency_key=f"invalid-role-{location}"
-            )
+        published = service.publish_parent_composition(
+            project_id, "main", body, idempotency_key=f"invalid-role-{location}"
+        )
+        report = published["data"]["schema_report"]
+        assert len(report) == 1
+        assert report[0]["code"] == "enum"
+        assert report[0]["path"].endswith("/tracks/0/role")
+        assert published["receipt"]["result"]["schema_report"] == report
         assert service.store.conn.execute(
             "SELECT COUNT(*) FROM parent_composition_revisions"
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 1
+    finally:
+        service.close()
+
+
+def test_legacy_loose_config_key_is_preserved_and_reported_once(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        body = _publication(project_id, config={"legacy_loose_key": True})
+        published = service.publish_parent_composition(
+            project_id, "main", body, idempotency_key="publish-legacy-loose-key"
+        )
+
+        report = published["data"]["schema_report"]
+        assert len(report) == 1
+        assert report[0] == {
+            "path": "/parent_composition/config/legacy_loose_key",
+            "code": "additional_property",
+            "message": "timeline config contains unrecognized property 'legacy_loose_key'",
+        }
+        assert published["data"]["payload"]["config"]["legacy_loose_key"] is True
+        assert published["receipt"]["result"]["schema_report"] == report
+        assert published["data"]["new_head"] == "parent-1"
     finally:
         service.close()
 
