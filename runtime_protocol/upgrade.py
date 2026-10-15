@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
+from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL, HISTORY_SCHEMA_STATEMENTS
 from .catalog import _safe_path
 from .errors import ConflictError, OwnerBusyError, RealmAdmissionError, ValidationError
 from .store import REQUIRED_SCHEMA_COLUMNS, REQUIRED_SCHEMA_TABLES, SCHEMA_VERSION, RealmStore
@@ -47,12 +47,12 @@ NEW_TABLES = frozenset({
     "runtime_schema", "managed_output_associations", "managed_output_lifecycle", "user_preferences",
     "internal_timeline_revisions", "shot_revisions", "parent_composition_revisions",
     "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences",
-    "composition_revision_dependencies",
+    "composition_revision_dependencies", "parent_composition_publications",
 })
 REVISION_TABLES = frozenset({
     "internal_timeline_revisions", "shot_revisions", "parent_composition_revisions",
     "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences",
-    "composition_revision_dependencies",
+    "composition_revision_dependencies", "parent_composition_publications",
 })
 DEFAULT_UPGRADE_TIMEOUT_SECONDS = 120.0
 CANONICAL_PREVIOUS_SCHEMA_VERSION = 24
@@ -61,6 +61,7 @@ EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION = 25
 EXECUTION_BINDING_TARGET_SCHEMA_VERSION = 26
 USER_PREFERENCES_PREVIOUS_SCHEMA_VERSION = 26
 USER_PREFERENCES_TARGET_SCHEMA_VERSION = 27
+HISTORY_TARGET_SCHEMA_VERSION = 28
 HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION = "MIGRATE MANAGED OUTPUTS"
 GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION = "REPAIR GENERIC MEDIA TYPES"
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv"})
@@ -291,10 +292,15 @@ def _canonical_shape_for(version: int) -> tuple[set[str], dict[str, set[str]]]:
         VARIANT_STATE_TARGET_SCHEMA_VERSION,
         EXECUTION_BINDING_TARGET_SCHEMA_VERSION,
         USER_PREFERENCES_TARGET_SCHEMA_VERSION,
+        HISTORY_TARGET_SCHEMA_VERSION,
     }:
         raise ValidationError(f"canonical schema version {version} is not supported")
     tables = set(REQUIRED_SCHEMA_TABLES)
     columns = {table: set(values) for table, values in REQUIRED_SCHEMA_COLUMNS.items()}
+    if version < HISTORY_TARGET_SCHEMA_VERSION:
+        tables.remove("parent_composition_publications")
+        columns.pop("parent_composition_publications")
+        columns["parent_composition_heads"].remove("publication_id")
     if version < USER_PREFERENCES_TARGET_SCHEMA_VERSION:
         tables.remove("user_preferences")
         columns.pop("user_preferences")
@@ -329,9 +335,9 @@ def _canonical_schema_identity(
     format_id, version = str(rows[0][1]), int(rows[0][2])
     if format_id != CANONICAL_FORMAT_ID:
         raise ValidationError(f"unsupported canonical format {format_id!r}")
-    if version > USER_PREFERENCES_TARGET_SCHEMA_VERSION:
+    if version > HISTORY_TARGET_SCHEMA_VERSION:
         raise ValidationError(
-            f"canonical schema v{version} is newer than supported v{USER_PREFERENCES_TARGET_SCHEMA_VERSION}"
+            f"canonical schema v{version} is newer than supported v{HISTORY_TARGET_SCHEMA_VERSION}"
         )
     if version < CANONICAL_PREVIOUS_SCHEMA_VERSION:
         raise ValidationError(f"canonical schema v{version} is not a supported migration source")
@@ -557,6 +563,64 @@ def _apply_v26_to_v27(connection: sqlite3.Connection) -> dict[str, object]:
     }
 
 
+def _apply_v27_to_v28(connection: sqlite3.Connection) -> dict[str, object]:
+    """Keep every publication receipt. Unknown historical ancestry stays null.
+
+    old_head is an explicit recorded fact; parent_revision_id is never ancestry.
+    Receipt ordering alone does not prove previous-publication or restore links.
+    Existing revision bytes and ledger rows are left exactly as they were.
+    """
+    for statement in HISTORY_SCHEMA_STATEMENTS:
+        connection.execute(statement)
+    connection.execute("ALTER TABLE parent_composition_heads ADD COLUMN publication_id TEXT")
+    rows = connection.execute(
+        "SELECT aggregate_id, txn_id, result_json, created_at FROM command_idempotency "
+        "WHERE command_kind='parent_composition.publish' ORDER BY rowid"
+    ).fetchall()
+    for row in rows:
+        value = json.loads(row["result_json"])
+        revision_id = value.get("revision_id")
+        revision = connection.execute(
+            "SELECT project_id, timeline_id FROM parent_composition_revisions WHERE id=?", (revision_id,)
+        ).fetchone()
+        if revision is None or not row["txn_id"] or revision["timeline_id"] != row["aggregate_id"]:
+            continue  # Insufficient historical evidence; never fabricate an event.
+        connection.execute(
+            "INSERT INTO parent_composition_publications(publication_id, project_id, timeline_id, revision_id, "
+            "previous_revision_id, provenance_json, created_at) VALUES (?,?,?,?,?,?,?)",
+            (row["txn_id"], revision["project_id"], revision["timeline_id"], revision_id,
+             value.get("old_head"), canonical_json({"source": {"via": "legacy-publish"}}), row["created_at"]),
+        )
+    # ACCEPT already recorded explicit ancestry and authenticated provenance.
+    # Copy those facts by exact publication identity; do not derive them from
+    # revision IDs, timestamp order, or the publication's parent_revision_id.
+    for row in connection.execute("SELECT result_json FROM command_idempotency WHERE command_kind='timeline.commit'"):
+        saved = json.loads(row[0])
+        summary = saved.get("summary")
+        if not isinstance(summary, dict):
+            continue
+        provenance = saved.get("result", {}).get("provenance")
+        if not isinstance(provenance, dict):
+            continue
+        connection.execute(
+            "UPDATE parent_composition_publications SET previous_revision_id=?, previous_publication_id=?, "
+            "restored_from_revision_id=?, provenance_json=? WHERE publication_id=? AND revision_id=?",
+            (summary.get("previous_revision_id"), summary.get("previous_publication_id"),
+             summary.get("restored_from_revision_id"), canonical_json(provenance),
+             summary.get("publication_id"), summary.get("revision_id")),
+        )
+    connection.execute(
+        "UPDATE parent_composition_heads SET publication_id=(SELECT p.publication_id "
+        "FROM parent_composition_publications p WHERE p.project_id=parent_composition_heads.project_id "
+        "AND p.timeline_id=parent_composition_heads.timeline_id AND p.revision_id=parent_composition_heads.revision_id "
+        "ORDER BY p.sequence DESC LIMIT 1)"
+    )
+    connection.execute("UPDATE runtime_schema SET version=? WHERE id=1", (HISTORY_TARGET_SCHEMA_VERSION,))
+    return {"source_schema_version": 27, "target_schema_version": HISTORY_TARGET_SCHEMA_VERSION,
+            "added_tables": ["parent_composition_publications"],
+            "added_columns": ["parent_composition_heads.publication_id"]}
+
+
 def migrate_canonical_v24_to_v25(
     root: str | Path,
     *,
@@ -661,9 +725,9 @@ def migrate_canonical_to_current(
     confirmation: str | None = None,
     expected_realm_id: str | None = None,
 ) -> dict:
-    """Atomically run every supported canonical step through pinned v27.
+    """Atomically run every supported canonical step through pinned v28.
 
-    Current v27 is a read-only idempotent result.  Unknown, alternate, and
+    Current v28 is a read-only idempotent result.  Unknown, alternate, and
     newer layouts are rejected by the read-only preflight before an owner-lock
     marker, SQLite sidecar, journal, process signal, or schema mutation occurs.
     """
@@ -676,12 +740,12 @@ def migrate_canonical_to_current(
     if confirmation != expected_confirmation:
         raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
     source_version = int(identity["version"])
-    if source_version == USER_PREFERENCES_TARGET_SCHEMA_VERSION:
+    if source_version == HISTORY_TARGET_SCHEMA_VERSION:
         return {
             "ok": True,
             "realm_id": realm_id,
             "source_schema_version": source_version,
-            "target_schema_version": USER_PREFERENCES_TARGET_SCHEMA_VERSION,
+            "target_schema_version": HISTORY_TARGET_SCHEMA_VERSION,
             "steps": [],
             "changed": False,
         }
@@ -708,9 +772,12 @@ def migrate_canonical_to_current(
                     raise ValidationError("v25 to v26 migration did not produce the pinned v26 layout")
             if int(current["version"]) == USER_PREFERENCES_PREVIOUS_SCHEMA_VERSION:
                 steps.append(_apply_v26_to_v27(connection))
+            current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
+            if int(current["version"]) == USER_PREFERENCES_TARGET_SCHEMA_VERSION:
+                steps.append(_apply_v27_to_v28(connection))
             final = _canonical_schema_identity(connection, expected_realm_id=realm_id)
-            if int(final["version"]) != USER_PREFERENCES_TARGET_SCHEMA_VERSION:
-                raise ValidationError("canonical migration did not produce the pinned v27 layout")
+            if int(final["version"]) != HISTORY_TARGET_SCHEMA_VERSION:
+                raise ValidationError("canonical migration did not produce the pinned v28 layout")
             if _quick_check(connection, float(timeout_seconds)) != "ok":
                 raise ValidationError("migrated database failed SQLite integrity check")
             foreign_keys = _foreign_key_errors(connection, float(timeout_seconds))
@@ -721,7 +788,7 @@ def migrate_canonical_to_current(
                 "ok": True,
                 "realm_id": realm_id,
                 "source_schema_version": source_version,
-                "target_schema_version": USER_PREFERENCES_TARGET_SCHEMA_VERSION,
+                "target_schema_version": HISTORY_TARGET_SCHEMA_VERSION,
                 "steps": steps,
                 "changed": True,
                 "elapsed_seconds": time.monotonic() - started,

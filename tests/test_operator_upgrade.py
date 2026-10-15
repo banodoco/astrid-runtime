@@ -54,6 +54,11 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
     paths.ensure_support_dirs()
     realm_root = paths.realms_dir / "realm-1"
     RealmStore.initialize(realm_root, realm_id="realm-1").close()
+    if version < 28:
+        with sqlite3.connect(realm_root / "realm.sqlite3") as connection:
+            connection.execute("DROP TABLE parent_composition_publications")
+            connection.execute("ALTER TABLE parent_composition_heads DROP COLUMN publication_id")
+            connection.execute("UPDATE runtime_schema SET version=? WHERE id=1", (version,))
     if version < 27:
         with sqlite3.connect(realm_root / "realm.sqlite3") as connection:
             connection.execute("DROP TABLE user_preferences")
@@ -195,7 +200,7 @@ def test_operator_upgrade_restarts_a_real_current_runtime(tmp_path):
         boundary.stop()
 
 
-def test_operator_upgrade_current_v27_uses_read_only_schema_noop(tmp_path, monkeypatch):
+def test_operator_upgrade_current_schema_uses_read_only_schema_noop(tmp_path, monkeypatch):
     paths, profile, _realm_root = _fixture(tmp_path, version=SCHEMA_VERSION)
     boundary = _Boundary(paths)
 
@@ -210,7 +215,7 @@ def test_operator_upgrade_current_v27_uses_read_only_schema_noop(tmp_path, monke
 
     monkeypatch.setattr("banodoco_local.operator_upgrade._bootstrap_locked", fake_start)
     result = upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
-    assert result["schema_before"] == "v27"
+    assert result["schema_before"] == f"v{SCHEMA_VERSION}"
     assert result["migration"]["changed"] is False
     assert result["migration"]["steps"] == []
 
@@ -218,7 +223,7 @@ def test_operator_upgrade_current_v27_uses_read_only_schema_noop(tmp_path, monke
 def test_operator_upgrade_rejects_newer_schema_before_journal_or_signal(tmp_path):
     paths, profile, realm_root = _fixture(tmp_path, version=SCHEMA_VERSION)
     connection = sqlite3.connect(realm_root / "realm.sqlite3")
-    connection.execute("UPDATE runtime_schema SET version=28 WHERE id=1")
+    connection.execute("UPDATE runtime_schema SET version=? WHERE id=1", (SCHEMA_VERSION + 1,))
     connection.commit()
     connection.close()
     tracked = [realm_root / "realm.sqlite3", paths.catalog_path, paths.discovery_path, paths.instance_lock_path]

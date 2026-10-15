@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 REALM_ADMISSION_TIMEOUT_SECONDS = 5.0
@@ -75,7 +75,8 @@ REQUIRED_SCHEMA_COLUMNS = {
     "shot_revisions": frozenset("id project_id shot_id internal_timeline_revision_id payload_json content_digest created_at".split()),
     "parent_composition_revisions": frozenset("id project_id timeline_id payload_json content_digest created_at".split()),
     "shot_revision_heads": frozenset("shot_id project_id revision_id updated_at".split()),
-    "parent_composition_heads": frozenset("timeline_id project_id revision_id updated_at".split()),
+    "parent_composition_heads": frozenset("timeline_id project_id revision_id publication_id updated_at".split()),
+    "parent_composition_publications": frozenset("sequence publication_id project_id timeline_id revision_id previous_revision_id previous_publication_id restored_from_revision_id provenance_json created_at".split()),
     "composition_revision_occurrences": frozenset("parent_revision_id occurrence_id ordinal project_id shot_id shot_revision_id placement_json source_offset_json duration_ms speed_json track transform_json gain muted provenance_json".split()),
     "composition_revision_dependencies": frozenset("parent_revision_id dependency_kind dependency_id content_digest ordinal".split()),
     "objects": frozenset("digest size media_type original_name created_at".split()),

@@ -40,6 +40,8 @@ def _legacy_realm(root, *, register_indexes=True):
             DROP TABLE managed_output_associations;
             DROP TABLE runtime_schema;
             DROP TABLE user_preferences;
+            DROP TABLE parent_composition_publications;
+            ALTER TABLE parent_composition_heads DROP COLUMN publication_id;
             CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
             CREATE TABLE canonical_receipt_backfills(id INTEGER PRIMARY KEY, detail TEXT);
             CREATE TABLE lost_and_found(id INTEGER PRIMARY KEY, payload BLOB);
@@ -156,6 +158,8 @@ def test_canonical_v24_variant_state_migration_is_additive_and_refuses_repeat(tm
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
         connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("DROP TABLE parent_composition_publications")
+        connection.execute("ALTER TABLE parent_composition_heads DROP COLUMN publication_id")
         connection.execute("ALTER TABLE generation_variants RENAME TO generation_variants_v25")
         connection.execute(
             """
@@ -235,6 +239,8 @@ def test_execution_binding_migration_adds_only_the_targeted_contract(tmp_path):
         connection.execute("ALTER TABLE tasks DROP COLUMN execution_request_json")
         connection.execute("DROP TABLE execution_bindings")
         connection.execute("DROP TABLE user_preferences")
+        connection.execute("DROP TABLE parent_composition_publications")
+        connection.execute("ALTER TABLE parent_composition_heads DROP COLUMN publication_id")
         connection.execute("UPDATE runtime_schema SET version=25 WHERE id=1")
         realm_id = connection.execute("SELECT id FROM realm LIMIT 1").fetchone()[0]
         connection.commit()
@@ -269,6 +275,9 @@ def _canonical_fixture(root, version):
     store.close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
+        if version < 28:
+            connection.execute("DROP TABLE parent_composition_publications")
+            connection.execute("ALTER TABLE parent_composition_heads DROP COLUMN publication_id")
         if version < 27:
             connection.execute("DROP TABLE user_preferences")
         if version <= 25:
@@ -297,8 +306,8 @@ def _canonical_fixture(root, version):
     return f"realm-v{version}"
 
 
-@pytest.mark.parametrize("source_version, expected_steps", [(24, 3), (25, 2), (26, 1)])
-def test_complete_canonical_migration_chain_reaches_exact_v27(tmp_path, source_version, expected_steps):
+@pytest.mark.parametrize("source_version, expected_steps", [(24, 4), (25, 3), (26, 2), (27, 1)])
+def test_complete_canonical_migration_chain_reaches_current(tmp_path, source_version, expected_steps):
     root = tmp_path / f"realm-{source_version}"
     realm_id = _canonical_fixture(root, source_version)
     assert inspect_canonical_schema(root)["kind"] == f"v{source_version}"
@@ -311,9 +320,9 @@ def test_complete_canonical_migration_chain_reaches_exact_v27(tmp_path, source_v
         expected_realm_id=realm_id,
     )
     assert result["source_schema_version"] == source_version
-    assert result["target_schema_version"] == 27
+    assert result["target_schema_version"] == SCHEMA_VERSION
     assert len(result["steps"]) == expected_steps
-    assert inspect_canonical_schema(root, expected_realm_id=realm_id)["version"] == 27
+    assert inspect_canonical_schema(root, expected_realm_id=realm_id)["version"] == SCHEMA_VERSION
 
     with sqlite3.connect(root / "realm.sqlite3") as connection:
         assert connection.execute("SELECT * FROM projects ORDER BY id").fetchall() == projects_before
@@ -359,7 +368,7 @@ def test_unknown_canonical_layout_is_rejected_without_mutation(tmp_path, mutatio
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
         if mutation == "newer":
-            connection.execute("UPDATE runtime_schema SET version=28 WHERE id=1")
+            connection.execute("UPDATE runtime_schema SET version=? WHERE id=1", (SCHEMA_VERSION + 1,))
         else:
             connection.execute("ALTER TABLE tasks ADD COLUMN distributed_binding_json TEXT")
         connection.commit()

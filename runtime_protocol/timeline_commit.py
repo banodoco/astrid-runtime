@@ -161,19 +161,14 @@ class TimelineCommitAcceptance:
     def head(self, project_id, timeline_id):
         with self.store._mutex:
             row = self.store.conn.execute(
-                "SELECT revision_id, updated_at FROM parent_composition_heads WHERE project_id=? AND timeline_id=?",
+                "SELECT revision_id, publication_id, updated_at FROM parent_composition_heads WHERE project_id=? AND timeline_id=?",
                 (project_id, timeline_id),
             ).fetchone()
             if not row or row["revision_id"] is None:
                 raise NotFoundError("timeline has no committed composition head")
-            publication = self.store.conn.execute(
-                "SELECT txn_id FROM command_idempotency WHERE command_kind='parent_composition.publish' "
-                "AND aggregate_id=? AND json_extract(result_json, '$.revision_id')=? ORDER BY rowid DESC LIMIT 1",
-                (timeline_id, row["revision_id"]),
-            ).fetchone()
-            if publication is None or not publication["txn_id"]:
+            if row["publication_id"] is None:
                 raise NotFoundError("composition head has no publication receipt")
-            return {"revision_id": row["revision_id"], "publication_id": publication["txn_id"], "updated_at": row["updated_at"]}
+            return dict(row)
 
     def evidence(self, evidence_digest):
         if not isinstance(evidence_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", evidence_digest):
@@ -192,7 +187,7 @@ class TimelineCommitAcceptance:
             return value
 
     def revisions(self, project_id, timeline_id, options):
-        # Acceptance facts only; HISTORY owns ancestry, restore and list wire behavior.
+        # Keep the existing CommitRevisionSummary contract for the semantic provider.
         with self.store._mutex:
             rows = self.store.conn.execute(
                 "SELECT result_json FROM command_idempotency WHERE command_kind=? AND aggregate_id=? ORDER BY rowid DESC",
@@ -206,7 +201,9 @@ class TimelineCommitAcceptance:
             values = [v for v in values if v is not None]
             if "before" in options:
                 _string(options["before"])
-                index = next((i for i, v in enumerate(values) if v["revision_id"] == options["before"]), None)
+                index = next((i for i, v in enumerate(values) if v["publication_id"] == options["before"]), None)
+                if index is None:
+                    index = next((i for i, v in enumerate(values) if v["revision_id"] == options["before"]), None)
                 if index is None:
                     raise NotFoundError("revision cursor not found")
                 values = values[index + 1:]
@@ -289,10 +286,13 @@ class TimelineCommitAcceptance:
                 before_payload = json.loads(before[0])
                 if before["content_digest"] != self._revision_digest(before_payload):
                     raise ConflictError("composition head failed immutable verification")
-                publication = request["publication"]
-                revision_id = publication_id = None
+                publication = copy.deepcopy(request["publication"])
                 if publication is not None:
                     _object(publication, ("parent_composition", "shot_revisions", "internal_timeline_revisions"))
+                candidate = before_payload if publication is None else publication["parent_composition"]
+                self._require_writable_composition(before_payload, candidate)
+                revision_id = publication_id = None
+                if publication is not None:
                     published = self.publish_parent_composition(project_id, timeline_id, {
                         **publication, "project_id": project_id, "timeline_id": timeline_id,
                         "expected_head": head["revision_id"],
@@ -317,6 +317,11 @@ class TimelineCommitAcceptance:
                 if "asserted_actor" in request:
                     receipt["asserted_actor"] = request["asserted_actor"]
                     provenance["asserted_actor"] = request["asserted_actor"]
+                if publication_id is not None:
+                    self.store.conn.execute(
+                        "UPDATE parent_composition_publications SET provenance_json=? WHERE publication_id=?",
+                        (canonical_json(provenance), publication_id),
+                    )
                 result.update(accepted_revision_id=revision_id, accepted_publication_id=publication_id,
                               previous_revision_id=head["revision_id"], runtime_receipt=receipt,
                               provenance=provenance, evidence={"digest": evidence_digest})

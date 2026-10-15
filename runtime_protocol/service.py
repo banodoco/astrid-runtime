@@ -2370,30 +2370,67 @@ class RuntimeService(TimelineCommitAcceptance):
         if timeline is None:
             raise NotFoundError("timeline not found", details={"timeline_id": timeline_id, "project_id": project["id"]})
         head = self.store.conn.execute(
-            "SELECT revision_id FROM parent_composition_heads WHERE timeline_id=? AND project_id=?",
+            "SELECT revision_id, publication_id FROM parent_composition_heads WHERE timeline_id=? AND project_id=?",
             (timeline_id, project["id"]),
         ).fetchone()
-        current_head = head["revision_id"] if head else None
+        current_publication = head["publication_id"] if head else None
         rows = self.store.conn.execute(
-            "SELECT * FROM parent_composition_revisions WHERE project_id=? AND timeline_id=? ORDER BY created_at DESC, id DESC",
+            "SELECT p.*, r.content_digest FROM parent_composition_publications p "
+            "JOIN parent_composition_revisions r ON r.id=p.revision_id "
+            "WHERE p.project_id=? AND p.timeline_id=? ORDER BY p.sequence DESC",
             (project["id"], timeline_id),
         ).fetchall()
+        rows = [{**dict(row), "history_key": (1, row["sequence"], "")} for row in rows]
+        # A pre-history revision without a retained receipt is still readable.
+        # Show it with unknown event/ancestry, never fabricate a publication ID.
+        unrecorded = self.store.conn.execute(
+            "SELECT r.* FROM parent_composition_revisions r WHERE r.project_id=? AND r.timeline_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM parent_composition_publications p WHERE p.revision_id=r.id) "
+            "ORDER BY r.created_at DESC, r.id DESC", (project["id"], timeline_id),
+        ).fetchall()
+        rows.extend({**dict(row), "revision_id": row["id"], "publication_id": None,
+                     "previous_revision_id": None, "previous_publication_id": None,
+                     "restored_from_revision_id": None, "provenance_json": "null",
+                     "history_key": (0, row["created_at"], row["id"])} for row in unrecorded)
         return _page_rows(
-            rows,
-            scope=f"parent-composition-history:{project['id']}:{timeline_id}",
-            cursor=cursor,
-            limit=limit,
-            key_fn=lambda row: (row["created_at"], row["id"]),
+            rows, scope=f"parent-composition-history:{project['id']}:{timeline_id}",
+            cursor=cursor, limit=limit, key_fn=lambda row: row["history_key"],
             resource_fn=lambda row: {
-                "revision_id": row["id"],
-                "project_id": row["project_id"],
-                "timeline_id": row["timeline_id"],
+                **self._publication_resource(row),
                 "content_digest": row["content_digest"],
-                "created_at": row["created_at"],
-                "is_current_head": row["id"] == current_head,
+                "is_current_head": (row["publication_id"] == current_publication
+                    if current_publication is not None else bool(head and row["revision_id"] == head["revision_id"])),
             },
             skip_after=lambda key, after: key >= after,
         )
+
+    @staticmethod
+    def _publication_resource(row):
+        return {
+            **{key: row[key] for key in ("project_id", "timeline_id", "revision_id", "publication_id",
+                "previous_revision_id", "previous_publication_id", "restored_from_revision_id", "created_at")},
+            "provenance": json.loads(row["provenance_json"]),
+        }
+
+    @staticmethod
+    def _require_writable_composition(before, candidate):
+        # Ordinary Runtime compositions need no Astrid dependency. An Astrid
+        # namespace must use its installed, single version authority, fail closed
+        # if unavailable, and check the actual stored head inside this transaction.
+        def namespaced(parent):
+            config = parent.get("config", {}) if isinstance(parent, dict) else {}
+            app = config.get("app", {}) if isinstance(config, dict) else {}
+            return isinstance(app, dict) and "astrid" in app
+        if not (namespaced(before) or namespaced(candidate)):
+            return
+        try:
+            from astrid.core.timeline.compatibility import require_writable_candidate
+        except ImportError as exc:
+            raise ValidationError("Astrid compatibility authority is unavailable; nothing was committed") from exc
+        try:
+            require_writable_candidate({"base_parent_payload": before, "parent": candidate})
+        except ValueError as exc:
+            raise ConflictError(str(exc), details={"code": "timeline_compatibility"}) from exc
 
     @_durable_mutation
     def restore_project_parent_composition_revision(self, project_id, timeline_id, revision, body, *, idempotency_key=None):
@@ -2557,9 +2594,14 @@ class RuntimeService(TimelineCommitAcceptance):
             "internal_timeline_revisions": list(internal_revisions.values()),
             "dependency_manifest": dependency_manifest,
         }
-        return self.publish_parent_composition(
+        result = self.publish_parent_composition(
             project["id"], timeline_id, publication, idempotency_key=idempotency_key,
         )
+        self.store.conn.execute(
+            "UPDATE parent_composition_publications SET restored_from_revision_id=?, provenance_json=? WHERE publication_id=?",
+            (revision, canonical_json({"source": {"via": "restore"}}), result["receipt"]["receipt_id"]),
+        )
+        return result
 
     def inspect_timeline(self, project, timeline_id, options=None):
         """Inspect one immutable timeline closure without reading source media."""
@@ -2974,7 +3016,7 @@ class RuntimeService(TimelineCommitAcceptance):
         timeline = self.store.conn.execute("SELECT * FROM timelines WHERE id=?", (timeline_id,)).fetchone()
         if timeline and timeline["project_id"] != project["id"]:
             raise ConflictError("timeline belongs to a different project")
-        current_head_row = self.store.conn.execute("SELECT revision_id FROM parent_composition_heads WHERE timeline_id=? AND project_id=?", (timeline_id, project["id"])).fetchone()
+        current_head_row = self.store.conn.execute("SELECT revision_id, publication_id FROM parent_composition_heads WHERE timeline_id=? AND project_id=?", (timeline_id, project["id"])).fetchone()
         current_head = current_head_row["revision_id"] if current_head_row else None
         if current_head != expected_head:
             raise ConflictError("parent composition head is stale", details={"expected_head": expected_head, "actual_head": current_head})
@@ -3058,6 +3100,8 @@ class RuntimeService(TimelineCommitAcceptance):
         if parent_source is None:
             raise ValidationError("parent_composition is required")
         parent_payload = self._complete_parent_payload(parent_source)
+        stored_head = self.get_project_parent_composition_revision(project["id"], timeline_id, current_head)["payload"] if current_head else None
+        self._require_writable_composition(stored_head, parent_payload)
         occurrences = []
         occurrence_ids = set()
         # A publication may link to an already committed immutable child
@@ -3293,7 +3337,18 @@ class RuntimeService(TimelineCommitAcceptance):
         event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
         result = {"project_id": project["id"], "timeline_id": timeline_id, "revision_id": parent_revision_id, "parent_revision_id": parent_revision_id, "content_digest": parent_digest, "payload": parent_payload, "old_head": expected_head, "new_head": parent_revision_id, "dependency_manifest": manifest, "content_digests": {"parent": parent_digest, **{item["revision_id"]: item["content_digest"] for item in manifest["shots"] + manifest["internal_timelines"]}, **{item["media_id"]: item["content_digest"] for item in manifest["media"]}}, "event_id": event_id, "created_at": timestamp}
         result["visual_seam_report"] = seam_report
-        return self._command_record("parent_composition.publish", timeline_id, idempotency_key, request_hash, result, project_id=project["id"], event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
+        recorded = self._command_record("parent_composition.publish", timeline_id, idempotency_key, request_hash, result, project_id=project["id"], event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
+        publication_id = recorded["receipt"]["receipt_id"]
+        self.store.conn.execute(
+            "INSERT INTO parent_composition_publications(publication_id, project_id, timeline_id, revision_id, "
+            "previous_revision_id, previous_publication_id, provenance_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (publication_id, project["id"], timeline_id, parent_revision_id, expected_head,
+             current_head_row["publication_id"] if current_head_row else None,
+             canonical_json({"source": {"via": "legacy-publish"}}), timestamp),
+        )
+        self.store.conn.execute("UPDATE parent_composition_heads SET publication_id=? WHERE project_id=? AND timeline_id=?",
+                                (publication_id, project["id"], timeline_id))
+        return recorded
 
     def _project_shot_resource(self, row):
         value = dict(row)

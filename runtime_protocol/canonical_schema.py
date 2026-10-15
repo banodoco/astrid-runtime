@@ -350,6 +350,7 @@ CREATE TABLE shot_revision_heads (
     updated_at TEXT NOT NULL
 );
 CREATE TABLE parent_composition_heads (
+    publication_id TEXT,
     timeline_id TEXT PRIMARY KEY REFERENCES timelines(id) ON DELETE CASCADE,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     revision_id TEXT REFERENCES parent_composition_revisions(id),
@@ -410,3 +411,21 @@ CREATE UNIQUE INDEX idx_timeline_render_publications_render_task
 CREATE INDEX idx_managed_output_task ON managed_output_associations(task_id, created_at);
 CREATE INDEX idx_managed_output_manifest ON managed_output_associations(manifest_digest, created_at);
 """
+
+# One immutable event per publication, independent of immutable revision identity.
+HISTORY_SCHEMA_STATEMENTS = (
+    """CREATE TABLE parent_composition_publications (
+        sequence INTEGER PRIMARY KEY,
+        publication_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        timeline_id TEXT NOT NULL REFERENCES timelines(id) ON DELETE CASCADE,
+        revision_id TEXT NOT NULL REFERENCES parent_composition_revisions(id),
+        previous_revision_id TEXT,
+        previous_publication_id TEXT,
+        restored_from_revision_id TEXT,
+        provenance_json TEXT NOT NULL CHECK (json_valid(provenance_json)),
+        created_at TEXT NOT NULL
+    );""",
+    "CREATE INDEX parent_composition_publication_history ON parent_composition_publications(project_id, timeline_id, sequence);",
+)
+CANONICAL_SCHEMA_SQL += "\n" + "\n".join(HISTORY_SCHEMA_STATEMENTS)
