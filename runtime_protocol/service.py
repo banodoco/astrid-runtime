@@ -2413,6 +2413,45 @@ class RuntimeService(TimelineCommitAcceptance):
         }
 
     @staticmethod
+    def _require_music_v2_compatibility(before, candidate):
+        """Keep the v2 carrier paired and prevent a feature-head downgrade.
+
+        The installed Astrid compatibility module remains authoritative for
+        supported format values and the general base/candidate comparison.
+        Runtime checks only the new carrier's pairing and preservation at its
+        existing current-head boundary; it never reads or rewrites carrier
+        entries.
+        """
+        def has_music_v2(parent, label):
+            config = parent.get("config", {}) if isinstance(parent, dict) else {}
+            app = config.get("app", {}) if isinstance(config, dict) else {}
+            if not isinstance(app, dict) or "astrid" not in app:
+                return False
+            astrid = app["astrid"]
+            if not isinstance(astrid, dict):
+                raise ValueError(f"{label} app.astrid must be an object")
+
+            version = astrid.get("v", 0)
+            has_music_beds = "music_beds" in astrid
+            declares_v2 = type(version) is int and version == 2
+            if declares_v2 or has_music_beds:
+                if type(version) is not int or version != 2:
+                    raise ValueError(f"{label} music_beds requires app.astrid.v=2")
+                if not has_music_beds:
+                    raise ValueError(f"{label} app.astrid.v=2 requires music_beds")
+                if not isinstance(astrid["music_beds"], dict):
+                    raise ValueError(f"{label} app.astrid.music_beds must be an object")
+                return True
+            return False
+
+        before_has_music_v2 = has_music_v2(before, "base/head")
+        candidate_has_music_v2 = has_music_v2(candidate, "candidate")
+        if before_has_music_v2 and not candidate_has_music_v2:
+            raise ValueError(
+                "candidate removes app.astrid.v=2 music_beds required by the base/head"
+            )
+
+    @staticmethod
     def _require_writable_composition(before, candidate):
         # Ordinary Runtime compositions need no Astrid dependency. An Astrid
         # namespace must use its installed, single version authority, fail closed
@@ -2423,6 +2462,10 @@ class RuntimeService(TimelineCommitAcceptance):
             return isinstance(app, dict) and "astrid" in app
         if not (namespaced(before) or namespaced(candidate)):
             return
+        try:
+            RuntimeService._require_music_v2_compatibility(before, candidate)
+        except ValueError as exc:
+            raise ConflictError(str(exc), details={"code": "timeline_compatibility"}) from exc
         try:
             from astrid.core.timeline.compatibility import require_writable_candidate
         except ImportError as exc:
