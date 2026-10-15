@@ -14,7 +14,7 @@ import jsonschema
 import pytest
 
 from runtime_protocol.auth import CredentialStore
-from runtime_protocol.errors import AuthorizationError, ConflictError, ValidationError
+from runtime_protocol.errors import AuthorizationError, ConflictError, NotFoundError, ValidationError
 from runtime_protocol.server import RuntimeHTTPServer, RuntimeHandler
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
@@ -424,6 +424,195 @@ def test_provider_registration_scope_and_dry_run_authority(fixture):
     with pytest.raises(AuthorizationError):
         dry.accept(prepared)
     assert s.lookup_request(p, 'main', request['request_id']) is None
+
+
+@pytest.fixture
+def closure_fixture(tmp_path):
+    s, p = _service(tmp_path)
+    try:
+        s.create_timeline(p, 'inside', idempotency_key='inside')
+        publication = _publication(p)
+        publication['internal_timeline_revisions'][0]['timeline_id'] = 'inside'
+        second_internal = copy.deepcopy(publication['internal_timeline_revisions'][0])
+        second_internal.update(revision_id='timeline-rev-2')
+        second_internal['payload']['layout'] = {'pinned': 2}
+        publication['internal_timeline_revisions'].append(second_internal)
+        shot = publication['shot_revisions'][0]
+        for shot_id, revision_id, internal_id in (
+            ('shot-0', 'shot-rev-0', 'timeline-rev-1'),
+            ('shot-2', 'shot-rev-2', 'timeline-rev-2'),
+        ):
+            publication['shot_revisions'].append({
+                **copy.deepcopy(shot), 'shot_id': shot_id, 'revision_id': revision_id,
+                'internal_timeline_revision_id': internal_id,
+            })
+        occurrence = publication['parent_composition']['occurrences'][0]
+        for index, shot_id in enumerate(('shot-2', 'shot-0', 'shot-1'), 1):
+            publication['parent_composition']['occurrences'].append({
+                **copy.deepcopy(occurrence), 'occurrence_id': f'repeat-{index}',
+                'shot_id': shot_id, 'shot_revision_id': 'shot-rev-' + shot_id[-1],
+                'placement': {'start_ms': index * 1000},
+            })
+        s.publish_parent_composition(p, 'main', publication, idempotency_key='closure-initial')
+        yield s, p, publication
+    finally:
+        s.close()
+
+
+def advance_closure(s, p, publication):
+    newer = copy.deepcopy(publication)
+    newer.update(expected_head='parent-1', parent_revision_id='parent-new')
+    for internal in newer['internal_timeline_revisions']:
+        internal['revision_id'] += '-new'
+        internal['payload']['layout'] = {'newer': True}
+    for shot in newer['shot_revisions']:
+        shot['revision_id'] += '-new'
+        shot['internal_timeline_revision_id'] += '-new'
+        shot['payload']['metadata']['title'] = 'newer head'
+    for occurrence in newer['parent_composition']['occurrences']:
+        occurrence['shot_revision_id'] += '-new'
+    s.publish_parent_composition(p, 'main', newer, idempotency_key='closure-newer')
+
+
+def test_revision_closure_empty_exact_parent_and_detached(fixture):
+    s, p = fixture
+    publication = _publication(p, expected_head='parent-1', parent_revision_id='empty')
+    publication['parent_composition']['occurrences'] = []
+    publication['shot_revisions'] = []
+    publication['internal_timeline_revisions'] = []
+    s.publish_parent_composition(p, 'main', publication, idempotency_key='empty')
+    port = s._request_commit_port(wire(p), IDENTITY)
+    before = '\n'.join(s.store.conn.iterdump())
+    expected = {'parent_revision': port.revision('empty'), 'shot_revisions': [], 'internal_timeline_revisions': []}
+    snapshot = port.revision_closure('empty')
+    assert snapshot == expected
+    snapshot['parent_revision']['payload']['config']['mutated'] = True
+    snapshot['shot_revisions'].append({'mutated': True})
+    snapshot['internal_timeline_revisions'].append({'mutated': True})
+    assert port.revision_closure('empty') == expected
+    assert '\n'.join(s.store.conn.iterdump()) == before
+
+
+def test_revision_closure_exact_pins_dedup_scope_and_detachment(closure_fixture, monkeypatch):
+    s, p, publication = closure_fixture
+    request = wire(p)
+    port = s._request_commit_port(request, IDENTITY)
+    expected = port.revision_closure('parent-1')
+    advance_closure(s, p, publication)
+    assert s.head(p, 'main')['revision_id'] == 'parent-new'
+    assert {row[0] for row in s.store.conn.execute('SELECT revision_id FROM shot_revision_heads')} == {
+        'shot-rev-0-new', 'shot-rev-1-new', 'shot-rev-2-new',
+    }
+    # The port captures authority before callers mutate their request snapshot.
+    request.update(project_id='foreign', timeline_id='foreign')
+    calls = []
+    for name in ('get_project_parent_composition_revision', 'get_project_shot_revision', 'get_project_timeline_revision'):
+        original = getattr(s, name)
+        def spy(*args, _name=name, _original=original):
+            assert s.store._mutex._is_owned()
+            calls.append((_name, args))
+            return _original(*args)
+        monkeypatch.setattr(s, name, spy)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('closure consulted mutable state')
+    for name in ('head', 'get_project_timeline', '_timeline_resource', '_project_shot_resource'):
+        monkeypatch.setattr(s, name, forbidden)
+    before = '\n'.join(s.store.conn.iterdump())
+    snapshot = port.revision_closure('parent-1')
+    assert snapshot == expected
+    assert calls == [
+        ('get_project_parent_composition_revision', (p, 'main', 'parent-1')),
+        ('get_project_shot_revision', (p, 'shot-0', 'shot-rev-0')),
+        ('get_project_timeline_revision', (p, 'inside', 'timeline-rev-1')),
+        ('get_project_shot_revision', (p, 'shot-1', 'shot-rev-1')),
+        ('get_project_shot_revision', (p, 'shot-2', 'shot-rev-2')),
+        ('get_project_timeline_revision', (p, 'inside', 'timeline-rev-2')),
+    ]
+    assert [v['shot_id'] for v in snapshot['shot_revisions']] == ['shot-0', 'shot-1', 'shot-2']
+    for shot in snapshot['shot_revisions']:
+        assert set(shot) == {'project_id', 'shot_id', 'revision_id', 'internal_timeline_revision_id', 'content_digest', 'payload'}
+    for internal in snapshot['internal_timeline_revisions']:
+        assert set(internal) == {'project_id', 'timeline_id', 'revision_id', 'content_digest', 'payload'}
+    assert json.loads(json.dumps(snapshot)) == snapshot
+    for value in [snapshot['parent_revision'], *snapshot['shot_revisions'], *snapshot['internal_timeline_revisions']]:
+        assert s._revision_digest(value['payload']) == value['content_digest']
+        value['payload']['mutated'] = ['snapshot']
+        value['project_id'] = 'mutated'
+    snapshot['shot_revisions'].clear()
+    assert port.revision_closure('parent-1') == expected
+    assert '\n'.join(s.store.conn.iterdump()) == before
+    with pytest.raises(TypeError):
+        port.revision_closure('parent-1', project_id=p)
+
+
+@pytest.mark.parametrize('scope', ['missing', 'project', 'timeline'])
+def test_revision_closure_parent_not_found(fixture, scope):
+    s, p = fixture
+    request = wire(p)
+    if scope == 'project':
+        request['project_id'] = s.create_project({'slug': 'foreign', 'name': 'Foreign'}, idempotency_key='foreign')['id']
+    elif scope == 'timeline':
+        s.create_timeline(p, 'other', idempotency_key='other')
+        request['timeline_id'] = 'other'
+    port = s._request_commit_port(request, IDENTITY)
+    with pytest.raises(NotFoundError):
+        port.revision_closure('missing' if scope == 'missing' else 'parent-1')
+
+
+@pytest.mark.parametrize('kind,damage', [
+    ('shot', 'missing'), ('shot', 'project'), ('shot', 'identity'), ('shot', 'digest'),
+    ('shot', 'pin'), ('internal', 'missing'), ('internal', 'project'), ('internal', 'digest'),
+    ('parent', 'digest'),
+])
+def test_revision_closure_corrupt_storage_fails_closed(closure_fixture, kind, damage):
+    s, p, publication = closure_fixture
+    port = s._request_commit_port(wire(p), IDENTITY)
+    advance_closure(s, p, publication)  # Valid current replacements must never mask broken pins.
+    table, revision = {
+        'parent': ('parent_composition_revisions', 'parent-1'),
+        'shot': ('shot_revisions', 'shot-rev-0'),
+        'internal': ('internal_timeline_revisions', 'timeline-rev-1'),
+    }[kind]
+    # Intentionally damage only this disposable synthetic realm, including FKs.
+    s.store.conn.execute('PRAGMA foreign_keys=OFF')
+    try:
+        with s.store._transaction():
+            if damage == 'missing':
+                s.store.conn.execute(f'DELETE FROM {table} WHERE id=?', (revision,))
+            else:
+                field, value = {
+                    'project': ('project_id', 'foreign-project'),
+                    'identity': ('shot_id', 'shot-2'),
+                    'digest': ('content_digest', 'sha256:' + '0' * 64),
+                    'pin': ('internal_timeline_revision_id', 'timeline-rev-2'),
+                }[damage]
+                s.store.conn.execute(f'UPDATE {table} SET {field}=? WHERE id=?', (value, revision))
+    finally:
+        s.store.conn.execute('PRAGMA foreign_keys=ON')
+    before = '\n'.join(s.store.conn.iterdump())
+    with pytest.raises(ConflictError) as error:
+        port.revision_closure('parent-1')
+    assert error.value.details['revision_id'] == revision
+    assert '\n'.join(s.store.conn.iterdump()) == before
+
+
+@pytest.mark.parametrize('kind,field', [
+    ('parent', 'project_id'), ('parent', 'timeline_id'), ('parent', 'revision_id'),
+    ('shot', 'project_id'), ('shot', 'shot_id'), ('shot', 'revision_id'),
+    ('internal', 'project_id'), ('internal', 'timeline_id'), ('internal', 'revision_id'),
+])
+def test_revision_closure_verifies_returned_identity(closure_fixture, monkeypatch, kind, field):
+    s, p, _ = closure_fixture
+    name = {'parent': 'get_project_parent_composition_revision', 'shot': 'get_project_shot_revision',
+            'internal': 'get_project_timeline_revision'}[kind]
+    original = getattr(s, name)
+    def wrong_identity(*args):
+        # Real getter and stored payload; inject only a returned identity defect.
+        return {**original(*args), field: 'wrong-identity'}
+    monkeypatch.setattr(s, name, wrong_identity)
+    with pytest.raises(ConflictError, match='identity mismatch') as error:
+        s._request_commit_port(wire(p), IDENTITY).revision_closure('parent-1')
+    assert error.value.details[field] != 'wrong-identity'
 
 
 def test_provider_cannot_report_unstored_success_and_failure_is_unavailable(fixture):

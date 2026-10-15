@@ -25,15 +25,17 @@ class RuntimeCommitPort:
     Only detached JSON snapshots and scoped callables cross this boundary.
     There is no service, store, connection, or caller-selected authority field.
     """
-    __slots__ = ("__lookup", "__head", "__revision", "__revisions", "__evidence", "__accept")
+    __slots__ = ("__lookup", "__head", "__revision", "__revision_closure", "__revisions", "__evidence", "__accept")
 
-    def __init__(self, *, lookup, head, revision, revisions, evidence, accept):
+    def __init__(self, *, lookup, head, revision, revision_closure, revisions, evidence, accept):
         self.__lookup, self.__head, self.__revision = lookup, head, revision
+        self.__revision_closure = revision_closure
         self.__revisions, self.__evidence, self.__accept = revisions, evidence, accept
 
     def lookup_request(self): return self.__lookup()
     def head(self): return self.__head()
     def revision(self, revision_id): return self.__revision(revision_id)
+    def revision_closure(self, revision_id): return self.__revision_closure(revision_id)
     def revisions(self, options): return self.__revisions(options)
     def evidence(self, evidence_digest): return self.__evidence(evidence_digest)
     def accept(self, request): return self.__accept(request)
@@ -371,6 +373,85 @@ class TimelineCommitAcceptance:
             with self.store._mutex:
                 return json.loads(canonical_json(call()))
 
+        def revision_closure(revision_id):
+            def verified(getter, kind, expected, *, dependency=False):
+                details = {"kind": kind, **expected}
+                try:
+                    value = getter()
+                except NotFoundError as exc:
+                    if not dependency:
+                        raise
+                    raise ConflictError("pinned revision dependency is missing", details=details) from exc
+                except (ValueError, TypeError) as exc:
+                    raise ConflictError("revision payload is invalid JSON", details=details) from exc
+                if (not isinstance(value, dict)
+                        or any(value.get(k) != v for k, v in expected.items())):
+                    raise ConflictError("revision closure identity mismatch", details=details)
+                payload = value.get("payload")
+                try:
+                    actual_digest = self._revision_digest(payload)
+                except (ValueError, TypeError) as exc:
+                    raise ConflictError("revision payload is invalid JSON", details=details) from exc
+                if not isinstance(payload, dict) or actual_digest != value.get("content_digest"):
+                    raise ConflictError("revision closure failed digest verification", details={
+                        **details, "stored_digest": value.get("content_digest"), "actual_digest": actual_digest,
+                    })
+                return value
+
+            def scoped():
+                parent = verified(
+                    lambda: self.get_project_parent_composition_revision(project, timeline, revision_id),
+                    "parent", {"project_id": project, "timeline_id": timeline, "revision_id": revision_id},
+                )
+                occurrences = parent["payload"].get("occurrences")
+                if not isinstance(occurrences, list):
+                    raise ValidationError("revision closure occurrences must be a list", details={"revision_id": revision_id})
+                pins = set()
+                for occurrence in occurrences:
+                    if (not isinstance(occurrence, dict)
+                            or any(not isinstance(occurrence.get(k), str) or not occurrence[k]
+                                   for k in ("shot_id", "shot_revision_id"))):
+                        raise ValidationError("revision closure occurrence has invalid shot pins", details={"revision_id": revision_id})
+                    pins.add((occurrence["shot_id"], occurrence["shot_revision_id"]))
+                shots, internals = [], {}
+                for shot_id, shot_revision_id in sorted(pins):
+                    shot = verified(
+                        lambda: self.get_project_shot_revision(project, shot_id, shot_revision_id),
+                        "shot", {"project_id": project, "shot_id": shot_id, "revision_id": shot_revision_id},
+                        dependency=True,
+                    )
+                    internal_id = shot.get("internal_timeline_revision_id")
+                    if (not isinstance(internal_id, str) or not internal_id
+                            or shot["payload"].get("internal_timeline_revision_id") != internal_id):
+                        raise ConflictError("pinned shot internal revision identity mismatch", details={"revision_id": shot_revision_id})
+                    if internal_id not in internals:
+                        # The shot pins a globally unique immutable revision ID.
+                        # Resolve its stored timeline identity, never a mutable head.
+                        row = self.store.conn.execute(
+                            "SELECT timeline_id FROM internal_timeline_revisions WHERE id=? AND project_id=?",
+                            (internal_id, project),
+                        ).fetchone()
+                        if row is None:
+                            raise ConflictError("pinned internal timeline dependency is missing", details={
+                                "project_id": project, "revision_id": internal_id,
+                            })
+                        internal_timeline = row["timeline_id"]
+                        internal = verified(
+                            lambda: self.get_project_timeline_revision(project, internal_timeline, internal_id),
+                            "internal_timeline", {"project_id": project, "timeline_id": internal_timeline, "revision_id": internal_id},
+                            dependency=True,
+                        )
+                        internals[internal_id] = {k: internal[k] for k in (
+                            "project_id", "timeline_id", "revision_id", "content_digest", "payload",
+                        )}
+                    shots.append({k: shot[k] for k in (
+                        "project_id", "shot_id", "revision_id", "internal_timeline_revision_id", "content_digest", "payload",
+                    )})
+                return {"parent_revision": parent, "shot_revisions": shots,
+                        "internal_timeline_revisions": sorted(internals.values(), key=lambda v: (v["timeline_id"], v["revision_id"]))}
+
+            return read(scoped)
+
         def evidence(evidence_digest):
             def scoped():
                 row = self.store.conn.execute(
@@ -400,6 +481,7 @@ class TimelineCommitAcceptance:
             lookup=lambda: read(lambda: self.lookup_request(project, timeline, key)),
             head=lambda: read(lambda: self.head(project, timeline)),
             revision=lambda revision_id: read(lambda: self.get_project_parent_composition_revision(project, timeline, revision_id)),
+            revision_closure=revision_closure,
             revisions=lambda options: read(lambda: self.revisions(project, timeline, copy.deepcopy(options))),
             evidence=evidence, accept=accept,
         )
