@@ -13,11 +13,11 @@
         },
         "version": "0.1.0",
         "resolved": [
-          "c1.rocket"
+          "parent/clip:c1.rocket"
         ]
       },
-      "raw": "{\n \"op\": \"clip.set\",\n \"select\": \"c1.rocket\",\n \"args\": {\n  \"opacity\": 0.75\n },\n \"version\": \"0.1.0\",\n \"resolved\": [\n  \"c1.rocket\"\n ]\n}\n",
-      "sha256": "8fee6c7b8ee7e02f7775949f54a116088077a25777fa103eada7886d03515246"
+      "raw": "{\n \"op\": \"clip.set\",\n \"select\": \"c1.rocket\",\n \"args\": {\n  \"opacity\": 0.75\n },\n \"version\": \"0.1.0\",\n \"resolved\": [\n  \"parent/clip:c1.rocket\"\n ]\n}\n",
+      "sha256": "1f6cb287ece8f2a5778b5a5da86656d7aab1bc6ddf77ca79c83020c0ff472043"
     },
     {
       "id": "CMD-ABSENT",
@@ -269,7 +269,7 @@
               },
               "version": "0.1.0",
               "resolved": [
-                "c1.rocket"
+                "parent/clip:c1.rocket"
               ]
             }
           ]
@@ -316,7 +316,7 @@
               },
               "version": "0.1.0",
               "resolved": [
-                "c1.rocket"
+                "parent/clip:c1.rocket"
               ]
             }
           ],
@@ -374,7 +374,7 @@
               },
               "version": "0.1.0",
               "resolved": [
-                "c1.rocket"
+                "parent/clip:c1.rocket"
               ]
             }
           ]
@@ -421,7 +421,7 @@
               },
               "version": "0.1.0",
               "resolved": [
-                "c1.rocket"
+                "parent/clip:c1.rocket"
               ]
             }
           ],
