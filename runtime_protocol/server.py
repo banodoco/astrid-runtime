@@ -74,6 +74,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 project = self.runtime.store.get_project(parts[2])["id"]
                 if project != grant.project_id:
                     paired_deny("project_grant_project_denied")
+            elif self._is_timeline_commit():
+                project = self.runtime.store.get_project(parts[3])["id"]
+                if project != grant.project_id:
+                    paired_deny("project_grant_project_denied")
             if self.command not in {"GET", "HEAD"} and urlsplit(self.path).path not in {"/v1/handshake", "/v1/tasks"}:
                 # Edit/commit admission belongs to its actual producer. Until
                 # connected, a paired session cannot take an older write path.

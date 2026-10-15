@@ -9,6 +9,7 @@ import pytest
 from http_helpers import Api
 from runtime_protocol.auth import CredentialStore
 from runtime_protocol.errors import AuthorizationError, ValidationError
+from runtime_protocol.server import RuntimeHandler
 from test_timeline_accept import (
     IDENTITY, count, fixture, fixture_provider, http_server, wire,
 )
@@ -160,7 +161,7 @@ def test_loopback_real_commit_with_v1_and_exact_scope_denials(fixture, tmp_path)
         thread.join()
 
 
-def test_real_pair_project_denial_and_commit_gate_remains_closed(fixture, tmp_path):
+def test_real_pair_project_denial_and_commit_gate_remains_closed(fixture, tmp_path, monkeypatch):
     service, project = fixture
     other = service.create_project({'slug': 'other', 'name': 'Other'}, idempotency_key='other')['id']
     calls = fixture_provider(service, project)
@@ -178,19 +179,43 @@ def test_real_pair_project_denial_and_commit_gate_remains_closed(fixture, tmp_pa
         handshake = api.request('GET', '/v1/handshake', headers=headers)
         assert handshake['project_grant']['project_id'] == project
         assert handshake['project_grant']['decision']['code'] == 'project_grant_allowed'
+        body_reads = []
+        original_body = RuntimeHandler._body
+
+        def track_body(handler):
+            body_reads.append(handler.path)
+            return original_body(handler)
+
+        monkeypatch.setattr(RuntimeHandler, '_body', track_body)
+        changes_before = service.store.conn.total_changes
         with pytest.raises(RuntimeError) as wrong_project:
             api.request('GET', f'/v1/projects/{other}', headers=headers)
         assert wrong_project.value.status == 403
         assert wrong_project.value.detail['details']['decision']['code'] == 'project_grant_project_denied'
         request = wire(project)
         request['asserted_actor']['id'] = 'connector'
+        commit_headers = {**headers, 'Idempotency-Key': request['request_id'],
+                          'X-Astrid-Session': request['session_id']}
+        with pytest.raises(RuntimeError) as wrong_project_commit:
+            # The body names the bound project; only Runtime's route selector
+            # may choose the project being authorized.
+            api.request('POST', f'/astrid/v1/projects/{other}/timelines/main/commit', request,
+                        headers=commit_headers)
+        assert wrong_project_commit.value.status == 403
+        assert wrong_project_commit.value.detail['details']['decision']['code'] == 'project_grant_project_denied'
+        assert body_reads == [] and calls == []
+        assert service.store.conn.total_changes == changes_before
+        assert count(service, 'parent_composition_revisions') == 1
+        assert service.lookup_request(other, 'main', request['request_id']) is None
+        assert service.lookup_request(project, 'main', request['request_id']) is None
         with pytest.raises(RuntimeError) as unavailable:
             api.request('POST', f'/astrid/v1/projects/{project}/timelines/main/commit', request,
-                headers={**headers, 'Idempotency-Key': request['request_id'],
-                         'X-Astrid-Session': request['session_id']})
+                        headers=commit_headers)
         assert unavailable.value.status == 403
         assert unavailable.value.detail['details']['decision']['code'] == 'project_grant_operation_unavailable'
         assert calls == [] and service.lookup_request(project, 'main', request['request_id']) is None
+        assert body_reads == [] and service.store.conn.total_changes == changes_before
+        assert count(service, 'parent_composition_revisions') == 1
     finally:
         server.shutdown()
         server.server_close()
