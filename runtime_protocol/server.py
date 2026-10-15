@@ -268,6 +268,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         from .timeline_commit import digest, result_template
         from .errors import ValidationError
         identity = self._identity("projects:write")
+        if "projects:write" not in identity["scopes"]:
+            raise AuthorizationError("credential lacks explicit commit scope", details={
+                "scope": "projects:write", "decision": {
+                    "status": "deny", "allowed": False, "code": "credential_scope_denied"}})
         request = self._project_mutation_body()
         try:
             sessions = self._header_values("X-Astrid-Session")
