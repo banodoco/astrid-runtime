@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import time
 import hashlib
 import json
 import os
@@ -140,6 +142,15 @@ class CredentialStore:
             raise ValidationError("credential metadata cannot override actor or scopes")
         expected_scopes = sorted(set(str(scope) for scope in scopes))
         expected_metadata = dict(metadata or {})
+        if "expires_at" in expected_metadata:
+            self._expiry(expected_metadata["expires_at"], provisioning=True)
+        if "connector_assertion" in expected_metadata:
+            binding = expected_metadata["connector_assertion"]
+            if (not isinstance(binding, dict) or set(binding) != {"connector_id", "realm_id"}
+                    or actor in {"owner", "astrid-pack-host"} or "admin" in expected_scopes
+                    or not all(isinstance(v, str) and v.strip() == v and v for v in binding.values())
+                    or "expires_at" not in expected_metadata):
+                raise ValidationError("connector assertion metadata is invalid")
         self._canonical(expected_metadata)
         expected = {"actor": actor, "scopes": expected_scopes, **expected_metadata}
         token_path, metadata_path, commit_path = self._paths(actor)
@@ -170,6 +181,36 @@ class CredentialStore:
             else:
                 self._disabled_actors.add(actor)
             return token, path
+
+    def provision_connector(self, actor: str, scopes: list[str], *, connector_id: str,
+                            realm_id: str, expires_at: float, rotate: bool = False):
+        """Host-only provisioning; never promote a shared ordinary bearer.
+
+        The HTTP credential handoff deliberately cannot supply this metadata.
+        A connector uses a distinct actor/token file under existing owner custody.
+        """
+        if (actor in {"owner", "astrid-pack-host"} or "admin" in scopes
+                or not all(isinstance(v, str) and v.strip() == v and v for v in (connector_id, realm_id))):
+            raise ValidationError("connector credential requires a dedicated non-admin actor and binding")
+        self._expiry(expires_at, provisioning=True)
+        with self._lock:
+            current = self.actor_metadata(actor)
+            if current is not None and current.get("connector_assertion") != {
+                    "connector_id": connector_id, "realm_id": realm_id}:
+                raise ValidationError("connector credential cannot replace an ordinary or differently bound actor")
+            if current is None and any(p.exists() or p.is_symlink() for p in self._paths(actor)):
+                raise ValidationError("connector credential actor custody is unresolved")
+            return self.provision(actor, scopes, metadata={
+                "connector_assertion": {"connector_id": connector_id, "realm_id": realm_id},
+                "expires_at": expires_at,
+            }, rotate=rotate)
+
+    @staticmethod
+    def _expiry(value, *, provisioning=False):
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= time.time():
+            if provisioning:
+                raise ValidationError("credential expiry must be a finite future epoch second")
+            raise AuthorizationError("credential expired or invalid", details={"decision": {"status": "deny", "allowed": False, "code": "paired_credential_expired"}})
 
     def provision_static(self, actor: str, token: str, scopes: list[str]) -> Path:
         """Install a caller-created token after an authenticated handoff."""
@@ -221,6 +262,11 @@ class CredentialStore:
                 except ValidationError:
                     continue
                 if secrets.compare_digest(expected, token):
+                    if "expires_at" in metadata:
+                        self._expiry(metadata["expires_at"])
+                    if "connector_assertion" in metadata:
+                        # Bound to this exact bearer generation, never a caller field.
+                        metadata = {**metadata, "_credential_binding": self._sha256(expected.encode())}
                     return metadata
         raise AuthorizationError("invalid bearer credential")
 

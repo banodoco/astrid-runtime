@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlsplit, parse_qs
 from .errors import RuntimeErrorBase, AuthorizationError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError, RetiredRouteError
 from .service import validate_idempotency_key
 from .cas import IO_CHUNK_BYTES
+from .paired_session import PAIRED_SESSION_HEADER, PairedSessionAuthority, deny as paired_deny
 
 
 class RuntimeHTTPServer(ThreadingHTTPServer):
@@ -21,6 +22,10 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
     # control-plane fan-in.
     request_queue_size = 64
     accepting_authenticated_requests = True
+
+    def __init__(self, *args, **kwargs):
+        self.paired_sessions = PairedSessionAuthority()
+        super().__init__(*args, **kwargs)
 
 
 class RuntimeHandler(BaseHTTPRequestHandler):
@@ -54,7 +59,26 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         value = self.headers.get("Authorization", "")
         if not value.startswith("Bearer "):
             raise AuthorizationError("bearer credential required")
-        return self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
+        identity = self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
+        contexts = self._header_values(PAIRED_SESSION_HEADER)
+        if identity.get("connector_assertion") and not contexts and urlsplit(self.path).path != "/v1/handshake":
+            paired_deny("paired_session_required")
+        if contexts:
+            if len(contexts) != 1:
+                paired_deny("paired_session_invalid")
+            grant = self.server.paired_sessions.authenticate(identity, contexts[0], self.runtime)
+            identity = {**identity, "_paired_session": grant}
+            # Project selectors are resolved by Runtime, not asserted by relay.
+            parts = [unquote(p) for p in urlsplit(self.path).path.split("/") if p]
+            if len(parts) >= 3 and parts[:2] == ["v1", "projects"] and parts[2] != "selection":
+                project = self.runtime.store.get_project(parts[2])["id"]
+                if project != grant.project_id:
+                    paired_deny("project_grant_project_denied")
+            if self.command not in {"GET", "HEAD"} and urlsplit(self.path).path not in {"/v1/handshake", "/v1/tasks"}:
+                # Edit/commit admission belongs to its actual producer. Until
+                # connected, a paired session cannot take an older write path.
+                paired_deny("project_grant_operation_unavailable")
+        return identity
 
     def _header_values(self, name):
         if hasattr(self.headers, "get_all"):
@@ -135,7 +159,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _body(self):
         raw = self._raw_body()
         try:
-            return json.loads(raw.decode("utf-8")) if raw else {}
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+            if isinstance(body, dict) and set(body) & {"paired_session", "_paired_session", "authenticated_session", "project_grant"}:
+                paired_deny("paired_browser_context_forbidden")
+            return body
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ProtocolError("request body must be valid JSON") from exc
 
@@ -259,10 +286,19 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             body["authenticated_actor"] = identity["actor"]
             body["authenticated_scopes"] = identity.get("scopes", [])
             value = self.runtime.handshake(body)
+            if "connector_assertion" in identity:
+                value["connector_assertion"] = identity["connector_assertion"]
+            if "_paired_session" in identity:
+                value["project_grant"] = self.server.paired_sessions.summary(identity["_paired_session"])
             return self._send(200, value)
         if path == ["v1", "handshake"] and method == "GET":
             identity = self._identity("handshake")
-            return self._send(200, self.runtime.handshake({"authenticated_actor": identity["actor"], "authenticated_scopes": identity.get("scopes", []), "requested_scopes": []}))
+            value = self.runtime.handshake({"authenticated_actor": identity["actor"], "authenticated_scopes": identity.get("scopes", []), "requested_scopes": []})
+            if "connector_assertion" in identity:
+                value["connector_assertion"] = identity["connector_assertion"]
+            if "_paired_session" in identity:
+                value["project_grant"] = self.server.paired_sessions.summary(identity["_paired_session"])
+            return self._send(200, value)
         if path == ["v1", "realm"] and method == "GET":
             self._identity("projects:read")
             return self._send(200, self.runtime.realm_resource())
@@ -692,8 +728,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if stream is not None:
                     stream.close()
         if path == ["v1", "tasks"] and method == "POST":
-            self._identity("tasks:write")
+            identity = self._identity("tasks:write")
             body = self._project_mutation_body()
+            if "_paired_session" in identity:
+                grant = identity["_paired_session"]
+                project = self.runtime.store.get_project(body.get("project"))["id"] if body.get("project") else ""
+                self.server.paired_sessions.decision(grant, project_id=project, operation=body.get("capability_id"))
+                # timeline.update is not an executor capability. Existing task
+                # readiness remains mandatory; this policy never invents one.
+                if body.get("capability_id") == "timeline.update":
+                    paired_deny("project_capability_unavailable")
             body["idempotency_key"] = self.headers.get("Idempotency-Key")
             if not body["idempotency_key"]:
                 raise ProtocolError("Idempotency-Key header is required")
