@@ -131,7 +131,7 @@ def compact_idempotency_ledger(root: str | Path, *, confirmation: str | None = N
                 batch = connection.execute(
                     "SELECT rowid, result_json FROM command_idempotency WHERE rowid > ? "
                     "AND created_at < ? AND substr(result_json, 1, ?) <> ? "
-                    "AND command_kind NOT IN ('object.ingest','media.import','parent_composition.publish') "
+                    "AND command_kind NOT IN ('object.ingest','media.import','parent_composition.publish','timeline.commit') "
                     "ORDER BY rowid LIMIT 500",
                     (cursor, cutoff, len(marker_prefix), marker_prefix),
                 ).fetchall()

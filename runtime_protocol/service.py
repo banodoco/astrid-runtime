@@ -39,6 +39,7 @@ from .shot_dependencies import analyze_invalidation
 from .timeline_inspection import inspect as inspect_timeline_closure
 from .timeline_view import markdown as render_timeline_markdown, png as render_timeline_png
 from .visual_seam import evaluate_closure
+from .timeline_commit import TimelineCommitAcceptance
 
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
@@ -439,7 +440,7 @@ def _durable_mutation(function):
     return wrapped
 
 
-class RuntimeService:
+class RuntimeService(TimelineCommitAcceptance):
     """Neutral application service composed by the daemon or an isolated test."""
 
     def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None):
@@ -1988,8 +1989,10 @@ class RuntimeService:
         if not prior:
             return False, None
         if prior["request_hash"] != request_hash:
+            if kind == "timeline.commit":
+                raise ConflictError("idempotency key was already used with different input", details={"code": "RequestIdConflict", "stored_request_hash": prior["request_hash"]})
             raise ConflictError("idempotency key was already used with different input")
-        result = command_result(prior["result_json"], kind=kind, created_at=None if kind in {"object.ingest", "media.import", "parent_composition.publish"} else prior["created_at"], connection=self.store.conn)
+        result = command_result(prior["result_json"], kind=kind, created_at=None if kind in {"object.ingest", "media.import", "parent_composition.publish", "timeline.commit"} else prior["created_at"], connection=self.store.conn)
         if project_id is not None and with_receipt:
             result = {"data": result, "receipt": self._receipt_payload(prior, project_id=project_id)}
         return True, result

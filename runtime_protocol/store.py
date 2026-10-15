@@ -2467,7 +2467,7 @@ class RealmStore:
             rows = self.conn.execute(
                 "SELECT rowid, result_json FROM command_idempotency "
                 "WHERE created_at < ? AND substr(result_json, 1, ?) <> ? "
-                "AND command_kind NOT IN ('object.ingest','media.import','parent_composition.publish') LIMIT 100",
+                "AND command_kind NOT IN ('object.ingest','media.import','parent_composition.publish','timeline.commit') LIMIT 100",
                 (cutoff, len('{"' + EXPIRED + '":'), '{"' + EXPIRED + '":'),
             ).fetchall()
             for old in rows:

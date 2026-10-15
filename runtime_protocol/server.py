@@ -230,9 +230,52 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         else:
             self._send(500, error={"code": "internal_error", "message": "internal runtime error", "request_id": self._request_id()})
 
+    def _timeline_commit(self, project_id, timeline_id):
+        from .timeline_commit import digest, result_template
+        from .errors import ValidationError
+        identity = self._identity("projects:write")
+        request = self._project_mutation_body()
+        try:
+            sessions = self._header_values("X-Astrid-Session")
+            if len(sessions) != 1 or sessions[0] != request.get("session_id"):
+                raise ValidationError("X-Astrid-Session must equal body session_id")
+            keys = self._header_values("Idempotency-Key")
+            if len(keys) != 1:
+                raise ValidationError("one Idempotency-Key is required")
+            result = self.runtime.commit_timeline(project_id, timeline_id, request,
+                                                  idempotency_key=keys[0], identity=identity)
+        except (ValidationError, InvalidRequestError, ConflictError, NotFoundError, ValueError, TypeError) as exc:
+            # CommitResult is the contract-defined HTTP body, not the generic
+            # legacy Runtime error envelope. Authentication keeps its 401/403.
+            diagnostic = {"request_id": "invalid-request", "base_revision_id": "invalid-base"}
+            for field in diagnostic:
+                if isinstance(request.get(field), str) and request[field]:
+                    diagnostic[field] = request[field]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~-]{0,255}", diagnostic["request_id"]):
+                diagnostic["request_id"] = "invalid-request"
+            try:
+                request_hash = digest(request)
+            except (ValueError, TypeError):
+                request_hash = digest(None)
+            result = result_template(diagnostic, request_hash)
+            code = "bad_request"
+            if isinstance(exc, NotFoundError):
+                code = "base_not_found"
+            elif (getattr(exc, "details", None) or {}).get("code") == "RequestIdConflict":
+                code = "request_id_conflict"
+            result["error"] = dict(code=code, message=str(exc), hint="Commit was not accepted",
+                                   next_action="Correct the request; preserve the original id for exact retries")
+        status = 200
+        if result["status"] == "error":
+            status = 503 if result["error"]["code"] == "runtime_unavailable" else 400
+        return self._send(status, result)
+
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
+        if (len(path) == 7 and path[:3] == ["astrid", "v1", "projects"]
+                and path[4] == "timelines" and path[6] == "commit" and method == "POST"):
+            return self._timeline_commit(path[3], path[5])
         if path == ["v1", "health"]:
             health = dict(self.runtime.health())
             daemon = getattr(self.server, "daemon_runtime", None)
