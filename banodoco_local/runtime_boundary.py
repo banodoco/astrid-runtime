@@ -271,6 +271,11 @@ class LocalRuntimeBoundary:
             argv += ["--admission-timeout", str(self.admission_timeout_seconds)]
         if source.worker_profile and "--worker-profile" not in argv:
             argv += ["--worker-profile", str(Path(source.worker_profile).expanduser().resolve())]
+        # The installed Astrid profile has one fixed semantic commit provider.
+        # Keep the neutral Runtime default provider-free; this closes the
+        # ordinary Astrid launcher path instead of registering from a test.
+        if source.profile == "astrid" and "--timeline-commit-provider" not in argv:
+            argv += ["--timeline-commit-provider", "astrid-v1"]
         return argv
 
     def create(self, *, realm_id: str, realm_root: Path, display_name: str, source_profile: SourceProfile) -> Mapping[str, Any]:
