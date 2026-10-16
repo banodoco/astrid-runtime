@@ -4,11 +4,14 @@ The absolute run-owned root supplies the admitted closure and disposable store.
 This first positive is a prerequisite to an in-flight revoke/publication proof.
 """
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import stat
+import threading
 import time
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -38,14 +41,28 @@ def test_qualified_real_render_task_positive(tmp_path):
 
     from astrid.core.execution import generic_host as gh
     from astrid.core.execution.remotion_closure import RemotionClosureBinding
-    from astrid.sdk.host_bootstrap import _host_render_environment, _prepare_render_validation
     from runtime_protocol.daemon import RuntimeDaemon
     from runtime_protocol.store import RealmStore
     from test_revoke_inflight_consumer import _request
     from test_task_authority_host_canary import SCOPES
 
     assert Path(gh.__file__).resolve().is_relative_to(source)
+    expected = json.loads((out / 'worker-preflight.json').read_text())['loaded_source_expected']
+    loaded = {}
+    import importlib
+    for relative, digest in expected.items():
+        path = source / relative
+        assert _sha(path) == digest
+        if relative.startswith('astrid/core/'):
+            module = importlib.import_module(relative[:-3].replace('/', '.'))
+            assert Path(module.__file__).resolve() == path.resolve()
+        loaded[relative] = {'path': str(path.resolve()), 'sha256': _sha(path)}
+    (out / 'loaded-source.json').write_text(json.dumps(loaded, indent=2) + '\n')
     events = []
+    cli_processes = []
+    ready = threading.Event()
+    release = threading.Event()
+    claim_done = threading.Event()
 
     def event(name, **fields):
         events.append({'sequence': len(events), 'event': name,
@@ -72,51 +89,62 @@ def test_qualified_real_render_task_positive(tmp_path):
         verification_receipt=admission['path'], receipt_sha256=admission['sha256'],
         manifest_sha256=admission['manifest_sha256'], lock_sha256=admission['lock_sha256'])
     event('strict-binding-validated', cli=str(binding.validate(project_dir)), files=len(binding.files))
-    # Reuse only a context validated by the real host path in this proof root.
-    # The unchanged validator checks the exact environment/source/closure.
-    ready_path = out / 'positive-ready-environment.json'
-    if ready_path.exists():
-        from astrid.core.rendering.remotion_runtime import _validated_runtime
-        env = json.loads(ready_path.read_text())
-        _validated_runtime(project_dir, environment=env)
-        launch = env['ASTRID_REMOTION_VALIDATION_LAUNCH']
-    else:
-        env = _host_render_environment(source)
-        launch = _prepare_render_validation(source, env, out / 'host-support',
-                                           os.environ['ASTRID_PACK_HOST_PYTHON'],
-                                           pack_roots=(source / 'astrid/packs/rendering',))
-    os.environ.update(env)
-    (out / 'positive-ready-environment.json').write_text(json.dumps(env, indent=2) + '\n')
-    binding.validate(project_dir)
-    event('real-host-readiness-refreshed', launch=launch)
+    # Reuse H027's exact launch artifact; never run a readiness transaction.
+    env = json.loads((prior / 'ready-environment.json').read_text())
+    from astrid.core.rendering.remotion_runtime import _validated_runtime
+    _validated_runtime(project_dir, environment=env)
+    event('h027-readiness-reused', launch=env['ASTRID_REMOTION_VALIDATION_LAUNCH'],
+          environment_sha256=_sha(prior / 'ready-environment.json'))
     RealmStore.initialize(tmp_path / 'realm').close()
     daemon = RuntimeDaemon(tmp_path / 'realm', support_root=tmp_path / 'support').start()
     tracked = []
     host = None
     lease_fd = None
     lease = {'identity': 'astrid-host-workload:v1', 'weight': 1,
-             'mode': 'shared_nonblocking', 'owner': 'H-REVOKE-RENDER-PUBLICATION-028',
+             'mode': 'shared_nonblocking', 'owner': 'H-REVOKE-RENDER-PUBLICATION-029',
              'supervisor_pid': os.getpid(), 'acquired': False, 'released': False}
     result = {'producer': 'unmodified rendering.render', 'render_proof': False,
               'inflight_pause_available': False, 'acceptance_claimed': False}
     task_id = None
+    thread = None
     try:
         client = gh.RuntimeProtocolClient(daemon.endpoint, daemon.worker_credential_path.read_text().strip())
         host = ObservedHost(pack_roots=[source / 'astrid/packs/rendering'], client=client,
                             executor_id='astrid-pack-host', attempt_base=tmp_path / 'attempts',
                             remotion_closure_binding=binding)
+        def observer(observation, process, cancelled):
+            event('render-command-observer', observation=observation,
+                  original_popen_id=id(process), poll=process.poll())
+            if observation['event'] == 'started':
+                cli_processes.append(process)
+                assert observation['pid'] == process.pid
+                assert observation['parent_pid'] == os.getpid()
+                assert observation['birth'] == process._astrid_process_birth
+                assert observation['registration'] == process._astrid_custody._launch_broker.registration
+                assert observation['identity']['pid'] == process.pid
+                assert observation['executable'] == str(Path(env['ASTRID_NODE_EXECUTABLE']).resolve())
+                assert Path(observation['command'][1]).resolve() == binding.validate(project_dir).resolve()
+                assert process.poll() is None
+                ready.set()
+                release.wait()
+            else:
+                assert observation['event'] == 'exited'
+                assert any(p is process for p in cli_processes)
+                assert process.poll() == observation['returncode']
+
+        host._render_command_observer = observer
         host.discover()
         host.register()
         record = host.capabilities['rendering.render']
         result['capability'] = record.manifest()
         service = daemon.service
-        project = service.create_project({'slug': 'h028-synthetic', 'name': 'H028 Synthetic'},
-                                         idempotency_key='h028-project')['id']
-        actor = 'h028-synthetic-connector'
+        project = service.create_project({'slug': 'h029-synthetic', 'name': 'H029 Synthetic'},
+                                         idempotency_key='h029-project')['id']
+        actor = 'h029-synthetic-connector'
         service.select_project(actor, project)
         token, _ = daemon.credentials.provision_connector(
             actor, SCOPES, connector_id=actor, realm_id=service.realm['id'], expires_at=time.time()+1800)
-        context = {'pair_id': 'h028-positive-pair', 'connector_id': actor,
+        context = {'pair_id': 'h029-positive-pair', 'connector_id': actor,
                    'realm_id': service.realm['id'], 'generation': 1,
                    'expires_at': int((time.time()+1700)*1000)}
         # Supported file-mode snapshot, using no real media or canonical film.
@@ -126,8 +154,8 @@ def test_qualified_real_render_task_positive(tmp_path):
         body = {'project': project, 'capability_id': 'rendering.render',
                 'capability_digest': record.capability_digest,
                 'spec': {'inputs': {'timeline_snapshot': snapshot, 'selector': 'rendering.remotion',
-                                    'output_name': 'h028-positive.mp4'}}}
-        status, answer = _request(daemon, token, context, 'POST', '/v1/tasks', body, 'h028-positive')
+                                    'output_name': 'h029-positive.mp4'}}}
+        status, answer = _request(daemon, token, context, 'POST', '/v1/tasks', body, 'h029-positive')
         result.update(admission_status=status, admission=answer, actor=actor, pair=context,
                       project_id=project, endpoint=daemon.endpoint)
         assert status == 201, answer
@@ -143,10 +171,42 @@ def test_qualified_real_render_task_positive(tmp_path):
         lease.update(acquired=True, acquired_unix=time.time(), projected_growth='bounded one-frame video plus temporary bundle; no install')
         (out / 'positive-lease.json').write_text(json.dumps(lease, indent=2) + '\n')
         event('host-workload-lease-acquired', device=st.st_dev, inode=st.st_ino)
-        try:
-            result['claim_result'] = host.claim_once()
-        except Exception as exc:
-            result['claim_error'] = {'type': type(exc).__name__, 'message': str(exc)}
+        def durable_state(label):
+            with service.store._mutex:
+                state = {'task': service.task(task_id),
+                         'attempts': [dict(row) for row in service.store.conn.execute(
+                             'SELECT * FROM attempts WHERE task_id=?', (task_id,)).fetchall()],
+                         'managed_outputs': service.store.list_managed_outputs(task_id),
+                         'database_dump': '\n'.join(service.store.conn.iterdump()),
+                         'cas': _inventory(service.store.cas_root),
+                         'staging': _inventory(service.store.staging_root)}
+            (out / ('positive-state-' + label + '.json')).write_text(json.dumps(state, indent=2, default=str) + '\n')
+            return state
+
+        durable_state('admitted')
+
+        def claim():
+            try:
+                result['claim_result'] = host.claim_once()
+            except Exception as exc:
+                result['claim_error'] = {'type': type(exc).__name__, 'message': str(exc)}
+            finally:
+                claim_done.set()
+                ready.set()
+
+        thread = threading.Thread(target=claim)
+        thread.start()
+        ready.wait()
+        result['live_observer_seen'] = bool(cli_processes)
+        if cli_processes:
+            result['original_claim'] = dict(host._confinement_policy.claim_binding)
+            durable_state('live')
+            assert not claim_done.is_set()
+            assert all(p.poll() is None for p in cli_processes)
+            result['inflight_pause_available'] = True
+        release.set()
+        thread.join()
+        durable_state('terminal')
         result['task'] = service.task(task_id)
         result['attempts'] = [dict(row) for row in service.store.conn.execute(
             'SELECT * FROM attempts WHERE task_id=?', (task_id,)).fetchall()]
@@ -158,21 +218,44 @@ def test_qualified_real_render_task_positive(tmp_path):
             result['output_readbacks'].append({'receipt': output, 'digest': hashlib.sha256(payload).hexdigest(),
                                                'size': len(payload)})
             assert hashlib.sha256(payload).hexdigest() == digest
+        result['public_readbacks'] = []
+        endpoint = urlsplit(daemon.endpoint)
+        for output in result['managed_outputs']:
+            digest = output['object_id'].removeprefix('sha256:')
+            connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=10)
+            try:
+                connection.request('GET', '/v1/objects/' + digest, headers={
+                    'Authorization': 'Bearer ' + token,
+                    'X-Reigh-Paired-Session': json.dumps(context)})
+                response = connection.getresponse()
+                data = response.read()
+                readback = {'status': response.status, 'sha256': hashlib.sha256(data).hexdigest(),
+                            'size': len(data), 'expected_digest': digest}
+                result['public_readbacks'].append(readback)
+                assert response.status == 200 and readback['sha256'] == digest
+            finally:
+                connection.close()
         result['render_proof'] = result['task']['task']['status'] == 'completed'
+        assert result['live_observer_seen'], result
+        assert all(p.poll() == 0 for p in cli_processes), result
         assert result['render_proof'], result
         assert result['managed_outputs'], result
     finally:
+        release.set()
+        if thread is not None:
+            thread.join()
         if host is not None:
             host.shutdown()
             result['cleanup'] = getattr(host, 'last_cleanup_receipt', None)
             result['active_processes_after_shutdown'] = len(host._active_processes)
             result['host_lifetime_processes_after_shutdown'] = len(host._host_lifetime_processes)
-        result['processes'] = [{'pid': p.pid, 'exit': p.poll()} for p in tracked]
+        result['processes'] = [{'pid': p.pid, 'exit': p.poll(), 'kind': 'cli' if p in cli_processes else 'executor'} for p in tracked + cli_processes]
         daemon.stop()
         event('owned-host-and-daemon-shutdown', processes=result['processes'])
         if lease_fd is not None:
             if lease['acquired']:
-                assert all(p.poll() is not None for p in tracked)
+                assert all(p.poll() is not None for p in tracked + cli_processes)
+                assert (os.stat(lock).st_dev, os.stat(lock).st_ino) == (lease['device'], lease['inode'])
                 fcntl.flock(lease_fd, fcntl.LOCK_UN)
                 lease.update(released=True, released_unix=time.time())
             os.close(lease_fd)
