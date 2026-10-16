@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from importlib import import_module
 import os
 import shutil
 import threading
@@ -223,6 +224,7 @@ class RuntimeDaemon:
     def _start(self, *, rotate_credentials=False):
         epoch_floor = self._read_epoch_floor()
         self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor, admission_timeout=self.admission_timeout)
+        self._bind_installed_timeline_audio_lane_provider()
         self.service.set_readiness_callback(self._revoke_readiness)
         self.service.set_local_claim_generation_verifier(self._verify_local_claim_generation, actor=WORKER_ACTOR)
         self.catalog.bind_owner(self._catalog_owner_valid)
@@ -245,6 +247,20 @@ class RuntimeDaemon:
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="banodoco-runtime", daemon=True)
         self.thread.start()
         return self
+
+    def _bind_installed_timeline_audio_lane_provider(self):
+        # Like the semantic commit port, this is a fixed trusted Astrid SDK
+        # binding. No request, realm document, or worker profile selects code.
+        # Older or neutral hosts keep the optional presentation unavailable.
+        try:
+            adapter = import_module("astrid.sdk.authoring_bundle")
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"astrid", "astrid.sdk", "astrid.sdk.authoring_bundle"}:
+                raise
+            return
+        provider = getattr(adapter, "project_audio_lane_for_runtime_inspection", None)
+        if provider is not None:
+            self.service.register_timeline_audio_lane_provider(provider)
 
     def _create_local_worker_launcher(self):
         from .local_worker import LocalWorkerLauncher

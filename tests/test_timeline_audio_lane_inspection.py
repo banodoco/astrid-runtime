@@ -1,7 +1,8 @@
 """Runtime's read-only port; integration uses the exact admitted Astrid source.
 
 Set RUNTIME_AUDIO_LANE_ASTRID_SOURCE to the verified producer checkout for the
-optional cross-repo cohort. No installed binding or production data is used.
+optional cross-repo cohort, including the daemon's fixed installed SDK binding.
+No production data is used.
 The JSON fixture is I AUDIO-LANE-011's actual adopted fixture/document and lane.
 """
 from __future__ import annotations
@@ -254,10 +255,9 @@ def test_http_post_auth_and_real_producer(tmp_path, astrid):
     service.publish_parent_composition(project, "main", publication(project), idempotency_key="publish")
     service.close()
     daemon = RuntimeDaemon(root, support_root=tmp_path / "support")
-    # Disposable daemon tests the port; installed launcher binding belongs to A.
+    # Normal startup binds the installed SDK adapter before serving HTTP.
     daemon.start()
     try:
-        daemon.service.register_timeline_audio_lane_provider(astrid[0])
         read, _ = daemon.credentials.provision("reader", ["projects:read"])
         denied, _ = daemon.credentials.provision("denied", ["tasks:read"])
         url = f"{daemon.endpoint}/v1/projects/{project}/timelines/main/inspect"
@@ -279,10 +279,12 @@ def test_http_post_auth_and_real_producer(tmp_path, astrid):
         assert request(read, {"presentation": {"audio_lane": True}})[0] == 409
         assert request(read, {"presentation": {"audio_lane": False}})[0] == 422
         assert "presentation" not in request(read, {})[1]
-        req = urllib.request.Request(url.removesuffix("/inspect"), headers={"Authorization": f"Bearer {read}"})
+        # Scoped timeline GET now exposes head metadata (C 0533069); it is
+        # not the inspection surface. Presentation requires canonical POST.
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {read}"})
         with pytest.raises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(req)
-        assert error.value.code == 410
+        assert error.value.code == 404
     finally:
         daemon.stop()
 
