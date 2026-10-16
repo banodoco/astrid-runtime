@@ -5778,10 +5778,14 @@ class RuntimeService(TimelineCommitAcceptance):
         self.store.authority_admission_digest(task_id, binding)
         self._resolve_task_authority(binding)
         if require_parent and binding.parent_task_id:
-            parent = self.store.conn.execute("SELECT status, attempt_id FROM tasks WHERE id=?", (binding.parent_task_id,)).fetchone()
+            parent = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (binding.parent_task_id,)).fetchone()
             if parent is None or parent["status"] != "running" or parent["attempt_id"] != binding.parent_attempt_id:
                 deny_authority("task_parent_authority_ended")
-            self._assert_task_authority(binding.parent_task_id)
+            parent_attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (binding.parent_attempt_id,)).fetchone()
+            self._validate_attempt_lease(parent_attempt, {
+                "lease_id": parent["lease_token"], "fence": parent["lease_fence"],
+                "runtime_epoch": parent["runtime_epoch"],
+            }, self.store._current_runtime_epoch())
         return binding
 
     def _task_authority_expiry(self, binding):
@@ -5793,6 +5797,12 @@ class RuntimeService(TimelineCommitAcceptance):
             current = metadata.get("expires_at")
             if current is not None:
                 expiry = min(expiry, current) if expiry is not None else current
+        if binding.parent_attempt_id:
+            parent = self.store.conn.execute("SELECT lease_expires_at FROM attempts WHERE id=?", (binding.parent_attempt_id,)).fetchone()
+            if parent is None or not parent[0]:
+                deny_authority("task_parent_authority_ended")
+            parent_expiry = datetime.fromisoformat(parent[0]).timestamp()
+            expiry = min(expiry, parent_expiry) if expiry is not None else parent_expiry
         return expiry
 
     def _claim_authority(self, attempt):

@@ -89,7 +89,7 @@ def test_private_binding_admission_receipt_replay_and_nonbearer_claim(pair):
     assert claim(pair)['attempt_id']==c['attempt_id']
 
 
-@pytest.mark.parametrize('mutation', ['rotation','disabled','scope','expiry','generation','issuer'])
+@pytest.mark.parametrize('mutation', ['rotation','disabled','scope','expiry','generation','issuer','connector','realm'])
 def test_exact_authority_rechecked_on_claim_and_renewal(pair,mutation):
     d,p,q,token,ctx,g,b=pair
     admit(pair)
@@ -101,6 +101,10 @@ def test_exact_authority_rechecked_on_claim_and_renewal(pair,mutation):
         meta=d.credentials.actor_metadata('connector'); meta['scopes']=['handshake']; d.credentials._publish('connector',token,meta)
     elif mutation=='expiry':
         meta=d.credentials.actor_metadata('connector'); meta['expires_at']=time.time()-1; d.credentials._publish('connector',token,meta)
+    elif mutation in ('connector','realm'):
+        meta=d.credentials.actor_metadata('connector')
+        meta['connector_assertion']['connector_id' if mutation=='connector' else 'realm_id']='foreign'
+        d.credentials._publish('connector',token,meta)
     elif mutation=='generation':
         d.httpd.paired_sessions.authenticate(d.credentials.load(token),json.dumps({**ctx,'pair_id':'new','generation':2}),d.service)
     else: d.httpd.paired_sessions.instance_id='replacement-instance'
@@ -277,3 +281,24 @@ def test_claim_client_decode_and_metadata_use_the_actual_contract_inputs(pair):
     decoded=AttemptFence.from_json(c)
     assert decoded.claim_authority==c['claim_authority']
     assert decoded.executor_id==c['executor_id']
+
+
+def test_child_renewal_cannot_outlive_parent_lease_before_reaping(pair):
+    from datetime import datetime,timedelta,timezone
+    d,p,q,token,ctx,g,b=pair;s=d.service
+    body=dict(capability_id=CAP,capability_digest=DIGEST,spec={},project=p,idempotency_key='parent-renewal',
+        child_delegation=dict(capabilities=[dict(capability_id=CAP,capability_digest=DIGEST)],targets=[dict(kind='default')],input_object_ids=[]))
+    s.create_task(body,authority_binding=b);parent=claim(pair)
+    identity=dict(actor='worker',scopes=['worker:execute'])
+    issued=s.issue_child_authority(parent['attempt_id'],lease(parent),identity=identity)
+    s.admit_delegated_child(dict(authority=issued['authority'],task=dict(capability_id=CAP,capability_digest=DIGEST,spec={})),idempotency_key='child-renewal',identity=identity)
+    child=claim(pair,'child-claim')
+    assert datetime.fromisoformat(child['lease_expires_at']) <= datetime.fromisoformat(parent['lease_expires_at'])
+    renewed=s.heartbeat_attempt(child['attempt_id'],lease(child),idempotency_key='bounded-child-renewal',identity=identity)['data']
+    assert datetime.fromisoformat(renewed['lease_expires_at']) <= datetime.fromisoformat(parent['lease_expires_at'])
+    expired=(datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat()
+    s.store.conn.execute('UPDATE tasks SET lease_expires_at=? WHERE id=?',(expired,parent['task_id']))
+    s.store.conn.execute('UPDATE attempts SET lease_expires_at=? WHERE id=?',(expired,parent['attempt_id']))
+    # No claim/reaper has run. A still-live child must not renew its expired parent.
+    with pytest.raises(LeaseError):
+        s.heartbeat_attempt(child['attempt_id'],lease(child),idempotency_key='late-child-renewal',identity=identity)

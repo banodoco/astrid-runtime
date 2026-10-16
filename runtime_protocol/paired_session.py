@@ -132,6 +132,8 @@ class PairedSessionAuthority:
                 deny("paired_issuer_unresolved")
             if self.credentials is not None:
                 metadata = self.credentials.validate_binding(grant.actor, grant.credential_binding, "handshake")
+                if metadata.get("connector_assertion") != {"connector_id": grant.connector_id, "realm_id": grant.realm_id}:
+                    deny("paired_connector_binding_changed")
                 if {"pair_id": grant.pair_id, "connector_id": grant.connector_id, "generation": grant.generation} in metadata.get("paired_revocations", []):
                     deny("project_grant_revoked")
             if grant.generation != self._generations.get(grant.connector_id):
