@@ -215,7 +215,7 @@ def test_real_http_chunked_import_replay_and_restart(daemon):
 def test_slow_cancelled_upload_and_unconsumed_download_do_not_block_health(daemon):
     url = urlsplit(daemon.endpoint)
     sock = socket.create_connection((url.hostname, url.port), timeout=5)
-    sock.sendall((f'POST /v1/objects HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {daemon.token}\r\nIdempotency-Key: interrupted\r\nContent-Length: 2097152\r\n\r\n').encode() + b'a')
+    sock.sendall((f'POST /v1/objects HTTP/1.1\r\nHost: localhost:{url.port}\r\nAuthorization: Bearer {daemon.token}\r\nIdempotency-Key: interrupted\r\nContent-Length: 2097152\r\n\r\n').encode() + b'a')
     # A health request must work while the first handler waits for more bytes.
     assert request(daemon, 'GET', '/v1/health')[0] == 200
     sock.shutdown(socket.SHUT_WR)
@@ -230,7 +230,7 @@ def test_slow_cancelled_upload_and_unconsumed_download_do_not_block_health(daemo
     assert status == 201
     object_id = json.loads(body)['data']['object_id']
     sock = socket.create_connection((url.hostname, url.port), timeout=5)
-    sock.sendall((f'GET /v1/objects/{object_id} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {daemon.token}\r\n\r\n').encode())
+    sock.sendall((f'GET /v1/objects/{object_id} HTTP/1.1\r\nHost: localhost:{url.port}\r\nAuthorization: Bearer {daemon.token}\r\n\r\n').encode())
     assert b'200' in sock.recv(512).split(b'\r\n', 1)[0]
     assert request(daemon, 'GET', '/v1/health')[0] == 200
     sock.close()

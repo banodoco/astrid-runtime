@@ -93,6 +93,36 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         value = self.headers.get(name)
         return [] if value is None else [value]
 
+    def _validate_transport(self):
+        """Pin HTTP authority to the actual listener before any route effects.
+
+        Local native clients omit Origin. Browser requests, when present, must
+        name this HTTP endpoint. A bearer never authorizes another authority.
+        Do not resolve caller-supplied names or trust forwarded headers here.
+        """
+        host, port = self.server.socket.getsockname()[:2]
+        authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        authorities = {authority, f"localhost:{port}"}
+        if port == 80:
+            authorities.update({f"[{host}]" if ":" in host else host, "localhost"})
+        try:
+            hosts = self._header_values("Host")
+            if len(hosts) != 1 or hosts[0].lower() not in authorities:
+                raise ForbiddenError("runtime Host does not match the bound endpoint")
+            origins = self._header_values("Origin")
+            if origins and (len(origins) != 1 or origins[0].lower() not in {
+                "http://" + value for value in authorities
+            }):
+                raise ForbiddenError("runtime Origin does not match the bound endpoint")
+            # Origin servers accept origin-form targets. An absolute target
+            # must not smuggle a second authority past the Host check.
+            if not self.path.startswith("/") or self.path.startswith("//"):
+                raise ForbiddenError("runtime request target must use origin form")
+        except ForbiddenError:
+            # Rejected bodies remain unread, so never reuse this connection.
+            self.close_connection = True
+            raise
+
     def _content_length(self, limit=None):
         """Strict framing, bounded decimal parsing, before touching the body."""
         values = self._header_values("Content-Length")
@@ -1065,6 +1095,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._pending_file_response = None
             self._defer_response = True
             try:
+                self._validate_transport()
                 if self._is_local_worker_control():
                     # Process preparation and OS observation are deliberately
                     # outside the SQLite mutex. Credential authentication and
