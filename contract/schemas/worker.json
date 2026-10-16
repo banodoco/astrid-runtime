@@ -185,6 +185,88 @@
         "scratch_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
     },
+    "ClaimAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "authority_instance_id",
+        "task_id",
+        "attempt_id",
+        "lease_id",
+        "executor_id",
+        "operation",
+        "lease_expires_at",
+        "admission_digest",
+        "version",
+        "fence",
+        "runtime_epoch",
+        "project_id",
+        "expiry"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authority_instance_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lease_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "executor_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lease_expires_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "admission_digest": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "fence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "runtime_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expiry": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
     "AttemptFence": {
       "type": "object", "additionalProperties": false,
       "required": ["attempt_id", "task_id", "run_id", "project_id", "lease_id", "fence", "lease_expires_at", "runtime_epoch", "input_object_ids"],
@@ -200,6 +282,8 @@
         "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "execution_request": { "$ref": "task.json#/definitions/ExecutionRequest" },
         "execution_binding": { "$ref": "task.json#/definitions/ExecutionBinding" },
+        "executor_id": { "type": "string", "minLength": 1 },
+        "claim_authority": { "$ref": "#/definitions/ClaimAuthority" },
         "spec": { "type": "object", "additionalProperties": true },
         "generation_intent": { "type": "object", "additionalProperties": true },
         "expected_effect": { "$ref": "#/definitions/Effect" },

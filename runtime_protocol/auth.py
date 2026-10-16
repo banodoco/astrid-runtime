@@ -132,7 +132,18 @@ class CredentialStore:
                     or not all(isinstance(v, str) and v and v.strip() == v for v in binding.values())
                     or "expires_at" not in metadata):
                 raise ValidationError("connector assertion metadata is invalid")
+        if "paired_revocations" in metadata:
+            self._validate_pair_markers(metadata["paired_revocations"])
         return metadata
+
+    @staticmethod
+    def _validate_pair_markers(markers):
+        if not isinstance(markers, list) or any(
+                not isinstance(m, dict) or set(m) != {"pair_id", "connector_id", "generation"}
+                or type(m["generation"]) is not int or m["generation"] < 1
+                or any(not isinstance(m[k], str) or not m[k] for k in ("pair_id", "connector_id"))
+                for m in markers):
+            raise ValidationError("paired denial metadata is invalid")
 
     @staticmethod
     def _deny_format():
@@ -193,6 +204,9 @@ class CredentialStore:
         expected = {"credential_format": self.FORMAT, "actor": actor, "scopes": expected_scopes, **expected_metadata}
         token_path, metadata_path, commit_path = self._paths(actor)
         with self._lock:
+            markers = self._paired_revocations(actor)
+            if markers:
+                expected["paired_revocations"] = markers
             current = None
             if not rotate:
                 try:
@@ -233,7 +247,7 @@ class CredentialStore:
             if current is not None and current.get("connector_assertion") != {
                     "connector_id": connector_id, "realm_id": realm_id}:
                 raise ValidationError("connector credential cannot replace an ordinary or differently bound actor")
-            if current is None and any(p.exists() or p.is_symlink() for p in self._paths(actor)):
+            if current is None and not self._paired_tombstone(actor) and any(p.exists() or p.is_symlink() for p in self._paths(actor)):
                 raise ValidationError("connector credential actor custody is unresolved")
             return self.provision(actor, scopes, metadata={
                 "connector_assertion": {"connector_id": connector_id, "realm_id": realm_id},
@@ -265,6 +279,61 @@ class CredentialStore:
             self._disabled_actors.discard(actor)
             return path
 
+    def validate_binding(self, actor, binding, scope):
+        with self._lock:
+            if actor in self._disabled_actors:
+                raise AuthorizationError("credential is disabled")
+            try:
+                token, metadata = self._read_actor(actor)
+                metadata = self._parse_credential(actor, metadata)
+            except ValidationError as exc:
+                raise AuthorizationError("credential binding is unavailable") from exc
+            if not isinstance(binding, str) or not secrets.compare_digest(self._sha256(token.encode()), binding):
+                raise AuthorizationError("credential binding changed")
+            if "expires_at" in metadata:
+                self._expiry(metadata["expires_at"])
+            if scope not in metadata["scopes"] and "admin" not in metadata["scopes"]:
+                raise AuthorizationError("credential lacks required scope")
+            return metadata
+
+    def _paired_tombstone(self, actor):
+        path = self._paths(actor)[1]
+        if not path.exists():
+            return None
+        self._safe_file(path, "credential denial metadata")
+        try:
+            value = json.loads(path.read_bytes())
+        except (ValueError, OSError) as exc:
+            raise ValidationError("credential denial metadata is invalid") from exc
+        if (isinstance(value, dict) and set(value) == {"credential_format", "actor", "paired_revocations"}
+                and value["credential_format"] == self.FORMAT and value["actor"] == actor):
+            self._validate_pair_markers(value["paired_revocations"])
+            return value
+        return None
+
+    def _paired_revocations(self, actor):
+        tombstone = self._paired_tombstone(actor)
+        if tombstone:
+            return list(tombstone["paired_revocations"])
+        current = self.actor_metadata(actor)
+        return list((current or {}).get("paired_revocations", []))
+
+    def revoke_pair(self, actor, binding, pair_id, connector_id, generation):
+        # A retained host authority can always narrow its own grant, including
+        # after credential rotation. This method never grants execution.
+        with self._lock:
+            marker = {"pair_id": pair_id, "connector_id": connector_id, "generation": generation}
+            markers = self._paired_revocations(actor)
+            if marker not in markers:
+                markers.append(marker)
+            try:
+                token, metadata = self._read_actor(actor)
+            except ValidationError:
+                self._atomic_replace(self._paths(actor)[1], self._canonical({
+                    "credential_format": self.FORMAT, "actor": actor, "paired_revocations": markers}).encode())
+            else:
+                self._publish(actor, token, {**metadata, "paired_revocations": markers})
+
     def actor_metadata(self, actor: str) -> dict | None:
         actor = self._actor(actor)
         with self._lock:
@@ -288,9 +357,14 @@ class CredentialStore:
         with self._lock:
             self._disabled_actors.add(actor)
             token_path, metadata_path, commit_path = self._paths(actor)
+            markers = self._paired_revocations(actor)
             commit_path.unlink(missing_ok=True)
-            metadata_path.unlink(missing_ok=True)
             token_path.unlink(missing_ok=True)
+            if markers:
+                self._atomic_replace(metadata_path, self._canonical({
+                    "credential_format": self.FORMAT, "actor": actor, "paired_revocations": markers}).encode())
+            else:
+                metadata_path.unlink(missing_ok=True)
 
     def load(self, token: str):
         if not token:

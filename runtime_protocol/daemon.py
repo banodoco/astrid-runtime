@@ -233,6 +233,7 @@ class RuntimeDaemon:
         self.httpd.runtime = self.service
         self.httpd.daemon_runtime = self
         self.httpd.credentials = self.credentials
+        self.service.bind_task_authority(self.httpd.paired_sessions, self.credentials)
         owner = self.service.catalog_admission(self.instance_id)
         # Persist the observed epoch before readiness publication.  A restored
         # older database can therefore never reuse an epoch from its snapshot.

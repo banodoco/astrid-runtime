@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 REALM_ADMISSION_TIMEOUT_SECONDS = 5.0
@@ -99,7 +99,7 @@ REQUIRED_SCHEMA_COLUMNS = {
     "shot_text_binding_events": frozenset("event_id binding_id project_id seq kind payload_json previous_hash event_hash created_at".split()),
     "shot_text_bindings": frozenset("id project_id shot_id kind slot media_digest event_stream_id head_seq created_at updated_at".split()),
     "task_dependencies": frozenset("continuation_task_id predecessor_task_id ordinal".split()),
-    "tasks": frozenset("id run_id capability spec_json status lease_token executor_id attempt expected_effect_json result_json created_at updated_at capability_digest waiting_reason lease_expires_at lease_fence attempt_id runtime_epoch execution_request_json".split()),
+    "tasks": frozenset("id run_id capability spec_json status lease_token executor_id attempt expected_effect_json result_json created_at updated_at capability_digest waiting_reason lease_expires_at lease_fence attempt_id runtime_epoch execution_request_json authority_binding_json".split()),
     "timeline_events": frozenset("id timeline_id kind payload_json previous_hash event_hash created_at".split()),
     "timeline_reference_state": frozenset("id version archived_at".split()),
     "timeline_references": frozenset("id timeline_id object_id role".split()),
@@ -1766,7 +1766,15 @@ class RealmStore:
             )
         return normalized
 
-    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False, execution_request=None):
+    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False, execution_request=None, authority_binding=None, authority_validator=None):
+        from .task_authority import TaskAuthorityBinding, reject_authority_fields
+        reject_authority_fields(spec)
+        reject_authority_fields(execution_request)
+        if authority_binding is not None and type(authority_binding) is not TaskAuthorityBinding:
+            raise ValidationError("task authority requires a typed trusted binding")
+        authority_record = authority_binding.record() if authority_binding is not None else None
+        if authority_record is not None and (not idempotency_key or not capability_digest):
+            raise ValidationError("bound task admission requires idempotency identity and capability digest")
         if not capability:
             raise ValidationError("capability is required")
         if not isinstance(spec, dict):
@@ -1797,6 +1805,10 @@ class RealmStore:
             spec["required_facts"] = normalize_execution_facts(spec["required_facts"], field="required_facts")
         with self._mutex, (self._transaction() if capability == "rendering.render" else nullcontext()):
             project_id = self._project(project)["id"] if project else None
+            if authority_binding is not None and (
+                    authority_binding.project_id != project_id or authority_binding.operation != capability
+                    or authority_binding.realm_id != self.realm["id"]):
+                raise ValidationError("trusted authority does not match task admission")
             if capability == "rendering.render":
                 admitted_spec = spec.get("spec") if isinstance(spec, dict) else None
                 admitted_spec, frozen_inputs = self._freeze_managed_render_inputs(
@@ -1843,7 +1855,12 @@ class RealmStore:
                 )
             self._validate_task_inputs(project_id, spec)
             with self._transaction():
-                request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": task_spec_for_request_hash(spec), "execution_request": execution_request, "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
+                if authority_binding is not None and authority_validator is not None:
+                    authority_validator(authority_binding)
+                admission = {"capability": capability, "spec": task_spec_for_request_hash(spec), "execution_request": execution_request, "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}
+                if authority_record is not None:
+                    admission["authority_binding"] = authority_record
+                request_hash = hashlib.sha256(canonical_json(admission).encode()).hexdigest()
                 aggregate_id = project_id or "unscoped"
                 old = None
                 old_task = None
@@ -1887,6 +1904,7 @@ class RealmStore:
                             or old_task["capability"] != capability
                             or canonical_json(old_request) != canonical_json(execution_request)
                             or canonical_json(stored_effect or None) != canonical_json(expected_effect or None)
+                            or canonical_json(json.loads(old_task["authority_binding_json"]) if old_task["authority_binding_json"] else None) != canonical_json(authority_record)
                             or digest_conflict
                         ):
                             raise ConflictError("idempotency key was already used with different input")
@@ -1975,7 +1993,7 @@ class RealmStore:
                     waiting_reason = "waiting_for_dependencies"
                 timestamp, run_id, task_id = now(), new_id(), new_id()
                 self.conn.execute("INSERT INTO runs VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)", (run_id, project_id, capability, canonical_json(spec), idempotency_key, timestamp, timestamp))
-                self.conn.execute("INSERT INTO tasks(id, run_id, capability, spec_json, status, capability_digest, waiting_reason, expected_effect_json, created_at, updated_at, execution_request_json) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)", (task_id, run_id, capability, canonical_json(spec), capability_digest, waiting_reason, canonical_json(expected_effect) if expected_effect else None, timestamp, timestamp, canonical_json(execution_request) if execution_request is not None else None))
+                self.conn.execute("INSERT INTO tasks(id, run_id, capability, spec_json, status, capability_digest, waiting_reason, expected_effect_json, created_at, updated_at, execution_request_json, authority_binding_json) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)", (task_id, run_id, capability, canonical_json(spec), capability_digest, waiting_reason, canonical_json(expected_effect) if expected_effect else None, timestamp, timestamp, canonical_json(execution_request) if execution_request is not None else None, canonical_json(authority_record) if authority_record is not None else None))
                 if execution_request is not None:
                     target = execution_request["target"]
                     target_id = target.get("id") or target.get("profile_alias") or target.get("machine_id") or target.get("pod_id")
@@ -2357,9 +2375,33 @@ class RealmStore:
             return None
         return _normalize_execution_request(legacy, spec.get("input_object_ids", []))
 
+    def authority_admission_digest(self, task_id, binding):
+        """Bind the private row to the original immutable admission/receipt."""
+        from .task_authority import deny_authority
+        task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        run = self.conn.execute("SELECT * FROM runs WHERE id=?", (task["run_id"],)).fetchone() if task else None
+        if run is None:
+            deny_authority("task_admission_receipt_missing")
+        receipt = self.conn.execute(
+            "SELECT request_hash, primary_stream_id FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
+            (run["project_id"] or "unscoped", run["idempotency_key"])).fetchone()
+        if receipt is None:
+            deny_authority("task_admission_receipt_missing")
+        admission = {"capability": run["capability"],
+            "spec": task_spec_for_request_hash(json.loads(run["spec_json"])),
+            "execution_request": self._execution_request_from_row(task),
+            "project_id": run["project_id"],
+            "expected_effect": json.loads(task["expected_effect_json"]) if task["expected_effect_json"] else None,
+            "capability_digest": task["capability_digest"], "authority_binding": binding.record()}
+        digest = hashlib.sha256(canonical_json(admission).encode()).hexdigest()
+        if receipt["request_hash"] != digest or receipt["primary_stream_id"] != run["id"]:
+            deny_authority("task_admission_binding_mismatch")
+        return receipt["request_hash"]
+
     def _task_result(self, run, task):
         result = dict(task)
         stored_spec = json.loads(result.pop("spec_json"))
+        result.pop("authority_binding_json", None)
         result.pop("execution_request_json", None)
         execution_request = self._execution_request_from_row(task)
         if execution_request is not None:

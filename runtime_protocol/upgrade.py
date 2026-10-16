@@ -62,6 +62,7 @@ EXECUTION_BINDING_TARGET_SCHEMA_VERSION = 26
 USER_PREFERENCES_PREVIOUS_SCHEMA_VERSION = 26
 USER_PREFERENCES_TARGET_SCHEMA_VERSION = 27
 HISTORY_TARGET_SCHEMA_VERSION = 28
+AUTHORITY_TARGET_SCHEMA_VERSION = 29
 HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION = "MIGRATE MANAGED OUTPUTS"
 GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION = "REPAIR GENERIC MEDIA TYPES"
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv"})
@@ -293,10 +294,13 @@ def _canonical_shape_for(version: int) -> tuple[set[str], dict[str, set[str]]]:
         EXECUTION_BINDING_TARGET_SCHEMA_VERSION,
         USER_PREFERENCES_TARGET_SCHEMA_VERSION,
         HISTORY_TARGET_SCHEMA_VERSION,
+        AUTHORITY_TARGET_SCHEMA_VERSION,
     }:
         raise ValidationError(f"canonical schema version {version} is not supported")
     tables = set(REQUIRED_SCHEMA_TABLES)
     columns = {table: set(values) for table, values in REQUIRED_SCHEMA_COLUMNS.items()}
+    if version < AUTHORITY_TARGET_SCHEMA_VERSION:
+        columns["tasks"].remove("authority_binding_json")
     if version < HISTORY_TARGET_SCHEMA_VERSION:
         tables.remove("parent_composition_publications")
         columns.pop("parent_composition_publications")
@@ -335,9 +339,9 @@ def _canonical_schema_identity(
     format_id, version = str(rows[0][1]), int(rows[0][2])
     if format_id != CANONICAL_FORMAT_ID:
         raise ValidationError(f"unsupported canonical format {format_id!r}")
-    if version > HISTORY_TARGET_SCHEMA_VERSION:
+    if version > AUTHORITY_TARGET_SCHEMA_VERSION:
         raise ValidationError(
-            f"canonical schema v{version} is newer than supported v{HISTORY_TARGET_SCHEMA_VERSION}"
+            f"canonical schema v{version} is newer than supported v{AUTHORITY_TARGET_SCHEMA_VERSION}"
         )
     if version < CANONICAL_PREVIOUS_SCHEMA_VERSION:
         raise ValidationError(f"canonical schema v{version} is not a supported migration source")
@@ -725,9 +729,9 @@ def migrate_canonical_to_current(
     confirmation: str | None = None,
     expected_realm_id: str | None = None,
 ) -> dict:
-    """Atomically run every supported canonical step through pinned v28.
+    """Atomically run every supported canonical step through pinned v29.
 
-    Current v28 is a read-only idempotent result.  Unknown, alternate, and
+    Current v29 is a read-only idempotent result.  Unknown, alternate, and
     newer layouts are rejected by the read-only preflight before an owner-lock
     marker, SQLite sidecar, journal, process signal, or schema mutation occurs.
     """
@@ -740,12 +744,12 @@ def migrate_canonical_to_current(
     if confirmation != expected_confirmation:
         raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
     source_version = int(identity["version"])
-    if source_version == HISTORY_TARGET_SCHEMA_VERSION:
+    if source_version == AUTHORITY_TARGET_SCHEMA_VERSION:
         return {
             "ok": True,
             "realm_id": realm_id,
             "source_schema_version": source_version,
-            "target_schema_version": HISTORY_TARGET_SCHEMA_VERSION,
+            "target_schema_version": AUTHORITY_TARGET_SCHEMA_VERSION,
             "steps": [],
             "changed": False,
         }
@@ -775,9 +779,15 @@ def migrate_canonical_to_current(
             current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
             if int(current["version"]) == USER_PREFERENCES_TARGET_SCHEMA_VERSION:
                 steps.append(_apply_v27_to_v28(connection))
+            current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
+            if int(current["version"]) == HISTORY_TARGET_SCHEMA_VERSION:
+                connection.execute("ALTER TABLE tasks ADD COLUMN authority_binding_json TEXT")
+                connection.execute("UPDATE runtime_schema SET version=29 WHERE id=1")
+                steps.append({"source_schema_version": 28, "target_schema_version": 29,
+                              "added_columns": ["tasks.authority_binding_json"]})
             final = _canonical_schema_identity(connection, expected_realm_id=realm_id)
-            if int(final["version"]) != HISTORY_TARGET_SCHEMA_VERSION:
-                raise ValidationError("canonical migration did not produce the pinned v28 layout")
+            if int(final["version"]) != AUTHORITY_TARGET_SCHEMA_VERSION:
+                raise ValidationError("canonical migration did not produce the pinned v29 layout")
             if _quick_check(connection, float(timeout_seconds)) != "ok":
                 raise ValidationError("migrated database failed SQLite integrity check")
             foreign_keys = _foreign_key_errors(connection, float(timeout_seconds))
@@ -788,7 +798,7 @@ def migrate_canonical_to_current(
                 "ok": True,
                 "realm_id": realm_id,
                 "source_schema_version": source_version,
-                "target_schema_version": HISTORY_TARGET_SCHEMA_VERSION,
+                "target_schema_version": AUTHORITY_TARGET_SCHEMA_VERSION,
                 "steps": steps,
                 "changed": True,
                 "elapsed_seconds": time.monotonic() - started,

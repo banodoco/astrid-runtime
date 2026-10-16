@@ -161,7 +161,7 @@ def test_loopback_real_commit_with_v1_and_exact_scope_denials(fixture, tmp_path)
         thread.join()
 
 
-def test_real_pair_project_denial_and_commit_gate_remains_closed(fixture, tmp_path, monkeypatch):
+def test_real_pair_project_denial_and_canonical_commit_only(fixture, tmp_path, monkeypatch):
     service, project = fixture
     other = service.create_project({'slug': 'other', 'name': 'Other'}, idempotency_key='other')['id']
     calls = fixture_provider(service, project)
@@ -208,14 +208,18 @@ def test_real_pair_project_denial_and_commit_gate_remains_closed(fixture, tmp_pa
         assert count(service, 'parent_composition_revisions') == 1
         assert service.lookup_request(other, 'main', request['request_id']) is None
         assert service.lookup_request(project, 'main', request['request_id']) is None
-        with pytest.raises(RuntimeError) as unavailable:
-            api.request('POST', f'/astrid/v1/projects/{project}/timelines/main/commit', request,
-                        headers=commit_headers)
-        assert unavailable.value.status == 403
-        assert unavailable.value.detail['details']['decision']['code'] == 'project_grant_operation_unavailable'
-        assert calls == [] and service.lookup_request(project, 'main', request['request_id']) is None
-        assert body_reads == [] and service.store.conn.total_changes == changes_before
-        assert count(service, 'parent_composition_revisions') == 1
+        accepted = api.request('POST', f'/astrid/v1/projects/{project}/timelines/main/commit', request,
+                               headers=commit_headers)
+        assert accepted['status'] == 'accepted'
+        assert calls and service.lookup_request(project, 'main', request['request_id'])['result'] == accepted
+        assert body_reads == [f'/astrid/v1/projects/{project}/timelines/main/commit']
+        assert count(service, 'parent_composition_revisions') == 2
+        # Unrelated legacy writes retain the original paired operation refusal.
+        with pytest.raises(RuntimeError) as unrelated:
+            api.request('POST', f'/v1/projects/{project}/timelines', {'slug':'blocked'}, headers=headers)
+        assert unrelated.value.status == 403
+        assert unrelated.value.detail['details']['decision']['code'] == 'project_grant_operation_unavailable'
+        assert len(body_reads) == 1
     finally:
         server.shutdown()
         server.server_close()

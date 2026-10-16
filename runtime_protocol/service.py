@@ -28,12 +28,14 @@ import subprocess
 import uuid
 import stat
 import math
+import time
 from collections.abc import Mapping
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError
+from .errors import ForbiddenError, AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
+from .task_authority import TaskAuthorityBinding, deny_authority, reject_authority_fields
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .shot_dependencies import analyze_invalidation
 from .timeline_inspection import inspect as inspect_timeline_closure
@@ -579,6 +581,8 @@ def _durable_mutation(function):
     return wrapped
 
 
+
+
 class RuntimeService(TimelineCommitAcceptance):
     """Neutral application service composed by the daemon or an isolated test."""
 
@@ -603,6 +607,8 @@ class RuntimeService(TimelineCommitAcceptance):
                 raise ValidationError("admission_timeout must be a finite positive number")
             store_kwargs["admission_timeout"] = admission_timeout
         self.store = RealmStore(root_path, **store_kwargs)
+        self._task_authority_owner = None
+        self._task_credentials = None
         self._verified = False
         self._admission_failure = None
         self._readiness_callback = None
@@ -5699,11 +5705,164 @@ class RuntimeService(TimelineCommitAcceptance):
         if selected is None:
             raise AuthorizationError("discovery grant selected project/run/task/attempt association does not match")
 
+    def bind_task_authority(self, owner, credentials):
+        """Trusted daemon composition, before serving requests; no discovery."""
+        with self.store._mutex:
+            if self._task_authority_owner is not None:
+                if self._task_authority_owner is not owner or self._task_credentials is not credentials:
+                    deny_authority("task_issuer_replacement_denied")
+                return
+            # One serialization order covers credential rotation/revoke,
+            # admission, grant revoke, claim, renewal and accepting effects.
+            credentials._lock = self.store._mutex
+            owner._lock = self.store._mutex
+            owner.credentials, owner.runtime = credentials, self
+            self._task_authority_owner, self._task_credentials = owner, credentials
+
+    def task_authority_for_identity(self, identity, *, project_id, operation):
+        with self.store._mutex:
+            owner = self._task_authority_owner
+            if owner is None or self._task_credentials is None:
+                deny_authority("task_issuer_unresolved")
+            grant = identity.get("_paired_session")
+            if grant is not None:
+                binding = owner.task_binding(grant, project_id=project_id, operation=operation)
+            else:
+                if identity.get("connector_assertion"):
+                    deny_authority("paired_session_required")
+                if "worker:execute" in identity.get("scopes", []) and "tasks:write" not in identity.get("scopes", []):
+                    deny_authority("worker_caller_authority_denied")
+                binding = TaskAuthorityBinding(1, "credential", self.runtime_session_id,
+                    self.realm["id"], identity.get("actor"), identity.get("_credential_binding"),
+                    project_id, operation, identity.get("expires_at"))
+            self._resolve_task_authority(binding)
+            return binding
+
+    def _resolve_task_authority(self, binding, *, scope="tasks:write"):
+        if type(binding) is not TaskAuthorityBinding:
+            deny_authority("task_authority_missing")
+        binding.record()
+        if binding.realm_id != self.realm["id"]:
+            deny_authority("task_authority_realm_mismatch")
+        if binding.expiry is not None and binding.expiry <= time.time():
+            deny_authority("task_authority_expired")
+        if binding.kind == "paired_session":
+            if self._task_authority_owner is None:
+                deny_authority("paired_issuer_unresolved")
+            self._task_authority_owner.resolve(binding, scope=scope)
+        elif binding.kind == "credential":
+            if self._task_credentials is None or binding.authority_instance_id != self.runtime_session_id:
+                deny_authority("task_issuer_unresolved")
+            metadata = self._task_credentials.validate_binding(binding.actor_id, binding.credential_binding, scope)
+            if metadata.get("connector_assertion") or ("worker:execute" in metadata.get("scopes", []) and "tasks:write" not in metadata.get("scopes", [])):
+                deny_authority("worker_caller_authority_denied")
+        elif binding.kind == "host_owned":
+            if binding.authority_instance_id != self.runtime_session_id or binding.actor_id != "runtime-internal":
+                deny_authority("task_issuer_unresolved")
+        return binding
+
+    def _task_authority(self, task_id):
+        row = self.store.conn.execute("SELECT authority_binding_json FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None or not row[0]:
+            deny_authority("task_authority_missing")
+        try:
+            return TaskAuthorityBinding.from_record(json.loads(row[0]))
+        except (ValueError, TypeError):
+            deny_authority("task_authority_invalid")
+
+    def _assert_task_authority(self, task_id, *, require_parent=True):
+        binding = self._task_authority(task_id)
+        row = self.store.conn.execute("SELECT t.capability, r.project_id FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.id=?", (task_id,)).fetchone()
+        if row is None or (binding.project_id, binding.operation) != (row["project_id"], row["capability"]):
+            raise AuthorizationError("task authority binding mismatch", details={"decision": {"status": "deny", "allowed": False, "code": "task_authority_binding_mismatch"}})
+        self.store.authority_admission_digest(task_id, binding)
+        self._resolve_task_authority(binding)
+        if require_parent and binding.parent_task_id:
+            parent = self.store.conn.execute("SELECT status, attempt_id FROM tasks WHERE id=?", (binding.parent_task_id,)).fetchone()
+            if parent is None or parent["status"] != "running" or parent["attempt_id"] != binding.parent_attempt_id:
+                deny_authority("task_parent_authority_ended")
+            self._assert_task_authority(binding.parent_task_id)
+        return binding
+
+    def _task_authority_expiry(self, binding):
+        expiry = binding.expiry
+        if binding.kind in {"paired_session", "credential"}:
+            if self._task_credentials is None:
+                deny_authority("task_issuer_unresolved")
+            metadata = self._task_credentials.validate_binding(binding.actor_id, binding.credential_binding, "tasks:write")
+            current = metadata.get("expires_at")
+            if current is not None:
+                expiry = min(expiry, current) if expiry is not None else current
+        return expiry
+
+    def _claim_authority(self, attempt):
+        binding = self._assert_task_authority(attempt["task_id"])
+        task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (attempt["task_id"],)).fetchone()
+        if (task["status"] != "running" or task["attempt_id"] != attempt["id"]
+                or task["lease_token"] != attempt["lease_id"] or task["executor_id"] != attempt["executor_id"]
+                or int(task["lease_fence"]) != int(attempt["fence"])
+                or int(task["runtime_epoch"]) != int(attempt["runtime_epoch"])):
+            raise LeaseError("attempt authority is fenced")
+        deadline = attempt["lease_expires_at"]
+        expiry = self._task_authority_expiry(binding)
+        if expiry is not None:
+            deadline = min(deadline, datetime.fromtimestamp(expiry, timezone.utc).isoformat(timespec="milliseconds"))
+        if datetime.fromisoformat(deadline) <= datetime.now(timezone.utc):
+            raise LeaseError("attempt authority expired")
+        admission_digest = self.store.authority_admission_digest(task["id"], binding)
+        return {"version": 1, "kind": binding.kind, "authority_instance_id": binding.authority_instance_id,
+                "task_id": task["id"], "attempt_id": attempt["id"], "lease_id": attempt["lease_id"],
+                "fence": attempt["fence"], "executor_id": attempt["executor_id"], "runtime_epoch": attempt["runtime_epoch"],
+                "project_id": binding.project_id, "operation": binding.operation,
+                "expiry": binding.expiry, "lease_expires_at": deadline, "admission_digest": admission_digest}
+
+    def _cap_authority_lease(self, task_id, attempt_id, deadline):
+        binding = self._assert_task_authority(task_id)
+        expiry = self._task_authority_expiry(binding)
+        if expiry is not None:
+            deadline = min(deadline, datetime.fromtimestamp(expiry, timezone.utc).isoformat(timespec="milliseconds"))
+        self.store.conn.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (deadline, task_id))
+        self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (deadline, attempt_id))
+        self.store.conn.execute("UPDATE reservations SET lease_expires_at=? WHERE task_id=? AND released_at IS NULL", (deadline, task_id))
+        return deadline
+
+    def cancel_authority_tasks(self, pair_id, generation, instance_id):
+        """Fence via the existing cancellation path; host heartbeat owns OS cleanup."""
+        with self.store._mutex:
+            rows = self.store.conn.execute("SELECT id, authority_binding_json FROM tasks WHERE authority_binding_json IS NOT NULL AND status NOT IN ('completed','cancelled')").fetchall()
+            for row in rows:
+                binding = TaskAuthorityBinding.from_record(json.loads(row["authority_binding_json"]))
+                if (binding.pair_id, binding.generation, binding.authority_instance_id) == (pair_id, generation, instance_id):
+                    self.store.cancel_task(row["id"])
+
+    def _assert_commit_authority(self, identity, project_id):
+        grant = identity.get("_paired_session") if isinstance(identity, dict) else None
+        if grant is not None:
+            owner = self._task_authority_owner
+            if owner is None:
+                deny_authority("paired_issuer_unresolved")
+            canonical_project = self.store.get_project(project_id)["id"]
+            binding = owner.task_binding(grant, project_id=canonical_project, operation="timeline.update")
+            self._resolve_task_authority(binding, scope="projects:write")
+
     @_verified_mutation
-    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None, _recoverable_outputs=None):
+    def create_task(self, body, *, enforce_readiness=False, authority_binding=None, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None, _recoverable_outputs=None):
         if "capability" in body or "expected_effect" in body:
             raise ValidationError("legacy task body aliases are not supported")
+        reject_authority_fields(body)
         capability = body.get("capability_id")
+        project_id = self.store.get_project(body["project"])["id"] if body.get("project") else None
+        if authority_binding is None and _host_owned:
+            authority_binding = TaskAuthorityBinding(1, "host_owned", self.runtime_session_id,
+                self.realm["id"], "runtime-internal", None, project_id, capability, None)
+        if authority_binding is not None:
+            if type(authority_binding) is not TaskAuthorityBinding:
+                deny_authority("task_authority_invalid")
+            if (authority_binding.project_id, authority_binding.operation) != (project_id, capability):
+                deny_authority("task_authority_binding_mismatch")
+            self._resolve_task_authority(authority_binding)
+            if not body.get("idempotency_key"):
+                body = {**body, "idempotency_key": new_id()}
         if capability == MEDIA_IMPORT_CAPABILITY and not _host_owned:
             raise AuthorizationError("runtime media import capability is host-owned")
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
@@ -5770,7 +5929,7 @@ class RuntimeService(TimelineCommitAcceptance):
             task_spec["required_facts"] = normalize_execution_facts(body["required_facts"], field="required_facts")
         if "storage_estimate" in body:
             task_spec["storage_estimate"] = self.store._validate_storage_estimate(body["storage_estimate"])
-        value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness, execution_request=execution_request)
+        value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness, execution_request=execution_request, authority_binding=authority_binding, authority_validator=self._resolve_task_authority)
         return value
 
     def _live_delegating_parent(self, attempt_id, lease, *, identity):
@@ -5787,6 +5946,7 @@ class RuntimeService(TimelineCommitAcceptance):
                 raise AuthorizationError("parent activation is missing, expired, revoked, or foreign")
         if json.loads(task["spec_json"]).get("delegated_parent") is not None:
             raise AuthorizationError("delegated children cannot delegate further")
+        self._assert_task_authority(task["id"])
         policy = json.loads(task["spec_json"]).get("child_delegation")
         if json.loads(task["spec_json"]).get("delegation_closed_attempt_id") == attempt_id:
             raise AuthorizationError("parent child authority has ended")
@@ -6195,7 +6355,7 @@ class RuntimeService(TimelineCommitAcceptance):
         admitted["project"] = project
         admitted["idempotency_key"] = idempotency_key
         recoverable = self._recoverable_child_grant(policy, task, lineage)
-        return self.create_task(admitted, enforce_readiness=True, _delegated_lineage=lineage, _delegated_stage=stage_name, _delegated_inputs=resolved_inputs, _verified_publication_source=verified_source, _recoverable_outputs=recoverable)
+        return self.create_task(admitted, enforce_readiness=True, authority_binding=self._task_authority(parent["id"]).child(operation=task["capability_id"], parent_task_id=parent["id"], parent_attempt_id=parent["attempt_id"]), _delegated_lineage=lineage, _delegated_stage=stage_name, _delegated_inputs=resolved_inputs, _verified_publication_source=verified_source, _recoverable_outputs=recoverable)
 
     @staticmethod
     def _recoverable_child_grant(policy, task, lineage):
@@ -7316,6 +7476,11 @@ class RuntimeService(TimelineCommitAcceptance):
                             require_fresh=not bool(replay.get("attempt_id")),
                         )):
                     raise AuthorizationError("remote activation is missing, revoked, or stale")
+            if isinstance(replay, dict) and replay.get("attempt_id"):
+                attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (replay["attempt_id"],)).fetchone()
+                self._assert_attempt_identity(attempt, identity)
+                self._validate_attempt_lease(attempt, replay, epoch)
+                replay = {**replay, "claim_authority": self._claim_authority(attempt)}
             return replay
         # Reap before selecting work. Otherwise an expired running task is
         # invisible to the queued-task query and reclaim waits for another
@@ -7332,6 +7497,12 @@ class RuntimeService(TimelineCommitAcceptance):
             if caps and item["capability"] not in caps:
                 continue
             full_task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (item["id"],)).fetchone()
+            try:
+                self._assert_task_authority(item["id"])
+            except (ForbiddenError, AuthorizationError) as exc:
+                code = (getattr(exc, "details", None) or {}).get("decision", {}).get("code", "task_credential_denied")
+                self.store._set_waiting_reason(item["id"], code)
+                continue
             if self.store._provider_retry_waiting_reason(full_task):
                 self.store._set_waiting_reason(item["id"], "provider_retry_after")
                 continue
@@ -7394,6 +7565,7 @@ class RuntimeService(TimelineCommitAcceptance):
                     "task.claim", "claim", idempotency_key, request_hash, result,
                     project_id="unscoped", with_receipt=False,
                 )
+        self._assert_task_authority(row["id"])
         attempt_id, lease_id = new_id(), new_id()
         value = self.store._claim_task(row["id"], executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
         if value["task"]["status"] != "running":
@@ -7420,12 +7592,17 @@ class RuntimeService(TimelineCommitAcceptance):
                         "execution_binding": binding,
                     },
                 )
+            expires = self._cap_authority_lease(row["id"], attempt_id, expires)
+            attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            claim_authority = self._claim_authority(attempt)
             # Return the immutable admitted spec alongside the lease. Workers
             # must execute exactly what was claimed, without a racy second read.
             admitted_spec, generation_intent = public_task_spec(task.get("spec") or {})
             if task.get("generation_intent") is not None:
                 generation_intent = task["generation_intent"]
             result = {"attempt_id": attempt_id, "task_id": row["id"], "run_id": value["run"]["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            result["claim_authority"] = claim_authority
+            result["executor_id"] = executor_id
             if task.get("execution_request") is not None:
                 result["execution_request"] = dict(task["execution_request"])
             if binding is not None:
@@ -7476,6 +7653,7 @@ class RuntimeService(TimelineCommitAcceptance):
             request_hash = hashlib.sha256(canonical_json({"attempt_id": attempt_id, "body": body}).encode()).hexdigest()
             replay = self._command_replay("attempt.settle", attempt_id, idempotency_key, request_hash, project_id=project_id or "unscoped")
             if replay is not None:
+                self._assert_task_authority(row["task_id"], require_parent=False)
                 return replay
             self._validate_attempt_lease(row, body, current_epoch)
             if not task or (task["runtime_epoch"] is not None and int(task["runtime_epoch"]) != current_epoch):
@@ -7556,6 +7734,7 @@ class RuntimeService(TimelineCommitAcceptance):
                 recorded = None
                 def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, created_at=None):
                     nonlocal recorded
+                    self._assert_task_authority(row["task_id"])
                     recorded = self._command_record(
                         "attempt.settle", attempt_id, idempotency_key, request_hash,
                         self._task_resource(value), project_id=project_id or "unscoped",
@@ -7563,6 +7742,7 @@ class RuntimeService(TimelineCommitAcceptance):
                         resulting_stream_seq=resulting_stream_seq,
                         created_at=created_at,
                     )
+                self._assert_task_authority(row["task_id"])
                 self.store._settle_attempt(
                     row["task_id"], row["lease_id"], result,
                     effect=effect, fence=body["fence"], attempt_id=attempt_id,
@@ -7623,6 +7803,7 @@ class RuntimeService(TimelineCommitAcceptance):
             current_epoch = self.store._current_runtime_epoch()
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (attempt["task_id"],)).fetchone() if attempt else None
             authoring_task_id = str(task["id"]) if task else ""
+            self._assert_task_authority(authoring_task_id)
             existing = self.store.timeline_render_publication(authoring_task_id) if authoring_task_id else None
             if existing is not None:
                 if existing["request_hash"] != request_hash:
@@ -7721,9 +7902,11 @@ class RuntimeService(TimelineCommitAcceptance):
                 if "storage_estimate" in render:
                     task_spec["storage_estimate"] = self.store._validate_storage_estimate(render["storage_estimate"])
                 render_key = f"timeline-publication-{authoring_task_id}"
+                render_authority = self._assert_task_authority(authoring_task_id).for_operation("rendering.render")
+                self._resolve_task_authority(render_authority)
                 render_value = self.store.create_task(
                     "rendering.render", task_spec, project_id, render_key,
-                    render.get("settlement_effect"), render_digest, enforce_readiness=True,
+                    render.get("settlement_effect"), render_digest, enforce_readiness=True, authority_binding=render_authority, authority_validator=self._resolve_task_authority,
                 )
                 render_task_id = render_value["task"]["id"]
                 render_run_id = render_value["run"]["id"]
@@ -8424,7 +8607,7 @@ class RuntimeService(TimelineCommitAcceptance):
             raise ValidationError("recovery nonce authorization is required")
         return nonce
 
-    def _validate_attempt_lease(self, row, body, current, *, require_epoch=True, allow_expired=False):
+    def _validate_attempt_lease(self, row, body, current, *, require_epoch=True, allow_expired=False, require_authority=True):
         """Validate the complete attempt fence before a mutating side effect."""
         if require_epoch:
             self.store._validate_runtime_epoch(
@@ -8447,6 +8630,9 @@ class RuntimeService(TimelineCommitAcceptance):
                     raise LeaseError("attempt lease has expired")
             except ValueError as exc:
                 raise LeaseError("attempt lease deadline is invalid") from exc
+        if require_authority:
+            self._assert_task_authority(row["task_id"])
+
     @_verified_mutation
     def prepare_reboot(self, body=None, *, identity=None):
         """Issue a one-shot nonce for an attempt's recovery handshake."""
@@ -8645,6 +8831,7 @@ class RuntimeService(TimelineCommitAcceptance):
             admitted_spec, generation_intent = public_task_spec(task_value["task"].get("spec") or {})
             if task_value["task"].get("generation_intent") is not None:
                 generation_intent = task_value["task"]["generation_intent"]
+            self._validate_attempt_lease(attempt, {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": attempt["runtime_epoch"]}, self.store._current_runtime_epoch())
             resource = {
                 "attempt_id": attempt["id"],
                 "task_id": attempt["task_id"],
@@ -8657,6 +8844,8 @@ class RuntimeService(TimelineCommitAcceptance):
                 "input_object_ids": list(admitted_spec.get("input_object_ids") or []),
                 "spec": admitted_spec,
             }
+            resource["executor_id"] = attempt["executor_id"]
+            resource["claim_authority"] = self._claim_authority(attempt)
             if generation_intent is not None:
                 resource["generation_intent"] = generation_intent
             binding = self.store.execution_binding(attempt["task_id"])
@@ -8668,6 +8857,7 @@ class RuntimeService(TimelineCommitAcceptance):
             current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
             row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
             self._assert_attempt_identity(row, identity)
+            self._assert_task_authority(row["task_id"])
             attempt_owner = self.store.conn.execute("SELECT executor_id FROM attempts WHERE id=?", (row["attempt_id"],)).fetchone()
             if attempt_owner is None:
                 raise ConflictError("resume executor is unresolved")
@@ -8733,6 +8923,7 @@ class RuntimeService(TimelineCommitAcceptance):
                             "recovery": "checkpoint_authorized_resume",
                         },
                     )
+            self._cap_authority_lease(row["task_id"], attempt_id, task["lease_expires_at"])
             resumed_attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             receipt = {"type": "runtime.recovery.receipt", "version": 1, "checkpoint_id": row["id"], "attempt_id": resumed_attempt["id"], "task_id": row["task_id"], "runtime_epoch": current, "command": "resume", "status": "resumed", "checkpoint_digest": "sha256:" + row["checkpoint_digest"], "checkpoint": checkpoint}
             with self.store._transaction():
@@ -8797,19 +8988,23 @@ class RuntimeService(TimelineCommitAcceptance):
             self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=row["executor_id"] if row else None, required=True)
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone() if row else None
             project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0] if task else "unscoped"
+            self._validate_attempt_lease(row, body, current)
+            confirmation = self._claim_authority(row)
             request_hash = hashlib.sha256(canonical_json({"attempt_id": attempt_id, "body": body}).encode()).hexdigest()
             replay = self._command_replay("attempt.heartbeat", attempt_id, idempotency_key, request_hash, project_id=project_id or "unscoped")
             if replay is not None:
-                return replay
+                return {**replay, "data": {**replay["data"], "claim_authority": confirmation}}
             self._validate_attempt_lease(row, body, current)
             recorded = None
             def record(value):
                 nonlocal recorded
-                expires = value["task"].get("lease_expires_at")
+                expires = self._cap_authority_lease(row["task_id"], attempt_id, value["task"].get("lease_expires_at"))
                 self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
                 if progress is not None:
                     self.store._append_event(task["run_id"], row["task_id"], "task.progress", progress)
                 result = {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": expires, "runtime_epoch": self.store._current_runtime_epoch()}
+                fresh_attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+                result["claim_authority"] = self._claim_authority(fresh_attempt)
                 recorded = self._command_record("attempt.heartbeat", attempt_id, idempotency_key, request_hash, result, project_id=project_id or "unscoped")
             self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30), record=record)
             return recorded
@@ -8840,7 +9035,7 @@ class RuntimeService(TimelineCommitAcceptance):
             replay = self._command_replay("attempt.fail", attempt_id, idempotency_key, request_hash, project_id=project_id or "unscoped")
             if replay is not None:
                 return replay
-            self._validate_attempt_lease(row, body, current)
+            self._validate_attempt_lease(row, body, current, require_authority=False)
             if "reason" in body:
                 raise ValidationError("reason is not supported; use error")
             failure = body.get("error") or {"code": "executor_failed"}

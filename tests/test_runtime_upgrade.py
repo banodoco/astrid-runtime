@@ -177,6 +177,7 @@ def test_canonical_v24_variant_state_migration_is_additive_and_refuses_repeat(tm
             "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) SELECT id, generation_id, object_id, variant_type, metadata_json, created_at FROM generation_variants_v25"
         )
         connection.execute("DROP TABLE generation_variants_v25")
+        connection.execute("ALTER TABLE tasks DROP COLUMN authority_binding_json")
         connection.execute("ALTER TABLE tasks DROP COLUMN execution_request_json")
         connection.execute("DROP TABLE execution_bindings")
         connection.execute("DROP TABLE user_preferences")
@@ -236,6 +237,7 @@ def test_execution_binding_migration_adds_only_the_targeted_contract(tmp_path):
     RealmStore.initialize(root).close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
+        connection.execute("ALTER TABLE tasks DROP COLUMN authority_binding_json")
         connection.execute("ALTER TABLE tasks DROP COLUMN execution_request_json")
         connection.execute("DROP TABLE execution_bindings")
         connection.execute("DROP TABLE user_preferences")
@@ -275,6 +277,8 @@ def _canonical_fixture(root, version):
     store.close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
+        if version < 29:
+            connection.execute("ALTER TABLE tasks DROP COLUMN authority_binding_json")
         if version < 28:
             connection.execute("DROP TABLE parent_composition_publications")
             connection.execute("ALTER TABLE parent_composition_heads DROP COLUMN publication_id")
@@ -306,7 +310,7 @@ def _canonical_fixture(root, version):
     return f"realm-v{version}"
 
 
-@pytest.mark.parametrize("source_version, expected_steps", [(24, 4), (25, 3), (26, 2), (27, 1)])
+@pytest.mark.parametrize("source_version, expected_steps", [(24, 5), (25, 4), (26, 3), (27, 2), (28, 1)])
 def test_complete_canonical_migration_chain_reaches_current(tmp_path, source_version, expected_steps):
     root = tmp_path / f"realm-{source_version}"
     realm_id = _canonical_fixture(root, source_version)

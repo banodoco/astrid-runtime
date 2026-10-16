@@ -12,7 +12,7 @@ import json
 import math
 import re
 
-from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError
+from .errors import ForbiddenError, AuthorizationError, ConflictError, NotFoundError, ValidationError
 from .util import canonical_json, now
 
 KIND = "timeline.commit"
@@ -365,6 +365,7 @@ class TimelineCommitAcceptance:
         aggregate = self._commit_aggregate(request["project_id"], request["timeline_id"])
         with self.store._mutex:
             self._assert_mutation_admitted()
+            self._assert_commit_authority(identity, request["project_id"])
             if self.store.conn.in_transaction:
                 raise ConflictError("accept must own the durable transaction boundary")
             with self.store._transaction():
@@ -483,7 +484,7 @@ class TimelineCommitAcceptance:
 
     def _request_commit_port(self, request, identity):
         # Trusted code is composed in-process; scope is enforced at every call.
-        original, principal = copy.deepcopy(request), copy.deepcopy(identity)
+        original, principal = copy.deepcopy(request), {k: copy.deepcopy(v) if k != "_paired_session" else v for k, v in identity.items()}
         project, timeline, key = original["project_id"], original["timeline_id"], original["request_id"]
         request_hash = digest(original)
         selections = []
@@ -652,6 +653,7 @@ class TimelineCommitAcceptance:
         request_hash = digest(request)
         with self.store._mutex:
             self._assert_mutation_admitted()
+            self._assert_commit_authority(identity, request["project_id"])
             self._timeline_commit_started = True
             if not request["dry_run"]:
                 found, wrapper = self._command_replay_state(KIND, self._commit_aggregate(project_id, timeline_id),
@@ -667,6 +669,8 @@ class TimelineCommitAcceptance:
         port = self._request_commit_port(request, identity)
         try:
             prepared = provider.commit(copy.deepcopy(request), port)
+        except (AuthorizationError, ForbiddenError):
+            raise
         except (ConnectionError, TimeoutError):
             raise  # The transport may have lost an already durable response.
         except Exception:

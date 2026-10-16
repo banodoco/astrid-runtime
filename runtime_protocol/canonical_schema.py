@@ -45,7 +45,7 @@ CREATE TABLE tasks (
     result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     capability_digest TEXT, waiting_reason TEXT, lease_expires_at TEXT,
     lease_fence INTEGER NOT NULL DEFAULT 0, attempt_id TEXT, runtime_epoch INTEGER,
-    execution_request_json TEXT
+    execution_request_json TEXT, authority_binding_json TEXT
 );
 CREATE TABLE events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id),

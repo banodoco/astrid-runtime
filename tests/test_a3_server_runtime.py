@@ -47,7 +47,8 @@ def test_heartbeat_progress_is_exposed_on_task_resource(service):
             "capability_id": "render.basic",
             "spec": {},
             "idempotency_key": "progress-task",
-        }
+        },
+        _host_owned=True,
     )
     epoch = service.health()["runtime_epoch"]
     attempt = service.claim_next(
@@ -156,7 +157,8 @@ def test_fence_zero_and_stale_lease_are_lease_errors(service):
             "capability_id": "render.basic",
             "spec": {},
             "idempotency_key": "lease-guard-task",
-        }
+        },
+        _host_owned=True,
     )
     epoch = service.health()["runtime_epoch"]
     attempt = service.claim_next(

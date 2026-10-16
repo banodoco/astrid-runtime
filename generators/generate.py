@@ -59,7 +59,13 @@ def contract_digest(manifest_path: Path = MANIFEST) -> str:
         h.update(len(relative).to_bytes(4, "big")); h.update(relative)
         h.update(len(data).to_bytes(8, "big")); h.update(data)
     data = _regular(OPCALL_SCHEMA, "Astrid OpCall contract input")
-    logical = opcall_schema()["$id"].encode()
+    # Hash source identity/bytes independently of language projection support.
+    # Generating a validator still calls opcall_schema() and refuses constructs
+    # it cannot enforce; an unrelated projection must not invent a digest.
+    identity = json.loads(data).get("$id")
+    if identity != "https://astrid.local/schemas/change-contract/opcall.schema.json":
+        raise SystemExit("unexpected OpCall source identity")
+    logical = identity.encode()
     h.update(len(logical).to_bytes(4, "big")); h.update(logical)
     h.update(len(data).to_bytes(8, "big")); h.update(data)
     return "sha256:" + h.hexdigest()

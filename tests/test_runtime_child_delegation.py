@@ -71,7 +71,7 @@ def parent(runtime, *, limits=None, targeted=False, key="parent"):
     body = {"project": project, "capability_id": PARENT, "capability_digest": digest(PARENT), "input_object_ids": [], "spec": {}, "child_delegation": policy, "idempotency_key": key}
     if targeted:
         body["execution_request"] = {"schema_version": 1, "target": TARGET, "inputs": []}
-    service.create_task(body, enforce_readiness=True)
+    service.create_task(body, enforce_readiness=True, _host_owned=True)
     return claim(service, PARENT, "claim-" + key)
 
 
@@ -633,7 +633,7 @@ def snapshot_parent(runtime, *, permitted=True, limits=None):
     if limits is not None:
         policy["limits"] = limits
     service.create_task({"project": project, "capability_id": PARENT, "capability_digest": digest(PARENT),
-        "input_object_ids": [], "spec": {}, "child_delegation": policy, "idempotency_key": "snapshot-parent"}, enforce_readiness=True)
+        "input_object_ids": [], "spec": {}, "child_delegation": policy, "idempotency_key": "snapshot-parent"}, enforce_readiness=True, _host_owned=True)
     return claim(service, PARENT, "claim-snapshot-parent")
 
 
@@ -1070,7 +1070,7 @@ def test_discovery_grant_persists_exact_historical_tuple_and_preserves_receipts(
     service, _ = runtime
     body = discovery_parent_body(runtime)
     expected = copy.deepcopy(body["child_delegation"]["discovery_grant"])
-    service.create_task(body, enforce_readiness=True)
+    service.create_task(body, enforce_readiness=True, _host_owned=True)
     attempt = claim(service, PARENT, "claim-discovery-parent")
     persisted = service.task(attempt["task_id"])["task"]["spec"]["child_delegation"]
     assert persisted["discovery_grant"] == expected
@@ -1098,7 +1098,7 @@ def test_discovery_grant_rejects_parent_or_selected_tuple_mismatch(runtime, fiel
     body = discovery_parent_body(runtime)
     body["child_delegation"]["discovery_grant"][field] = digest("foreign") if field == "capability_digest" else "foreign"
     with pytest.raises(AuthorizationError, match="discovery grant"):
-        service.create_task(body, enforce_readiness=True)
+        service.create_task(body, enforce_readiness=True, _host_owned=True)
 
 
 @pytest.mark.parametrize("bad", [None, [], {}, {"authority": "caller-forged"}])
@@ -1107,7 +1107,7 @@ def test_discovery_grant_rejects_malformed_object(runtime, bad):
     body = discovery_parent_body(runtime)
     body["child_delegation"]["discovery_grant"] = bad
     with pytest.raises(ValidationError, match="discovery_grant"):
-        service.create_task(body)
+        service.create_task(body, _host_owned=True)
 
 
 @pytest.mark.parametrize("field", ["project_id", "run_id", "task_id", "attempt_id", "capability_id", "capability_digest", "limits"])
@@ -1116,7 +1116,7 @@ def test_discovery_grant_rejects_missing_required_fields(runtime, field):
     body = discovery_parent_body(runtime)
     del body["child_delegation"]["discovery_grant"][field]
     with pytest.raises(ValidationError, match="discovery_grant"):
-        service.create_task(body)
+        service.create_task(body, _host_owned=True)
 
 
 @pytest.mark.parametrize("field", list(service_module.DISCOVERY_GRANT_CEILINGS))
@@ -1130,7 +1130,7 @@ def test_discovery_grant_requires_every_finite_budget(runtime, field, bad):
     else:
         bounds[field] = service_module.DISCOVERY_GRANT_CEILINGS[field] + 1 if bad == "excessive" else bad
     with pytest.raises(ValidationError, match="finite prototype bound"):
-        service.create_task(body)
+        service.create_task(body, _host_owned=True)
 
 
 @pytest.mark.parametrize("change", ["wildcard", "empty_identity", "list_identity", "bare_digest", "extra_grant", "extra_limit", "empty_limits", "forged_parent_attempt", "spec", "body"])
@@ -1157,14 +1157,14 @@ def test_discovery_grant_rejects_wildcard_unknown_and_caller_authority(runtime, 
     else:
         (body["spec"] if change == "spec" else body)["discovery_grant"] = grant
     with pytest.raises(ValidationError):
-        service.create_task(body)
+        service.create_task(body, _host_owned=True)
 
 
 @pytest.mark.parametrize("change", ["grant", "policy", "signature", "redelegation"])
 def test_discovery_grant_policy_is_signed_and_cannot_redelegate(runtime, change):
     service, _ = runtime
     body = discovery_parent_body(runtime)
-    service.create_task(body)
+    service.create_task(body, _host_owned=True)
     attempt = claim(service, PARENT, "claim-discovery-parent")
     receipt = authority(service, attempt)
     if change in {"grant", "policy"}:
@@ -1181,7 +1181,7 @@ def test_discovery_grant_policy_is_signed_and_cannot_redelegate(runtime, change)
         receipt["authority"] = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=") + "." + signature
     else:
         with pytest.raises(ValidationError, match="cannot delegate further"):
-            service.create_task(body, _delegated_lineage={"parent_attempt_id": attempt["attempt_id"]})
+            service.create_task(body, _delegated_lineage={"parent_attempt_id": attempt["attempt_id"]}, _host_owned=True)
         child = admit(service, receipt)
         child_attempt = claim(service, CHILD, "claim-discovery-child")
         spec = json.loads(service.store.conn.execute("SELECT spec_json FROM tasks WHERE id=?", (child["task"]["id"],)).fetchone()[0])
@@ -1197,7 +1197,7 @@ def test_discovery_grant_policy_is_signed_and_cannot_redelegate(runtime, change)
 @pytest.mark.parametrize("end", ["cancel", "expired", "epoch", "fence", "recovered"])
 def test_discovery_grant_uses_live_parent_lifecycle(runtime, monkeypatch, end):
     service, _ = runtime
-    service.create_task(discovery_parent_body(runtime))
+    service.create_task(discovery_parent_body(runtime), _host_owned=True)
     attempt = claim(service, PARENT, "claim-discovery-parent")
     receipt = authority(service, attempt)
     if end == "cancel":
