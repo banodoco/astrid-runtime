@@ -1,6 +1,5 @@
 """Real paired HTTP admission through ordinary Astrid host; synthetic command only."""
 import json
-import os
 import errno
 import socket
 import threading
@@ -38,7 +37,7 @@ def flow(tmp_path, request):
         configuration=getattr(request, 'param', 0.35)
         delegated=isinstance(configuration,dict) and configuration.get('delegation') is True
         module=isinstance(configuration,dict) and configuration.get('module') is True
-        delay=0.35 if isinstance(configuration,dict) else configuration
+        delay=configuration.get('delay', 0.35) if isinstance(configuration,dict) else configuration
         probe = """
 import errno,json,os,socket,subprocess,sys,time
 from pathlib import Path
@@ -55,6 +54,7 @@ r={'read':check(lambda:Path(outside).read_text()),'write':check(lambda:Path(outs
 if len(sys.argv)==1:
     child=subprocess.run([sys.executable,'-I','-S','-c',__CHILD__,'descendant'],capture_output=True,text=True,check=True)
     r['descendant']=json.loads(child.stdout)
+    __INFLIGHT__
     time.sleep(__DELAY__)
     r['finished']=time.monotonic()
     r['attempt']=str(Path('__OUTPUT__').parent.parent.name)
@@ -74,6 +74,8 @@ else:
     else:
         raise AssertionError('foreign child status was accepted')
 """)
+        marker = "Path('__OUTPUT__').with_name('inflight.json').write_text(json.dumps(r))"
+        probe=probe.replace('__INFLIGHT__', marker if isinstance(configuration,dict) and configuration.get('inflight') else 'pass')
         child=probe.replace('__OUTSIDE__' ,repr(str(outside))).replace('__PORT__',str(listener.getsockname()[1]))
         child=child.replace('__CHILD__', "''").replace('__DELAY__','0').replace('__OUTPUT__','unused')
         probe=probe.replace('__OUTSIDE__',repr(str(outside))).replace('__PORT__',str(listener.getsockname()[1]))
