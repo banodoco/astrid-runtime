@@ -510,3 +510,49 @@ def test_descriptor_change_in_flight_is_discarded(runtime, tmp_path):
         s.store.conn.execute("UPDATE executors SET capabilities_json=? WHERE id='host'",(json.dumps(descriptor),))
     install_fake(d,tmp_path,action)
     assert http(d,p)[0] == 409
+
+@pytest.mark.parametrize("versions", [[True], [0], [-1], [], "1,2", [1, 2.0]])
+def test_generated_health_rejects_invalid_catalog_negotiation(runtime, versions):
+    from banodoco_workspace_client.generated import Health
+    d, _ = runtime
+    value = {**d.service.health(), "runtime_instance_id": d.instance_id,
+             "capability_catalog_versions": versions}
+    with pytest.raises(ValueError):
+        Health.from_json(value)
+
+
+def test_generated_health_keeps_authenticated_catalog_versions(runtime):
+    from banodoco_workspace_client.generated import Health
+    d, _ = runtime
+    value = {**d.service.health(), "runtime_instance_id": d.instance_id}
+    parsed = Health.from_json(value)
+    assert parsed.capability_catalog_versions == [1, 2]
+    value["capability_catalog_versions"].clear()
+    assert parsed.capability_catalog_versions == [1, 2]
+    del value["capability_catalog_versions"]
+    assert Health.from_json(value).capability_catalog_versions is None
+
+
+def test_request_estimated_catalog_admission_and_claim_use_explicit_pair(runtime):
+    d, project = runtime
+    service = d.service
+    v1 = service.list_capabilities(catalog_version=1)["items"][0]
+    v2 = service.list_capabilities(catalog_version=2)["items"][0]
+    assert v1["status"] == "unsupported"
+    assert v2["status"] == "ready" and v2["storage_estimate"] == CONTRACT
+    authority = service.task_authority_for_identity(identity(d), project_id=project, operation=CAP)
+    body = {"project": project, "capability_id": CAP, "capability_digest": SHA,
+            "schema_version": "1", "spec": SPEC, "input_object_ids": [],
+            "idempotency_key": "dynamic-task"}
+    with pytest.raises(RuntimeErrorBase):
+        service.create_task(body, enforce_readiness=True, authority_binding=authority)
+    pair = {"scratch_bytes": 123, "output_bytes": 456}
+    admitted = service.create_task({**body, "storage_estimate": pair},
+        enforce_readiness=True, authority_binding=authority)
+    assert admitted["task"]["status"] == "queued"
+    assert service.store.storage_preflight(CAP, storage_estimate=pair)["estimate_source"] == "task"
+    claimed = service.claim_next({"executor_id": "host", "capability_ids": [CAP],
+        "runtime_epoch": service.health()["runtime_epoch"]}, idempotency_key="dynamic-claim")
+    assert claimed["task_id"] == admitted["task"]["id"]
+    assert claimed["storage_estimate"] == pair
+

@@ -36,7 +36,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .errors import ForbiddenError, AuthorizationError, ConflictError, NoCommittedRequestError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST, OPERATION_VERSIONS
-from .storage_contract import REQUEST_ESTIMATOR_PENDING
 from .task_authority import TaskAuthorityBinding, deny_authority, reject_authority_fields
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .shot_dependencies import analyze_invalidation
@@ -7587,13 +7586,13 @@ class RuntimeService(TimelineCommitAcceptance):
     def _capability_resource(self, row, declarations=None, *, catalog_version=1):
         status = row["status"]
         reason = row["unavailable_reason"]
-        if status == "ready" and not self.store.matching_live_executor(row["id"], row["definition_digest"]):
+        storage = self.store.capability_storage_contract(row["id"], row["definition_digest"])
+        if status == "ready" and not self.store.matching_live_executor(row["id"], row["definition_digest"],
+                include_storage=storage["mode"] != "request_estimated"):
             status, reason = "unavailable", "no_live_matching_executor"
         resource = {"capability_id": row["id"], "definition_digest": row["definition_digest"], "status": status, "required_resource_keys": json.loads(row["required_resource_keys_json"]), "estimated_scratch_bytes": row["estimated_scratch_bytes"], "estimated_output_bytes": row["estimated_output_bytes"], "unavailable_reason": reason}
-        storage = self.store.capability_storage_contract(row["id"], row["definition_digest"])
-        if storage["mode"] == "request_estimated":
-            resource.update(status="unsupported" if catalog_version == 1 else "unavailable",
-                            unavailable_reason="request_estimated_requires_catalog_v2" if catalog_version == 1 else REQUEST_ESTIMATOR_PENDING)
+        if storage["mode"] == "request_estimated" and catalog_version == 1:
+            resource.update(status="unsupported", unavailable_reason="request_estimated_requires_catalog_v2")
         elif storage["mode"] == "unavailable":
             resource.update(status="unavailable", unavailable_reason=storage["reason"])
         if catalog_version == 2:
