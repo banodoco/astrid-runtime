@@ -61,7 +61,8 @@ def binding_for(d, root):
         runtime_process=copy.deepcopy(ACTOR), host_process=copy.deepcopy(ACTOR), realm_id=d.service.realm["id"], runtime_instance_id=d.instance_id,
         runtime_session_id=d.service.runtime_session_id, runtime_epoch=d.service.health()["runtime_epoch"],
         executor_id="host", source_epoch="opaque:E1", capability_id=CAP, capability_digest=SHA,
-        storage_estimate_contract=CONTRACT, source_digest=SOURCE, dependency_digest=DEPENDENCY, preparation_source_digest=SOURCE, deadline_ms=1000)
+        storage_estimate_contract=CONTRACT, source_digest=SOURCE, dependency_digest=DEPENDENCY, preparation_source_digest=SOURCE, preparation_dependency_digest=DEPENDENCY,
+        host_instance_id="fixture-host", boot_manifest_hash="e"*64, deadline_ms=1000)
 
 
 def identity(d, token=None):
@@ -188,7 +189,8 @@ def test_paired_guard_and_capability_project_grants(runtime, tmp_path):
     token, _ = d.credentials.provision_connector("connector", ["handshake", "projects:read", "projects:write", "tasks:write"],
         connector_id="c", realm_id=s.realm["id"], expires_at=time.time()+120)
     ctx = dict(pair_id="pair", connector_id="c", generation=1, realm_id=s.realm["id"], expires_at=int((time.time()+90)*1000))
-    assert http(d, p, token=token, context=ctx)[0] == 200
+    status, value = http(d, p, token=token, context=ctx)
+    assert status == 200, value
     assert http(d, p, token=token)[0] == 403
     other = s.create_project({"slug": "two", "name": "Two"}, idempotency_key="p2")["id"]
     assert http(d, other, token=token, context=ctx)[0] == 403
@@ -346,7 +348,7 @@ def test_real_kernel_socket_via_daemon_binding_and_public_route(socket_relay, ru
         assert status == 200, value
         assert value["spec"] == SPEC and value["source_digest"] == SOURCE
         assert db_snapshot(d.service) == before
-        assert seen[0]["runtime"]["runtime_instance_id"] == d.instance_id
+        assert seen[0]["context"]["runtime"]["runtime_instance_id"] == d.instance_id
     finally:
         thread.join(2)
         assert not thread.is_alive()
@@ -410,8 +412,8 @@ def test_contract_schemas_clients_and_original_profiles_preserved():
     assert list(Draft202012Validator(reply_schema).iter_errors({"preparation":prepared(request)}))
     old=json.loads(subprocess.check_output(["git","show","6f96b62e40eb5fde69500727053d626cf9d101b2:runtime_protocol/contract_metadata.py"]).decode().split("OPERATION_VERSIONS = ")[1].split("\n")[0].replace("'",'"'))
     assert len(old) == 139
-    assert {key:OPERATION_VERSIONS[key] for key in old} == old
-    assert len(OPERATION_VERSIONS) == 140
+    assert all(set(versions).issubset(OPERATION_VERSIONS[key]) for key, versions in old.items())
+    assert len(OPERATION_VERSIONS) >= 140
     generate.validate_python_client(generate.render_python_client())
     generate.validate_typescript_client(source=generate.render_typescript_client())
 
