@@ -343,8 +343,10 @@ def bind_selected_host(daemon, profile, handle):
             executor_id = launch.get("executor_id", "astrid-pack-host")
             row = next((v for v in rows if v["id"] == executor_id), None)
             if row is not None and receipt is not None:
+                daemon._assert_local_relinquish_receipt(receipt, metadata)
                 if (row["source_digest"] != source or row["dependency_digest"] != dependency
-                        or receipt["host"] != report["processes"]["host"]):
+                        or any(receipt["host"].get(k) != report["processes"]["host"][k]
+                               for k in ("pid", "birth_id"))):
                     raise unavailable("selected_source_changed")
                 binding = dict(realm_id=service.realm["id"], runtime_instance_id=service.runtime_instance_id,
                     runtime_session_id=service.runtime_session_id, runtime_epoch=service.store._current_runtime_epoch(),

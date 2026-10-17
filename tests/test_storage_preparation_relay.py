@@ -6,6 +6,59 @@ def test_preparation_operation_is_implemented_and_declared():
     assert OPERATION_VERSIONS.get("prepareCapabilityStorage") == [1]
     assert callable(getattr(RuntimeService, "prepare_capability_storage", None))
 
+def test_production_binding_projects_rich_launch_receipt_and_fences_revocation(runtime, tmp_path, monkeypatch):
+    """Real bind_selected_host/configure/service validation; native launch is doubled."""
+    from types import SimpleNamespace
+    from astrid.core.execution import generic_host as hosts
+    from runtime_protocol import local_preparation_relay as transport
+    from runtime_protocol.daemon import WORKER_ACTOR
+    d, _ = runtime
+    source = hosts._canonical_digest({CAP: SOURCE.removeprefix("sha256:")})
+    dependency = hosts._canonical_digest({CAP: DEPENDENCY.removeprefix("sha256:")})
+    d.service.store.conn.execute("UPDATE executors SET source_digest=?,dependency_digest=? WHERE id='host'", (source, dependency))
+    record = SimpleNamespace(id=CAP, has_request_storage_estimator=True,
+        source_digest=SOURCE.removeprefix("sha256:"), dependency_digest=DEPENDENCY.removeprefix("sha256:"),
+        capability_digest=SHA, request_storage_estimate_contract=CONTRACT)
+    class Inventory:
+        def __init__(self, **kwargs):
+            assert kwargs["pack_roots"] == [str(tmp_path)]
+        def discover(self): return [record]
+        def shutdown(self): pass
+    monkeypatch.setattr(hosts, "GenericPackHost", Inventory)
+    class Actor:
+        def verify(self): return copy.deepcopy(ACTOR)
+    monkeypatch.setattr(transport.AuthenticatedCleanupActor, "current", lambda: Actor())
+    handle = SimpleNamespace(closed=False, activated=True, retained=Actor())
+    report = {"owner_epoch": d.service.runtime_instance_id,
+              "processes": {"host": {k: ACTOR[k] for k in ("pid", "birth_id")}}}
+    d.local_worker_preparer = SimpleNamespace(current_handle=lambda: handle,
+        report=lambda value: report, timeout_seconds=1)
+    receipt = {"host": {**report["processes"]["host"], "uid": ACTOR["uid"],
+                       "executable": "/trusted/python", "artifact_digest": SHA},
+               "executor_incarnation": "fixture-host"}
+    d.credentials.provision(WORKER_ACTOR, ["worker:execute"], metadata={"local_launch_receipt": receipt}, rotate=True)
+    verified = []
+    monkeypatch.setattr(d, "_assert_local_relinquish_receipt", lambda value, metadata: verified.append(copy.deepcopy(value)))
+    monkeypatch.setattr(transport.LocalPreparationRelay, "_paths", lambda self: None)
+    profile = SimpleNamespace(execution_mode="host_only_cpu", support_root=tmp_path,
+        host_launch={"pack_root": str(tmp_path), "executor_id": "host", "boot_manifest_hash": "e"*64})
+    transport.bind_selected_host(d, profile, handle)
+    relay = d.service._preparation_relay
+    assert relay.binding["source_digest"] == source
+    assert relay.binding["preparation_source_digest"] == SOURCE
+    assert relay.binding["preparation_dependency_digest"] == DEPENDENCY
+    assert relay.binding["host_instance_id"] == receipt["executor_incarnation"]
+    assert verified and relay._selected_host_check is not None
+    relay._selected_host_check()
+    handle.closed = True
+    with pytest.raises(RuntimeErrorBase):
+        relay._selected_host_check()
+    handle.closed = False
+    d.credentials.revoke(WORKER_ACTOR)
+    with pytest.raises(RuntimeErrorBase):
+        relay._selected_host_check()
+
+
 import copy
 from http.client import HTTPConnection
 import json
