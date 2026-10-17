@@ -1956,7 +1956,7 @@ class RealmStore:
                     # and live executor registration is present.
                     waiting_reason = "capability_unavailable" if capability_digest is not None else None
                 storage_estimate = spec.get("storage_estimate")
-                if waiting_reason is None and contract["mode"] != "static":
+                if waiting_reason is None and contract["mode"] not in {"static", "request_estimated"}:
                     waiting_reason = "capability_unavailable"
                 if enforce_readiness and waiting_reason is None and not self.matching_live_executor(capability, capability_digest, include_storage=False, required_facts=spec.get("required_facts")):
                     # Queue the durable task while making the unavailable
@@ -2860,7 +2860,8 @@ class RealmStore:
         advertised_digest = descriptor.get("definition_digest")
         if advertised_digest and advertised_digest != capability["definition_digest"]:
             return False
-        if self.capability_storage_contract(capability_id, capability_digest)["mode"] != "static":
+        mode = self.capability_storage_contract(capability_id, capability_digest)["mode"]
+        if mode not in {"static", "request_estimated"}:
             return False
         if required_facts is not None:
             verified_facts = descriptor.get("verified_facts", {"exact": {}, "minimum": {}})
@@ -2870,7 +2871,7 @@ class RealmStore:
         for key in self._required_resource_keys(capability_id):
             if key not in available:
                 return False
-        return not include_storage or self.storage_preflight(capability_id)["ok"]
+        return not include_storage or (mode == "static" and self.storage_preflight(capability_id)["ok"])
 
     def matching_live_executor(self, capability_id, capability_digest=None, *, include_storage=True, required_facts=None):
         with self._mutex:
@@ -2915,9 +2916,13 @@ class RealmStore:
     def storage_preflight(self, capability, *, storage_estimate=None):
         estimate = self._validate_storage_estimate(storage_estimate)
         contract = self.capability_storage_contract(capability)
+        if contract["mode"] == "request_estimated":
+            row = self.conn.execute("SELECT status, unavailable_reason FROM capabilities WHERE id=?", (capability,)).fetchone()
+            if row is None or row["status"] != "ready":
+                return {"ok": False, "reason": row["unavailable_reason"] if row else "capability_not_registered"}
         if estimate is None and self._requires_task_storage_estimate(capability):
             raise ValidationError("request-estimated capability requires task storage_estimate")
-        if contract["mode"] != "static":
+        if contract["mode"] != "static" and not (contract["mode"] == "request_estimated" and estimate is not None):
             return {"ok": False, "reason": REQUEST_ESTIMATOR_PENDING if contract["mode"] == "request_estimated" else contract["reason"]}
         if estimate is None:
             row = self.conn.execute("SELECT estimated_scratch_bytes, estimated_output_bytes FROM capabilities WHERE id=?", (capability,)).fetchone()
@@ -3050,7 +3055,7 @@ class RealmStore:
                     waiting_reason = "capability_unavailable"
                 elif capability and capability["status"] != "ready":
                     waiting_reason = "capability_unavailable"
-                elif self.capability_storage_contract(task["capability"], task["capability_digest"])["mode"] != "static":
+                elif self.capability_storage_contract(task["capability"], task["capability_digest"])["mode"] not in {"static", "request_estimated"}:
                     waiting_reason = "capability_unavailable"
                 elif not self.storage_preflight(task["capability"], storage_estimate=task_spec.get("storage_estimate"))["ok"]:
                     waiting_reason = "insufficient_storage"

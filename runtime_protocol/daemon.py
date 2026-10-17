@@ -831,6 +831,11 @@ class RuntimeDaemon:
                     credential_file=self.worker_credential_path,
                 )
             result = self.local_worker_launcher.start(profile_id, expected_workspace_uuid)
+            # The listener starts in that authenticated Host only after its live
+            # registration. Compose its independent launch expectations here.
+            from .local_preparation_relay import bind_selected_host
+            bind_selected_host(self, self.local_worker_profiles[profile_id],
+                               self.local_worker_preparer.current_handle())
             if self.authoring_profile == "astrid":
                 from .authoring_scene import SelectedHostScene
                 handle = self.local_worker_preparer.current_handle()

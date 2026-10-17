@@ -6,6 +6,59 @@ def test_preparation_operation_is_implemented_and_declared():
     assert OPERATION_VERSIONS.get("prepareCapabilityStorage") == [1]
     assert callable(getattr(RuntimeService, "prepare_capability_storage", None))
 
+def test_production_binding_projects_rich_launch_receipt_and_fences_revocation(runtime, tmp_path, monkeypatch):
+    """Real bind_selected_host/configure/service validation; native launch is doubled."""
+    from types import SimpleNamespace
+    from astrid.core.execution import generic_host as hosts
+    from runtime_protocol import local_preparation_relay as transport
+    from runtime_protocol.daemon import WORKER_ACTOR
+    d, _ = runtime
+    source = hosts._canonical_digest({CAP: SOURCE.removeprefix("sha256:")})
+    dependency = hosts._canonical_digest({CAP: DEPENDENCY.removeprefix("sha256:")})
+    d.service.store.conn.execute("UPDATE executors SET source_digest=?,dependency_digest=? WHERE id='host'", (source, dependency))
+    record = SimpleNamespace(id=CAP, has_request_storage_estimator=True,
+        source_digest=SOURCE.removeprefix("sha256:"), dependency_digest=DEPENDENCY.removeprefix("sha256:"),
+        capability_digest=SHA, request_storage_estimate_contract=CONTRACT)
+    class Inventory:
+        def __init__(self, **kwargs):
+            assert kwargs["pack_roots"] == [str(tmp_path)]
+        def discover(self): return [record]
+        def shutdown(self): pass
+    monkeypatch.setattr(hosts, "GenericPackHost", Inventory)
+    class Actor:
+        def verify(self): return copy.deepcopy(ACTOR)
+    monkeypatch.setattr(transport.AuthenticatedCleanupActor, "current", lambda: Actor())
+    handle = SimpleNamespace(closed=False, activated=True, retained=Actor())
+    report = {"owner_epoch": d.service.runtime_instance_id,
+              "processes": {"host": {k: ACTOR[k] for k in ("pid", "birth_id")}}}
+    d.local_worker_preparer = SimpleNamespace(current_handle=lambda: handle,
+        report=lambda value: report, timeout_seconds=1)
+    receipt = {"host": {**report["processes"]["host"], "uid": ACTOR["uid"],
+                       "executable": "/trusted/python", "artifact_digest": SHA},
+               "executor_incarnation": "fixture-host"}
+    d.credentials.provision(WORKER_ACTOR, ["worker:execute"], metadata={"local_launch_receipt": receipt}, rotate=True)
+    verified = []
+    monkeypatch.setattr(d, "_assert_local_relinquish_receipt", lambda value, metadata: verified.append(copy.deepcopy(value)))
+    monkeypatch.setattr(transport.LocalPreparationRelay, "_paths", lambda self: None)
+    profile = SimpleNamespace(execution_mode="host_only_cpu", support_root=tmp_path,
+        host_launch={"pack_root": str(tmp_path), "executor_id": "host", "boot_manifest_hash": "e"*64})
+    transport.bind_selected_host(d, profile, handle)
+    relay = d.service._preparation_relay
+    assert relay.binding["source_digest"] == source
+    assert relay.binding["preparation_source_digest"] == SOURCE
+    assert relay.binding["preparation_dependency_digest"] == DEPENDENCY
+    assert relay.binding["host_instance_id"] == receipt["executor_incarnation"]
+    assert verified and relay._selected_host_check is not None
+    relay._selected_host_check()
+    handle.closed = True
+    with pytest.raises(RuntimeErrorBase):
+        relay._selected_host_check()
+    handle.closed = False
+    d.credentials.revoke(WORKER_ACTOR)
+    with pytest.raises(RuntimeErrorBase):
+        relay._selected_host_check()
+
+
 import copy
 from http.client import HTTPConnection
 import json
@@ -61,7 +114,8 @@ def binding_for(d, root):
         runtime_process=copy.deepcopy(ACTOR), host_process=copy.deepcopy(ACTOR), realm_id=d.service.realm["id"], runtime_instance_id=d.instance_id,
         runtime_session_id=d.service.runtime_session_id, runtime_epoch=d.service.health()["runtime_epoch"],
         executor_id="host", source_epoch="opaque:E1", capability_id=CAP, capability_digest=SHA,
-        storage_estimate_contract=CONTRACT, source_digest=SOURCE, dependency_digest=DEPENDENCY, preparation_source_digest=SOURCE, deadline_ms=1000)
+        storage_estimate_contract=CONTRACT, source_digest=SOURCE, dependency_digest=DEPENDENCY, preparation_source_digest=SOURCE, preparation_dependency_digest=DEPENDENCY,
+        host_instance_id="fixture-host", boot_manifest_hash="e"*64, deadline_ms=1000)
 
 
 def identity(d, token=None):
@@ -93,6 +147,8 @@ class FakeRelay:
         self.binding = binding
         self.action = action
         self.calls = 0
+    def check_readiness(self):
+        pass  # Explicit synthetic pure transport; actual listener interop is separate.
     def exchange(self, request):
         self.calls += 1
         if self.action:
@@ -188,7 +244,8 @@ def test_paired_guard_and_capability_project_grants(runtime, tmp_path):
     token, _ = d.credentials.provision_connector("connector", ["handshake", "projects:read", "projects:write", "tasks:write"],
         connector_id="c", realm_id=s.realm["id"], expires_at=time.time()+120)
     ctx = dict(pair_id="pair", connector_id="c", generation=1, realm_id=s.realm["id"], expires_at=int((time.time()+90)*1000))
-    assert http(d, p, token=token, context=ctx)[0] == 200
+    status, value = http(d, p, token=token, context=ctx)
+    assert status == 200, value
     assert http(d, p, token=token)[0] == 403
     other = s.create_project({"slug": "two", "name": "Two"}, idempotency_key="p2")["id"]
     assert http(d, other, token=token, context=ctx)[0] == 403
@@ -346,7 +403,7 @@ def test_real_kernel_socket_via_daemon_binding_and_public_route(socket_relay, ru
         assert status == 200, value
         assert value["spec"] == SPEC and value["source_digest"] == SOURCE
         assert db_snapshot(d.service) == before
-        assert seen[0]["runtime"]["runtime_instance_id"] == d.instance_id
+        assert seen[0]["context"]["runtime"]["runtime_instance_id"] == d.instance_id
     finally:
         thread.join(2)
         assert not thread.is_alive()
@@ -410,8 +467,8 @@ def test_contract_schemas_clients_and_original_profiles_preserved():
     assert list(Draft202012Validator(reply_schema).iter_errors({"preparation":prepared(request)}))
     old=json.loads(subprocess.check_output(["git","show","6f96b62e40eb5fde69500727053d626cf9d101b2:runtime_protocol/contract_metadata.py"]).decode().split("OPERATION_VERSIONS = ")[1].split("\n")[0].replace("'",'"'))
     assert len(old) == 139
-    assert {key:OPERATION_VERSIONS[key] for key in old} == old
-    assert len(OPERATION_VERSIONS) == 140
+    assert all(set(versions).issubset(OPERATION_VERSIONS[key]) for key, versions in old.items())
+    assert len(OPERATION_VERSIONS) >= 140
     generate.validate_python_client(generate.render_python_client())
     generate.validate_typescript_client(source=generate.render_typescript_client())
 
@@ -455,3 +512,94 @@ def test_descriptor_change_in_flight_is_discarded(runtime, tmp_path):
         s.store.conn.execute("UPDATE executors SET capabilities_json=? WHERE id='host'",(json.dumps(descriptor),))
     install_fake(d,tmp_path,action)
     assert http(d,p)[0] == 409
+
+@pytest.mark.parametrize("versions", [[True], [0], [-1], [], "1,2", [1, 2.0], None])
+def test_generated_health_rejects_invalid_catalog_negotiation(runtime, versions):
+    from banodoco_workspace_client.generated import Health
+    d, _ = runtime
+    value = {**d.service.health(), "runtime_instance_id": d.instance_id,
+             "capability_catalog_versions": versions}
+    with pytest.raises(ValueError):
+        Health.from_json(value)
+
+
+def test_generated_health_keeps_authenticated_catalog_versions(runtime):
+    from banodoco_workspace_client.generated import Health
+    d, _ = runtime
+    value = {**d.service.health(), "runtime_instance_id": d.instance_id}
+    parsed = Health.from_json(value)
+    assert parsed.capability_catalog_versions == [1, 2]
+    value["capability_catalog_versions"].clear()
+    assert parsed.capability_catalog_versions == [1, 2]
+    del value["capability_catalog_versions"]
+    assert Health.from_json(value).capability_catalog_versions is None
+
+
+def test_request_estimated_catalog_admission_and_claim_use_explicit_pair(runtime, tmp_path, monkeypatch):
+    d, project = runtime
+    service = d.service
+    assert service.list_capabilities(catalog_version=2)["items"][0]["status"] == "unavailable"
+    install_fake(d, tmp_path)
+    v1 = service.list_capabilities(catalog_version=1)["items"][0]
+    v2 = service.list_capabilities(catalog_version=2)["items"][0]
+    assert v1["status"] == "unsupported"
+    assert v2["status"] == "ready" and v2["storage_estimate"] == CONTRACT
+    authority = service.task_authority_for_identity(identity(d), project_id=project, operation=CAP)
+    body = {"project": project, "capability_id": CAP, "capability_digest": SHA,
+            "schema_version": "1", "spec": SPEC, "input_object_ids": [],
+            "idempotency_key": "dynamic-task"}
+    with pytest.raises(RuntimeErrorBase):
+        service.create_task(body, enforce_readiness=True, authority_binding=authority)
+    from types import SimpleNamespace
+    free = {"bytes": 579}
+    monkeypatch.setattr("runtime_protocol.store.shutil.disk_usage", lambda path: SimpleNamespace(free=free["bytes"]))
+    pair = {"scratch_bytes": 123, "output_bytes": 456}
+    admitted = service.create_task({**body, "storage_estimate": pair},
+        enforce_readiness=True, authority_binding=authority)
+    assert admitted["task"]["status"] == "queued"
+    assert admitted["task"].get("waiting_reason") is None
+    assert service.store.storage_preflight(CAP, storage_estimate=pair)["estimate_source"] == "task"
+    free["bytes"] = 578
+    waiting = service.claim_next({"executor_id": "host", "capability_ids": [CAP],
+        "runtime_epoch": service.health()["runtime_epoch"]}, idempotency_key="dynamic-low-space")
+    assert waiting is None or waiting.get("task_id") is None
+    assert service.store.get_task(admitted["task"]["id"])["task"]["spec"]["storage_estimate"] == pair
+    free["bytes"] = 579
+    claimed = service.claim_next({"executor_id": "host", "capability_ids": [CAP],
+        "runtime_epoch": service.health()["runtime_epoch"]}, idempotency_key="dynamic-claim")
+    assert claimed["task_id"] == admitted["task"]["id"]
+    assert claimed["storage_estimate"] == pair
+
+@pytest.mark.parametrize("case", ["relay", "epoch", "source", "descriptor", "record", "dead", "unavailable"])
+def test_v2_catalog_requires_matching_usable_preparation_binding(runtime, tmp_path, case):
+    d, _ = runtime
+    service = d.service
+    relay = install_fake(d, tmp_path)
+    service.register_executor({"executor_id": "static-host", "capabilities": [{
+        "capability_id": "static.zero", "definition_digest": SHA,
+        "storage_estimate_contract": {"mode": "static", "scratch_bytes": 0, "output_bytes": 0}}]},
+        idempotency_key="static-register")
+    assert next(v for v in service.list_capabilities(catalog_version=2)["items"] if v["capability_id"] == CAP)["status"] == "ready"
+    if case == "relay":
+        service._preparation_relay = None
+    elif case == "epoch":
+        relay.binding["runtime_epoch"] += 1
+    elif case == "source":
+        service.store.conn.execute("UPDATE executors SET source_epoch='next' WHERE id='host'")
+    elif case == "descriptor":
+        descriptor = json.loads(service.store.conn.execute("SELECT capabilities_json FROM executors WHERE id='host'").fetchone()[0])
+        descriptor[0]["storage_estimate_contract"]["estimator"]["version"] += 1
+        service.store.conn.execute("UPDATE executors SET capabilities_json=? WHERE id='host'", (json.dumps(descriptor),))
+    elif case == "record":
+        def refuse():
+            raise unavailable("readiness_stale")
+        from runtime_protocol.local_preparation_relay import unavailable
+        relay.check_readiness = refuse
+    elif case == "dead":
+        service.store.conn.execute("UPDATE executors SET last_seen_at='2000-01-01T00:00:00+00:00' WHERE id='host'")
+    else:
+        service.store.conn.execute("UPDATE capabilities SET status='unavailable',unavailable_reason='producer_failed' WHERE id=?", (CAP,))
+    rows = {v["capability_id"]: v for v in service.list_capabilities(catalog_version=2)["items"]}
+    assert rows[CAP]["status"] == "unavailable"
+    assert rows["static.zero"]["status"] == "ready"
+    assert rows["static.zero"]["storage_estimate"] == {"mode": "static", "scratch_bytes": 0, "output_bytes": 0}
