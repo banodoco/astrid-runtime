@@ -119,6 +119,7 @@ class LocalPreparationRelay:
             raise unavailable("startup_binding_invalid")
         self._binding = copy.deepcopy(binding)
         self._selected_host_check = None
+        self._selected_host_ready = None
         b = self._binding
         for key in CONTEXT_FIELDS + BINDING_FIELDS + ("source_digest", "dependency_digest"):
             if key in {"runtime_epoch", "storage_estimate_contract"}:
@@ -226,6 +227,12 @@ class LocalPreparationRelay:
                 raise unavailable("readiness_stale")
         finally:
             os.close(fd)
+
+    def check_readiness(self):
+        """File/registration check only; no IPC while catalog holds its mutex."""
+        self._paths()
+        if self._selected_host_ready is not None:
+            self._selected_host_ready()
 
     def exchange(self, request):
         b = self._binding
@@ -375,12 +382,10 @@ def bind_selected_host(daemon, profile, handle):
                 # the service before and after IPC. This fences stop/revoke and
                 # replacement even while the old native process is still alive.
                 expected_receipt = copy.deepcopy(receipt)
-                def check_selected():
+                def check_selected_ready():
                     if (daemon.local_worker_preparer.current_handle() is not handle
                             or handle.closed or not handle.activated):
                         raise unavailable("selected_host_changed")
-                    if handle.retained.verify() != host:
-                        raise unavailable("host_peer_changed")
                     with service.store._mutex:
                         token, _ = daemon.credentials._read_actor(WORKER_ACTOR)
                         daemon.credentials.require(token, "worker:execute")
@@ -388,10 +393,15 @@ def bind_selected_host(daemon, profile, handle):
                         if not isinstance(current, dict) or current.get("local_launch_receipt") != expected_receipt:
                             raise unavailable("selected_activation_changed")
                         daemon._assert_local_relinquish_receipt(expected_receipt, current)
+                def check_selected():
+                    check_selected_ready()
+                    if handle.retained.verify() != host:
+                        raise unavailable("host_peer_changed")
                 check_selected()
                 with service.store._mutex:
                     daemon.configure_preparation_relay(binding)
                     service._preparation_relay._selected_host_check = check_selected
+                    service._preparation_relay._selected_host_ready = check_selected_ready
                 return
         if time.monotonic() >= end:
             raise unavailable("preparation_startup_deadline")

@@ -147,6 +147,8 @@ class FakeRelay:
         self.binding = binding
         self.action = action
         self.calls = 0
+    def check_readiness(self):
+        pass  # Explicit synthetic pure transport; actual listener interop is separate.
     def exchange(self, request):
         self.calls += 1
         if self.action:
@@ -511,7 +513,7 @@ def test_descriptor_change_in_flight_is_discarded(runtime, tmp_path):
     install_fake(d,tmp_path,action)
     assert http(d,p)[0] == 409
 
-@pytest.mark.parametrize("versions", [[True], [0], [-1], [], "1,2", [1, 2.0]])
+@pytest.mark.parametrize("versions", [[True], [0], [-1], [], "1,2", [1, 2.0], None])
 def test_generated_health_rejects_invalid_catalog_negotiation(runtime, versions):
     from banodoco_workspace_client.generated import Health
     d, _ = runtime
@@ -533,9 +535,11 @@ def test_generated_health_keeps_authenticated_catalog_versions(runtime):
     assert Health.from_json(value).capability_catalog_versions is None
 
 
-def test_request_estimated_catalog_admission_and_claim_use_explicit_pair(runtime):
+def test_request_estimated_catalog_admission_and_claim_use_explicit_pair(runtime, tmp_path, monkeypatch):
     d, project = runtime
     service = d.service
+    assert service.list_capabilities(catalog_version=2)["items"][0]["status"] == "unavailable"
+    install_fake(d, tmp_path)
     v1 = service.list_capabilities(catalog_version=1)["items"][0]
     v2 = service.list_capabilities(catalog_version=2)["items"][0]
     assert v1["status"] == "unsupported"
@@ -546,13 +550,56 @@ def test_request_estimated_catalog_admission_and_claim_use_explicit_pair(runtime
             "idempotency_key": "dynamic-task"}
     with pytest.raises(RuntimeErrorBase):
         service.create_task(body, enforce_readiness=True, authority_binding=authority)
+    from types import SimpleNamespace
+    free = {"bytes": 579}
+    monkeypatch.setattr("runtime_protocol.store.shutil.disk_usage", lambda path: SimpleNamespace(free=free["bytes"]))
     pair = {"scratch_bytes": 123, "output_bytes": 456}
     admitted = service.create_task({**body, "storage_estimate": pair},
         enforce_readiness=True, authority_binding=authority)
     assert admitted["task"]["status"] == "queued"
+    assert admitted["task"].get("waiting_reason") is None
     assert service.store.storage_preflight(CAP, storage_estimate=pair)["estimate_source"] == "task"
+    free["bytes"] = 578
+    waiting = service.claim_next({"executor_id": "host", "capability_ids": [CAP],
+        "runtime_epoch": service.health()["runtime_epoch"]}, idempotency_key="dynamic-low-space")
+    assert waiting is None or waiting.get("task_id") is None
+    assert service.store.get_task(admitted["task"]["id"])["task"]["spec"]["storage_estimate"] == pair
+    free["bytes"] = 579
     claimed = service.claim_next({"executor_id": "host", "capability_ids": [CAP],
         "runtime_epoch": service.health()["runtime_epoch"]}, idempotency_key="dynamic-claim")
     assert claimed["task_id"] == admitted["task"]["id"]
     assert claimed["storage_estimate"] == pair
 
+@pytest.mark.parametrize("case", ["relay", "epoch", "source", "descriptor", "record", "dead", "unavailable"])
+def test_v2_catalog_requires_matching_usable_preparation_binding(runtime, tmp_path, case):
+    d, _ = runtime
+    service = d.service
+    relay = install_fake(d, tmp_path)
+    service.register_executor({"executor_id": "static-host", "capabilities": [{
+        "capability_id": "static.zero", "definition_digest": SHA,
+        "storage_estimate_contract": {"mode": "static", "scratch_bytes": 0, "output_bytes": 0}}]},
+        idempotency_key="static-register")
+    assert next(v for v in service.list_capabilities(catalog_version=2)["items"] if v["capability_id"] == CAP)["status"] == "ready"
+    if case == "relay":
+        service._preparation_relay = None
+    elif case == "epoch":
+        relay.binding["runtime_epoch"] += 1
+    elif case == "source":
+        service.store.conn.execute("UPDATE executors SET source_epoch='next' WHERE id='host'")
+    elif case == "descriptor":
+        descriptor = json.loads(service.store.conn.execute("SELECT capabilities_json FROM executors WHERE id='host'").fetchone()[0])
+        descriptor[0]["storage_estimate_contract"]["estimator"]["version"] += 1
+        service.store.conn.execute("UPDATE executors SET capabilities_json=? WHERE id='host'", (json.dumps(descriptor),))
+    elif case == "record":
+        def refuse():
+            raise unavailable("readiness_stale")
+        from runtime_protocol.local_preparation_relay import unavailable
+        relay.check_readiness = refuse
+    elif case == "dead":
+        service.store.conn.execute("UPDATE executors SET last_seen_at='2000-01-01T00:00:00+00:00' WHERE id='host'")
+    else:
+        service.store.conn.execute("UPDATE capabilities SET status='unavailable',unavailable_reason='producer_failed' WHERE id=?", (CAP,))
+    rows = {v["capability_id"]: v for v in service.list_capabilities(catalog_version=2)["items"]}
+    assert rows[CAP]["status"] == "unavailable"
+    assert rows["static.zero"]["status"] == "ready"
+    assert rows["static.zero"]["storage_estimate"] == {"mode": "static", "scratch_bytes": 0, "output_bytes": 0}

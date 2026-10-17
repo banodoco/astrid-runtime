@@ -1956,7 +1956,7 @@ class RealmStore:
                     # and live executor registration is present.
                     waiting_reason = "capability_unavailable" if capability_digest is not None else None
                 storage_estimate = spec.get("storage_estimate")
-                if waiting_reason is None and contract["mode"] != "static":
+                if waiting_reason is None and contract["mode"] not in {"static", "request_estimated"}:
                     waiting_reason = "capability_unavailable"
                 if enforce_readiness and waiting_reason is None and not self.matching_live_executor(capability, capability_digest, include_storage=False, required_facts=spec.get("required_facts")):
                     # Queue the durable task while making the unavailable

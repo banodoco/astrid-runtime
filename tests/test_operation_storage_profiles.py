@@ -114,7 +114,7 @@ def test_static_zero_request_and_unavailable_are_distinct(service):
     assert rows["static"]["status"] == "ready"
     assert rows["request"]["storage_estimate"] == REQUEST
     assert rows["request"]["status"] == "unavailable"
-    assert rows["request"]["unavailable_reason"] == "request_estimator_execution_not_integrated"
+    assert rows["request"]["unavailable_reason"] == "preparation_binding_unavailable"
     assert rows["unknown"]["storage_estimate"] == {"mode": "unavailable", "reason": "fixture_no_bound"}
     assert all("estimated_scratch_bytes" not in row and "estimated_output_bytes" not in row for row in rows.values())
     assert all(None not in row["storage_estimate"].values() for row in rows.values())
@@ -148,7 +148,7 @@ def test_malformed_contract_registration_is_atomic(service, contract):
     assert service.store.conn.execute("SELECT COUNT(*) FROM executors").fetchone()[0] == 0
 
 
-def test_request_pair_required_and_no_static_preflight_or_claim(service):
+def test_request_pair_required_and_same_explicit_pair_reaches_claim(service):
     register(service, REQUEST)
     before = snapshot(service)
     with pytest.raises(ValidationError, match="requires task storage_estimate"):
@@ -156,16 +156,17 @@ def test_request_pair_required_and_no_static_preflight_or_claim(service):
     assert snapshot(service) == before
     with pytest.raises(ValidationError, match="requires task storage_estimate"):
         service.store.storage_preflight("fixture.action")
-    assert not service.store.storage_preflight("fixture.action", storage_estimate={"scratch_bytes": 0, "output_bytes": 0})["ok"]
+    assert service.store.storage_preflight("fixture.action", storage_estimate={"scratch_bytes": 0, "output_bytes": 0})["ok"]
     admitted = service.create_task(body({"scratch_bytes": 0, "output_bytes": 0}), _host_owned=True)
-    assert admitted["task"]["waiting_reason"] == "capability_unavailable"
+    assert admitted["task"].get("waiting_reason") is None
     assert service.create_task(body({"scratch_bytes": 0, "output_bytes": 0}), _host_owned=True) == admitted
     before = snapshot(service)
     with pytest.raises(ConflictError):
         service.create_task(body({"scratch_bytes": 1, "output_bytes": 0}), _host_owned=True)
     assert snapshot(service) == before
     claimed = service.claim_next({"executor_id": "fixture-worker", "capability_ids": ["fixture.action"], "runtime_epoch": service.health()["runtime_epoch"]}, idempotency_key="claim")
-    assert claimed is None or claimed.get("task_id") is None
+    assert claimed["task_id"] == admitted["task"]["id"]
+    assert claimed["storage_estimate"] == {"scratch_bytes": 0, "output_bytes": 0}
 
 
 def test_legacy_static_projection_keeps_current_capability_estimates(service):

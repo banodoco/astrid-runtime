@@ -7583,6 +7583,24 @@ class RuntimeService(TimelineCommitAcceptance):
                 result[key] = ("available", None, declaration)
         return result
 
+    def _request_preparation_ready(self, capability_id, capability_digest):
+        # Binding is installed only by trusted daemon startup after exact Host
+        # readiness. Recheck its live DB/session/source and owner-only record.
+        # No socket/native RPC may run in this catalog's store mutex.
+        from .errors import RuntimeErrorBase
+        relay = self._preparation_relay
+        if relay is None:
+            return False
+        try:
+            binding = relay.binding
+            if (binding["capability_id"], binding["capability_digest"]) != (capability_id, capability_digest):
+                return False
+            self._preparation_context(binding)
+            relay.check_readiness()
+            return True
+        except (RuntimeErrorBase, OSError):
+            return False
+
     def _capability_resource(self, row, declarations=None, *, catalog_version=1):
         status = row["status"]
         reason = row["unavailable_reason"]
@@ -7593,6 +7611,9 @@ class RuntimeService(TimelineCommitAcceptance):
         resource = {"capability_id": row["id"], "definition_digest": row["definition_digest"], "status": status, "required_resource_keys": json.loads(row["required_resource_keys_json"]), "estimated_scratch_bytes": row["estimated_scratch_bytes"], "estimated_output_bytes": row["estimated_output_bytes"], "unavailable_reason": reason}
         if storage["mode"] == "request_estimated" and catalog_version == 1:
             resource.update(status="unsupported", unavailable_reason="request_estimated_requires_catalog_v2")
+        elif (storage["mode"] == "request_estimated" and resource["status"] == "ready"
+                and not self._request_preparation_ready(row["id"], row["definition_digest"])):
+            resource.update(status="unavailable", unavailable_reason="preparation_binding_unavailable")
         elif storage["mode"] == "unavailable":
             resource.update(status="unavailable", unavailable_reason=storage["reason"])
         if catalog_version == 2:
