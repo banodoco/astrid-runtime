@@ -9,18 +9,59 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import math
 import re
 
 from .narration import (narration_lines, narration_projection, request_take_refs,
                         validate_take_refs, validate_artifacts, validate_line_take,
                         NarrationTakeRefs, VerifiedNarrationTake)
-from .errors import ForbiddenError, AuthorizationError, ConflictError, NotFoundError, ValidationError
+from .errors import (ForbiddenError, AuthorizationError, ConflictError, NotFoundError, ValidationError,
+                     CapabilityUnavailableError)
 from .util import canonical_json, now, MANAGED_OUTPUT_ASSOCIATION_KEY
 
 KIND = "timeline.commit"
 PROVIDER_INTERFACE_VERSION = 1
 PROVIDER_FACTORY = "astrid.sdk.timeline.commit.create_runtime_commit_service"
+_LOGGER = logging.getLogger(__name__)
+
+
+def _record_commit_failure(stage, exc):
+    """Best-effort internal diagnosis, containing only fixed vocabulary.
+
+    Never inspect exception text, args, custom class names or instance codes.
+    Exact class identity prevents subclasses from supplying diagnostic data.
+    Logging failure must not change the existing uncertain public response.
+    """
+    try:
+        exception_class, error_code = "OtherException", None
+        for cls, label, code in (
+            (ConflictError, "ConflictError", "conflict"),
+            (NotFoundError, "NotFoundError", "not_found"),
+            (ValidationError, "ValidationError", "validation_error"),
+            (CapabilityUnavailableError, "CapabilityUnavailableError", "unavailable"),
+            (KeyError, "KeyError", None),
+            (TypeError, "TypeError", None),
+            (ValueError, "ValueError", None),
+            (AttributeError, "AttributeError", None),
+            (RuntimeError, "RuntimeError", None),
+            (OSError, "OSError", None),
+            (FileNotFoundError, "FileNotFoundError", None),
+            (PermissionError, "PermissionError", None),
+            (ImportError, "ImportError", None),
+            (ModuleNotFoundError, "ModuleNotFoundError", None),
+        ):
+            if type(exc) is cls:
+                exception_class, error_code = label, code
+                break
+        if type(stage) is not str or stage not in ("provider_commit", "preview_scene_validation"):
+            stage = "unknown"
+        diagnostic = dict(stage=stage, exception_class=exception_class)
+        if error_code is not None:
+            diagnostic["error_code"] = error_code
+        _LOGGER.error("timeline_commit_failure %s", canonical_json(diagnostic))
+    except Exception:
+        pass  # Diagnosis cannot replace the original failure/uncertainty result.
 
 
 def validate_timeline_commit_provider(provider):
@@ -1388,16 +1429,19 @@ class TimelineCommitAcceptance:
                                    hint="No semantic commit was attempted", next_action="Retry the original request after provider startup")
             return result
         port = self._request_commit_port(request, identity)
+        stage = "provider_commit"
         try:
             prepared = provider.commit(copy.deepcopy(request), port)
             if (getattr(provider, "requires_scene_evaluation", False) and isinstance(prepared, dict)
                     and prepared.get("status") == "preview"):
+                stage = "preview_scene_validation"
                 port.validate_scene(prepared["canonical_document"])
         except (AuthorizationError, ForbiddenError):
             raise
         except (ConnectionError, TimeoutError):
             raise  # The transport may have lost an already durable response.
-        except Exception:
+        except Exception as exc:
+            _record_commit_failure(stage, exc)
             result["error"] = dict(code="runtime_unavailable", message="Astrid commit provider failed; outcome may be unknown",
                                    hint="Acceptance may already be durable", next_action="Retry the original request id unchanged")
             return result
