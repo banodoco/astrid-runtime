@@ -498,10 +498,11 @@ def test_trusted_local_alias_targets_are_retained_without_directory_import_disco
         gate._local_inventory(inv)
 
 
-def test_trusted_local_namespace_cannot_fall_back_to_stale_installed_astrid(tmp_path):
-    f=fixture_authority(tmp_path);site=tmp_path/'site';(site/'astrid/core').mkdir(parents=True)
-    (site/'astrid/__init__.py').write_text('STALE=1')
-    (site/'astrid/core/extra.py').write_text('STALE=1')
+@pytest.mark.parametrize('namespace', ['astrid', 'banodoco_workspace_client', 'runtime_protocol', 'banodoco_local'])
+def test_trusted_local_namespace_cannot_fall_back_to_stale_installed_astrid(tmp_path, namespace):
+    f=fixture_authority(tmp_path);site=tmp_path/'site';(site/namespace/'core').mkdir(parents=True)
+    (site/namespace/'__init__.py').write_text('STALE=1')
+    (site/namespace/'core/extra.py').write_text('STALE=1')
     inv=gate.installed_inventory(site);pin=gate.raw_digest(inv)
     f.record['inventories'][pin]=inv;f.record['import_binding']['mode']=gate.TRUSTED_LOCAL_MODE
     f.record['import_binding']['import_roots'].append({'path':str(site),'inventory_digest':pin})
@@ -509,7 +510,7 @@ def test_trusted_local_namespace_cannot_fall_back_to_stale_installed_astrid(tmp_
     proof=local.verify(**f.args);_,data=local.claim(proof,**f.args,binding_fd=3)
     mapping=json.loads(data)['mapping']
     assert mapping['astrid']['path']==str(f.source/'astrid/__init__.py')
-    assert 'astrid.core.extra' not in mapping
+    assert namespace+'.core.extra' not in mapping
 
 
 def test_trusted_local_standard_resources_use_selected_package_only(tmp_path):

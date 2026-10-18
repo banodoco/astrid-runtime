@@ -49,6 +49,45 @@ def test_record_pin_retains_installer_newline_bytes(monkeypatch, tmp_path):
     assert hashlib.sha256(payload).hexdigest() != hashlib.sha256(distribution.read_text("RECORD").encode()).hexdigest()
 
 
+@pytest.mark.parametrize('edge', ['valid', 'ambient-origin', 'missing-transitive'])
+def test_producer_and_release_verifier_share_explicit_host_closure(tmp_path, monkeypatch, edge):
+    from types import SimpleNamespace
+    from banodoco_local import host_only_profile as producer
+    from runtime_protocol import local_worker_composition as composition
+    from runtime_protocol import verified_host_launch as gate
+    from test_selected_python_inventory import write_host_records
+    for relative in ('schemas/astrid-intent/astrid-intent.schema.json',
+                     'astrid/core/rendering/schemas/v1/plan.json', 'astrid/packs/rendering/pack.yaml'):
+        path = tmp_path/relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text('{}')
+    write_host_records(tmp_path)
+    distributions = {gate.re.sub(r'[-_.]+', '-', d.metadata['Name']).lower(): d
+                     for d in producer.metadata.distributions(path=[str(tmp_path)])}
+    monkeypatch.setattr(producer.sys, 'prefix', str(tmp_path))
+    monkeypatch.setattr(producer.sysconfig, 'get_path', lambda name: str(tmp_path))
+    monkeypatch.setattr(producer.metadata, 'distribution', lambda name: distributions[name])
+    def imported(name):
+        relative = 'typing_extensions.py' if name == 'typing_extensions' else name+'/__init__.py'
+        path = tmp_path/relative
+        if edge == 'ambient-origin' and name == 'jsonschema': path = tmp_path.parent/'ambient/jsonschema/__init__.py'
+        return SimpleNamespace(__file__=str(path))
+    monkeypatch.setattr(producer.importlib, 'import_module', imported)
+    if edge == 'missing-transitive':
+        import shutil
+        shutil.rmtree(Path(distributions['referencing']._path))
+    if edge != 'valid':
+        with pytest.raises((BootstrapError, gate.HostLaunchError)):
+            producer._installed_inputs()
+        return
+    root, identities = producer._installed_inputs()
+    assert set(identities) == set(gate.HOST_DISTRIBUTIONS)
+    profile = SimpleNamespace(release_digest='sha256:'+gate.raw_digest(identities))
+    assert composition._verify_installed_host_records(profile, {'source_checkout':str(root)}) == identities
+    profile.release_digest = 'sha256:'+'0'*64
+    from runtime_protocol.errors import ConflictError
+    with pytest.raises(ConflictError, match='release digest differs'):
+        composition._verify_installed_host_records(profile, {'source_checkout':str(root)})
+
+
 def test_cli_provisions_existing_source_route_without_runtime(monkeypatch, tmp_path, capsys):
     captured = {}
     def provision(**kwargs):
@@ -204,11 +243,8 @@ else:
         assert profile.worker_executable is None and profile.engine_launch is None
         assert str(profile.host_executable) == os.path.abspath(sys.executable)
         _selected_profile_payload(profile)
-        actual_records = {}
-        for package in ("astrid", "banodoco-workspace-runtime"):
-            distribution = original_distribution(package)
-            entry = next(p for p in distribution.files if str(p).endswith(".dist-info/RECORD"))
-            actual_records[package] = hashlib.sha256(distribution.locate_file(entry).read_bytes()).hexdigest()
+        from runtime_protocol.verified_host_launch import installed_host_closure
+        actual_records = installed_host_closure(raw["source_checkout"])["distributions"]
         assert profile.release_digest == "sha256:" + raw_digest(actual_records)
     except AssertionError: raise
     except Exception as exc:

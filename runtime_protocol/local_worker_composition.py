@@ -1496,17 +1496,16 @@ def _installed_record_bytes(distribution):
 
 def _verify_installed_host_records(profile, config):
     """Observe current installation bytes against selected release RECORD pins."""
-    import base64, csv, importlib.metadata, sysconfig
-    from .verified_host_launch import raw_digest
+    import base64, csv, importlib.metadata
+    from .verified_host_launch import installed_host_closure, raw_digest, HostLaunchError
     source = Path(config["source_checkout"])
-    records = {}
+    # Retain the SDK/Runtime prefix and entry-point checks in addition to the
+    # narrower child import closure (which never follows scripts outside it).
     for package in ("astrid", "banodoco-workspace-runtime"):
         distribution = importlib.metadata.distribution(package)
         if Path(distribution.locate_file("")).resolve() != source:
             raise ConflictError("host-only release is outside current installed root")
-        record_bytes = _installed_record_bytes(distribution)
-        record = record_bytes.decode("utf-8")
-        records[package] = hashlib.sha256(record_bytes).hexdigest()
+        record = _installed_record_bytes(distribution).decode("utf-8")
         for relative, checksum, size in csv.reader(record.splitlines()):
             if not checksum: continue
             target = Path(distribution.locate_file(relative)).resolve()
@@ -1515,6 +1514,10 @@ def _verify_installed_host_records(profile, config):
             algorithm, encoded = checksum.split("=", 1)
             if algorithm != "sha256" or hashlib.sha256(target.read_bytes()).digest() != base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)):
                 raise ConflictError("installed release file differs from RECORD")
+    try:
+        records = installed_host_closure(config["source_checkout"])["distributions"]
+    except HostLaunchError as exc:
+        raise ConflictError(str(exc)) from exc
     if "sha256:" + raw_digest(records) != profile.release_digest:
         raise ConflictError("host-only installed release digest differs")
     return records

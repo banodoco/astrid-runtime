@@ -36,6 +36,145 @@ _COMPONENTS = {
     "vendored_workspace_client": "banodoco_workspace_client",
 }
 
+# An installed directory is a selector, never an import grant. Keep this small
+# Host closure explicit; optional format/CLI/docs/test extras are not selected.
+HOST_DISTRIBUTIONS = {
+    "astrid": ("astrid", "banodoco_workspace_client", "schemas"),
+    "banodoco-workspace-runtime": ("banodoco_local", "runtime_protocol"),
+    "jsonschema": ("jsonschema",), "attrs": ("attr", "attrs"),
+    "jsonschema-specifications": ("jsonschema_specifications",),
+    "referencing": ("referencing",), "rpds-py": ("rpds",),
+    "typing-extensions": ("typing_extensions.py",),
+    "pyyaml": ("yaml", "_yaml"), "pillow": ("PIL",),
+    "python-dotenv": ("dotenv",),
+}
+
+
+def installed_host_closure(root):
+    """Select RECORD-covered Host distributions without importing their code.
+
+    This is an observation of trusted local installed artifacts, not a resolver,
+    installer, or hostile-writer defense. Unsupported new dependency metadata
+    fails closed and needs an explicit closure policy update.
+    """
+    import base64
+    import csv
+    root = _absolute(str(root))
+    if any(p.is_symlink() for p in (root, *root.parents)):
+        raise HostLaunchError("installed Host origin contains a symlink")
+    normalize = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+    selected = {}
+    for dist in importlib.metadata.distributions(path=[str(root)]):
+        name = normalize(dist.metadata.get("Name", ""))
+        if name not in HOST_DISTRIBUTIONS:
+            continue
+        if name in selected:
+            raise HostLaunchError("installed Host distribution has duplicate origins")
+        selected[name] = dist
+    if set(selected) != set(HOST_DISTRIBUTIONS):
+        raise HostLaunchError("missing installed Host dependency: " + ", ".join(sorted(set(HOST_DISTRIBUTIONS) - set(selected))))
+    files = {}; identities = {}
+    for name, dist in sorted(selected.items()):
+        if Path(dist.locate_file("")).resolve() != root or not dist.version:
+            raise HostLaunchError("installed Host distribution origin/version differs")
+        record_entries = [str(p) for p in dist.files or () if str(p).endswith(".dist-info/RECORD")]
+        if len(record_entries) != 1:
+            raise HostLaunchError("installed Host distribution has no unique RECORD")
+        record_relative = record_entries[0]
+        directory = Path(record_relative).parent
+        if len(directory.parts) != 1:
+            raise HostLaunchError("installed Host RECORD origin escapes selected root")
+        def read(relative):
+            path = root / relative
+            if any(p.is_symlink() for p in (path, *path.parents)):
+                raise HostLaunchError("installed Host file contains a symlink")
+            return _bounded_source(path)
+        record_bytes = read(record_relative)
+        if record_bytes.decode().splitlines() != (dist.read_text("RECORD") or "").splitlines():
+            raise HostLaunchError("installed Host RECORD metadata differs")
+        covered = {}
+        for row in csv.reader(record_bytes.decode().splitlines()):
+            if len(row) != 3:
+                raise HostLaunchError("installed Host RECORD row is invalid")
+            relative, checksum, size = row
+            path = Path(relative)
+            # Wheel entry-point scripts outside site-packages are not child
+            # import inputs. Never follow them or admit them as module roots.
+            if ".." in path.parts and not path.is_absolute():
+                continue
+            if path.is_absolute() or str(path) != relative or not path.parts:
+                raise HostLaunchError("installed Host RECORD path is invalid")
+            if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+                continue
+            if path.parts[0] not in (*HOST_DISTRIBUTIONS[name], str(directory)):
+                raise HostLaunchError("installed Host RECORD contains an undeclared package")
+            if relative in covered or relative in files:
+                raise HostLaunchError("installed Host RECORD has duplicate file ownership")
+            content = read(relative)
+            pin = hashlib.sha256(content).hexdigest()
+            if relative != record_relative:
+                expected = "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode().rstrip("=")
+                if checksum != expected or size != str(len(content)):
+                    raise HostLaunchError("installed Host file differs from RECORD or lacks coverage")
+            elif checksum or size:
+                raise HostLaunchError("installed Host RECORD self identity is invalid")
+            covered[relative] = pin
+        if record_relative not in covered or str(directory / "METADATA") not in covered:
+            raise HostLaunchError("installed Host metadata/RECORD coverage is absent")
+        direct = dist.read_text("direct_url.json")
+        if direct and json.loads(direct).get("dir_info", {}).get("editable"):
+            raise HostLaunchError("editable installed Host origin is forbidden")
+        # Bind the original metadata, canonical origin, and every covered byte.
+        identities[name] = {"name": name, "version": dist.version,
+            "origin": str(root / directory), "record_sha256": hashlib.sha256(record_bytes).hexdigest(),
+            "files": covered}
+        files.update(covered)
+    for name, dist in selected.items():
+        if name in {"astrid", "banodoco-workspace-runtime"}:
+            # Their full optional SDK surface is not the eager Host closure.
+            continue
+        for requirement in dist.requires or ():
+            spec, _, marker = requirement.partition(";")
+            if marker:
+                marker = marker.strip()
+                if re.fullmatch(r"extra\s*==\s*['\"][\w-]+['\"]", marker):
+                    continue
+                match = re.fullmatch(r"python_version\s*<\s*['\"](\d+)\.(\d+)['\"]", marker)
+                if not match:
+                    raise HostLaunchError("unreviewed Host dependency marker")
+                if sys.version_info[:2] >= tuple(map(int, match.groups())):
+                    continue
+            match = re.fullmatch(r"\s*([\w.-]+)\s*(?:>=\s*(\d+(?:\.\d+)*))?\s*", spec)
+            if not match or normalize(match[1]) not in selected:
+                raise HostLaunchError("missing or unreviewed transitive Host dependency")
+            if match[2]:
+                version = selected[normalize(match[1])].version
+                if not re.fullmatch(r"\d+(?:\.\d+)*", version):
+                    raise HostLaunchError("unreviewed Host dependency version")
+                actual, minimum = (tuple(map(int, v.split('.'))) for v in (version, match[2]))
+                length = max(len(actual), len(minimum))
+                if actual + (0,) * (length-len(actual)) < minimum + (0,) * (length-len(minimum)):
+                    raise HostLaunchError("installed Host transitive dependency version is incompatible")
+    # No unrecorded source, resource, metadata or native artifact may acquire
+    # authority, including additions inside an otherwise admitted package.
+    for path in root.rglob("*"):
+        if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
+        if path.is_symlink():
+            raise HostLaunchError("installed Host origin contains a symlink")
+        if path.is_file() and str(path.relative_to(root)) not in files:
+            if path.suffix == ".pth" and path.parent == root:
+                continue  # -S never executes it; it grants no mapped imports.
+            raise HostLaunchError("installed Host has an undeclared file outside RECORD coverage")
+    for name, modules in HOST_DISTRIBUTIONS.items():
+        for module in modules:
+            if module in {"schemas", "_yaml"}:
+                continue
+            relative = module if module.endswith(".py") else module + "/__init__.py"
+            if relative not in identities[name]["files"]:
+                raise HostLaunchError("installed Host required module lacks RECORD coverage")
+    return {"distributions": identities, "files": files}
+
 
 class HostLaunchError(RuntimeError):
     """Selection or retained import authority is unresolved."""
@@ -185,7 +324,7 @@ def _mapping(import_roots, inventories, runtime_inventory, *, trusted_local=Fals
                 # source/dependency roots cannot smuggle native representations.
                 if not trusted_local and (not path.is_relative_to(runtime_root) or runtime_inventory["files"].get(str(path.relative_to(runtime_root))) != pin):
                     raise HostLaunchError("native dependency is outside protected Python runtime inventory")
-            if trusted_local and name.split('.')[0] in {"astrid", "banodoco_workspace_client"} and root != source_root:
+            if trusted_local and name.split('.')[0] in {"astrid", "banodoco_workspace_client", "banodoco_local", "runtime_protocol"} and root != source_root:
                 # These selected namespaces are closed over the first, exact
                 # installed host root. An older site copy cannot fill gaps.
                 continue
@@ -239,7 +378,7 @@ def _distribution_metadata(import_roots, inventories):
             if not name or not candidate.version:
                 raise HostLaunchError("reviewed distribution identity is incomplete")
             normalized = re.sub(r"[-_.]+", "-", name).lower()
-            if normalized in {"astrid", "banodoco-workspace-client"} and str(root) != import_roots[0]["path"]:
+            if normalized in {"astrid", "banodoco-workspace-client", "banodoco-workspace-runtime"} and str(root) != import_roots[0]["path"]:
                 raise HostLaunchError("selected distribution is outside the selected host root")
             if normalized in names:
                 raise HostLaunchError("reviewed distribution has duplicate origins")
@@ -505,6 +644,10 @@ def installed_inventory(root, *, python_role=None, selected_source=None):
     root = _absolute(str(root))
     layout = selected_python_layout(selected_source) if python_role is not None else None
     policy = _selected_inventory_policy(root, python_role, layout) if layout is not None else None
+    if python_role == "installed-packages":
+        closure = installed_host_closure(root)
+        return {"root": str(root), "files": closure["files"],
+                "distributions": closure["distributions"], "selection": policy}
     files = {}; aliases = {}
     def walk(directory):
         for path in sorted(directory.iterdir()):
@@ -543,7 +686,7 @@ def installed_inventory(root, *, python_role=None, selected_source=None):
 
 def _local_inventory(value):
     if (not isinstance(value, dict) or not {"root", "files"} <= set(value)
-            or set(value) - {"root", "files", "aliases", "selection"}):
+            or set(value) - {"root", "files", "aliases", "selection", "distributions"}):
         raise HostLaunchError("installed inventory shape is invalid")
     root = _absolute(value["root"])
     selection = value.get("selection")
@@ -584,6 +727,7 @@ class _LocalInstallationObservation:
     """Retained launch observation; deliberately offers no protection lease."""
     def __init__(self, profile, launcher, layout=None):
         self._layout = layout
+        self._release_digest = profile.get("release_digest")
         self._renderer = profile.get("host_launch", {}).get("renderer_selection")
         self._renderer_binding = None
         self._pins = [(profile["host_executable"], profile["host_artifact_digest"][7:]),
@@ -593,6 +737,10 @@ class _LocalInstallationObservation:
     def verify(self):
         if self._layout is not None and selected_python_layout(self._layout["roots"]["installed-packages"]) != self._layout:
             raise HostLaunchError("selected Python startup or inclusion boundary changed")
+        if self._layout is not None:
+            closure = installed_host_closure(self._layout["roots"]["installed-packages"])
+            if "sha256:" + raw_digest(closure["distributions"]) != self._release_digest:
+                raise HostLaunchError("selected Host dependency release changed")
         if self._renderer is not None:
             from astrid.core.execution.host_renderer_selection import validate_renderer_selection
             try:
@@ -657,6 +805,8 @@ class TrustedLocalHostLaunchVerifier(HostLaunchVerifier):
             role = selection["role"]
             if selection != _selected_inventory_policy(Path(inventory["root"]), role, layout) or role in roles:
                 raise HostLaunchError("host-only inventory has changed or duplicate selection")
+            if role == "installed-packages" and "sha256:" + raw_digest(inventory.get("distributions")) != profile["release_digest"]:
+                raise HostLaunchError("host-only dependency selection differs from selected release")
             roles[role] = pin
         if set(roles) != set(layout["roots"]):
             raise HostLaunchError("host-only inventory selection is incomplete")

@@ -25,7 +25,8 @@ from runtime_protocol.local_worker_composition import (
     _verify_installed_host_records, load_local_worker_composition,
 )
 from runtime_protocol.verified_host_launch import (
-    CURRENT_ROLES_VERSION, HOST_MODULE, raw_digest, source_checkout_closure,
+    CURRENT_ROLES_VERSION, HOST_MODULE, raw_digest, source_checkout_closure, installed_host_closure,
+    HOST_DISTRIBUTIONS,
 )
 
 PRODUCER_VERSION = "host-only-installed/v1"
@@ -48,12 +49,11 @@ def _hash(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _installed_inputs() -> tuple[Path, dict[str, str]]:
+def _installed_inputs() -> tuple[Path, dict[str, Any]]:
     """Observe metadata AND import origins; never infer an install from a path."""
     root = _path(sysconfig.get_path("purelib"))
     if not root.is_relative_to(Path(sys.prefix)) or not root.is_dir():
         raise BootstrapError("installed package root is outside the selected environment")
-    records = {}
     for name, modules in _PACKAGES.items():
         dist = metadata.distribution(name)
         if Path(dist.locate_file("")).resolve() != root:
@@ -86,8 +86,19 @@ def _installed_inputs() -> tuple[Path, dict[str, str]]:
                 if file.is_file() and "__pycache__" not in file.parts and file.suffix not in {".pyc", ".pyo"}:
                     if not rows.get(str(file), "").startswith("sha256="):
                         raise BootstrapError("installed package file is missing from RECORD")
-        records[name] = hashlib.sha256(_installed_record_bytes(dist)).hexdigest()
-    return root, records
+        _installed_record_bytes(dist)
+    closure = installed_host_closure(root)
+    for name, modules in HOST_DISTRIBUTIONS.items():
+        if name in _PACKAGES:
+            continue
+        for module_name in modules:
+            if module_name == "_yaml":
+                continue  # optional native compatibility package, still covered
+            module = importlib.import_module(module_name.removesuffix(".py"))
+            expected = root / module_name if module_name.endswith(".py") else root / module_name / "__init__.py"
+            if _path(str(module.__file__)) != expected:
+                raise BootstrapError("raw or mixed Host dependency import origin")
+    return root, closure["distributions"]
 
 
 def _boot_inputs():
