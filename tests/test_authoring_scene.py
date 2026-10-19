@@ -479,10 +479,16 @@ def source_empty(source_composition, scene_native_boundary, monkeypatch):
     from astrid.core.execution import generic_host as hosts
     from astrid.core.execution import authoring_scene_protocol as protocol, authoring_scene_transport as transport
     from astrid.core.execution import authoring_scene_startup as startup
+    from astrid.core.pack import source_setup
     from astrid.core.execution.storage_preparation_transport import ProcessIdentity
     from runtime_protocol.daemon import WORKER_ACTOR
     from test_shot_composition_runtime import _publication
     w = source_composition
+    # This fixture owns its two source packs. Do not consult the user's managed
+    # source catalogue, or inherit the transport-only fixture's 10ms race budget
+    # for the real authenticated file/registration checks used here.
+    monkeypatch.setenv(source_setup.SOURCE_STATE_ENV, str(w.profile.support_root / "fixture-sources.json"))
+    w.d.local_worker_preparer.timeout_seconds = 1
     monkeypatch.setattr(hosts, "GenericPackHost", w.real_host_type)
     declaration = {"kind": "generator", "description": "Offline source regression",
         "invocation": {"kind": "command", "command": {"argv": ["{python_exec}", "-c", "raise RuntimeError('must not execute')"]}},
@@ -572,6 +578,126 @@ def test_source_daemon_empty_selection_accepts_with_unavailable_storage(source_e
     selection, relay = w.s._authoring_scene_selection, w.s._authoring_scene_relay
     w.d.start_local_worker(w.profile.profile_id, w.s.realm["id"])
     assert w.s._authoring_scene_selection is selection and w.s._authoring_scene_relay is relay
+
+
+@pytest.mark.parametrize("resolved_before_failure", [False, True])
+def test_failed_retained_composition_refuses_absent_capture_until_guarded_recomposition(
+        source_empty, monkeypatch, resolved_before_failure):
+    from runtime_protocol import local_preparation_relay as storage
+    from runtime_protocol.errors import ConflictError
+
+    w = source_empty
+    body = publish_empty(w)
+    body.update(request_id="offline-after-composition-failure", dry_run=True)
+    before = snapshot(w.s)
+    selected = w.s._authoring_scene_selection
+    assert selected is not None and w.s._authoring_scene_relay is None
+    previous = None
+    if resolved_before_failure:
+        previous = scene.RequestSceneEvaluation(w.s, body, w.identity)
+        previous.check()
+        assert previous.relay is selected.relay is w.s._authoring_scene_relay
+
+    original_bind = storage.bind_selected_host
+    primary = ConflictError("offline first composition failure")
+
+    def failed_bind(*args):
+        raise primary
+
+    monkeypatch.setattr(storage, "bind_selected_host", failed_bind)
+    launcher, handle = w.d.local_worker_launcher, w.handle
+    with pytest.raises(ConflictError) as caught:
+        w.d.start_local_worker(w.profile.profile_id, w.s.realm["id"])
+    assert caught.value is primary
+    assert primary.details["local_worker_state"] == "activated_composition_failed"
+    assert w.d.local_worker_launcher is launcher
+    assert w.selected[0] is handle and handle.activated and not handle.closed
+    assert w.s._preparation_relay is None
+    assert w.s._authoring_scene_selection is None and w.s._authoring_scene_relay is None
+    assert w.d._local_composition_handle is None
+    if previous is not None:
+        with pytest.raises(AuthorizationError) as revoked:
+            previous.check()
+        assert revoked.value._authoring_invocation_reason is Reason.CURRENT_RELAY_REPLACED
+
+    absent = scene.RequestSceneEvaluation(w.s, body, w.identity)
+    assert absent.selection is None and absent.relay is None
+    with pytest.raises(AuthorizationError) as refused:
+        absent.check()
+    assert refused.value._authoring_invocation_reason is Reason.CAPTURED_RELAY_ABSENT
+    with pytest.raises(AuthorizationError) as consumer_refusal:
+        w.s.commit_timeline(w.p, "main", body, idempotency_key=body["request_id"], identity=w.identity)
+    assert consumer_refusal.value._authoring_invocation_reason is Reason.CAPTURED_RELAY_ABSENT
+    assert snapshot(w.s) == before
+    assert w.s.lookup_request(w.p, "main", body["request_id"]) is None
+
+    # Only a successful pass through the real composer can install a selection.
+    # This fixture's retained launcher/Host authority is synthetic; no Host starts.
+    monkeypatch.setattr(storage, "bind_selected_host", original_bind)
+    w.d.start_local_worker(w.profile.profile_id, w.s.realm["id"])
+    replacement = w.s._authoring_scene_selection
+    assert replacement is not selected and replacement.handle is handle
+    assert w.s._authoring_scene_relay is None and w.s._preparation_relay is None
+    current = scene.RequestSceneEvaluation(w.s, body, w.identity)
+    current.check()
+    assert current.relay is replacement.relay is w.s._authoring_scene_relay
+    with pytest.raises(AuthorizationError) as still_absent:
+        absent.check()
+    assert still_absent.value._authoring_invocation_reason is Reason.CAPTURED_RELAY_ABSENT
+    body["request_id"] = "offline-fresh-after-recomposition"
+    result = w.s.commit_timeline(w.p, "main", body, idempotency_key=body["request_id"], identity=w.identity)
+    assert result["status"] == "preview", result
+    assert snapshot(w.s) == before
+    assert w.s.lookup_request(w.p, "main", body["request_id"]) is None
+    current.close()
+    absent.close()
+    if previous is not None:
+        previous.close()
+
+
+def test_selected_scene_resolution_failure_preserves_selection_and_first_error(
+        source_empty, monkeypatch):
+    from runtime_protocol.errors import ConflictError
+    from astrid.core.execution.authoring_scene_transport import AuthoringSceneRelay
+
+    w = source_empty
+    body = publish_empty(w)
+    body.update(request_id="offline-resolve-failure", dry_run=True)
+    before = snapshot(w.s)
+    selected = w.s._authoring_scene_selection
+    original_check, original_close = scene.check_binding, AuthoringSceneRelay.close
+    primary, closed = ConflictError("offline first resolution failure"), []
+
+    def failed_check(*args):
+        raise primary
+
+    def close(relay):
+        closed.append(relay)
+        original_close(relay)
+        raise RuntimeError("offline secondary close failure")
+
+    monkeypatch.setattr(scene, "check_binding", failed_check)
+    monkeypatch.setattr(AuthoringSceneRelay, "close", close)
+    with pytest.raises(ConflictError) as caught:
+        scene.RequestSceneEvaluation(w.s, body, w.identity)
+    assert caught.value is primary and len(closed) == 1
+    assert w.s._authoring_scene_selection is selected
+    assert selected.relay is None and w.s._authoring_scene_relay is None
+    assert w.handle.activated and not w.handle.closed
+
+    # Resolution failure is not an absent capture: the same authorized selection
+    # remains eligible for a later fresh invocation, with all checks restored.
+    monkeypatch.setattr(scene, "check_binding", original_check)
+    monkeypatch.setattr(AuthoringSceneRelay, "close", original_close)
+    current = scene.RequestSceneEvaluation(w.s, body, w.identity)
+    current.check()
+    assert current.selection is selected
+    assert current.relay is selected.relay is w.s._authoring_scene_relay
+    result = w.s.commit_timeline(w.p, "main", body, idempotency_key=body["request_id"], identity=w.identity)
+    assert result["status"] == "preview", result
+    assert snapshot(w.s) == before
+    assert w.s.lookup_request(w.p, "main", body["request_id"]) is None
+    current.close()
 
 
 def test_source_daemon_empty_selection_refuses_frame_and_nonempty_candidate(source_empty):

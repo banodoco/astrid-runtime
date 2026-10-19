@@ -181,3 +181,50 @@ def test_internal_diagnostic_never_reads_exception_data(caplog, kind):
     assert record.getMessage() == "timeline_commit_failure " + timeline_commit.canonical_json(expected)
     assert record.exc_info is None and record.stack_info is None
     assert secret not in caplog.text
+
+
+@pytest.mark.parametrize("occurrence_preview", ["saved"], indirect=True)
+@pytest.mark.parametrize("error_type", [TimeoutError, ConnectionError])
+@pytest.mark.parametrize("sink_available", [True, False])
+def test_saved_preview_resolution_transport_failure_keeps_stage_and_original_error(
+        occurrence_preview, monkeypatch, caplog, error_type, sink_available):
+    from types import SimpleNamespace
+    from astrid.sdk.timeline.commit import create_runtime_commit_service
+
+    w, body = occurrence_preview
+    secret = "credential-canary /private/canary raw-body-canary"
+    original = error_type(secret)
+    resolutions = []
+
+    def resolve():
+        resolutions.append(True)
+        raise original
+
+    # Exercise the real provider's lazy retained-scene resolution, before an
+    # invocation is attached to the port. No live Host, socket or old key is used.
+    w.s._timeline_commit_provider = create_runtime_commit_service()
+    w.s._authoring_scene_relay = None
+    w.s._authoring_scene_selection = SimpleNamespace(resolve=resolve)
+    if not sink_available:
+        def unavailable(*args, **kwargs):
+            raise OSError("secondary diagnostic sink failure")
+        monkeypatch.setattr(timeline_commit._LOGGER, "error", unavailable)
+    before = snapshot(w.s)
+    with caplog.at_level(logging.ERROR, logger=timeline_commit.__name__):
+        with pytest.raises(error_type) as caught:
+            runtime_preview(w, body)
+    assert caught.value is original
+    assert resolutions == [True]
+    records = [r for r in caplog.records if r.name == timeline_commit.__name__]
+    if sink_available:
+        expected = dict(stage="provider_commit", exception_class=error_type.__name__)
+        assert [r.getMessage() for r in records] == [
+            "timeline_commit_failure " + timeline_commit.canonical_json(expected)]
+        assert records[0].exc_info is None and records[0].stack_info is None
+    else:
+        assert not records
+    assert secret not in caplog.text
+    assert all(value not in caplog.text for value in (
+        body["request_id"], body["session_id"], w.identity["actor"]))
+    assert snapshot(w.s) == before
+    assert w.s.lookup_request(w.p, "main", body["request_id"]) is None

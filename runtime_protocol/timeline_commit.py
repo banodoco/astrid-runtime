@@ -45,6 +45,8 @@ def _record_commit_failure(stage, exc):
             (ValueError, "ValueError", None),
             (AttributeError, "AttributeError", None),
             (RuntimeError, "RuntimeError", None),
+            (ConnectionError, "ConnectionError", None),
+            (TimeoutError, "TimeoutError", None),
             (OSError, "OSError", None),
             (FileNotFoundError, "FileNotFoundError", None),
             (PermissionError, "PermissionError", None),
@@ -1459,7 +1461,8 @@ class TimelineCommitAcceptance:
                 port.validate_scene(prepared["canonical_document"])
         except (AuthorizationError, ForbiddenError):
             raise
-        except (ConnectionError, TimeoutError):
+        except (ConnectionError, TimeoutError) as exc:
+            _record_commit_failure(stage, exc)
             raise  # The transport may have lost an already durable response.
         except Exception as exc:
             _record_commit_failure(stage, exc)
