@@ -6,7 +6,6 @@ This first positive is a prerequisite to an in-flight revoke/publication proof.
 import hashlib
 import http.client
 import importlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -39,23 +38,18 @@ def test_qualified_real_render_task_positive(tmp_path):
     source = Path(config['astrid'])
     prior = Path(config['prior'])
     project_dir = prior / 'project'
-    assert tmp_path.is_relative_to(out)
+    assert tmp_path.is_relative_to(Path(config['proof_root']) / 'runtime')
     assert _sha(prior / 'HAND-BACK-027.md') == 'cf955f875639b7ae24b45df224e44caa8e76e4b25e4f1869acea7313582af741'
 
-    # H030 admission selects only these unchanged validator bytes at their
-    # genuine H027 location. All producer imports continue to use joined source.
-    validator_path = Path(config['validator_source']) / 'astrid/core/rendering/remotion_runtime.py'
+    # H032 uses the real admitted joined validator; no alternate module loader.
+    validator_path = source / 'astrid/core/rendering/remotion_runtime.py'
     assert _sha(validator_path) == '7ec87517ce807557cb6672a6a5a4bf51648bf3283bae96083796a386d9f13dd2'
     validator_name = 'astrid.core.rendering.remotion_runtime'
-    assert validator_name not in sys.modules
-    importlib.import_module('astrid.core.rendering')
-    spec = importlib.util.spec_from_file_location(validator_name, validator_path)
-    validator = importlib.util.module_from_spec(spec)
-    sys.modules[validator_name] = validator
-    spec.loader.exec_module(validator)
+    validator = importlib.import_module(validator_name)
     assert Path(validator.__file__) == validator_path
     st = Path(validator.__file__).stat()
-    assert (st.st_dev, st.st_ino) == (16777234, 1165491776)
+    assert (st.st_dev, st.st_ino) == (config['validator_identity']['st_dev'],
+                                    config['validator_identity']['st_ino'])
     (out / 'loaded-validator.json').write_text(json.dumps({
         'module': validator_name, 'path': validator.__file__,
         'sha256': _sha(validator_path), 'device': st.st_dev, 'inode': st.st_ino,
@@ -113,19 +107,27 @@ def test_qualified_real_render_task_positive(tmp_path):
         verification_receipt=admission['path'], receipt_sha256=admission['sha256'],
         manifest_sha256=admission['manifest_sha256'], lock_sha256=admission['lock_sha256'])
     event('strict-binding-validated', cli=str(binding.validate(project_dir)), files=len(binding.files))
-    # Reuse H027's exact launch artifact; never run a readiness transaction.
-    env = json.loads((prior / 'ready-environment.json').read_text())
+    # The isolated consumer was prepared once, before Host construction.
+    env = json.loads((out / 'ready-environment.json').read_text())
+    # pytest adds only these two diagnostics around the already installed mapping.
+    assert {k: v for k, v in os.environ.items()
+            if k not in {'PYTEST_CURRENT_TEST', 'PYTEST_VERSION'}} == env
+    receipt = Path(env['ASTRID_REMOTION_VALIDATION_PATH'])
+    assert receipt.is_relative_to(Path(config['proof_root']) / 'host-support')
+    assert not receipt.is_symlink() and receipt.stat().st_uid == os.getuid()
+    assert stat.S_IMODE(receipt.stat().st_mode) == 0o600
+    assert _sha(receipt) == env['ASTRID_REMOTION_VALIDATION_SHA256']
     from astrid.core.rendering.remotion_runtime import _validated_runtime
-    _validated_runtime(project_dir, environment=env)
-    event('h027-readiness-reused', launch=env['ASTRID_REMOTION_VALIDATION_LAUNCH'],
-          environment_sha256=_sha(prior / 'ready-environment.json'))
+    _validated_runtime(project_dir, environment=dict(os.environ))
+    event('h032-readiness-consumed', launch=env['ASTRID_REMOTION_VALIDATION_LAUNCH'],
+          environment_sha256=_sha(out / 'ready-environment.json'))
     RealmStore.initialize(tmp_path / 'realm').close()
     daemon = RuntimeDaemon(tmp_path / 'realm', support_root=tmp_path / 'support').start()
     tracked = []
     host = None
     lease_fd = None
     lease = {'identity': 'astrid-host-workload:v1', 'weight': 1,
-             'mode': 'shared_nonblocking', 'owner': 'H-REVOKE-RENDER-PUBLICATION-030',
+             'mode': 'shared_nonblocking', 'owner': 'H-REVOKE-RENDER-PUBLICATION-032',
              'supervisor_pid': os.getpid(), 'acquired': False, 'released': False}
     result = {'producer': 'unmodified rendering.render', 'render_proof': False,
               'inflight_pause_available': False, 'acceptance_claimed': False}
@@ -135,6 +137,7 @@ def test_qualified_real_render_task_positive(tmp_path):
         client = gh.RuntimeProtocolClient(daemon.endpoint, daemon.worker_credential_path.read_text().strip())
         host = ObservedHost(pack_roots=[source / 'astrid/packs/rendering'], client=client,
                             executor_id='astrid-pack-host', attempt_base=tmp_path / 'attempts',
+                            capability_matrix=source / 'config/astrid-beta-capabilities.json',
                             remotion_closure_binding=binding)
         def observer(observation, process, cancelled):
             event('render-command-observer', observation=observation,
@@ -162,13 +165,13 @@ def test_qualified_real_render_task_positive(tmp_path):
         record = host.capabilities['rendering.render']
         result['capability'] = record.manifest()
         service = daemon.service
-        project = service.create_project({'slug': 'h030-synthetic', 'name': 'H030 Synthetic'},
-                                         idempotency_key='h030-project')['id']
-        actor = 'h030-synthetic-connector'
+        project = service.create_project({'slug': 'h032-synthetic', 'name': 'H032 Synthetic'},
+                                         idempotency_key='h032-project')['id']
+        actor = 'h032-synthetic-connector'
         service.select_project(actor, project)
         token, _ = daemon.credentials.provision_connector(
             actor, SCOPES, connector_id=actor, realm_id=service.realm['id'], expires_at=time.time()+1800)
-        context = {'pair_id': 'h030-positive-pair', 'connector_id': actor,
+        context = {'pair_id': 'h032-positive-pair', 'connector_id': actor,
                    'realm_id': service.realm['id'], 'generation': 1,
                    'expires_at': int((time.time()+1700)*1000)}
         # Supported file-mode snapshot, using no real media or canonical film.
@@ -178,8 +181,8 @@ def test_qualified_real_render_task_positive(tmp_path):
         body = {'project': project, 'capability_id': 'rendering.render',
                 'capability_digest': record.capability_digest,
                 'spec': {'inputs': {'timeline_snapshot': snapshot, 'selector': 'rendering.remotion',
-                                    'output_name': 'h030-positive.mp4'}}}
-        status, answer = _request(daemon, token, context, 'POST', '/v1/tasks', body, 'h030-positive')
+                                    'output_name': 'h032-positive.mp4'}}}
+        status, answer = _request(daemon, token, context, 'POST', '/v1/tasks', body, 'h032-positive')
         result.update(admission_status=status, admission=answer, actor=actor, pair=context,
                       project_id=project, endpoint=daemon.endpoint)
         assert status == 201, answer
