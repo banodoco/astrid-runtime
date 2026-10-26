@@ -36,6 +36,7 @@ import json
 import os as process_os
 from .dirfd import filesystem as os
 import re
+import selectors
 import socket
 import stat
 
@@ -91,6 +92,43 @@ class _Refusal(Exception):
     def __init__(self, status: int, code: str):
         super().__init__(code)
         self.status, self.code = status, code
+
+
+def _is_acp_prompt(method: str, path: str, body: bytes | None) -> bool:
+    """Only prompt completion waits may outlive the ordinary chat timeout."""
+    if method != "POST":
+        return False
+    path = urlsplit(path).path
+    if re.fullmatch(r"/acp/projects/[^/]+/chat/prompt", path):
+        return True
+    if not re.fullmatch(r"/acp/[^/]+/rpc", path):
+        return False
+    try:
+        request = json.loads(body or b"")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(request, dict) and request.get("method") == "session/prompt"
+
+
+def _wait_for_prompt_response(upstream: socket.socket, browser: socket.socket) -> bool:
+    """Wait for completion or disconnect, without imposing an execution deadline.
+
+    Closing the door shuts down the tracked upstream socket and wakes this wait.
+    A vanished browser releases only its HTTP connection; it never cancels work.
+    """
+    with selectors.DefaultSelector() as selector:
+        selector.register(upstream, selectors.EVENT_READ)
+        selector.register(browser, selectors.EVENT_READ)
+        while True:
+            readable = {key.fileobj for key, _ in selector.select()}
+            if browser in readable:
+                if not browser.recv(1, socket.MSG_PEEK):
+                    return False
+                # Extra/pipelined request bytes aren't part of this response.
+                # Avoid spinning; this handler closes the connection as usual.
+                selector.unregister(browser)
+            if upstream in readable:
+                return True
 
 
 def exact_https_origin(value: str) -> str:
@@ -741,8 +779,8 @@ class DoorHandler(RuntimeHandler):
             # Calls through the door always select the hosted, local-media-only policy.
             ACP_LOCAL_MEDIA_ONLY_HEADER: "1",
         })
-        # A browser that goes away while the chat service is silent is noticed on the next write, or by this idle
-        # timeout (acp_idle_timeout, 300 s by default): nothing reads the browser's socket while waiting upstream.
+        # Connection establishment, writes, and response transfer stay bounded.
+        # A prompt has no completion deadline: progress travels on another request.
         self.connection.settimeout(door.acp_idle_timeout)
         upstream = http.client.HTTPConnection("127.0.0.1", port, timeout=door.acp_idle_timeout)
         tracked = None
@@ -753,6 +791,10 @@ class DoorHandler(RuntimeHandler):
                 if not self.server.track_upstream(tracked):
                     raise _Refusal(503, "acp_unavailable")
                 upstream.request(self.command, route.path[len("/acp"):] or "/", body=body, headers=headers)
+                if _is_acp_prompt(self.command, route.path, body):
+                    if not _wait_for_prompt_response(tracked, self.connection):
+                        self.close_connection = True
+                        return
                 response = upstream.getresponse()
             except (socket.timeout, TimeoutError):
                 raise _Refusal(504, "upstream_timeout") from None

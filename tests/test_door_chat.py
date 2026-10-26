@@ -14,6 +14,7 @@ import json
 import os
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -283,6 +284,95 @@ def test_stalled_chat_service_times_out_and_door_keeps_serving(make_world, chat)
         assert (after.status, after.json()) == (200, {"agents": []})
     finally:
         release.set()
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/projects/project-1/chat/prompt", b'{"prompt": [{"type": "text", "text": "hi"}]}'),
+    ("/connection-1/rpc", RPC_BODY),
+])
+def test_prompt_completion_outlives_chat_timeout(make_world, chat, path, body):
+    world = make_world(acp_idle_timeout=0.05)
+    _point_chat_at(world, chat.endpoint)
+    started, release = threading.Event(), threading.Event()
+
+    def prompt(handler):
+        started.set()
+        release.wait(GUARD_SECONDS)
+        _json_reply(handler, 200, {"result": {"stopReason": "end_turn"}})
+
+    chat.hooks[("POST", path)] = prompt
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(world.call, "/api/astrid/acp" + path, "POST",
+                              headers={"Content-Type": "application/json"}, body=body)
+        try:
+            assert started.wait(GUARD_SECONDS)
+            with pytest.raises(FutureTimeout):
+                pending.result(timeout=0.2)
+            assert world.call(AGENTS).status == 200
+        finally:
+            release.set()
+        reply = pending.result(timeout=GUARD_SECONDS)
+    assert (reply.status, reply.json()) == (200, {"result": {"stopReason": "end_turn"}})
+    assert sum(entry["path"] == path for entry in chat.requests) == 1
+
+
+@pytest.mark.parametrize("body", [b'{"method": "session/load"}', b'[]', b'not json'])
+def test_non_prompt_rpc_keeps_chat_timeout(make_world, chat, body):
+    world = make_world(acp_idle_timeout=0.05)
+    _point_chat_at(world, chat.endpoint)
+    release = threading.Event()
+
+    def stall(handler):
+        release.wait(GUARD_SECONDS)
+
+    chat.hooks[("POST", "/connection-1/rpc")] = stall
+    try:
+        reply = world.call("/api/astrid/acp/connection-1/rpc", "POST",
+                           headers={"Content-Type": "application/json"}, body=body)
+        assert (reply.status, reply.json()) == (504, {"error": "upstream_timeout"})
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("close_listener", [False, True], ids=["browser-disconnect", "listener-shutdown"])
+def test_pending_prompt_connection_closes_without_cancelling_work(make_world, chat, close_listener):
+    world = make_world(acp_idle_timeout=0.05)
+    _point_chat_at(world, chat.endpoint)
+    started, upstream_closed = threading.Event(), threading.Event()
+
+    def prompt(handler):
+        started.set()
+        handler.connection.settimeout(GUARD_SECONDS)
+        assert handler.rfile.read(1) == b""
+        upstream_closed.set()
+
+    chat.hooks[("POST", "/connection-1/rpc")] = prompt
+    connection = http.client.HTTPConnection("127.0.0.1", world.port, timeout=GUARD_SECONDS)
+    try:
+        connection.request("POST", "/api/astrid/acp/connection-1/rpc", body=RPC_BODY,
+                           headers={"Origin": HOSTED, "Content-Type": "application/json"})
+        assert started.wait(GUARD_SECONDS)
+        if close_listener:
+            world.daemon.stop()
+        else:
+            connection.close()
+        assert upstream_closed.wait(GUARD_SECONDS), "pending prompt HTTP connection leaked"
+        assert [entry["path"] for entry in chat.requests] == ["/connection-1/rpc"]
+    finally:
+        connection.close()
+
+
+def test_prompt_upstream_disconnect_is_unavailable(make_world, chat):
+    world = make_world(acp_idle_timeout=0.05)
+    _point_chat_at(world, chat.endpoint)
+
+    def disconnect(handler):
+        handler.connection.shutdown(socket.SHUT_RDWR)
+
+    chat.hooks[("POST", "/connection-1/rpc")] = disconnect
+    reply = world.call("/api/astrid/acp/connection-1/rpc", "POST",
+                       headers={"Content-Type": "application/json"}, body=RPC_BODY)
+    assert (reply.status, reply.json()) == (503, {"error": "acp_unavailable"})
 
 
 # 7. Redirect -----------------------------------------------------------------
