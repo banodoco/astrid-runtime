@@ -179,7 +179,9 @@ def _owner_record(paths: RuntimePaths, realm_id: str, realm_root: Path, boundary
     return discovery
 
 
-def _verify_running(paths: RuntimePaths, boundary: RuntimeBoundary, result: Any) -> dict[str, Any]:
+def _verify_running(
+    paths: RuntimePaths, boundary: RuntimeBoundary, result: Any, *, timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     discovery = _read_support_json(paths.discovery_path) or {}
     endpoint = str(discovery.get("endpoint") or getattr(result, "endpoint", ""))
     pid = int(discovery.get("pid") or getattr(result, "pid", 0) or 0)
@@ -193,7 +195,7 @@ def _verify_running(paths: RuntimePaths, boundary: RuntimeBoundary, result: Any)
         raise OperatorUpgradeError("runtime restarted but owner credential is unavailable") from exc
     if not token:
         raise OperatorUpgradeError("runtime restarted but owner credential is empty")
-    connection = boundary.connect(endpoint=endpoint, credential=token)
+    connection = boundary.connect(endpoint=endpoint, credential=token, timeout_seconds=timeout_seconds)
     report = _mapping(connection.doctor())
     if not report or not bool(report.get("ok")):
         raise OperatorUpgradeError("runtime restarted but integrity verification failed")
@@ -283,7 +285,7 @@ def upgrade_workspace(
             _journal(paths, operation_id=operation_id, state="activated", realm_id=realm_id, schema_before=kind, migration=migration)
             restarted_result = _bootstrap_locked(paths, boundary, config)
             restarted = True
-            verification = _verify_running(paths, boundary, restarted_result)
+            verification = _verify_running(paths, boundary, restarted_result, timeout_seconds=timeout_seconds)
             _journal(paths, operation_id=operation_id, state="restarted", realm_id=realm_id, migration=migration, verification=verification)
         relocation_result = None
         if destination is not None:

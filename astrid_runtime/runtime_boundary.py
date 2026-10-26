@@ -636,7 +636,7 @@ class LocalRuntimeBoundary:
     def _http_health(endpoint: str) -> bool:
         return LocalRuntimeBoundary._http_status(endpoint) == "ok"
 
-    def connect(self, *, endpoint: str, credential: str) -> RuntimeConnection:
+    def connect(self, *, endpoint: str, credential: str, timeout_seconds: float | None = None) -> RuntimeConnection:
         try:
             parsed = urlsplit(str(endpoint))
             if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
@@ -651,7 +651,11 @@ class LocalRuntimeBoundary:
         except ImportError as exc:
             raise BootstrapError("The installed generated workspace client is unavailable; install astrid-runtime-client.") from exc
         connection = RuntimeConnection(endpoint, credential, self._bootstrap_credential)
-        connection._client = WorkspaceClient(endpoint, credential)
+        # Upgrade integrity verification can legitimately exceed the generated
+        # client's ordinary request timeout. Keep its explicit bounded budget
+        # local to that connection; other bootstrap requests retain the default.
+        options = {} if timeout_seconds is None else {"timeout": timeout_seconds}
+        connection._client = WorkspaceClient(endpoint, credential, **options)
         return connection
 
     def health(self, *, endpoint: str, pid: int, instance_id: str) -> bool:

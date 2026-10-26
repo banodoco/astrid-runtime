@@ -45,7 +45,8 @@ class _Boundary:
     def health(self, **_kwargs):
         return True
 
-    def connect(self, **_kwargs):
+    def connect(self, **kwargs):
+        self.connection_options = kwargs
         return SimpleNamespace(doctor=lambda: {"ok": True, "state": "healthy"})
 
 
@@ -141,6 +142,7 @@ def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, 
     )
     result = upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
     assert result["ok"] is True
+    assert boundary.connection_options["timeout_seconds"] == 120.0
     assert result["schema_before"] == "v25"
     assert migration_calls == [
         ((realm_root,), {"timeout_seconds": 120.0, "confirmation": "MIGRATE CANONICAL realm-1", "expected_realm_id": "realm-1"})
@@ -151,6 +153,48 @@ def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, 
     journal = json.loads((paths.runtime_support / "upgrade-journal.json").read_text())
     assert journal["state"] == "complete"
     assert [event["state"] for event in journal["history"]] == ["planned", "stopping", "stopped", "activated", "restarted", "complete"]
+
+
+@pytest.mark.parametrize("healthy", [True, False])
+def test_upgrade_integrity_uses_its_budget_without_skipping_failed_checks(tmp_path, monkeypatch, healthy):
+    from astrid_runtime.operator_upgrade import _verify_running
+
+    paths, _profile, _realm_root = _fixture(tmp_path)
+    boundary = LocalRuntimeBoundary()
+    monkeypatch.setattr(boundary, "health", lambda **_kwargs: True)
+    observed = []
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"ok": healthy, "state": "ready" if healthy else "unhealthy"}).encode()
+
+    def slow_integrity(request, *, timeout):
+        assert request.full_url.endswith("/v1/doctor")
+        observed.append(timeout)
+        # Model an intact large realm whose integrity pass outlasts the
+        # ordinary 30-second HTTP budget, without adding a wall-clock sleep.
+        if timeout < 75:
+            raise TimeoutError("large realm integrity pass exceeded request budget")
+        return Response()
+
+    monkeypatch.setattr("astrid_runtime_client.generated._urlopen_loopback", slow_integrity)
+    if healthy:
+        assert _verify_running(paths, boundary, None, timeout_seconds=90)["integrity"]["ok"] is True
+    else:
+        with pytest.raises(OperatorUpgradeError, match="integrity verification failed"):
+            _verify_running(paths, boundary, None, timeout_seconds=90)
+    assert observed == [90]
+    # The upgrade-specific budget must not lengthen ordinary client requests.
+    assert boundary.connect(endpoint="http://127.0.0.1:1234", credential="token")._client.timeout == 30
 
 
 def test_operator_upgrade_refuses_running_task_before_signaling_owner(tmp_path):
