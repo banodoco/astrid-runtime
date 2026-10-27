@@ -246,6 +246,14 @@ class SourceProfile:
 
 
 @dataclass(frozen=True)
+class RestoreSelection:
+    """Existing installer paths that identify a realm during restore replay."""
+
+    journal_path: Path
+    selection_path: Path
+
+
+@dataclass(frozen=True)
 class DoorSettings:
     """The hosted page's browser door that a started daemon opens (``runtime_protocol.door``)."""
 
@@ -495,6 +503,12 @@ def _read_catalog(paths: RuntimePaths) -> dict[str, Any]:
     catalog = _read_support_json(paths.catalog_path)
     if catalog is None:
         return {"version": CATALOG_VERSION, "selected_realm_id": None, "realms": [], "source_profiles": {}}
+    return _validate_catalog(catalog)
+
+
+def _validate_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one already-read catalog snapshot and return its document."""
+    catalog = dict(catalog)
     if catalog.get("version") != CATALOG_VERSION:
         raise BootstrapError("Neutral realm catalog version is unsupported; run astrid-runtime doctor.")
     if not isinstance(catalog.get("realms", []), list):
@@ -1322,11 +1336,202 @@ def _fenced_stop_and_manager(
             "runtime": stopped, "interruption": final_report}
 
 
+def _restore_json_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
+    """Read exact regular-file bytes without following a final symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise BootstrapError(f"Restore metadata is missing or unsafe: {path}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        chunks = bytearray()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.extend(chunk)
+    finally:
+        os.close(fd)
+    raw = bytes(chunks)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BootstrapError(f"Restore metadata is malformed: {path}") from exc
+    if not isinstance(value, Mapping):
+        raise BootstrapError(f"Restore metadata must contain an object: {path}")
+    return raw, dict(value)
+
+
+def _canonical_metadata_path(value: Path, *, label: str) -> Path:
+    path = Path(value).expanduser()
+    if (not path.is_absolute() or _has_symlink_component(path) or path.is_symlink()
+            or Path(os.path.abspath(path)) != path):
+        raise BootstrapError(f"Restore {label} path must be absolute, canonical and symlink-free.")
+    return path
+
+
+def _restore_selection_snapshot(
+    paths: RuntimePaths, selection: RestoreSelection,
+) -> dict[str, Any]:
+    """Derive a recovery realm only from agreeing existing installer metadata."""
+    journal_path = _canonical_metadata_path(Path(selection.journal_path), label="journal")
+    selection_path = _canonical_metadata_path(Path(selection.selection_path), label="selection")
+    if journal_path.name != "update-transaction.json":
+        raise BootstrapError("Restore journal path is not the installation update transaction.")
+    install_root = journal_path.parent
+    if not install_root.is_dir():
+        raise BootstrapError("Restore installation root is unavailable.")
+    journal_bytes, journal = _restore_json_snapshot(journal_path)
+    selection_bytes, selected = _restore_json_snapshot(selection_path)
+    if (journal.get("format") != "astrid-install-update/v1"
+            or journal.get("step") != "recovering"
+            or journal.get("transaction_kind") not in (None, "migration")):
+        raise BootstrapError("Restore selection requires a pending migration recovery journal.")
+    if (not isinstance(journal.get("operation_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", journal["operation_id"])):
+        raise BootstrapError("Restore journal operation identity is malformed.")
+
+    backup = journal.get("backup")
+    if not isinstance(backup, Mapping) or backup.get("kind") not in ("clone", "runtime"):
+        raise BootstrapError("Restore journal does not name a supported retained backup.")
+    backup_root = _canonical_metadata_path(Path(str(backup.get("root") or "")), label="backup")
+    expected_backups = _canonical_metadata_path(install_root / "backups", label="backup directory")
+    if backup_root.parent != expected_backups or not backup_root.is_dir():
+        raise BootstrapError("Restore backup is outside this installation's retained backups.")
+    backup_catalog_path = backup_root / "support" / "runtime" / "catalog.json"
+    backup_catalog_path = _canonical_metadata_path(backup_catalog_path, label="retained catalog")
+    backup_catalog_bytes, backup_catalog_value = _restore_json_snapshot(backup_catalog_path)
+
+    owner = str(selected.get("owner") or "")
+    raw_program_root = str(selected.get("program_root") or "")
+    raw_data_root = str(selected.get("data_root") or "")
+    realm_id = str(selected.get("realm_id") or "")
+    raw_realm_root = str(selected.get("realm_root") or "")
+    if owner != "haus.astrid.runtime":
+        raise BootstrapError("Restore install selection has an unsupported owner.")
+    program_root = _canonical_metadata_path(Path(raw_program_root), label="program root")
+    data_root = _canonical_metadata_path(Path(raw_data_root), label="data root")
+    realm_root = _canonical_realm_root(
+        _canonical_metadata_path(Path(raw_realm_root), label="realm root"))
+    journal_data = _canonical_metadata_path(Path(str(journal.get("data_root") or "")), label="journal data root")
+    journal_realm = journal.get("realm")
+    if not isinstance(journal_realm, Mapping):
+        raise BootstrapError("Restore journal does not identify its selected realm.")
+    journal_realm_root = _canonical_metadata_path(
+        Path(str(journal_realm.get("realm_root") or "")), label="journal realm root")
+    if (program_root != install_root or data_root != journal_data
+            or str(journal_realm.get("realm_id") or "") != realm_id
+            or journal_realm_root != realm_root
+            or not realm_id or any(char in realm_id for char in "/\\")
+            or not isinstance(journal_realm.get("realm_id"), str)
+            or not isinstance(selected.get("realm_id"), str)):
+        raise BootstrapError("Restore journal and install selection disagree on installation or realm identity.")
+
+    retained = _validate_catalog(backup_catalog_value)
+    retained_realm = _selected_realm(retained)
+    retained_root = _canonical_realm_root(_canonical_metadata_path(
+        Path(str(retained_realm.get("data_root") or "")), label="retained realm root")) if retained_realm else None
+    if (retained_realm is None or not isinstance(retained.get("selected_realm_id"), str)
+            or not isinstance(retained_realm.get("realm_id"), str)
+            or retained.get("selected_realm_id") != realm_id
+            or str(retained_realm.get("realm_id") or "") != realm_id
+            or retained_root != realm_root):
+        raise BootstrapError("Retained backup catalog conflicts with the install selection.")
+
+    live_catalog_bytes = None
+    live_catalog = None
+    if os.path.lexists(str(paths.catalog_path)):
+        live_catalog_bytes, live_catalog = _restore_json_snapshot(paths.catalog_path)
+        parsed_live = _validate_catalog(live_catalog)
+        live_realm = _selected_realm(parsed_live)
+        live_root = _canonical_realm_root(_canonical_metadata_path(
+            Path(str(live_realm.get("data_root") or "")), label="current realm root")) if live_realm else None
+        if (live_realm is None
+                or not isinstance(parsed_live.get("selected_realm_id"), str)
+                or not isinstance(live_realm.get("realm_id"), str)
+                or str(parsed_live.get("selected_realm_id") or "") != realm_id
+                or str(live_realm.get("realm_id") or "") != realm_id
+                or live_root != realm_root):
+            raise BootstrapError("Current Runtime catalog conflicts with the retained restore selection.")
+
+    return {
+        "journal_path": journal_path, "selection_path": selection_path,
+        "journal_bytes": journal_bytes, "selection_bytes": selection_bytes,
+        "backup_catalog_path": backup_catalog_path,
+        "backup_catalog_bytes": backup_catalog_bytes,
+        "catalog": retained, "live_catalog_bytes": live_catalog_bytes,
+        "realm_id": realm_id, "realm_root": realm_root, "data_root": data_root,
+    }
+
+
+def _validate_restore_snapshot(paths: RuntimePaths, selection: RestoreSelection,
+                               snapshot: Mapping[str, Any]) -> None:
+    current = _restore_selection_snapshot(paths, selection)
+    for key in ("journal_bytes", "selection_bytes", "backup_catalog_bytes", "live_catalog_bytes",
+                "realm_id", "realm_root"):
+        if current.get(key) != snapshot.get(key):
+            raise BootstrapError("Restore metadata changed during Runtime interruption; refusing recovery.")
+    _inspect_restore_realm(current)
+
+
+def _selected_restore_snapshot(paths: RuntimePaths, selection: RestoreSelection) -> dict[str, Any]:
+    snapshot = _restore_selection_snapshot(paths, selection)
+    if Path(snapshot["data_root"]) != paths.app_support:
+        raise BootstrapError("Restore selection does not belong to this Runtime data root.")
+    _inspect_restore_realm(snapshot)
+    return snapshot
+
+
+def _require_restore_publications_absent(paths: RuntimePaths) -> None:
+    if (_read_support_json(paths.discovery_path) is not None
+            or _read_support_json(paths.instance_lock_path) is not None):
+        raise BootstrapError("Restore recovery refuses while Runtime owner publications are present.")
+
+
+def _inspect_restore_realm(snapshot: Mapping[str, Any]) -> None:
+    from runtime_protocol.upgrade import inspect_canonical_schema
+
+    try:
+        inspect_canonical_schema(
+            Path(snapshot["realm_root"]), expected_realm_id=str(snapshot["realm_id"]),
+        )
+    except Exception as exc:
+        raise BootstrapError("Restore selection does not match the readable Runtime realm identity.") from exc
+
+
 def _interrupt_owner_locked(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
+    restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
     """Identity-stop the owner while the caller holds the launcher mutex."""
     _validate_support_paths(paths)
+    if restore_selection is not None:
+        snapshot = _selected_restore_snapshot(paths, restore_selection)
+        _require_restore_publications_absent(paths)
+
+        def validate_restore() -> None:
+            _validate_restore_snapshot(paths, restore_selection, snapshot)
+            _require_restore_publications_absent(paths)
+
+        # The pending selection identifies a readable realm, but gives no
+        # authority to bypass the ordinary final lifecycle fence.
+        result = _fenced_stop_and_manager(
+            paths, boundary, realm_id=str(snapshot["realm_id"]),
+            realm_root=Path(snapshot["realm_root"]), discovery=None, marker=None,
+            owner=None, stop_manager=stop_manager, validate_stop=validate_restore,
+        )
+        # The same launcher mutex still serializes publication. Revalidate
+        # every source and the no-owner state before atomically repairing K2's
+        # catalog with Runtime's existing writer.
+        validate_restore()
+        if snapshot["live_catalog_bytes"] is None:
+            atomic_write_json(paths.catalog_path, snapshot["catalog"])
+        return {"status": "stopped", "realm_id": snapshot["realm_id"],
+                "idle": result["interruption"],
+                "catalog_restored": snapshot["live_catalog_bytes"] is None}
+
     discovery = _read_support_json(paths.discovery_path)
     if not discovery:
         raise BootstrapError("No runtime owner is available to interrupt.")
@@ -1362,16 +1567,32 @@ def _interrupt_owner_locked(
 
 def _interrupt_owner(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
+    restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
     """Serialize owner validation, fencing, signal, and cleanup."""
-    _preflight_owner_interruption(paths)
+    _preflight_owner_interruption(paths, restore_selection=restore_selection)
     with _bootstrap_mutex(paths):
-        return _interrupt_owner_locked(paths, boundary, stop_manager=stop_manager)
+        return _interrupt_owner_locked(paths, boundary, stop_manager=stop_manager,
+                                       restore_selection=restore_selection)
 
 
-def _preflight_owner_interruption(paths: RuntimePaths) -> None:
+def _preflight_owner_interruption(
+    paths: RuntimePaths, *, restore_selection: RestoreSelection | None = None,
+) -> None:
     """Refuse known busy state before acquiring/creating launcher sidecars."""
     _validate_support_paths(paths)
+    if restore_selection is not None:
+        snapshot = _selected_restore_snapshot(paths, restore_selection)
+        _require_restore_publications_absent(paths)
+        report = inspect_interruption_state(Path(snapshot["realm_root"]))
+        if not report.get("safe", False):
+            refusal = BootstrapError(
+                "Runtime interruption refused while work is active or unreconciled.",
+                details=report,
+            )
+            message, details = refusal_from(refusal)
+            raise BootstrapError(message, details=details)
+        return
     if _read_support_json(paths.discovery_path) is None:
         raise BootstrapError("No runtime owner is available to interrupt.")
     preflight_stop(paths)
@@ -1379,11 +1600,15 @@ def _preflight_owner_interruption(paths: RuntimePaths) -> None:
 
 def down(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
+    restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
     """Stop the selected owner only when all durable work is reconciled."""
     if stop_manager is not None and not callable(stop_manager):
         raise TypeError("stop_manager must be a zero-argument callback")
-    return _interrupt_owner(paths, boundary, stop_manager=stop_manager)
+    if restore_selection is not None and not isinstance(restore_selection, RestoreSelection):
+        raise TypeError("restore_selection must be a RestoreSelection")
+    return _interrupt_owner(paths, boundary, stop_manager=stop_manager,
+                            restore_selection=restore_selection)
 
 
 def _selected_stop_realm(paths: RuntimePaths) -> tuple[dict[str, Any], Path]:
@@ -1400,10 +1625,19 @@ def _raise_conflict(exc: ConflictError) -> BootstrapError:
     return BootstrapError(message, details=details)
 
 
-def preflight_stop(paths: RuntimePaths) -> dict[str, Any]:
+def preflight_stop(
+    paths: RuntimePaths, *, restore_selection: RestoreSelection | None = None,
+) -> dict[str, Any]:
     """Read-only selected-realm interruption check for installer callers."""
     _validate_support_paths(paths)
-    _realm, realm_root = _selected_stop_realm(paths)
+    if restore_selection is not None and not isinstance(restore_selection, RestoreSelection):
+        raise TypeError("restore_selection must be a RestoreSelection")
+    if restore_selection is not None:
+        snapshot = _selected_restore_snapshot(paths, restore_selection)
+        _require_restore_publications_absent(paths)
+        realm_root = Path(snapshot["realm_root"])
+    else:
+        _realm, realm_root = _selected_stop_realm(paths)
     try:
         report = inspect_interruption_state(realm_root)
         if not report.get("safe", False):
