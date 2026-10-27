@@ -37,7 +37,7 @@ def _document(**fields):
 
 def _supervisor(tmp_path, specs=None, **kwargs):
     support = tmp_path / "support"
-    support.mkdir(exist_ok=True)
+    platform.private_directory(support)
     config = ServiceConfiguration(tuple(specs or parse_services(_document())), sys.executable, tmp_path)
     return ServiceSupervisor(config, support_root=support, realm_root=tmp_path / "realm",
         realm_id="realm", runtime_endpoint="http://127.0.0.1:1234", log_directory=tmp_path / "logs", **kwargs)

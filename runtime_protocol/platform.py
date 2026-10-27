@@ -949,6 +949,10 @@ def stop_tree(process, grace=5.0, *, stop_channel=False):
             # Hidden services have no console. EOF is their cooperative stop
             # request; allow handlers to finish before forced Job cleanup.
             time.sleep(max(0.0, deadline - time.monotonic()))
+            try:
+                process.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                pass
 
         # The leader may already have exited while descendants remain in the
         # Job. Always terminate the retained Job and wait for its accounting
