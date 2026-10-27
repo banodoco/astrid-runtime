@@ -551,6 +551,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"restart", "down"}:
             config = _config(args, paths)
             boundary = LocalRuntimeBoundary()
+            if args.command == "down":
+                # down validates and prepares the selected owner inside its
+                # fence, including the already-stopped case.
+                _emit(down(paths, boundary), json_mode=args.json)
+                return 0
             source = config.resolve_source_profile(paths)
             catalog = _read_catalog(paths)
             realm_id = str(catalog.get("selected_realm_id") or "")
@@ -559,10 +564,7 @@ def main(argv: list[str] | None = None) -> int:
             if not realm or not discovery.get("pid"):
                 raise BootstrapError("No selected runtime owner to restart; run astrid-runtime up --profile astrid.")
             boundary.prepare_restart(source_profile=source, realm_id=realm_id, realm_root=Path(str(realm["data_root"])), support_root=paths.runtime_support, pid=int(discovery["pid"]))
-            if args.command == "restart":
-                _emit_ready(restart(paths, boundary, config), json_mode=args.json)
-            else:
-                _emit(down(paths, boundary), json_mode=args.json)
+            _emit_ready(restart(paths, boundary, config), json_mode=args.json)
             return 0
         if args.command == "status":
             _validate_support_paths(paths)
