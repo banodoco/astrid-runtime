@@ -81,6 +81,8 @@ class RuntimeDaemon:
         self.installer_operation_id = operation_id
         self._identity_runtime_checkout = runtime_checkout
         self._identity_agent_checkout = agent_checkout
+        from astrid_runtime.update import UpdateAdmission
+        self.update_admission = UpdateAdmission(self)
         self._startup_identity = None
         self._startup_identity_instance_id = None
         self.service = None
