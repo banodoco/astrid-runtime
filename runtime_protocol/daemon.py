@@ -671,7 +671,7 @@ class RuntimeDaemon:
                     or verification.get("evidence_digest") != receipt.get("evidence_digest")):
                 raise ConflictError("local Worker relinquish credential binding changed")
 
-    def relinquish_local_worker(self, executor_incarnation, evidence_digest, *, identity):
+    def relinquish_local_worker(self, executor_incarnation, evidence_digest, *, identity, expected_task_ids=None):
         """Fence, stop, and retire one exact local shared-actor generation.
 
         The checkpoint is intentionally kept through process and credential
@@ -680,6 +680,12 @@ class RuntimeDaemon:
         """
         if not isinstance(executor_incarnation, str) or not executor_incarnation or not isinstance(evidence_digest, str) or not evidence_digest:
             raise ProtocolError("exact local Worker generation is required")
+        if expected_task_ids is not None:
+            if (not isinstance(expected_task_ids, list) or not expected_task_ids
+                    or any(not isinstance(value, str) or not value for value in expected_task_ids)
+                    or len(set(expected_task_ids)) != len(expected_task_ids)):
+                raise ProtocolError("expected_task_ids must contain unique exact task ids")
+            expected_task_ids = sorted(expected_task_ids)
         if not self.local_worker_profiles or self.service is None:
             raise ConflictError("local Worker relinquish requires a configured Runtime owner")
         with self._worker_actor_lock:
@@ -690,6 +696,18 @@ class RuntimeDaemon:
                 checkpoint = self._local_relinquish_state()
                 metadata = self.credentials.actor_metadata(WORKER_ACTOR)
                 receipt = metadata.get("local_launch_receipt") if isinstance(metadata, dict) else None
+                same_checkpoint = checkpoint is not None and (
+                    checkpoint["receipt"].get("executor_incarnation") == executor_incarnation
+                    and checkpoint["receipt"].get("evidence_digest") == evidence_digest)
+                if same_checkpoint and checkpoint.get("expected_task_ids") != expected_task_ids:
+                    raise ConflictError("local Worker relinquish task authority changed")
+                if expected_task_ids is not None:
+                    outstanding = self.service.store._owned_cancellation_rows(WORKER_ACTOR)
+                    additional = outstanding - set(expected_task_ids)
+                    if additional:
+                        raise ConflictError("local Worker has unlisted outstanding tasks", details={"required_task_ids": sorted(additional)})
+                    if not same_checkpoint and not outstanding.intersection(expected_task_ids):
+                        raise ConflictError("no named outstanding task belongs to this local Worker")
                 if checkpoint is not None and checkpoint["state"] != "complete":
                     saved = checkpoint["receipt"]
                     if (saved.get("executor_incarnation") != executor_incarnation
@@ -726,6 +744,8 @@ class RuntimeDaemon:
                         for path in self.credentials._paths(WORKER_ACTOR)
                     }
                     checkpoint = {"version": 1, "state": "fencing", "receipt": dict(receipt), "file_digests": file_digests}
+                    if expected_task_ids is not None:
+                        checkpoint["expected_task_ids"] = expected_task_ids
                     if captured is not None:
                         checkpoint["owned_cancellations"] = captured
                     self._write_local_relinquish(checkpoint)
@@ -804,6 +824,25 @@ class RuntimeDaemon:
                 self.local_worker_launcher = None
                 self._local_worker_deferred = False
             return {"state": "relinquished", "executor_incarnation": executor_incarnation}
+
+    def task_settlement(self, task_id, *, identity):
+        """Observe exact-id settlement through the same authority used by down.
+
+        A terminal task can still own unsettled attempts or resources. This
+        read-only owner control never interprets cancellation as stop proof.
+        """
+        from .lifecycle import _interruption_report
+
+        with self.service.store._mutex:
+            if self.service._require_placement_recovery_owner(identity) != "owner":
+                raise ConflictError("task settlement requires the Runtime owner")
+            value = self.service.store.get_task(task_id)
+            state = value["task"]["status"]
+            blockers = [row for row in _interruption_report(self.service.store.conn)["blockers"]
+                        if row["task_id"] == task_id]
+            return {"task_id": task_id, "state": "succeeded" if state == "completed" else state,
+                    "settled": state in {"completed", "failed", "cancelled"} and not blockers,
+                    "blockers": blockers, "task": self.service._task_resource(value)}
 
     def local_worker_generation(self, *, identity):
         """Read the exact local generation held by this owner, including a pending stop."""

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from astrid_runtime import cli
 from astrid_runtime.bootstrap import BootstrapError
 from astrid_runtime.paths import RuntimePaths
@@ -44,6 +46,46 @@ def test_parser_exposes_operator_lifecycle_without_legacy_verbs():
     upgrade = cli.parser().parse_args(["upgrade", "--profile", "astrid", "--data-root", "/tmp/astrid", "--json"])
     assert upgrade.command == "upgrade"
     assert upgrade.data_root == Path("/tmp/astrid")
+
+
+def test_tasks_clear_cli_dispatches_exact_occurrences_and_uses_result_exit_code(monkeypatch, tmp_path, capsys):
+    paths = RuntimePaths.sandbox(tmp_path)
+    result = {"ok": False, "outcomes": [
+        {"task_id": "named", "outcome": "settled", "repeated": False},
+        {"task_id": "missing", "outcome": "unknown", "repeated": False},
+    ]}
+    observed = {}
+
+    def clear_tasks(got_paths, task_ids, **kwargs):
+        observed["paths"] = got_paths
+        observed["task_ids"] = task_ids
+        observed["kwargs"] = kwargs
+        return result
+
+    from astrid_runtime import task_clear
+    monkeypatch.setattr(task_clear, "clear_tasks", clear_tasks)
+    monkeypatch.setattr(cli, "_paths", lambda _args: paths)
+    assert cli.main(["tasks", "clear", "named", "missing", "--json"]) == 1
+    assert observed["paths"] is paths
+    assert observed["task_ids"] == ["named", "missing"]
+    output = json.loads(capsys.readouterr().out)
+    assert output == result
+
+
+def test_tasks_clear_parser_help_mentions_exact_named_ids(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.parser().parse_args(["tasks", "clear", "--help"])
+    assert exc.value.code == 0
+    assert "exact task ids" in capsys.readouterr().out
+
+
+def test_tasks_clear_paths_failure_still_reports_every_input_occurrence(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_paths", lambda _args: (_ for _ in ()).throw(ValueError("bad support root")))
+    assert cli.main(["tasks", "clear", "one", "one", "--json"]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert [row["task_id"] for row in result["outcomes"]] == ["one", "one"]
+    assert [row["outcome"] for row in result["outcomes"]] == ["failed", "failed"]
+    assert result["outcomes"][1]["repeated"] is True
 
 
 def test_checkpoint_requires_and_forwards_exact_epoch_nonce_and_state(monkeypatch, tmp_path, capsys):

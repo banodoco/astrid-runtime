@@ -267,6 +267,22 @@ def test_generated_owner_local_worker_restart():
     assert client.start_local_worker("astrid", "realm-1") == expected
 
 
+def test_generated_owner_task_settlement_and_named_relinquish():
+    expected = {"task_id": "task/with space", "state": "cancelled", "settled": True, "blockers": []}
+    def transport(method, path, headers, body):
+        if method == "GET":
+            assert path == "/v1/control/tasks/task%2Fwith%20space/settlement"
+            return 200, {}, json.dumps(expected).encode()
+        assert (method, path) == ("POST", "/v1/control/local-worker/relinquish")
+        assert json.loads(body) == {"executor_incarnation": "inc-1", "evidence_digest": "sha256:" + "a" * 64,
+                                    "expected_task_ids": ["task/with space", "other"]}
+        return 200, {}, b'{"state":"relinquished","executor_incarnation":"inc-1"}'
+    client = WorkspaceClient("http://runtime", "owner-token", transport=transport)
+    assert client.get_task_settlement("task/with space") == expected
+    assert client.relinquish_local_worker("inc-1", "sha256:" + "a" * 64,
+                                         expected_task_ids=["task/with space", "other"])["state"] == "relinquished"
+
+
 def test_generation_intent_round_trips_through_admission_claim_and_terminal_readback(tmp_path: Path) -> None:
     realm = tmp_path / "realm"
     RealmStore.initialize(realm).close()
