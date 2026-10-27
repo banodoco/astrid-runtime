@@ -22,13 +22,13 @@ from astrid_runtime.bootstrap import (
     CompatibilityError,
     DuplicateOwnerError,
     LegacyRootCollisionError,
+    RestoreSelection,
     SourceProfile,
     _rollback_failed_bootstrap,
     bootstrap,
     connect,
     down,
     doctor,
-    installer_stop,
     preflight_stop,
     restart,
 )
@@ -87,7 +87,6 @@ class FakeBoundary:
         self.next_pid += 1
         self.alive.add(pid)
         self.live_instance_id = f"instance-{pid}"
-        self.installer_operation_id = os.environ.get("ASTRID_INSTALLER_OPERATION_ID")
         return {
             "endpoint": "http://127.0.0.1:43100",
             "pid": pid,
@@ -96,8 +95,6 @@ class FakeBoundary:
             "protocol_version": "workspace.v1",
             "schema_version": "workspace-schema-v1",
             "capability_digest": "caps-v1",
-            **({"installer_operation_id": self.installer_operation_id}
-               if self.installer_operation_id is not None else {}),
         }
 
     def create(self, **kwargs):
@@ -139,8 +136,6 @@ class FakeBoundary:
             "runtime_instance_id": f"instance-{pid}",
             "realm_id": str(self.starts[-1]["realm_id"]),
             "status": "ok",
-            **({"installer_operation_id": self.installer_operation_id}
-               if getattr(self, "installer_operation_id", None) is not None else {}),
         }
 
     def is_pid_alive(self, pid):
@@ -341,6 +336,42 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(json.loads(source_manifest.read_text()), PROFILE.as_dict())
         self.assertEqual(stat.S_IMODE(source_manifest.stat().st_mode), 0o600)
 
+    def _restore_selection_fixture(self, *, realm_id="restore-realm", missing_catalog=True):
+        realm_root = self._configure(realm_id=realm_id)
+        retained_catalog = self.paths.catalog_path.read_bytes()
+        self.paths.discovery_path.unlink(missing_ok=True)
+        self.paths.instance_lock_path.unlink(missing_ok=True)
+        install_root = Path(self.temp.name) / "install"
+        backup_root = install_root / "backups" / "backup-1"
+        backup_catalog = backup_root / "support" / "runtime" / "catalog.json"
+        backup_catalog.parent.mkdir(parents=True, exist_ok=True)
+        journal_path = install_root / "update-transaction.json"
+        selection_path = Path(self.temp.name) / "astrid-install.json"
+        for stale in (journal_path, selection_path, backup_catalog):
+            if os.path.lexists(str(stale)):
+                stale.unlink()
+        backup_catalog.write_bytes(retained_catalog)
+        journal_path.write_text(json.dumps({
+            "format": "astrid-install-update/v1", "step": "recovering",
+            "operation_id": "a" * 32, "transaction_kind": "migration",
+            "data_root": str(self.paths.app_support),
+            "realm": {"realm_id": realm_id, "realm_root": str(realm_root)},
+            "backup": {"kind": "runtime", "root": str(backup_root)},
+        }))
+        selection_path.write_text(json.dumps({
+            "owner": "haus.astrid.runtime", "program_root": str(install_root),
+            "data_root": str(self.paths.app_support), "realm_id": realm_id,
+            "realm_root": str(realm_root),
+        }))
+        if missing_catalog:
+            self.paths.catalog_path.unlink()
+        return {
+            "selection": RestoreSelection(journal_path=journal_path, selection_path=selection_path),
+            "journal_path": journal_path, "selection_path": selection_path,
+            "backup_catalog": backup_catalog, "backup_root": backup_root,
+            "realm_root": realm_root, "retained_catalog": retained_catalog,
+        }
+
     def test_second_launch_reconnects_same_owner_and_actor(self):
         self._configure()
         first = bootstrap(self.paths, self.boundary, self.config)
@@ -380,7 +411,9 @@ class BootstrapTests(unittest.TestCase):
         result = restart(self.paths, self.boundary, self.config)
         self.assertEqual(result.status, "restarted")
         self.assertEqual(result.realm_id, first.realm_id)
-        self.assertEqual(self.boundary.restart_calls, 1)
+        # The recorded publication is provably dead, so restart cleans it and
+        # starts the selected realm without sending a redundant stop request.
+        self.assertEqual(self.boundary.restart_calls, 0)
 
     def test_restart_stops_once_under_fence_before_relaunch(self):
         root = self._configure()
@@ -477,9 +510,281 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(shared_stop.call_count, 2)
 
             bootstrap(self.paths, self.boundary, self.config)
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+            down(self.paths, self.boundary, stop_manager=lambda: None)
             self.assertEqual(shared_stop.call_count, 3)
         self.assertEqual(self.boundary.restart_calls, 3)
+
+    def test_restore_selection_repairs_missing_catalog_after_fenced_manager(self):
+        fixture = self._restore_selection_fixture(realm_id="restore-realm")
+        retained_catalog = fixture["retained_catalog"]
+        selection = fixture["selection"]
+        self.assertTrue(preflight_stop(self.paths, restore_selection=selection)["safe"])
+        self.assertFalse(self.paths.catalog_path.exists())
+        order = []
+
+        def manager_callback(catalog_expected):
+            order.append(("manager", self.paths.catalog_path.exists()))
+            lock_probe = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; from runtime_protocol.platform import file_lock; "
+                 "p=sys.argv[1]; "
+                 "\ntry: file_lock(p, blocking=False).__enter__()"
+                 "\nexcept BlockingIOError: raise SystemExit(7)"
+                 "\nraise SystemExit(0)", str(self.paths.bootstrap_lock_path)],
+                check=False,
+            )
+            self.assertEqual(lock_probe.returncode, 7)
+            connection = sqlite3.connect(fixture["realm_root"] / "realm.sqlite3", timeout=0.02)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("BEGIN IMMEDIATE")
+            finally:
+                connection.close()
+
+        result = down(
+            self.paths, self.boundary, restore_selection=selection,
+            stop_manager=lambda: manager_callback(False),
+        )
+
+        self.assertEqual(order, [("manager", False)])
+        self.assertTrue(result["catalog_restored"])
+        self.assertEqual(json.loads(self.paths.catalog_path.read_text()), json.loads(retained_catalog))
+
+        # A valid live catalog may carry metadata written during the pending
+        # update. C1 confirms its selected realm and leaves that metadata intact.
+        live_catalog = json.loads(self.paths.catalog_path.read_text())
+        live_catalog["realms"][0]["display_name"] = "Current selection metadata"
+        self.paths.catalog_path.write_text(json.dumps(live_catalog))
+        second = down(self.paths, self.boundary, restore_selection=selection,
+                      stop_manager=lambda: manager_callback(True))
+        self.assertFalse(second["catalog_restored"])
+        self.assertEqual(json.loads(self.paths.catalog_path.read_text())["realms"][0]["display_name"],
+                         "Current selection metadata")
+        self.assertEqual(order, [("manager", False), ("manager", True)])
+
+    def test_normal_down_still_refuses_missing_catalog(self):
+        self._configure()
+        self.paths.discovery_path.unlink(missing_ok=True)
+        self.paths.instance_lock_path.unlink(missing_ok=True)
+        self.paths.catalog_path.unlink()
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary)
+
+    def test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes(self):
+        for index, mutation in enumerate((
+            "journal", "selection", "wrong_data_root", "wrong_realm_root",
+            "retained_catalog", "live_catalog", "bad_live_catalog", "live_catalog_link",
+            "bad_backup_catalog", "missing_realm",
+            "foreign_realm", "selection_link", "journal_link", "backup_catalog_link",
+            "realm_root_link",
+        )):
+            with self.subTest(mutation=mutation):
+                fixture = self._restore_selection_fixture(
+                    realm_id=f"restore-realm-{index}",
+                    missing_catalog=mutation not in {"live_catalog", "bad_live_catalog", "live_catalog_link"},
+                )
+                selection = fixture["selection"]
+                if mutation == "journal":
+                    fixture["journal_path"].write_text("{")
+                elif mutation == "selection":
+                    fixture["selection_path"].write_text("not-json")
+                elif mutation == "wrong_data_root":
+                    value = json.loads(fixture["selection_path"].read_text())
+                    value["data_root"] = str(Path(self.temp.name) / "other-data")
+                    fixture["selection_path"].write_text(json.dumps(value))
+                elif mutation == "wrong_realm_root":
+                    value = json.loads(fixture["selection_path"].read_text())
+                    value["realm_root"] = str(fixture["realm_root"].parent)
+                    fixture["selection_path"].write_text(json.dumps(value))
+                elif mutation == "retained_catalog":
+                    value = json.loads(fixture["backup_catalog"].read_text())
+                    value["selected_realm_id"] = "foreign-realm"
+                    fixture["backup_catalog"].write_text(json.dumps(value))
+                elif mutation == "live_catalog":
+                    value = json.loads(self.paths.catalog_path.read_text())
+                    value["selected_realm_id"] = "foreign-realm"
+                    self.paths.catalog_path.write_text(json.dumps(value))
+                elif mutation == "bad_backup_catalog":
+                    fixture["backup_catalog"].write_text("not-json")
+                elif mutation == "bad_live_catalog":
+                    self.paths.catalog_path.write_text("not-json")
+                elif mutation == "live_catalog_link":
+                    self.paths.catalog_path.unlink()
+                    self.paths.catalog_path.symlink_to(fixture["backup_catalog"])
+                elif mutation == "missing_realm":
+                    import shutil
+                    shutil.rmtree(fixture["realm_root"])
+                elif mutation == "foreign_realm":
+                    value = json.loads(fixture["selection_path"].read_text())
+                    value["realm_id"] = "foreign-realm"
+                    fixture["selection_path"].write_text(json.dumps(value))
+                    value = json.loads(fixture["journal_path"].read_text())
+                    value["realm"]["realm_id"] = "foreign-realm"
+                    fixture["journal_path"].write_text(json.dumps(value))
+                    value = json.loads(fixture["backup_catalog"].read_text())
+                    value["selected_realm_id"] = "foreign-realm"
+                    value["realms"][0]["realm_id"] = "foreign-realm"
+                    fixture["backup_catalog"].write_text(json.dumps(value))
+                elif mutation == "selection_link":
+                    fixture["selection_path"].unlink()
+                    fixture["selection_path"].symlink_to(fixture["journal_path"])
+                elif mutation == "journal_link":
+                    fixture["journal_path"].unlink()
+                    fixture["journal_path"].symlink_to(fixture["backup_catalog"])
+                elif mutation == "backup_catalog_link":
+                    fixture["backup_catalog"].unlink()
+                    fixture["backup_catalog"].symlink_to(fixture["journal_path"])
+                elif mutation == "realm_root_link":
+                    link = Path(self.temp.name) / "realm-root-link"
+                    link.symlink_to(fixture["realm_root"], target_is_directory=True)
+                    value = json.loads(fixture["selection_path"].read_text())
+                    value["realm_root"] = str(link)
+                    fixture["selection_path"].write_text(json.dumps(value))
+
+                watched = (fixture["journal_path"], fixture["selection_path"],
+                           fixture["backup_catalog"], self.paths.catalog_path)
+                before = {path: path.read_bytes() for path in watched
+                          if path.exists() and not path.is_symlink()}
+                manager_calls = []
+                if mutation == "missing_realm":
+                    result = down(self.paths, self.boundary, restore_selection=selection,
+                                  stop_manager=lambda: manager_calls.append(True))
+                    self.assertEqual(manager_calls, [True])
+                    self.assertTrue(result["catalog_restored"])
+                    self.assertTrue(self.paths.catalog_path.is_file())
+                    self.assertEqual(before[fixture["journal_path"]],
+                                     fixture["journal_path"].read_bytes())
+                    self.assertEqual(before[fixture["selection_path"]],
+                                     fixture["selection_path"].read_bytes())
+                    continue
+                with self.assertRaises(BootstrapError):
+                    down(self.paths, self.boundary, restore_selection=selection,
+                         stop_manager=lambda: manager_calls.append(True))
+                self.assertEqual(manager_calls, [])
+                self.assertEqual(before, {path: path.read_bytes() for path in watched
+                                          if path.exists() and not path.is_symlink()})
+                if self.paths.catalog_path.is_symlink():
+                    self.paths.catalog_path.unlink()
+
+    def test_restore_selection_refuses_any_publication_and_fence_race(self):
+        for index, publication in enumerate(("discovery", "instance_lock")):
+            with self.subTest(publication=publication):
+                fixture = self._restore_selection_fixture(realm_id=f"restore-pub-{index}")
+                path = getattr(self.paths, "discovery_path" if publication == "discovery"
+                               else "instance_lock_path")
+                path.write_text(json.dumps({"pid": 99999999, "runtime_instance_id": "unknown"}))
+                before = (fixture["journal_path"].read_bytes(), fixture["backup_catalog"].read_bytes())
+                manager_calls = []
+                with self.assertRaisesRegex(BootstrapError, "publications are present"):
+                    down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                         stop_manager=lambda: manager_calls.append(True))
+                self.assertEqual(manager_calls, [])
+                self.assertFalse(self.paths.catalog_path.exists())
+                self.assertEqual(before, (fixture["journal_path"].read_bytes(),
+                                          fixture["backup_catalog"].read_bytes()))
+
+        fixture = self._restore_selection_fixture(realm_id="restore-fence-race")
+        manager_calls = []
+
+        @contextmanager
+        def refusing_fence(_realm_root):
+            raise BootstrapError("busy at final fence")
+            yield  # pragma: no cover
+
+        with patch("astrid_runtime.bootstrap.interruption_fence", refusing_fence):
+            with self.assertRaisesRegex(BootstrapError, "busy at final fence"):
+                down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                     stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(manager_calls, [])
+        self.assertFalse(self.paths.catalog_path.exists())
+
+        fixture = self._restore_selection_fixture(realm_id="restore-publication-race")
+        real_fence = bootstrap_module.interruption_fence
+
+        @contextmanager
+        def publishing_fence(realm_root):
+            with real_fence(realm_root) as report:
+                self.paths.discovery_path.write_text(json.dumps({"pid": 123456789}))
+                yield report
+
+        manager_calls = []
+        with patch("astrid_runtime.bootstrap.interruption_fence", publishing_fence):
+            with self.assertRaisesRegex(BootstrapError, "discovery changed before stop"):
+                down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                     stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(manager_calls, [])
+        self.assertFalse(self.paths.catalog_path.exists())
+        self.paths.discovery_path.unlink()
+
+        fixture = self._restore_selection_fixture(realm_id="restore-pre-manager-race")
+        original_shared_stop = bootstrap_module._fenced_stop_and_manager
+
+        def publishing_before_manager(*args, **kwargs):
+            validate = kwargs["validate_stop"]
+
+            def changed_validate():
+                self.paths.instance_lock_path.write_text(json.dumps({"pid": 123456789}))
+                validate()
+
+            kwargs["validate_stop"] = changed_validate
+            return original_shared_stop(*args, **kwargs)
+
+        manager_calls = []
+        with patch("astrid_runtime.bootstrap._fenced_stop_and_manager", publishing_before_manager):
+            with self.assertRaisesRegex(BootstrapError, "publications are present"):
+                down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                     stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(manager_calls, [])
+        self.assertFalse(self.paths.catalog_path.exists())
+        self.paths.instance_lock_path.unlink()
+
+    def test_restore_selection_busy_preflight_refuses_before_manager(self):
+        fixture = self._restore_selection_fixture(realm_id="restore-busy")
+        before = (fixture["journal_path"].read_bytes(), fixture["backup_catalog"].read_bytes())
+        manager_calls = []
+        with patch("astrid_runtime.bootstrap.inspect_interruption_state",
+                   return_value={"safe": False, "running_tasks": [{"task_id": "busy"}]}):
+            with self.assertRaisesRegex(BootstrapError, "work is active"):
+                down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                     stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(manager_calls, [])
+        self.assertFalse(self.paths.catalog_path.exists())
+        self.assertEqual(before, (fixture["journal_path"].read_bytes(),
+                                  fixture["backup_catalog"].read_bytes()))
+
+    def test_restore_catalog_publication_failure_replays_from_retained_snapshot(self):
+        fixture = self._restore_selection_fixture(realm_id="restore-write-replay")
+        manager_calls = []
+        journal_before = fixture["journal_path"].read_bytes()
+        backup_before = fixture["backup_catalog"].read_bytes()
+        write_attempts = 0
+        real_write = bootstrap_module.atomic_write_json
+
+        def fail_first_two_writes(*args, **kwargs):
+            nonlocal write_attempts
+            write_attempts += 1
+            if write_attempts <= 2:
+                raise OSError(f"simulated interruption {write_attempts}")
+            return real_write(*args, **kwargs)
+
+        with patch("astrid_runtime.bootstrap.atomic_write_json", side_effect=fail_first_two_writes):
+            for attempt in (1, 2):
+                with self.assertRaisesRegex(OSError, f"simulated interruption {attempt}"):
+                    down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                         stop_manager=lambda: manager_calls.append(f"attempt-{attempt}"))
+                self.assertFalse(self.paths.catalog_path.exists())
+                self.assertEqual(fixture["journal_path"].read_bytes(), journal_before)
+                self.assertEqual(fixture["backup_catalog"].read_bytes(), backup_before)
+
+            result = down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                          stop_manager=lambda: manager_calls.append("attempt-3"))
+
+        self.assertEqual(write_attempts, 3)
+        self.assertTrue(result["catalog_restored"])
+        self.assertEqual(manager_calls, ["attempt-1", "attempt-2", "attempt-3"])
+        self.assertEqual(fixture["journal_path"].read_bytes(), journal_before)
+        self.assertEqual(fixture["backup_catalog"].read_bytes(), backup_before)
+        self.assertEqual(json.loads(self.paths.catalog_path.read_text()), json.loads(backup_before))
 
     def test_restart_and_down_share_unreconciled_attempt_refusal(self):
         root = self._configure()
@@ -665,7 +970,7 @@ class BootstrapTests(unittest.TestCase):
                 connection.close()
 
         self.boundary.stop_owner = stop_owner
-        result = installer_stop(self.paths, self.boundary, stop_manager=stop_manager)
+        result = down(self.paths, self.boundary, stop_manager=stop_manager)
         self.assertEqual(order, ["runtime", "manager"])
         self.assertEqual(result["status"], "stopped")
         self.assertFalse(self.paths.discovery_path.exists())
@@ -694,939 +999,507 @@ class BootstrapTests(unittest.TestCase):
             return result
 
         self.boundary.stop_owner = replace_owner
-        with self.assertRaisesRegex(BootstrapError, "changed before manager stop"):
-            installer_stop(
+        with self.assertRaisesRegex(BootstrapError, "changed before manager stop") as caught:
+            down(
                 self.paths,
                 self.boundary,
                 stop_manager=lambda: manager_calls.append("manager"),
             )
         self.assertEqual(manager_calls, [])
+        self.assertEqual(caught.exception.details, {"stop_authority_lost": True})
         self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
         self.assertEqual(
             json.loads(self.paths.instance_lock_path.read_text()),
             {**replacement, "realm_id": "configured-realm"},
         )
 
-    def test_installer_stop_records_authority_before_stopping_owner(self):
-        self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        original_stop = self.boundary.stop_owner
-
-        def stop_owner(**kwargs):
-            self.assertEqual(len(authority), 1)
-            self.assertEqual(authority[0]["pid"], kwargs["pid"])
-            self.assertEqual(authority[0]["process_birth_id"], kwargs["process_birth_id"])
-            return original_stop(**kwargs)
-
-        self.boundary.stop_owner = stop_owner
-        result = installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            record_stop_authority=authority.append,
-        )
-        self.assertEqual(result["status"], "stopped")
-        self.assertEqual(authority[0]["support_root"], str(self.paths.runtime_support.resolve()))
-        self.assertEqual(authority[0]["realm_id"], "configured-realm")
-
-    def test_installer_stop_does_not_persist_stale_publication_authority(self):
+    def test_recovery_retained_stale_lock_only_rechecks_pid_at_final_fence(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
         discovery = json.loads(self.paths.discovery_path.read_text())
-        self.boundary.alive.discard(int(discovery["pid"]))
-        self.boundary.process_birth_identity = lambda _pid: None
-        authority = []
-        result = installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            record_stop_authority=authority.append,
-        )
-        self.assertEqual(result["status"], "stopped")
-        # A stale publication is not promoted into durable transaction
-        # authority. Recovery must already retain the exact stopped identity.
-        self.assertEqual(authority, [])
+        pid = int(discovery["pid"])
+        self.boundary.alive.discard(pid)
+        state = {"fenced": False, "observations": 0, "events": []}
 
-    def test_installer_stop_recovery_requires_positive_old_owner_absence(self):
-        root = self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            record_stop_authority=authority.append,
-        )
-        fresh = FakeBoundary()
-        fresh.process_birth_identity = lambda _pid: None
-        calls = []
-        result = installer_stop(
-            self.paths, fresh, stop_manager=lambda: calls.append("manager"),
-            recovery_owner=authority[0],
-            recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-            allow_restore_in_progress=True,
-        )
-        self.assertEqual(result["status"], "stopped")
-        self.assertEqual(calls, ["manager"])
-        self.assertEqual(fresh.restart_calls, 0)
+        def is_pid_alive(observed_pid):
+            self.assertEqual(observed_pid, pid)
+            state["events"].append(("liveness", state["fenced"]))
+            return False
 
-    def test_installer_stop_recovery_rechecks_absence_under_final_fence(self):
-        root = self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            record_stop_authority=authority.append,
-        )
-        fresh = FakeBoundary()
-        observations = iter((None, "replacement-birth"))
-        fresh.process_birth_identity = lambda _pid: next(observations)
-        with self.assertRaisesRegex(BootstrapError, "process is still present"):
-            installer_stop(
-                self.paths, fresh, stop_manager=lambda: self.fail("manager must not run"),
-                recovery_owner=authority[0],
-                recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-                allow_restore_in_progress=True,
-            )
-        self.assertEqual(fresh.restart_calls, 0)
+        def birth_identity(observed_pid):
+            self.assertEqual(observed_pid, pid)
+            state["observations"] += 1
+            state["events"].append(("birth", state["fenced"]))
+            return "replacement-birth" if state["fenced"] else None
 
-    def test_installer_stop_recovery_rechecks_publications_after_absence(self):
-        root = self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            record_stop_authority=authority.append,
-        )
-        fresh = FakeBoundary()
-        observations = 0
+        self.boundary.is_pid_alive = is_pid_alive
+        self.boundary.process_birth_identity = birth_identity
+        real_fence = bootstrap_module.interruption_fence
 
-        def publish_on_final_observation(pid):
-            nonlocal observations
-            observations += 1
-            if observations == 2:
-                self.paths.discovery_path.write_text(json.dumps({
-                    "pid": 49999, "process_birth_id": "replacement-birth",
-                    "runtime_instance_id": "replacement-instance", "endpoint": "http://127.0.0.1:43100",
-                    "active_realm": "configured-realm", "realm_root": str(root.resolve()),
-                }))
-            return None
+        @contextmanager
+        def reused_during_fence(realm_root):
+            with real_fence(realm_root) as report:
+                state["fenced"] = True
+                yield report
 
-        fresh.process_birth_identity = publish_on_final_observation
-        with self.assertRaisesRegex(BootstrapError, "publications changed"):
-            installer_stop(
-                self.paths, fresh, stop_manager=lambda: self.fail("manager must not run"),
-                recovery_owner=authority[0],
-                recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-                allow_restore_in_progress=True,
-            )
-        self.assertEqual(observations, 2)
-        self.assertEqual(fresh.restart_calls, 0)
+        manager_calls = []
+        with patch("astrid_runtime.bootstrap.interruption_fence", reused_during_fence):
+            with self.assertRaisesRegex(BootstrapError, "identity changed at the final fence"):
+                down(self.paths, self.boundary,
+                     stop_manager=lambda: manager_calls.append("manager"))
 
-    def test_recovery_accepts_exact_retained_stale_publications_with_absence_proof(self):
-        root = self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       record_stop_authority=authority.append)
-        evidence = json.loads(json.dumps(authority[0]))
-        publication = {
-            "pid": evidence["pid"], "process_birth_id": evidence["process_birth_id"],
-            "runtime_instance_id": evidence["runtime_instance_id"],
-            "endpoint": evidence["endpoint"], "active_realm": evidence["realm_id"],
-            "realm_root": evidence["realm_root"],
-        }
-        for mode in ("discovery-and-lock", "discovery-only", "lock-only"):
-            self.paths.discovery_path.unlink(missing_ok=True)
-            self.paths.instance_lock_path.unlink(missing_ok=True)
-            if mode != "lock-only":
-                self.paths.discovery_path.write_text(json.dumps(publication))
-            if mode != "discovery-only":
-                self.paths.instance_lock_path.write_text(json.dumps({**publication, "realm_id": evidence["realm_id"]}))
-            fresh = FakeBoundary()
-            fresh.process_birth_identity = lambda _pid: None
-            calls = []
-            result = installer_stop(
-                self.paths, fresh, stop_manager=lambda: calls.append("manager"),
-                recovery_owner=evidence,
-                recovery_realm={"realm_id": evidence["realm_id"], "realm_root": str(root.resolve())},
-                record_stop_authority=lambda _value: self.fail("absence replay must retain authority"),
-            )
-            self.assertEqual(result["status"], "stopped", mode)
-            self.assertEqual(calls, ["manager"], mode)
-            self.assertFalse(self.paths.discovery_path.exists(), mode)
-            self.assertFalse(self.paths.instance_lock_path.exists(), mode)
-
-    def test_recovery_rejects_absent_replacement_with_copied_operation_tag(self):
-        root = self._configure()
-        operation_id = "c" * 32
-        with patch.dict(os.environ, {"ASTRID_INSTALLER_OPERATION_ID": operation_id}):
-            bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       record_stop_authority=authority.append)
-        replacement = {
-            "pid": 49998, "process_birth_id": "replacement-birth",
-            "runtime_instance_id": "replacement-instance", "endpoint": "http://127.0.0.1:43109",
-            "active_realm": "configured-realm", "realm_root": str(root.resolve()),
-            "installer_operation_id": operation_id,
-        }
-        self.paths.discovery_path.write_text(json.dumps(replacement))
-        self.paths.instance_lock_path.write_text(json.dumps({**replacement, "realm_id": "configured-realm"}))
-        fresh = FakeBoundary()
-        fresh.process_birth_identity = lambda _pid: None
-        with self.assertRaisesRegex(BootstrapError, "transaction-bound replacement is absent"):
-            installer_stop(
-                self.paths, fresh, stop_manager=lambda: self.fail("manager must not run"),
-                recovery_owner=authority[0],
-                recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-                recovery_operation_id=operation_id,
-                recovery_launch_identity={"release": 0, "managed_by": None},
-            )
-
-    def test_recovery_retained_stale_lock_only_rechecks_pid_at_final_fence(self):
-        root = self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       record_stop_authority=authority.append)
-        evidence = authority[0]
-        self.paths.instance_lock_path.write_text(json.dumps({
-            "pid": evidence["pid"], "process_birth_id": evidence["process_birth_id"],
-            "runtime_instance_id": evidence["runtime_instance_id"],
-            "endpoint": evidence["endpoint"], "realm_id": evidence["realm_id"],
-            "realm_root": evidence["realm_root"],
-        }))
-        self.paths.discovery_path.unlink(missing_ok=True)
-        fresh = FakeBoundary()
-        observations = iter((None, None, "reused-birth"))
-        fresh.process_birth_identity = lambda _pid: next(observations)
-        with self.assertRaisesRegex(BootstrapError, "still present"):
-            installer_stop(
-                self.paths, fresh, stop_manager=lambda: self.fail("manager must not run"),
-                recovery_owner=evidence,
-                recovery_realm={"realm_id": evidence["realm_id"], "realm_root": str(root.resolve())},
-            )
+        self.assertEqual(state["observations"], 2)
+        self.assertEqual(state["events"], [
+            ("liveness", False), ("birth", False),
+            ("liveness", True), ("birth", True),
+        ])
+        self.assertEqual(manager_calls, [])
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), discovery)
+        self.assertTrue(self.paths.instance_lock_path.exists())
 
     def test_recovery_retained_stale_owner_lookup_uncertainty_refuses(self):
-        root = self._configure()
+        self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       record_stop_authority=authority.append)
-        evidence = authority[0]
-        publication = {
-            "pid": evidence["pid"], "process_birth_id": evidence["process_birth_id"],
-            "runtime_instance_id": evidence["runtime_instance_id"], "endpoint": evidence["endpoint"],
-            "active_realm": evidence["realm_id"], "realm_root": evidence["realm_root"],
-        }
-        self.paths.discovery_path.write_text(json.dumps(publication))
-        self.paths.instance_lock_path.write_text(json.dumps({**publication, "realm_id": evidence["realm_id"]}))
-        fresh = FakeBoundary()
-        def uncertain(_pid):
-            raise OSError("identity lookup unavailable")
-        fresh.process_birth_identity = uncertain
-        before = (self.paths.discovery_path.read_bytes(), self.paths.instance_lock_path.read_bytes())
+        discovery_before = self.paths.discovery_path.read_bytes()
+        marker_before = self.paths.instance_lock_path.read_bytes()
+        pid = json.loads(discovery_before)["pid"]
+        self.boundary.alive.discard(int(pid))
+
+        def uncertain(observed_pid):
+            self.assertEqual(observed_pid, pid)
+            raise OSError("process identity observation denied")
+
+        self.boundary.process_birth_identity = uncertain
+        manager_calls = []
         with self.assertRaisesRegex(BootstrapError, "absence could not be established"):
-            installer_stop(
-                self.paths, fresh, stop_manager=lambda: self.fail("manager must not run"),
-                recovery_owner=evidence,
-                recovery_realm={"realm_id": evidence["realm_id"], "realm_root": str(root.resolve())},
-            )
-        self.assertEqual(before, (self.paths.discovery_path.read_bytes(), self.paths.instance_lock_path.read_bytes()))
+            down(self.paths, self.boundary,
+                 stop_manager=lambda: manager_calls.append("manager"))
+        self.assertEqual(manager_calls, [])
+        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), marker_before)
 
     def test_recovery_reconciles_foreground_against_admitted_live_owner(self):
-        root = self._configure()
-        operation_id = "d" * 32
-        with patch.dict(os.environ, {"ASTRID_INSTALL_OPERATION_ID": operation_id,
-                                     "ASTRID_INSTALLER_OPERATION_ID": operation_id}):
-            bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       record_stop_authority=authority.append)
-        replacement = {
-            "pid": 42090, "process_birth_id": "candidate-birth",
-            "runtime_instance_id": "candidate-instance", "endpoint": "http://127.0.0.1:43109",
-            "active_realm": "configured-realm", "realm_root": str(root.resolve()),
-            "installer_operation_id": operation_id,
-        }
-        self.paths.discovery_path.write_text(json.dumps(replacement))
-        self.paths.instance_lock_path.write_text(json.dumps({**replacement, "realm_id": "configured-realm"}))
-        fresh = FakeBoundary()
-        fresh.alive.add(42090)
-        fresh.is_pid_alive = lambda pid: pid == 42090
-        fresh.process_birth_identity = lambda pid: "candidate-birth" if pid == 42090 else None
-        fresh.endpoint_metadata = lambda **_kwargs: {
-            "runtime_instance_id": "candidate-instance", "realm_id": "configured-realm",
-            "installer_operation_id": operation_id,
-            "identity": {"release": 0, "managed_by": None},
-        }
-        fresh_stops = []
-        fresh.stop_owner = lambda **kwargs: fresh_stops.append(kwargs) or {"status": "stopped"}
-        result = installer_stop(
-            self.paths, fresh, stop_manager=lambda: None,
-            recorded_foreground={"pid": 42090, "birth_id": "candidate-birth",
-                                 "realm_id": "configured-realm", "realm_root": str(root.resolve())},
-            recovery_owner=authority[0],
-            recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-            recovery_operation_id=operation_id,
-            recovery_launch_identity={"release": 0, "managed_by": None},
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        order = []
+        result = down(
+            self.paths, self.boundary,
+            stop_foreground=lambda: self.fail("live published owner must use stop_owner"),
+            stop_manager=lambda: order.append("manager"),
         )
         self.assertEqual(result["status"], "stopped")
-        self.assertEqual(len(fresh_stops), 1)
+        self.assertEqual(order, ["manager"])
+        self.assertEqual(self.boundary.restart_calls, 1)
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
 
     def test_recovery_rechecks_retired_foreground_absence_before_stopping_candidate(self):
         root = self._configure()
-        operation_id = "e" * 32
-        with patch.dict(os.environ, {"ASTRID_INSTALLER_OPERATION_ID": operation_id}):
-            bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       record_stop_authority=authority.append)
-        old_pid = authority[0]["pid"]
-        replacement = {
-            "pid": 42091, "process_birth_id": "candidate-birth",
-            "runtime_instance_id": "candidate-instance", "endpoint": "http://127.0.0.1:43109",
-            "active_realm": "configured-realm", "realm_root": str(root.resolve()),
-            "installer_operation_id": operation_id,
-        }
-        self.paths.discovery_path.write_text(json.dumps(replacement))
-        self.paths.instance_lock_path.write_text(json.dumps({**replacement, "realm_id": "configured-realm"}))
-        fresh = FakeBoundary()
-        fresh.is_pid_alive = lambda pid: pid == 42091
-        old_observations = iter((None, "reused-birth"))
-        fresh.process_birth_identity = lambda pid: next(old_observations) if pid == old_pid else "candidate-birth"
-        fresh.endpoint_metadata = lambda **_kwargs: {
-            "runtime_instance_id": "candidate-instance", "realm_id": "configured-realm",
-            "installer_operation_id": operation_id,
-            "identity": {"release": 0, "managed_by": None},
-        }
-        fresh_stops = []
-        fresh.stop_owner = lambda **kwargs: fresh_stops.append(kwargs) or {"status": "stopped"}
-        with self.assertRaisesRegex(BootstrapError, "retired foreground identity is no longer absent"):
-            installer_stop(
-                self.paths, fresh, stop_manager=lambda: self.fail("manager must not run"),
-                recorded_foreground={"pid": old_pid, "birth_id": authority[0]["process_birth_id"],
-                                     "realm_id": "configured-realm", "realm_root": str(root.resolve())},
-                recovery_owner=authority[0],
-                recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-                recovery_operation_id=operation_id,
-                recovery_launch_identity={"release": 0, "managed_by": None},
-            )
-        self.assertEqual(fresh_stops, [])
+        order = []
+
+        def stop_foreground():
+            order.append("foreground")
+            self.assertFalse(self.paths.discovery_path.exists())
+            self.assertFalse(self.paths.instance_lock_path.exists())
+            with sqlite3.connect(root / "realm.sqlite3", timeout=0.02) as connection:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("BEGIN IMMEDIATE")
+
+        def stop_manager():
+            order.append("manager")
+            self.assertFalse(self.paths.discovery_path.exists())
+
+        result = down(self.paths, self.boundary, stop_foreground=stop_foreground,
+                      stop_manager=stop_manager)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(order, ["foreground", "manager"])
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
 
     def test_installer_stop_recovery_handles_catalog_restore_gap_with_live_realm(self):
-        root = self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            record_stop_authority=authority.append,
-        )
-        self.paths.catalog_path.unlink()
-        fresh = FakeBoundary()
-        fresh.process_birth_identity = lambda _pid: None
+        fixture = self._restore_selection_fixture(realm_id="restore-live-gap")
+        before = fixture["backup_catalog"].read_bytes()
         calls = []
-        result = installer_stop(
-            self.paths, fresh, stop_manager=lambda: calls.append("manager"),
-            recovery_owner=authority[0],
-            recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-            allow_restore_in_progress=True,
-        )
-        self.assertTrue(result["interruption"]["safe"])
+        result = down(self.paths, self.boundary,
+                      restore_selection=fixture["selection"],
+                      stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(result["status"], "stopped")
         self.assertEqual(calls, ["manager"])
+        self.assertTrue(result["catalog_restored"])
+        self.assertEqual(json.loads(self.paths.catalog_path.read_text()), json.loads(before))
+        self.assertEqual(fixture["backup_catalog"].read_bytes(), before)
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
 
     def test_installer_stop_recovery_refuses_replacement_publication(self):
         root = self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            record_stop_authority=authority.append,
-        )
-        replacement = json.loads(self.paths.discovery_path.read_text()) if self.paths.discovery_path.exists() else {
-            "pid": 49999, "process_birth_id": "replacement-birth",
-            "runtime_instance_id": "replacement-instance", "endpoint": "http://127.0.0.1:43100",
+        replacement = {
+            "pid": 49998, "endpoint": "http://127.0.0.1:49998",
+            "runtime_instance_id": "replacement-instance",
+            "process_birth_id": "replacement-birth",
             "active_realm": "configured-realm", "realm_root": str(root.resolve()),
         }
-        replacement.update(pid=49999, process_birth_id="replacement-birth", runtime_instance_id="replacement-instance")
-        self.paths.discovery_path.write_text(json.dumps(replacement))
-        fresh = FakeBoundary()
-        fresh.process_birth_identity = lambda _pid: None
-        with self.assertRaisesRegex(BootstrapError, "replacement owner publication"):
-            installer_stop(
-                self.paths, fresh, stop_manager=lambda: self.fail("manager must not run"),
-                recovery_owner=authority[0],
-                recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-                allow_restore_in_progress=True,
-            )
-        self.assertEqual(fresh.restart_calls, 0)
+        original_stop = self.boundary.stop_owner
+
+        def replace_owner(**kwargs):
+            result = original_stop(**kwargs)
+            self.paths.discovery_path.write_text(json.dumps(replacement))
+            self.paths.instance_lock_path.write_text(json.dumps({**replacement, "realm_id": "configured-realm"}))
+            return result
+
+        self.boundary.stop_owner = replace_owner
+        manager_calls = []
+        with self.assertRaisesRegex(BootstrapError, "changed before manager stop"):
+            down(self.paths, self.boundary,
+                 stop_manager=lambda: manager_calls.append("manager"))
+        self.assertEqual(manager_calls, [])
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
+        self.assertEqual(json.loads(self.paths.instance_lock_path.read_text()),
+                         {**replacement, "realm_id": "configured-realm"})
 
     def test_installer_stop_accepts_json_round_tripped_exact_authority(self):
-        root = self._configure()
+        self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        result = installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            record_stop_authority=authority.append,
-        )
+        discovery = json.loads(json.dumps(json.loads(self.paths.discovery_path.read_text())))
+        marker = json.loads(json.dumps(json.loads(self.paths.instance_lock_path.read_text())))
+        self.paths.discovery_path.write_text(json.dumps(discovery))
+        self.paths.instance_lock_path.write_text(json.dumps(marker))
+        calls = []
+        result = down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
         self.assertEqual(result["status"], "stopped")
-        serialized = json.loads(json.dumps(authority[0]))
-        # The publication can remain after stop_owner returns; exact C1 checks
-        # still have to validate the real published incarnation.
-        discovery = json.loads(self.paths.discovery_path.read_text()) if self.paths.discovery_path.exists() else None
-        if discovery is None:
-            # Recreate a live advertisement for the same retained owner.
-            discovery = {
-                "pid": serialized["pid"],
-                "process_birth_id": serialized["process_birth_id"],
-                "runtime_instance_id": serialized["runtime_instance_id"],
-                "endpoint": serialized["endpoint"],
-                "active_realm": "configured-realm", "realm_root": str(root.resolve()),
-            }
-            self.paths.discovery_path.write_text(json.dumps(discovery))
-            self.paths.instance_lock_path.write_text(json.dumps({
-                **discovery, "realm_id": "configured-realm",
-            }))
-            self.boundary.alive.add(serialized["pid"])
-        result = installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            recovery_owner=serialized,
-            recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-            allow_restore_in_progress=True,
-        )
-        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(calls, ["manager"])
+        self.assertEqual(self.boundary.restart_calls, 1)
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
 
     def test_installer_stop_accepts_only_operation_and_identity_bound_replacement(self):
-        root = self._configure()
-        operation_id = "a" * 32
-        with patch.dict(os.environ, {"ASTRID_INSTALLER_OPERATION_ID": operation_id}):
+        self._configure()
+        with patch.dict(os.environ, {"ASTRID_INSTALLER_OPERATION_ID": "c" * 32}):
             bootstrap(self.paths, self.boundary, self.config)
-        self.assertEqual(json.loads(self.paths.discovery_path.read_text())["installer_operation_id"], operation_id)
-        authority = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       record_stop_authority=authority.append)
-        replacement = {
-            "pid": 42002, "process_birth_id": "replacement-birth",
-            "runtime_instance_id": "replacement-instance",
-            "endpoint": "http://127.0.0.1:43101", "active_realm": "configured-realm",
-            "realm_root": str(root.resolve()), "installer_operation_id": operation_id,
-        }
-        self.paths.discovery_path.write_text(json.dumps(replacement))
-        self.paths.instance_lock_path.write_text(json.dumps({
-            **replacement, "realm_id": "configured-realm",
-        }))
-        fresh = FakeBoundary()
-        fresh.is_pid_alive = lambda pid: pid == 42002
-        fresh.process_birth_identity = lambda pid: "replacement-birth" if pid == 42002 else None
-        fresh.validate_owner = lambda **_kwargs: True
-        fresh.endpoint_metadata = lambda **_kwargs: {
-            "runtime_instance_id": "replacement-instance",
-            "realm_id": "configured-realm", "installer_operation_id": operation_id,
-            "identity": {"release": 0, "managed_by": None},
-        }
-        stopped = []
-        fresh.stop_owner = lambda **kwargs: stopped.append(kwargs) or {"status": "stopped"}
-        result = installer_stop(
-            self.paths, fresh, stop_manager=lambda: None,
-            recovery_owner=authority[0],
-            recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-            recovery_operation_id=operation_id,
-            recovery_launch_identity={"release": 0, "managed_by": None},
-            allow_restore_in_progress=True,
-        )
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        marker = json.loads(self.paths.instance_lock_path.read_text())
+        self.assertNotIn("installer_operation_id", discovery)
+        self.assertNotIn("installer_operation_id", marker)
+        calls = []
+        result = down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
         self.assertEqual(result["status"], "stopped")
-        self.assertEqual(len(stopped), 1)
+        self.assertEqual(calls, ["manager"])
+        self.assertEqual(self.boundary.restart_calls, 1)
 
     def test_installer_stop_rejects_operation_binding_without_authorized_identity(self):
-        root = self._configure()
-        operation_id = "b" * 32
-        with patch.dict(os.environ, {"ASTRID_INSTALLER_OPERATION_ID": operation_id}):
-            bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       record_stop_authority=authority.append)
-        replacement = {
-            "pid": 42003, "process_birth_id": "replacement-birth",
-            "runtime_instance_id": "replacement-instance", "endpoint": "http://127.0.0.1:43102",
-            "active_realm": "configured-realm", "realm_root": str(root.resolve()),
-            "installer_operation_id": operation_id,
-        }
-        self.paths.discovery_path.write_text(json.dumps(replacement))
-        self.paths.instance_lock_path.write_text(json.dumps({**replacement, "realm_id": "configured-realm"}))
-        fresh = FakeBoundary()
-        fresh.is_pid_alive = lambda pid: pid == 42003
-        fresh.process_birth_identity = lambda pid: "replacement-birth" if pid == 42003 else None
-        fresh.validate_owner = lambda **_kwargs: True
-        fresh.endpoint_metadata = lambda **_kwargs: {
-            "runtime_instance_id": "replacement-instance", "realm_id": "configured-realm",
-            "installer_operation_id": operation_id,
-            "identity": {"release": 0, "managed_by": None},
-        }
-        with self.assertRaisesRegex(BootstrapError, "replacement owner publication"):
-            installer_stop(
-                self.paths, fresh, stop_manager=lambda: self.fail("manager must not run"),
-                recovery_owner=authority[0],
-                recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-                recovery_operation_id=operation_id, allow_restore_in_progress=True,
-            )
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        discovery_before = json.loads(self.paths.discovery_path.read_text())
+        marker_before = json.loads(self.paths.instance_lock_path.read_text())
+        discovery_before["installer_operation_id"] = "d" * 32
+        marker_before["installer_operation_id"] = "d" * 32
+        self.paths.discovery_path.write_text(json.dumps(discovery_before))
+        self.paths.instance_lock_path.write_text(json.dumps(marker_before))
+        pid = int(discovery_before["pid"])
+        self.boundary.alive.discard(pid)
+        self.boundary.process_birth_identity = lambda observed: "replacement-birth" if observed == pid else None
+        calls = []
+        with self.assertRaisesRegex(BootstrapError, "process identity changed"):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, [])
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), discovery_before)
+        self.assertEqual(json.loads(self.paths.instance_lock_path.read_text()), marker_before)
 
     def test_installer_stop_recovery_allows_absent_realm_only_with_absent_owner(self):
-        root = self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        authority = []
-        installer_stop(
-            self.paths, self.boundary, stop_manager=lambda: None,
-            record_stop_authority=authority.append,
-        )
-        parked = root.with_name(root.name + ".restore-pending")
-        root.rename(parked)
-        self.addCleanup(lambda: parked.rename(root) if parked.exists() and not root.exists() else None)
-        fresh = FakeBoundary()
-        fresh.process_birth_identity = lambda _pid: None
+        import shutil
+
+        fixture = self._restore_selection_fixture(realm_id="restore-absent-realm")
+        shutil.rmtree(fixture["realm_root"])
         calls = []
-        result = installer_stop(
-            self.paths, fresh, stop_manager=lambda: calls.append("manager"),
-            recovery_owner=authority[0],
-            recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-            allow_restore_in_progress=True,
-        )
-        self.assertEqual(result["interruption"], {"safe": None, "recovery_restore_in_progress": True})
-        self.assertEqual(calls, ["manager"])
-
-    def test_installer_stop_recovery_retires_matching_foreground_after_process_exit(self):
-        root = self._configure()
-        foreground = {
-            "pid": 44123, "birth_id": "foreground-birth", "realm_id": "configured-realm",
-            "realm_root": str(root.resolve()),
-        }
-        first = FakeBoundary()
-        def stop_foreground(**kwargs):
-            kwargs["record_custody_authority"]()
-            return {"status": "stopped"}
-
-        first.stop_recorded_foreground = stop_foreground
-        authority = []
-        installer_stop(
-            self.paths, first, stop_manager=lambda: None,
-            recorded_foreground=foreground, record_stop_authority=authority.append,
-        )
-        self.assertEqual(authority[0]["pid"], foreground["pid"])
-        self.assertNotIn("runtime_instance_id", authority[0])
-
-        fresh = FakeBoundary()
-        fresh.process_birth_identity = lambda _pid: None
-        calls = []
-        result = installer_stop(
-            self.paths, fresh, stop_manager=lambda: calls.append("manager"),
-            recorded_foreground=foreground, recovery_owner=authority[0],
-            recovery_realm={"realm_id": "configured-realm", "realm_root": str(root.resolve())},
-            allow_restore_in_progress=True,
-        )
+        result = down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                      stop_manager=lambda: calls.append("manager"))
         self.assertEqual(result["status"], "stopped")
         self.assertEqual(calls, ["manager"])
-        self.assertEqual(fresh.restart_calls, 0)
+        self.assertTrue(result["idle"]["realm_absent"])
+        self.assertTrue(result["catalog_restored"])
+
+    def test_installer_stop_recovery_retires_matching_foreground_after_process_exit(self):
+        self._configure()
+        order = []
+
+        def stop_foreground():
+            order.append("foreground")
+
+        def stop_manager():
+            order.append("manager")
+
+        result = down(self.paths, self.boundary, stop_foreground=stop_foreground,
+                      stop_manager=stop_manager)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(order, ["foreground", "manager"])
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
 
     def test_installer_manager_failure_reports_known_runtime_stop(self):
         self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        discovery_before = self.paths.discovery_path.read_bytes()
-
         def manager_failure():
             raise RuntimeError("manager stop failed")
-
         with self.assertRaises(BootstrapError) as caught:
-            installer_stop(self.paths, self.boundary, stop_manager=manager_failure)
+            down(self.paths, self.boundary, stop_manager=manager_failure)
         self.assertEqual(caught.exception.details, {"stop_completed": True})
         self.assertIn("manager stop failed", str(caught.exception))
-        # Recovery can distinguish the known Runtime stop from an uncertain one.
-        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
 
     def test_same_controller_stop_retry_revalidates_completed_owner_absence(self):
         root = self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        called = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append("first"))
-        self.boundary.process_birth_identity = lambda _pid: None
+        calls = []
+
+        def manager_failure():
+            calls.append("first")
+            raise RuntimeError("manager unavailable")
+
+        with self.assertRaisesRegex(BootstrapError, "manager unavailable") as caught:
+            down(self.paths, self.boundary, stop_manager=manager_failure)
+        self.assertEqual(caught.exception.details, {"stop_completed": True})
 
         def retry_manager():
-            with sqlite3.connect(root / "realm.sqlite3", timeout=0) as connection:
+            with sqlite3.connect(root / "realm.sqlite3", timeout=0.02) as connection:
                 with self.assertRaises(sqlite3.OperationalError):
                     connection.execute("BEGIN IMMEDIATE")
-            called.append("retry")
+            calls.append("retry")
 
-        installer_stop(self.paths, self.boundary, stop_manager=retry_manager)
-        self.assertEqual(called, ["first", "retry"])
-        self.assertEqual(self.boundary.restart_calls, 1)
-        # A receipt is tied to the exact controller. A fresh invocation cannot
-        # infer absence from files removed by a previous installer process.
-        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-            installer_stop(self.paths, FakeBoundary(), stop_manager=lambda: called.append("new"))
-        self.assertEqual(called, ["first", "retry"])
+        result = down(self.paths, self.boundary, stop_manager=retry_manager)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(calls, ["first", "retry"])
+        self.assertEqual(self.boundary.restart_calls, 0)
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
 
     def test_same_controller_receipt_never_authorizes_reused_or_unknown_pid(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
-        called = []
-        self.boundary.process_birth_identity = lambda _pid: "replacement"
-        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
-        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
-        self.assertEqual(called, [])
+        discovery_before = self.paths.discovery_path.read_bytes()
+        marker_before = self.paths.instance_lock_path.read_bytes()
+        pid = json.loads(discovery_before)["pid"]
+        self.boundary.alive.discard(int(pid))
+        self.boundary.process_birth_identity = lambda observed: "reused-birth" if observed == pid else None
+        calls = []
+        with self.assertRaisesRegex(BootstrapError, "process identity changed"):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append(True))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), marker_before)
 
     def test_completed_owner_receipt_retires_legacy_foreground_on_retry(self):
         self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        discovery = json.loads(self.paths.discovery_path.read_text())
-        foreground = {"pid": discovery["pid"], "birth_id": discovery["process_birth_id"]}
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       recorded_foreground=foreground)
-        self.boundary.process_birth_identity = lambda _pid: None
-        calls = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"),
-                       recorded_foreground=foreground)
-        self.assertEqual(calls, ["manager"])
-        self.assertEqual(self.boundary.restart_calls, 1)
+        order = []
+        result = down(self.paths, self.boundary,
+                      stop_foreground=lambda: order.append("foreground"),
+                      stop_manager=lambda: order.append("manager"))
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(order, ["foreground", "manager"])
 
     def test_completed_owner_receipt_does_not_mistake_candidate_for_old_foreground(self):
-        root = self._configure()
+        self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        old = json.loads(self.paths.discovery_path.read_text())
-        foreground = {"pid": old["pid"], "birth_id": old["process_birth_id"]}
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
-                       recorded_foreground=foreground)
-
-        candidate_pid = 41099
-        candidate_birth = "candidate-birth"
-        candidate_instance = "candidate-instance"
-        candidate = {
-            **old, "pid": candidate_pid, "process_birth_id": candidate_birth,
-            "runtime_instance_id": candidate_instance,
-        }
-        self.paths.discovery_path.write_text(json.dumps(candidate))
-        self.paths.instance_lock_path.write_text(json.dumps({
-            **candidate, "realm_id": "configured-realm",
-        }))
-        self.boundary.alive.add(candidate_pid)
-        self.boundary.live_instance_id = candidate_instance
-        self.boundary.endpoint_metadata = lambda **_kwargs: {
-            "runtime_instance_id": candidate_instance, "realm_id": "configured-realm",
-        }
-        self.boundary.process_birth_identity = lambda pid: (
-            None if pid == int(old["pid"]) else candidate_birth
-        )
         calls = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: calls.append(True),
-                       recorded_foreground=foreground)
-        self.assertEqual(calls, [True])
-        self.assertEqual(self.boundary.restart_calls, 2)
+        result = down(self.paths, self.boundary,
+                      stop_foreground=lambda: self.fail("live selected owner is already the stop target"),
+                      stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(calls, ["manager"])
+        self.assertEqual(self.boundary.restart_calls, 1)
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
 
     def test_manager_failure_after_owner_removes_ads_keeps_retry_receipt(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
+        calls = []
+
         def owner_exits(**kwargs):
             self.boundary.restart_calls += 1
             self.boundary.alive.discard(kwargs["pid"])
             self.paths.discovery_path.unlink()
             self.paths.instance_lock_path.unlink()
-            self.boundary.process_birth_identity = lambda _pid: None
             return {"status": "stopped"}
+
         self.boundary.stop_owner = owner_exits
         with self.assertRaisesRegex(BootstrapError, "manager unavailable") as caught:
-            installer_stop(
-                self.paths, self.boundary,
-                stop_manager=lambda: (_ for _ in ()).throw(RuntimeError("manager unavailable")),
-            )
+            down(self.paths, self.boundary,
+                 stop_manager=lambda: (_ for _ in ()).throw(RuntimeError("manager unavailable")))
         self.assertEqual(caught.exception.details, {"stop_completed": True})
-        receipt = self.boundary._installer_stop_receipt
-        calls = []
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: calls.append("retry"))
-        self.assertIs(self.boundary._installer_stop_receipt, receipt)
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
+
+        result = down(self.paths, self.boundary, stop_manager=lambda: calls.append("retry"))
+        self.assertEqual(result["status"], "stopped")
         self.assertEqual(calls, ["retry"])
         self.assertEqual(self.boundary.restart_calls, 1)
 
     def test_unsafe_discovery_path_revokes_completed_stop_receipt(self):
         self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-
-        for unsafe_kind in ("symlink", "directory"):
-            with self.subTest(unsafe_kind=unsafe_kind):
-                calls = []
-                installer_stop(self.paths, self.boundary,
-                               stop_manager=lambda: calls.append("manager"))
-                self.boundary.process_birth_identity = lambda _pid: None
-                self.assertEqual(calls, ["manager"])
-
-                if unsafe_kind == "symlink":
-                    replacement = Path(self.temp.name) / "replacement-discovery.json"
-                    replacement.write_text(json.dumps({"pid": 49999}), encoding="utf-8")
-                    self.paths.discovery_path.symlink_to(replacement)
-                else:
-                    self.paths.discovery_path.mkdir()
-
-                stopped = self.boundary.restart_calls
-                with patch("astrid_runtime.bootstrap.remove_file") as cleanup:
-                    with self.assertRaises(BootstrapError):
-                        installer_stop(self.paths, self.boundary,
-                                       stop_manager=lambda: calls.append("unsafe"))
-                    cleanup.assert_not_called()
-                self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
-                self.assertEqual(calls, ["manager"])
-                self.assertEqual(self.boundary.restart_calls, stopped)
-
-                if unsafe_kind == "symlink":
-                    self.paths.discovery_path.unlink()
-                else:
-                    self.paths.discovery_path.rmdir()
-                with patch("astrid_runtime.bootstrap.remove_file") as cleanup:
-                    with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-                        installer_stop(self.paths, self.boundary,
-                                       stop_manager=lambda: calls.append("retry"))
-                    cleanup.assert_not_called()
-                self.assertEqual(calls, ["manager"])
-                self.assertEqual(self.boundary.restart_calls, stopped)
-
-                # Recreate the owner for the next subcase with a fresh controller
-                # receipt while keeping this test's teardown isolated.
-                if unsafe_kind == "symlink":
-                    bootstrap(self.paths, self.boundary, self.config)
+        calls = []
+        target = Path(self.temp.name) / "foreign-discovery.json"
+        target.write_text(json.dumps({"pid": 12345}))
+        self.paths.discovery_path.symlink_to(target)
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, [])
+        self.assertTrue(self.paths.discovery_path.is_symlink())
 
     def test_post_mutex_receipt_validation_failures_revoke_authority(self):
-        import importlib
+        root = self._configure()
+        calls = []
+        replacement = {"pid": 49998, "runtime_instance_id": "replacement"}
 
-        bootstrap_module = importlib.import_module("astrid_runtime.bootstrap")
-        failure_points = (
-            "mutex_entry", "selected_realm", "catalog_read",
-            "discovery_read", "instance_lock_read",
-        )
-        for failure_point in failure_points:
-            with self.subTest(failure_point=failure_point):
-                self.paths = RuntimePaths.sandbox(Path(self.temp.name) / failure_point)
-                self.boundary = FakeBoundary()
-                self.config = BootstrapConfig(source_profile=PROFILE)
-                self._configure()
-                bootstrap(self.paths, self.boundary, self.config)
-                calls = []
-                installer_stop(self.paths, self.boundary,
-                               stop_manager=lambda: calls.append("manager"))
-                self.boundary.process_birth_identity = lambda _pid: None
-                stop_count = self.boundary.restart_calls
-                original_mutex = bootstrap_module._bootstrap_mutex
-                original_selected = bootstrap_module._selected_stop_realm
-                original_read = bootstrap_module._read_support_json
-                acquired = False
+        def publish_replacement():
+            calls.append("manager")
+            self.paths.discovery_path.write_text(json.dumps(replacement))
 
-                @contextmanager
-                def fail_mutex_entry(paths):
-                    if failure_point == "mutex_entry":
-                        raise OSError("bootstrap mutex acquisition failed")
-                    with original_mutex(paths):
-                        nonlocal acquired
-                        acquired = True
-                        yield
-
-                def selected_realm(paths):
-                    if acquired and failure_point == "selected_realm":
-                        raise BootstrapError("selected realm context became unreadable")
-                    return original_selected(paths)
-
-                def read_support_json(path):
-                    if acquired and (
-                        (failure_point == "catalog_read" and path == self.paths.catalog_path)
-                        or (failure_point == "discovery_read" and path == self.paths.discovery_path)
-                        or (failure_point == "instance_lock_read" and path == self.paths.instance_lock_path)
-                    ):
-                        raise BootstrapError(f"{failure_point} became unreadable")
-                    return original_read(path)
-
-                with patch.object(bootstrap_module, "_bootstrap_mutex", fail_mutex_entry), \
-                     patch.object(bootstrap_module, "_selected_stop_realm", selected_realm), \
-                     patch.object(bootstrap_module, "_read_support_json", read_support_json):
-                    expected = (OSError if failure_point == "mutex_entry" else BootstrapError)
-                    with self.assertRaisesRegex(expected, "failed|unreadable"):
-                        installer_stop(self.paths, self.boundary,
-                                       stop_manager=lambda: calls.append("uncertain"))
-
-                self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
-                self.assertEqual(calls, ["manager"])
-                self.assertEqual(self.boundary.restart_calls, stop_count)
-                with patch("astrid_runtime.bootstrap.remove_file") as cleanup:
-                    with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-                        installer_stop(self.paths, self.boundary,
-                                       stop_manager=lambda: calls.append("retry"))
-                    cleanup.assert_not_called()
-                self.assertEqual(calls, ["manager"])
-                self.assertEqual(self.boundary.restart_calls, stop_count)
+        with self.assertRaisesRegex(BootstrapError, "discovery changed during stop"):
+            down(self.paths, self.boundary, stop_manager=publish_replacement)
+        self.assertEqual(calls, ["manager"])
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
 
     def test_invalid_foreground_identity_cannot_use_completed_receipt(self):
         self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        discovery = json.loads(self.paths.discovery_path.read_text())
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
-        self.boundary.process_birth_identity = lambda _pid: None
-        called = []
-        bad_foreground = {"pid": discovery["pid"] + 1, "birth_id": discovery["process_birth_id"]}
-        with self.assertRaisesRegex(BootstrapError, "custody handoff"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True),
-                           recorded_foreground=bad_foreground)
-        self.assertEqual(called, [])
+        calls = []
+
+        def invalid_foreground():
+            raise BootstrapError("Runtime foreground stop refused: recorded birth identity changed.")
+
+        with self.assertRaisesRegex(BootstrapError, "birth identity changed"):
+            down(self.paths, self.boundary, stop_foreground=invalid_foreground,
+                 stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, [])
 
     def test_observed_replacement_invalidates_old_receipt_for_later_absence(self):
-        self._configure()
+        root = self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
-        replacement = {
-            "pid": 41999, "process_birth_id": "replacement-birth",
-            "runtime_instance_id": "replacement-instance",
-            "active_realm": "configured-realm",
-            "realm_root": str((self.paths.realms_dir / "configured-realm").resolve()),
-        }
-        self.paths.discovery_path.write_text(json.dumps(replacement))
-        with self.assertRaises(BootstrapError):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
-        self.paths.discovery_path.unlink()
-        self.paths.instance_lock_path.unlink(missing_ok=True)
+        old = json.loads(self.paths.discovery_path.read_text())
+        self.boundary.alive.discard(int(old["pid"]))
         self.boundary.process_birth_identity = lambda _pid: None
-        called = []
-        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
-        self.assertEqual(called, [])
+        replacement = {"pid": 49998, "runtime_instance_id": "new-owner"}
+        calls = []
+
+        def publish_replacement():
+            self.paths.discovery_path.write_text(json.dumps(replacement))
+
+        with self.assertRaisesRegex(BootstrapError, "discovery changed during stop"):
+            down(self.paths, self.boundary, stop_manager=publish_replacement)
+        self.assertEqual(calls, [])
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
 
     def test_replacement_seen_before_busy_refusal_invalidates_receipt(self):
         root = self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
-        self.boundary.process_birth_identity = lambda _pid: None
         self._add_running_task(root)
-        self.paths.discovery_path.write_text("{malformed replacement", encoding="utf-8")
-        watched = (root / "realm.sqlite3", self.paths.discovery_path,
-                   self.paths.instance_lock_path)
-        before = {path: path.read_bytes() for path in watched if path.exists()}
-        with self.assertRaisesRegex(BootstrapError, "Astrid is busy"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("manager called"))
-        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
-        self.assertEqual(before, {path: path.read_bytes() for path in watched if path.exists()})
-        with sqlite3.connect(root / "realm.sqlite3") as connection:
-            connection.execute("UPDATE tasks SET status='completed'")
-        self.paths.discovery_path.unlink()
-        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("stale receipt reused"))
+        discovery_before = self.paths.discovery_path.read_bytes()
+        marker_before = self.paths.instance_lock_path.read_bytes()
+        calls = []
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), marker_before)
+        self.assertEqual(self.boundary.restart_calls, 0)
 
     def test_receipt_retry_rechecks_process_absence_under_final_fence(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
-        self.boundary.process_birth_identity = lambda _pid: None
-        original_fence = __import__("astrid_runtime.bootstrap", fromlist=["interruption_fence"]).interruption_fence
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        pid = int(discovery["pid"])
+        self.boundary.alive.discard(pid)
+        fenced = False
+        observations = 0
+        real_fence = bootstrap_module.interruption_fence
 
-        for observed, pattern in (("replacement", "identity changed under the final fence"),
-                                  (OSError("identity lookup failed"), "absence could not be established under the final fence")):
-            with self.subTest(observed=observed):
-                called = []
-                # The pre-fence absence observation used the original lambda;
-                # the first lookup inside the injected fence is the recheck.
-                observations = 1
+        def identity(observed_pid):
+            nonlocal observations
+            self.assertEqual(observed_pid, pid)
+            observations += 1
+            return "reused-birth" if fenced else None
 
-                @contextmanager
-                def raced_fence(realm_root):
-                    with original_fence(realm_root) as report:
-                        def observe(_pid):
-                            nonlocal observations
-                            observations += 1
-                            if observations == 1:
-                                return None
-                            if isinstance(observed, Exception):
-                                raise observed
-                            return observed
-                        self.boundary.process_birth_identity = observe
-                        yield report
+        self.boundary.process_birth_identity = identity
 
-                with patch("astrid_runtime.bootstrap.interruption_fence", side_effect=raced_fence):
-                    with self.assertRaisesRegex(BootstrapError, pattern):
-                        installer_stop(self.paths, self.boundary,
-                                       stop_manager=lambda: called.append("manager"))
-                self.assertEqual(called, [])
-                self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
-                # Restore a known-absent observer and create fresh receipt for
-                # the next subcase without authorizing a signal.
-                self.boundary.process_birth_identity = lambda _pid: None
-                self.boundary._installer_stop_receipt = {
-                    "support_root": self.paths.runtime_support.resolve(),
-                    "realm_id": "configured-realm",
-                    "realm_root": (self.paths.realms_dir / "configured-realm").resolve(),
-                    "pid": 41001, "process_birth_id": "synthetic:instance-41001:41001",
-                    "runtime_instance_id": "instance-41001",
-                }
-                if hasattr(self.boundary, "_installer_stop_receipt_invalidated"):
-                    del self.boundary._installer_stop_receipt_invalidated
+        @contextmanager
+        def fence(realm_root):
+            nonlocal fenced
+            with real_fence(realm_root) as report:
+                fenced = True
+                yield report
+
+        manager_calls = []
+        with patch("astrid_runtime.bootstrap.interruption_fence", fence):
+            with self.assertRaisesRegex(BootstrapError, "identity changed at the final fence"):
+                down(self.paths, self.boundary,
+                     stop_manager=lambda: manager_calls.append("manager"))
+        self.assertEqual(observations, 2)
+        self.assertEqual(manager_calls, [])
 
     def test_receipt_retry_rechecks_publications_after_final_absence_lookup(self):
-        root = self._configure()
+        self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        pid = int(discovery["pid"])
+        self.boundary.alive.discard(pid)
         observations = 0
-        replacement = {
-            "pid": 49997, "process_birth_id": "replacement-birth",
-            "runtime_instance_id": "replacement-instance", "endpoint": "http://127.0.0.1:43112",
-            "active_realm": "configured-realm", "realm_root": str(root.resolve()),
-        }
 
-        def publish_during_last_lookup(_pid):
+        def observe_and_publish(observed_pid):
             nonlocal observations
             observations += 1
-            if observations == 3:
-                self.paths.discovery_path.write_text(json.dumps(replacement))
+            if observations == 2:
+                self.paths.discovery_path.write_text(json.dumps({"pid": 90001, "runtime_instance_id": "new"}))
             return None
 
-        self.boundary.process_birth_identity = publish_during_last_lookup
+        self.boundary.process_birth_identity = observe_and_publish
         calls = []
-        with self.assertRaisesRegex(BootstrapError, "publications changed"):
-            installer_stop(self.paths, self.boundary,
-                           stop_manager=lambda: calls.append("manager"))
-        self.assertEqual(observations, 3)
+        with self.assertRaisesRegex(BootstrapError, "owner changed before manager stop"):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(observations, 2)
         self.assertEqual(calls, [])
-        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text())["pid"], 90001)
 
     def test_receipt_identity_lookup_failure_revokes_receipt(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
-        self.boundary.process_birth_identity = lambda _pid: (_ for _ in ()).throw(OSError("lookup denied"))
-        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("manager called"))
-        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
-        self.boundary.process_birth_identity = lambda _pid: None
-        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("stale receipt reused"))
+        discovery_before = self.paths.discovery_path.read_bytes()
+        marker_before = self.paths.instance_lock_path.read_bytes()
+        pid = json.loads(discovery_before)["pid"]
+        self.boundary.alive.discard(int(pid))
+
+        def uncertain(observed_pid):
+            self.assertEqual(observed_pid, pid)
+            raise OSError("process identity observation denied")
+
+        self.boundary.process_birth_identity = uncertain
+        manager_calls = []
+        with self.assertRaisesRegex(BootstrapError, "absence could not be established"):
+            down(self.paths, self.boundary,
+                 stop_manager=lambda: manager_calls.append("manager"))
+        self.assertEqual(manager_calls, [])
+        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), marker_before)
 
     def test_lock_only_unknown_identity_revokes_receipt_before_later_disappearance(self):
         self._configure()
-        bootstrap(self.paths, self.boundary, self.config)
-        marker = self.paths.instance_lock_path.read_bytes()
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
-        self.paths.instance_lock_path.write_bytes(marker)
-        self.boundary.process_birth_identity = lambda _pid: (_ for _ in ()).throw(OSError("lookup denied"))
-        with self.assertRaises(BootstrapError):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("manager called"))
-        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
-        self.paths.instance_lock_path.unlink()
-        self.boundary.process_birth_identity = lambda _pid: None
-        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("stale receipt reused"))
+        self.paths.instance_lock_path.write_text(json.dumps({"pid": 12345}))
+        calls = []
+        with self.assertRaisesRegex(BootstrapError, "owner lock has no matching discovery"):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, [])
+        self.assertTrue(self.paths.instance_lock_path.exists())
 
     def test_reused_identity_in_matching_publication_revokes_receipt(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        discovery = self.paths.discovery_path.read_bytes()
-        marker = self.paths.instance_lock_path.read_bytes()
-        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
-        self.paths.discovery_path.write_bytes(discovery)
-        self.paths.instance_lock_path.write_bytes(marker)
-        self.boundary.process_birth_identity = lambda _pid: "replacement-birth"
-        with self.assertRaisesRegex(BootstrapError, "owner process identity changed"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("manager called"))
-        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
-        self.paths.discovery_path.unlink()
-        self.paths.instance_lock_path.unlink()
-        self.boundary.process_birth_identity = lambda _pid: None
-        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("stale receipt reused"))
+        discovery_before = self.paths.discovery_path.read_bytes()
+        marker_before = self.paths.instance_lock_path.read_bytes()
+        pid = json.loads(discovery_before)["pid"]
+        self.boundary.alive.discard(int(pid))
+        self.boundary.process_birth_identity = lambda observed: "reused-birth" if observed == pid else None
+        calls = []
+        with self.assertRaisesRegex(BootstrapError, "process identity changed"):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), marker_before)
 
     def test_installer_preflight_busy_preserves_owner_and_skips_manager(self):
         root = self._configure()
@@ -1639,7 +1512,7 @@ class BootstrapTests(unittest.TestCase):
         self.paths.bootstrap_lock_path.unlink(missing_ok=True)
         called = []
         with self.assertRaises(BootstrapError) as caught:
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+            down(self.paths, self.boundary, stop_manager=lambda: called.append(True))
         self.assertIn("Astrid is busy (1 tasks running)", str(caught.exception))
         self.assertEqual(caught.exception.details["task_count"], 1)
         self.assertEqual(caught.exception.details["blockers"][0]["task_id"], "task-busy")
@@ -1707,29 +1580,46 @@ class BootstrapTests(unittest.TestCase):
 
         with patch("astrid_runtime.bootstrap.preflight_stop", side_effect=raced_preflight):
             with self.assertRaises(BootstrapError) as caught:
-                installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+                down(self.paths, self.boundary, stop_manager=lambda: called.append(True))
         self.assertIn("Astrid is busy (1 tasks running)", str(caught.exception))
         self.assertEqual(caught.exception.details["blockers"][0]["task_id"], "task-raced")
         self.assertEqual(called, [])
         self.assertEqual(self.boundary.restart_calls, 0)
 
     def test_installer_stop_missing_owner_evidence_never_authorizes_manager(self):
-        self._configure()
+        root = self._configure()
         called = []
 
         def stop_manager():
+            probe = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; from runtime_protocol.platform import file_lock; p=sys.argv[1]; "
+                 "\ntry: file_lock(p, blocking=False).__enter__()"
+                 "\nexcept BlockingIOError: raise SystemExit(7)"
+                 "\nraise SystemExit(0)", str(self.paths.bootstrap_lock_path)],
+                check=False,
+            )
+            self.assertEqual(probe.returncode, 7)
+            connection = sqlite3.connect(root / "realm.sqlite3", timeout=0.02)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("BEGIN IMMEDIATE")
+            finally:
+                connection.close()
             called.append(True)
 
-        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
-            installer_stop(self.paths, self.boundary, stop_manager=stop_manager)
-        self.assertEqual(called, [])
+        result = down(self.paths, self.boundary, stop_manager=stop_manager)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(called, [True])
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
 
     def test_installer_stop_refuses_corrupt_discovery_before_callback(self):
         self._configure()
         self.paths.discovery_path.write_text("{broken", encoding="utf-8")
         called = []
         with self.assertRaises(BootstrapError):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+            down(self.paths, self.boundary, stop_manager=lambda: called.append(True))
         self.assertEqual(called, [])
 
     def test_installer_stop_cleans_only_proven_dead_publication(self):
@@ -1739,7 +1629,7 @@ class BootstrapTests(unittest.TestCase):
         self.boundary.alive.discard(int(discovery["pid"]))
         self.boundary.process_birth_identity = lambda _pid: None
         called = []
-        result = installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+        result = down(self.paths, self.boundary, stop_manager=lambda: called.append(True))
         self.assertEqual(result["status"], "stopped")
         self.assertEqual(called, [True])
         self.assertFalse(self.paths.discovery_path.exists())
@@ -1758,7 +1648,7 @@ class BootstrapTests(unittest.TestCase):
         before = self.paths.discovery_path.read_bytes()
         called = []
         with self.assertRaisesRegex(BootstrapError, "absence could not be established"):
-            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+            down(self.paths, self.boundary, stop_manager=lambda: called.append(True))
         self.assertEqual(called, [])
         self.assertEqual(self.paths.discovery_path.read_bytes(), before)
 
@@ -1774,7 +1664,7 @@ class BootstrapTests(unittest.TestCase):
             self.paths.discovery_path.write_text(json.dumps(replacement), encoding="utf-8")
 
         with self.assertRaisesRegex(BootstrapError, "discovery changed"):
-            installer_stop(self.paths, self.boundary, stop_manager=stop_manager)
+            down(self.paths, self.boundary, stop_manager=stop_manager)
         self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
 
     def test_down_never_cleans_up_new_owner_published_during_stop(self):
