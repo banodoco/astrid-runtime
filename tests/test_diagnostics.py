@@ -52,11 +52,11 @@ def test_report_includes_identity_update_runtime_and_disk_details(tmp_path):
     record_path.parent.mkdir(parents=True, exist_ok=True)
     platform.owner_only(program / "logs", directory=True)
     platform.owner_only(program / "logs" / "launcher.log")
-    (record_path.parent / "update-transaction.json").write_text(json.dumps({"result": "rolled_back", "log": str(record_path.parent / "update.log")}))
-    (record_path.parent / "update.log").write_text("installer output")
-    platform.owner_only(record_path.parent, directory=True)
-    platform.owner_only(record_path.parent / "update-transaction.json")
-    platform.owner_only(record_path.parent / "update.log")
+    (program / "update-transaction.json").write_text(json.dumps({"result": "rolled_back", "log": str(program / "update.log")}))
+    (program / "update.log").write_text("installer output")
+    platform.owner_only(program, directory=True)
+    platform.owner_only(program / "update-transaction.json")
+    platform.owner_only(program / "update.log")
     runtime_log = platform.log_dir(paths.home) / "runtime.log"
     runtime_log.parent.mkdir(parents=True, exist_ok=True)
     runtime_log.write_text("runtime output")
@@ -86,6 +86,29 @@ def test_source_checkout_includes_owner_only_launcher_log(tmp_path):
     platform.owner_only(launcher)
     report = diagnostics_report(paths, {"healthy": True})
     assert "Launcher log:\nsource launcher output" in report
+
+
+def test_diagnostics_uses_shared_update_job_result_and_program_root_log(tmp_path):
+    paths = RuntimePaths.sandbox(tmp_path / "home")
+    record_path = _install_record_path(paths.home)
+    record_path.parent.mkdir(parents=True)
+    root = tmp_path / "managed-program"
+    data_root = tmp_path / "managed-data"
+    record_path.write_text(json.dumps({"owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data_root)}))
+    log = root / "logs" / "accepted-update.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("worker output")
+    platform.owner_only(log.parent, directory=True)
+    platform.owner_only(log)
+    (root / "install.json").write_text(json.dumps({"owner": "haus.astrid.runtime", "data_root": str(data_root), "update_job": {
+        "operation_id": "55555555555555555555555555555555", "state": "updated", "result": "Updated to release 9.",
+        "log_path": str(log),
+    }}))
+    platform.owner_only(root / "install.json")
+    report = diagnostics_report(paths, {"healthy": True})
+    assert "Last update result: Updated to release 9." in report
+    assert "Installer transaction log:\nworker output" in report
+    assert f"Update log: {log}" in report
 
 
 def test_redaction_covers_home_as_native_and_windows_path(tmp_path):

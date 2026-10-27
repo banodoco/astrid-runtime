@@ -66,8 +66,17 @@ def _head(root: Path) -> str:
     return head
 
 
-def _verify_checkout_root(root: Path) -> None:
-    """Require root itself to be the worktree attached to its own .git marker."""
+def validate_checkout_root(root: Path) -> Path:
+    """Admit an explicit absolute worktree root without capturing its contents."""
+    root = Path(root)
+    if not root.is_absolute():
+        raise SourceIdentityError(f"source checkout path must be absolute: {root}")
+    if not root.is_dir():
+        raise SourceIdentityError(f"source checkout is not a directory: {root}")
+    try:
+        root = root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SourceIdentityError(f"cannot resolve source checkout: {root}") from exc
     marker = root / ".git"
     try:
         # rev-parse emits a newline terminator; a top-level worktree's prefix
@@ -98,6 +107,7 @@ def _verify_checkout_root(root: Path) -> None:
         raise SourceIdentityError(f"cannot bind Git metadata to source checkout: {root}") from exc
     if actual_git_dir != expected_git_dir:
         raise SourceIdentityError(f"source path is not the root of its Git checkout: {root}")
+    return root
 
 
 def _same_file_state(before: os.stat_result, after: os.stat_result) -> bool:
@@ -157,10 +167,7 @@ def _tracked_inventory(root: Path) -> list[tuple[bytes, bytes]]:
 
 
 def _capture_repo(root_arg: Path) -> tuple[str, bytes, bool, tuple]:
-    root = Path(root_arg)
-    if not root.is_dir():
-        raise SourceIdentityError(f"source checkout is not a directory: {root}")
-    _verify_checkout_root(root)
+    root = validate_checkout_root(root_arg)
     head = _head(root)
     # Gitlinks have independent worktrees and need recursive capture. Fail closed until
     # that representation is supported rather than treating their pointer as clean.

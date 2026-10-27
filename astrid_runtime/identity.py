@@ -10,7 +10,7 @@ from runtime_protocol.startup_identity import capture_startup_identity
 
 
 IDENTITY_REFUSAL_MESSAGE = (
-    "An older Astrid is still running. Run `astrid-runtime restart`; it waits for running tasks."
+    "An older Astrid is still running. Restart it after its running tasks finish."
 )
 
 
@@ -76,13 +76,6 @@ def validate_live_owner_identity(
     if health.get("runtime_instance_id") != instance_id or not instance_id:
         raise StartupIdentityError("live health belongs to a different owner instance")
     return normalize_startup_identity(health.get("identity"))
-
-
-def identities_match(expected: Any, observed: Any) -> bool:
-    try:
-        return normalize_startup_identity(expected) == normalize_startup_identity(observed)
-    except StartupIdentityError:
-        return False
 
 
 def _valid_head(value: Any) -> bool:
