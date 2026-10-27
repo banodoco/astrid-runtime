@@ -118,6 +118,22 @@ def test_allowed_health_read_and_response_headers(tmp_path, prefix):
         world.stop()
 
 
+def test_diagnostics_route_is_narrow_and_owner_authenticated(tmp_path):
+    world = start_door_world(tmp_path)
+    try:
+        reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
+        assert reply.status == 200, reply.body
+        assert "Astrid diagnostics" in reply.json()["report"]
+        app_reply = world.call(f"{API_RUNTIME}/v1/diagnostics?app_build=app-build-123&app_release=12")
+        assert app_reply.status == 200, app_reply.body
+        assert "App build: app-build-123" in app_reply.json()["report"]
+        assert "App release: 12" in app_reply.json()["report"]
+        assert world.call(f"{API_RUNTIME}/v1/diagnostics/anything").status == 404
+        assert world.call(f"{API_RUNTIME}/v1/doctor").status == 404
+    finally:
+        world.stop()
+
+
 def test_health_reports_pinokio_only_as_a_door_extension(tmp_path, monkeypatch):
     monkeypatch.delenv("ASTRID_INSTALL_RELEASE", raising=False)
     monkeypatch.delenv("ASTRID_INSTALL_MANAGED_BY", raising=False)

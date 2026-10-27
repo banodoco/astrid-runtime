@@ -500,7 +500,11 @@ def main(argv: list[str] | None = None) -> int:
         # Doctor is read-only but must still use the concrete process boundary
         # to distinguish a live, matching owner from a stale/reused PID.
         result = doctor(paths, LocalRuntimeBoundary())
-        _emit(result, json_mode=args.json)
+        if args.json:
+            _emit(result, json_mode=True)
+        else:
+            from .diagnostics import diagnostics_report
+            print(diagnostics_report(paths, result))
         return 0 if result["healthy"] else 1
     if args.command == "tasks" and args.tasks_command == "clear":
         from .task_clear import clear_tasks
