@@ -1663,3 +1663,26 @@ def handoff_child_identity(process):
     if not _windows_process_active(handle):
         raise ProcessLookupError("prepared Worker exited during authentication")
     return observed
+
+
+def reserve_loopback_listener(port: int, *, backlog: int = 128):
+    """Reserve a Linux listener for one retained, socket-activated child.
+
+    This is a local native resource, not a service registry or a recoverable
+    process reference. See ``linux_listener.RetainedListener`` for the caller's
+    adoption, sole-waiter, trust and cleanup obligations.
+    """
+    from .linux_listener import RetainedListener
+    return RetainedListener(port, backlog=backlog)
+
+
+def linux_abstract_listener(name: bytes, *, backlog: int = 8):
+    """Create a non-inheritable local AF_UNIX listener; caller owns authentication."""
+    from .linux_listener import abstract_listener
+    return abstract_listener(name, backlog=backlog)
+
+
+def linux_abstract_connect(name: bytes, *, deadline: float):
+    """Connect local AF_UNIX IPC; no identity or authority comes from its name."""
+    from .linux_listener import abstract_connect
+    return abstract_connect(name, deadline=deadline)
