@@ -10,7 +10,7 @@ from runtime_protocol.startup_identity import capture_startup_identity
 
 
 IDENTITY_REFUSAL_MESSAGE = (
-    "An older Astrid is still running. Run `astrid-runtime restart`; it waits for running tasks."
+    "An older Astrid is still running. Restart it after its running tasks finish."
 )
 
 

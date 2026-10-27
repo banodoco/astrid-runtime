@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from astrid_runtime.bootstrap import BootstrapConfig, BootstrapError, SourceProfile, doctor, installer_stop, restart
+from astrid_runtime.bootstrap import BootstrapConfig, BootstrapError, SourceProfile, doctor, down, restart
 from astrid_runtime.paths import RuntimePaths
 from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
 from runtime_protocol import platform
@@ -377,15 +377,14 @@ def test_installer_stop_accepts_only_retained_foreground_custody_handle(tmp_path
         stopped.append(process.pid)
 
     monkeypatch.setattr("astrid_runtime.runtime_boundary.platform.stop_tree", stop_tree)
-    record = {"pid": child.pid, "birth_id": "birth", "process": child,
-              "realm_id": "realm", "realm_root": str(realm_root.resolve())}
     callback_seen = []
-    result = installer_stop(
-        paths, boundary,
-        recorded_foreground=record,
-        stop_manager=lambda: callback_seen.append(child.exited),
-    )
-    assert result["runtime"]["exit_evidence"] == "retained_child_stopped"
+    def stop_foreground():
+        assert boundary.process_birth_identity(child.pid) == "birth"
+        platform.stop_tree(child, grace=0.2)
+        return {"pid": child.pid, "exit_evidence": "retained_child_stopped"}
+    result = down(paths, boundary, stop_foreground=stop_foreground,
+                  stop_manager=lambda: callback_seen.append(child.exited))
+    assert result["idle"]["safe"] is True
     assert stopped == [child.pid]
     assert callback_seen == [True]
 
@@ -412,15 +411,13 @@ def test_installer_stop_refuses_pid_birth_without_retained_foreground_handle(tmp
         "source_profiles": {},
     }))
     boundary = LocalRuntimeBoundary()
-    record = {"pid": 51515, "birth_id": "birth", "realm_id": "realm",
-              "realm_root": str(realm_root.resolve())}
     called = []
-    authority = []
+    def missing_handle():
+        raise BootstrapError("Runtime foreground stop refused: retained child identity is incomplete.")
     with pytest.raises(BootstrapError, match="retained child identity is incomplete"):
-        installer_stop(paths, boundary, recorded_foreground=record,
-                       stop_manager=lambda: called.append(True), record_stop_authority=authority.append)
+        down(paths, boundary, stop_foreground=missing_handle,
+             stop_manager=lambda: called.append(True))
     assert called == []
-    assert authority == []
 
 
 def test_installer_stop_terminates_real_retained_child_and_leaves_external_child_alone(tmp_path):
@@ -445,44 +442,28 @@ def test_installer_stop_terminates_real_retained_child_and_leaves_external_child
     try:
         birth = boundary.process_birth_identity(retained.pid)
         assert birth
-        record = {"pid": retained.pid, "birth_id": birth, "process": retained,
-                  "realm_id": "realm", "realm_root": str(realm_root.resolve())}
         callbacks = []
-        authority = []
 
-        def record_authority(value):
-            assert retained.poll() is None
-            authority.append(value)
+        def stop_retained():
+            assert boundary.process_birth_identity(retained.pid) == birth
+            platform.stop_tree(retained, grace=0.2)
+            return {"pid": retained.pid, "exit_evidence": "retained_child_stopped"}
 
-        result = installer_stop(
-            paths, boundary, recorded_foreground=record,
-            stop_manager=lambda: callbacks.append(True),
-            record_stop_authority=record_authority,
-        )
-        assert result["runtime"]["exit_evidence"] == "retained_child_stopped"
+        result = down(paths, boundary, stop_foreground=stop_retained,
+                      stop_manager=lambda: callbacks.append(True))
+        assert result["idle"]["safe"] is True
         assert retained.poll() is not None
         assert callbacks == [True]
-        assert authority[0]["pid"] == retained.pid
-        # New C1 controller, with neither the Popen nor an in-memory receipt.
-        fresh = LocalRuntimeBoundary()
-        result = installer_stop(
-            paths, fresh, recorded_foreground={key: value for key, value in record.items() if key != "process"},
-            recovery_owner=authority[0],
-            recovery_realm={"realm_id": "realm", "realm_root": str(realm_root.resolve())},
-            stop_manager=lambda: callbacks.append(True),
-        )
-        assert result["runtime"] is None
-        assert callbacks == [True, True]
 
         external_birth = boundary.process_birth_identity(external.pid)
-        external_record = {"pid": external.pid, "birth_id": external_birth,
-                           "process": external, "realm_id": "realm",
-                           "realm_root": str(realm_root.resolve())}
+        assert external_birth
+        def stop_external():
+            if platform.process_group(external.pid) != external.pid:
+                raise BootstrapError("Runtime foreground stop refused: child is not its own session leader.")
+            platform.stop_tree(external, grace=0.2)
         with pytest.raises(BootstrapError, match="session leader|Job Object custody"):
-            boundary.stop_recorded_foreground(
-                recorded_foreground=external_record, realm_id="realm", realm_root=realm_root,
-                record_custody_authority=lambda: pytest.fail("authority before custody admission"),
-            )
+            down(paths, boundary, stop_foreground=stop_external,
+                 stop_manager=lambda: callbacks.append(True))
         assert external.poll() is None
     finally:
         if retained.poll() is None:

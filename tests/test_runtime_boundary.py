@@ -386,8 +386,7 @@ def test_boundary_lost_relinquish_ack_advances_only_from_durable_readback(tmp_pa
     assert boundary._process is child
 
 
-@pytest.mark.parametrize("operation_id", [None, "c" * 32])
-def test_windows_spawn_passes_only_current_operation_binding(tmp_path, monkeypatch, operation_id):
+def test_windows_spawn_passes_only_current_operation_binding(tmp_path, monkeypatch):
     from astrid_runtime import runtime_boundary as module
 
     child = _CustodyChild()
@@ -400,14 +399,12 @@ def test_windows_spawn_passes_only_current_operation_binding(tmp_path, monkeypat
         return child
     monkeypatch.setattr(module.platform, "spawn_tree", spawn)
     boundary = LocalRuntimeBoundary()
-    boundary._installer_operation_id = operation_id
     monkeypatch.setenv("ASTRID_INSTALLER_OPERATION_ID", "stale")
     process, broker = boundary._spawn_runtime(
         ["/isolated/python", "-m", "runtime_protocol"], support_root=tmp_path, stdout=None,
     )
     assert process is child and broker is None
-    assert observed["kwargs"]["env"].get("ASTRID_INSTALLER_OPERATION_ID") == operation_id
-    assert observed["kwargs"]["env"].get("ASTRID_INSTALLER_OPERATION_ID") != "stale"
+    assert "ASTRID_INSTALLER_OPERATION_ID" not in observed["kwargs"]["env"]
 
 
 def test_boundary_unknown_commit_retains_controller_and_child(tmp_path, monkeypatch):

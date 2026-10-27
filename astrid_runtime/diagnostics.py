@@ -11,6 +11,7 @@ from runtime_protocol import platform
 
 from . import __version__
 from .paths import RuntimePaths, _install_record_path
+from .update import read_update_status
 
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)(\b(?:authorization|proxy-authorization)\b[\"']?\s*[:=]\s*[\"']?(?:bearer\s+)?)[^\"'\s,;}]+"), r"\1[REDACTED]"),
@@ -84,20 +85,23 @@ def diagnostics_report(
 ) -> str:
     record, program_root = _install_info(paths)
     identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
-    transaction_path = _install_record_path(paths.home).parent / "update-transaction.json"
+    status = read_update_status(paths.home)
+    transaction_path = (program_root / "update-transaction.json") if program_root else _install_record_path(paths.home).parent / "update-transaction.json"
     transaction = _read_json(transaction_path)
-    tx_log = transaction.get("log") or transaction.get("log_path")
+    tx_log = status.get("log_path") or transaction.get("log") or transaction.get("log_path")
     tx_log_path = Path(tx_log).expanduser() if isinstance(tx_log, str) else transaction_path.with_name("update.log")
     launcher_log = (program_root / "logs" / "launcher.log") if program_root else None
     log_path = platform.log_dir(paths.home) / "runtime.log"
     retained = program_root / "versions" if program_root else None
-    result = transaction.get("result") or transaction.get("state") or "No update has run yet."
+    result = status.get("result") if status.get("state") != "none" else None
+    result = result or transaction.get("result") or transaction.get("state") or "No update has run yet."
     lines = [
         "Astrid diagnostics",
         f"Runtime version: {__version__}",
         f"B1 identity: managed_by={identity.get('managed_by', record.get('managed_by', 'unknown'))}; release={identity.get('release', 'unknown')}",
         f"Runtime support state: {support.get('state', 'unknown')} (healthy={support.get('healthy', 'unknown')})",
         f"Last update result: {result}",
+        f"Update log: {status.get('log_path') or '(not available)'}",
         "Installer transaction log:",
         _tail(tx_log_path, paths.home),
     ]
