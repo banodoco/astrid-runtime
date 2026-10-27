@@ -81,14 +81,9 @@ def _install_info(paths: RuntimePaths) -> tuple[dict[str, Any], Path | None]:
 def diagnostics_report(
     paths: RuntimePaths,
     support: dict[str, Any],
-    *,
-    app_build: str | None = None,
-    app_release: str | int | None = None,
 ) -> str:
     record, program_root = _install_info(paths)
     identity = record.get("identity") if isinstance(record.get("identity"), dict) else {}
-    app_build = redact(str(app_build), paths.home) if app_build else "unavailable (not supplied by the App)"
-    app_release = redact(str(app_release), paths.home) if app_release is not None else "unavailable (not supplied by the App)"
     transaction_path = _install_record_path(paths.home).parent / "update-transaction.json"
     transaction = _read_json(transaction_path)
     tx_log = transaction.get("log") or transaction.get("log_path")
@@ -100,8 +95,6 @@ def diagnostics_report(
     lines = [
         "Astrid diagnostics",
         f"Runtime version: {__version__}",
-        f"App build: {app_build}",
-        f"App release: {app_release}",
         f"B1 identity: managed_by={identity.get('managed_by', record.get('managed_by', 'unknown'))}; release={identity.get('release', 'unknown')}",
         f"Runtime support state: {support.get('state', 'unknown')} (healthy={support.get('healthy', 'unknown')})",
         f"Last update result: {result}",
