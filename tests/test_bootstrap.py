@@ -11,9 +11,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from importlib import import_module
 from contextlib import closing, contextmanager
 from unittest.mock import patch
 
+bootstrap_module = import_module("astrid_runtime.bootstrap")
 from astrid_runtime.bootstrap import (
     BootstrapConfig,
     BootstrapError,
@@ -380,6 +382,105 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result.realm_id, first.realm_id)
         self.assertEqual(self.boundary.restart_calls, 1)
 
+    def test_restart_stops_once_under_fence_before_relaunch(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        order = []
+        original_stop = self.boundary.stop_owner
+        original_start = self.boundary.start
+
+        def stop_owner(**kwargs):
+            order.append("stop")
+            # The shared stop callback must retain both launcher serialization
+            # and the SQLite interruption fence until it has returned.
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; from runtime_protocol.platform import file_lock; p=sys.argv[1]; "
+                    "\ntry: file_lock(p, blocking=False).__enter__()"
+                    "\nexcept BlockingIOError: raise SystemExit(7)"
+                    "\nraise SystemExit(0)",
+                    str(self.paths.bootstrap_lock_path),
+                ],
+                check=False,
+            )
+            self.assertEqual(probe.returncode, 7)
+            connection = sqlite3.connect(root / "realm.sqlite3", timeout=0.02)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("BEGIN IMMEDIATE")
+            finally:
+                connection.close()
+            return original_stop(**kwargs)
+
+        def start(**kwargs):
+            order.append("start")
+            return original_start(**kwargs)
+
+        self.boundary.stop_owner = stop_owner
+        self.boundary.start = start
+        result = restart(self.paths, self.boundary, self.config)
+        self.assertEqual(result.status, "restarted")
+        self.assertEqual(order, ["stop", "start"])
+        self.assertEqual(self.boundary.restart_calls, 1)
+
+    def test_down_manager_callback_runs_once_after_stop_under_shared_fence(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        order = []
+        original_stop = self.boundary.stop_owner
+
+        def stop_owner(**kwargs):
+            order.append("runtime")
+            return original_stop(**kwargs)
+
+        def stop_manager():
+            order.append("manager")
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; from runtime_protocol.platform import file_lock; p=sys.argv[1]; "
+                    "\ntry: file_lock(p, blocking=False).__enter__()"
+                    "\nexcept BlockingIOError: raise SystemExit(7)"
+                    "\nraise SystemExit(0)",
+                    str(self.paths.bootstrap_lock_path),
+                ],
+                check=False,
+            )
+            self.assertEqual(probe.returncode, 7)
+            connection = sqlite3.connect(root / "realm.sqlite3", timeout=0.02)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("BEGIN IMMEDIATE")
+            finally:
+                connection.close()
+
+        self.boundary.stop_owner = stop_owner
+        result = down(self.paths, self.boundary, stop_manager=stop_manager)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(order, ["runtime", "manager"])
+
+    def test_down_restart_and_installer_stop_use_shared_primitive(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        with patch(
+            "astrid_runtime.bootstrap._fenced_stop_and_manager",
+            wraps=bootstrap_module._fenced_stop_and_manager,
+        ) as shared_stop:
+            down(self.paths, self.boundary)
+            self.assertEqual(shared_stop.call_count, 1)
+
+            bootstrap(self.paths, self.boundary, self.config)
+            restart(self.paths, self.boundary, self.config)
+            self.assertEqual(shared_stop.call_count, 2)
+
+            bootstrap(self.paths, self.boundary, self.config)
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+            self.assertEqual(shared_stop.call_count, 3)
+        self.assertEqual(self.boundary.restart_calls, 3)
+
     def test_restart_and_down_share_unreconciled_attempt_refusal(self):
         root = self._configure()
         bootstrap(self.paths, self.boundary, self.config)
@@ -464,6 +565,60 @@ class BootstrapTests(unittest.TestCase):
             down(self.paths, self.boundary)
         self.assertEqual(self.boundary.restart_calls, 0)
 
+    def test_down_and_restart_refuse_missing_or_invalid_owner_lock(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        valid_marker = json.loads(self.paths.instance_lock_path.read_text())
+        realm_root = Path(discovery["realm_root"])
+        malformed = {
+            "empty": {},
+            "bad_pid": {**valid_marker, "pid": "not-a-pid"},
+            "missing_birth": {key: value for key, value in valid_marker.items()
+                               if key != "process_birth_id"},
+            "wrong_instance": {**valid_marker, "runtime_instance_id": "other-instance"},
+            "wrong_realm_root": {**valid_marker, "realm_root": str(realm_root.parent)},
+            # active_realm is a discovery field; the instance lock must bind
+            # its owner using its own required realm_id field.
+            "active_realm_without_realm_id": {
+                **{key: value for key, value in valid_marker.items() if key != "realm_id"},
+                "active_realm": "configured-realm",
+            },
+        }
+        manager_calls = []
+        starts = len(self.boundary.starts)
+        for case, marker in (("missing", None), *malformed.items()):
+            with self.subTest(case=case):
+                if marker is None:
+                    self.paths.instance_lock_path.unlink()
+                else:
+                    self.paths.instance_lock_path.write_text(json.dumps(marker))
+                watched = (
+                    self.paths.catalog_path,
+                    self.paths.discovery_path,
+                    self.paths.instance_lock_path,
+                    self.paths.credentials_dir / "astrid.json",
+                    realm_root / "realm.sqlite3",
+                )
+                before = {path: path.read_bytes() for path in watched if path.exists()}
+                for command in (
+                    lambda: down(
+                        self.paths, self.boundary,
+                        stop_manager=lambda: manager_calls.append("down manager"),
+                    ),
+                    lambda: restart(self.paths, self.boundary, self.config),
+                ):
+                    with self.assertRaisesRegex(BootstrapError, "owner lock"):
+                        command()
+                self.assertEqual(manager_calls, [])
+                self.assertEqual(self.boundary.restart_calls, 0)
+                self.assertEqual(len(self.boundary.starts), starts)
+                self.assertEqual(before, {path: path.read_bytes() for path in watched if path.exists()})
+                # Restore the starting publication so each subcase begins
+                # with the same valid owner identity.
+                self.paths.discovery_path.write_text(json.dumps(discovery))
+                self.paths.instance_lock_path.write_text(json.dumps(valid_marker))
+
     def test_down_holds_bootstrap_mutex_through_stop_owner(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
@@ -515,6 +670,42 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result["status"], "stopped")
         self.assertFalse(self.paths.discovery_path.exists())
         self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_installer_replacement_during_runtime_stop_skips_manager_and_cleanup(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        replacement = {
+            "pid": 49998,
+            "endpoint": "http://127.0.0.1:49998",
+            "runtime_instance_id": "replacement-instance",
+            "process_birth_id": "replacement-birth",
+            "active_realm": "configured-realm",
+            "realm_root": str(root.resolve()),
+        }
+        manager_calls = []
+        original_stop = self.boundary.stop_owner
+
+        def replace_owner(**kwargs):
+            result = original_stop(**kwargs)
+            self.paths.discovery_path.write_text(json.dumps(replacement))
+            self.paths.instance_lock_path.write_text(json.dumps({
+                **replacement, "realm_id": "configured-realm",
+            }))
+            return result
+
+        self.boundary.stop_owner = replace_owner
+        with self.assertRaisesRegex(BootstrapError, "changed before manager stop"):
+            installer_stop(
+                self.paths,
+                self.boundary,
+                stop_manager=lambda: manager_calls.append("manager"),
+            )
+        self.assertEqual(manager_calls, [])
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
+        self.assertEqual(
+            json.loads(self.paths.instance_lock_path.read_text()),
+            {**replacement, "realm_id": "configured-realm"},
+        )
 
     def test_installer_stop_records_authority_before_stopping_owner(self):
         self._configure()
@@ -1606,7 +1797,7 @@ class BootstrapTests(unittest.TestCase):
             }))
 
         self.boundary.stop_owner = replace_owner
-        with self.assertRaisesRegex(BootstrapError, "changed during stop"):
+        with self.assertRaisesRegex(BootstrapError, "changed before manager stop"):
             down(self.paths, self.boundary)
         self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
         self.assertEqual(
