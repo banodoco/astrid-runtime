@@ -148,6 +148,19 @@ def test_tracked_file_replaced_by_directory_with_untracked_child(tmp_path: Path)
     assert removed["dirty_hash"] != second["dirty_hash"]
 
 
+@pytest.mark.parametrize("checkout", ["runtime", "agent"])
+def test_untracked_nested_checkout_directory_fails_closed(tmp_path: Path, checkout: str) -> None:
+    runtime, agent = _repo(tmp_path / "runtime"), _repo(tmp_path / "agent")
+    root = runtime if checkout == "runtime" else agent
+    nested = _repo(root / "local-plugin")
+    # Git reports the checkout as a directory, hiding its child paths.
+    assert _git(root, "ls-files", "--others", "--exclude-standard", "-z") == "local-plugin/\0"
+    for content in ("initial\n", "edited plugin source\n"):
+        (nested / "tracked.txt").write_text(content)
+        with pytest.raises(SourceIdentityError, match="untracked source directory"):
+            _capture(runtime, agent)
+
+
 @requires_posix_private_modes
 def test_filemode_disabled_does_not_hide_tracked_executable_change(tmp_path: Path) -> None:
     runtime, agent = _repo(tmp_path / "runtime"), _repo(tmp_path / "agent")
@@ -282,53 +295,64 @@ def test_invalid_checkout_and_git_failure_raise_source_error(tmp_path: Path, mon
 
 def test_tracked_read_error_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime, agent = _repo(tmp_path / "runtime"), _repo(tmp_path / "agent")
-    original = Path.read_bytes
+    original = subprocess.run
 
-    def unreadable(path: Path) -> bytes:
-        if path == runtime / "tracked.txt":
-            raise PermissionError("denied")
-        return original(path)
+    def unreadable(argv, **kwargs):
+        if "hash-object" in argv and str(runtime) == argv[2]:
+            raise subprocess.CalledProcessError(128, argv, stderr=b"cannot open tracked.txt: denied")
+        return original(argv, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", unreadable)
-    with pytest.raises(SourceIdentityError, match="cannot read tracked source entry"):
+    monkeypatch.setattr(subprocess, "run", unreadable)
+    with pytest.raises(SourceIdentityError, match=r"cannot inspect Git checkout \(hash-object\)"):
         _capture(runtime, agent)
 
 
 def test_file_changed_during_raw_read_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime, agent = _repo(tmp_path / "runtime"), _repo(tmp_path / "agent")
-    original = Path.read_bytes
+    original = subprocess.run
     changed = False
 
-    def racing_read(path: Path) -> bytes:
+    def racing_read(argv, **kwargs):
         nonlocal changed
-        data = original(path)
-        if path == runtime / "tracked.txt" and not changed:
+        result = original(argv, **kwargs)
+        if "hash-object" in argv and str(runtime) == argv[2] and not changed:
+            assert "--no-filters" in argv
             changed = True
-            path.write_text("changed while being captured\n")
-        return data
+            # Git has read the old raw bytes, but the caller has not consumed its OID.
+            (runtime / "tracked.txt").write_text("changed while being captured\n")
+        return result
 
-    monkeypatch.setattr(Path, "read_bytes", racing_read)
+    monkeypatch.setattr(subprocess, "run", racing_read)
     with pytest.raises(SourceIdentityError, match="changed during identity capture"):
         _capture(runtime, agent)
+    assert changed
 
 
 def test_same_status_content_race_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime, agent = _repo(tmp_path / "runtime"), _repo(tmp_path / "agent")
-    source_identity = __import__("runtime_protocol.source_identity", fromlist=["_tracked_inventory"])
-    original = source_identity._tracked_inventory
-    calls = 0
+    from runtime_protocol import source_identity
 
-    def racing(root: Path):
-        nonlocal calls
-        inventory = original(root)
-        calls += 1
-        if root == runtime and calls == 1:
-            (runtime / "tracked.txt").write_text("changed during capture\n")
-        return inventory
+    (runtime / "tracked.txt").write_text("dirty before capture\n")
+    before = (_git(runtime, "rev-parse", "HEAD"), _git(runtime, "ls-files", "--stage"),
+              _git(runtime, "status", "--porcelain"))
+    assert before[2] == "M tracked.txt"
+    original = source_identity._blob_ids
+    changed = False
 
-    monkeypatch.setattr(source_identity, "_tracked_inventory", racing)
+    def racing(root: Path, paths: list[bytes]):
+        nonlocal changed
+        hashes = original(root, paths)
+        if root == runtime and b"tracked.txt" in paths and not changed:
+            changed = True
+            (runtime / "tracked.txt").write_text("dirty after capture\n")
+            assert before == (_git(runtime, "rev-parse", "HEAD"), _git(runtime, "ls-files", "--stage"),
+                              _git(runtime, "status", "--porcelain"))
+        return hashes
+
+    monkeypatch.setattr(source_identity, "_blob_ids", racing)
     with pytest.raises(SourceIdentityError, match="changed during identity capture"):
         _capture(runtime, agent)
+    assert changed
 
 
 def test_head_race_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -359,3 +383,51 @@ def test_git_worktree_dot_git_file_is_supported(tmp_path: Path) -> None:
     assert (linked / ".git").is_file()
     identity = _capture(linked, agent)
     assert identity["dirty"] is False
+
+
+@requires_posix_private_modes
+def test_raw_hash_batches_preserve_unusual_paths_and_do_not_write_objects(tmp_path: Path) -> None:
+    runtime, agent = _repo(tmp_path / "runtime"), _repo(tmp_path / "agent")
+    # Cross a batch boundary, including names that a newline pipeline would misparse.
+    for name in [f"file-{i}" for i in range(70)] + ["-option", 'quote"', "line\nbreak", "tab\tname"]:
+        (runtime / name).write_text(name)
+    objects = sorted((runtime / ".git/objects").rglob("*"))
+    first = _capture(runtime, agent)
+    (runtime / "line\nbreak").write_text("changed")
+    second = _capture(runtime, agent)
+    assert first["dirty"] is second["dirty"] is True
+    assert first["dirty_hash"] != second["dirty_hash"]
+    assert sorted((runtime / ".git/objects").rglob("*")) == objects
+
+
+@pytest.mark.parametrize("output", [b"", b"not-an-object-id\n"])
+def test_incomplete_or_invalid_git_blob_hashes_fail_closed(tmp_path: Path, monkeypatch, output) -> None:
+    runtime, agent = _repo(tmp_path / "runtime"), _repo(tmp_path / "agent")
+    from runtime_protocol import source_identity
+
+    original = source_identity._git
+
+    def corrupt(root, *args, **kwargs):
+        if args[0] == "hash-object":
+            return output
+        return original(root, *args, **kwargs)
+
+    monkeypatch.setattr(source_identity, "_git", corrupt)
+    with pytest.raises(SourceIdentityError, match="raw blob hash"):
+        _capture(runtime, agent)
+
+
+def test_checkout_root_admission_is_absolute_and_does_not_capture_contents(tmp_path, monkeypatch):
+    from runtime_protocol import source_identity
+
+    root = _repo(tmp_path / "source")
+    assert source_identity.validate_checkout_root(root) == root.resolve()
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SourceIdentityError, match="absolute"):
+        source_identity.validate_checkout_root(Path("source"))
+    nested = root / "nested"
+    nested.mkdir()
+    with pytest.raises(SourceIdentityError, match="not the root"):
+        source_identity.validate_checkout_root(nested)
+    monkeypatch.setattr(source_identity, "_head", lambda *_: pytest.fail("admission must not capture HEAD"))
+    assert source_identity.validate_checkout_root(root) == root.resolve()

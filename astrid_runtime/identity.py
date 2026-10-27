@@ -78,13 +78,6 @@ def validate_live_owner_identity(
     return normalize_startup_identity(health.get("identity"))
 
 
-def identities_match(expected: Any, observed: Any) -> bool:
-    try:
-        return normalize_startup_identity(expected) == normalize_startup_identity(observed)
-    except StartupIdentityError:
-        return False
-
-
 def _valid_head(value: Any) -> bool:
     return isinstance(value, str) and len(value) in (40, 64) and _lower_hex(value)
 

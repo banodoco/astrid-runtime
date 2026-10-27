@@ -76,6 +76,8 @@ class FakeBoundary:
         self.restart_calls = 0
         self.live_identity = dict(NATIVE_IDENTITY)
         self.live_instance_id = None
+        self.identity_observations = []
+        self.healthy = True
 
     def start(self, **kwargs):
         self.calls.append("start")
@@ -113,9 +115,11 @@ class FakeBoundary:
         return FakeConnection(self)
 
     def health(self, **kwargs):
-        return kwargs["pid"] in self.alive
+        self.identity_observations.append("health")
+        return self.healthy and kwargs["pid"] in self.alive
 
     def owner_startup_identity(self, *, endpoint, instance_id):
+        self.identity_observations.append("identity")
         return {
             "runtime_instance_id": self.live_instance_id or instance_id,
             "identity": (
@@ -235,6 +239,7 @@ class BootstrapTests(unittest.TestCase):
             str(caught.exception),
             "An older Astrid is still running. Restart it after its running tasks finish.",
         )
+        self.assertEqual(caught.exception.details, {"code": "identity_mismatch"})
         self.assertEqual(before, {file: file.read_bytes() for file in files})
         self.assertEqual(
             side_effect_counts,
@@ -275,6 +280,47 @@ class BootstrapTests(unittest.TestCase):
                     expected_identity=expected, observed_identity=expected,
                     bad_instance_id="different-owner",
                 )
+
+    def test_start_and_reconnect_validate_identity_once_after_successful_health(self):
+        self._configure()
+        with patch.object(bootstrap_module, "validate_live_owner_identity",
+                          wraps=bootstrap_module.validate_live_owner_identity) as validate:
+            bootstrap(self.paths, self.boundary, self.config)
+            self.assertEqual(self.boundary.identity_observations, ["health", "identity"])
+            self.assertEqual(validate.call_count, 1)
+            for caller in (bootstrap, connect):
+                with self.subTest(caller=caller.__name__):
+                    validate.reset_mock()
+                    self.boundary.identity_observations.clear()
+                    caller(self.paths, self.boundary, self.config)
+                    self.assertEqual(self.boundary.identity_observations, ["health", "identity"])
+                    self.assertEqual(validate.call_count, 1)
+
+    def test_unhealthy_owner_refuses_before_identity_read_or_writes(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        files = (self.paths.catalog_path, self.paths.source_profiles_dir / "astrid.json",
+                 self.paths.discovery_path, self.paths.instance_lock_path,
+                 self.paths.credentials_dir / "astrid.json")
+        before = {file: file.read_bytes() for file in files}
+        counts = (len(self.boundary.starts), len(self.boundary.connects),
+                  len(self.boundary.provisions), len(self.boundary.handshakes),
+                  self.boundary.restart_calls)
+        self.boundary.healthy = False
+        self.boundary.live_identity = None  # Health refusal has precedence over identity refusal.
+        for caller in (bootstrap, connect):
+            with self.subTest(caller=caller.__name__):
+                self.boundary.identity_observations.clear()
+                with patch.object(bootstrap_module, "validate_live_owner_identity") as validate:
+                    with self.assertRaisesRegex(BootstrapError, "unhealthy") as caught:
+                        caller(self.paths, self.boundary, self.config)
+                    validate.assert_not_called()
+                self.assertIsNone(caught.exception.details)
+                self.assertEqual(self.boundary.identity_observations, ["health"])
+                self.assertEqual(before, {file: file.read_bytes() for file in files})
+                self.assertEqual(counts, (len(self.boundary.starts), len(self.boundary.connects),
+                                         len(self.boundary.provisions), len(self.boundary.handshakes),
+                                         self.boundary.restart_calls))
 
     def test_source_identity_fields_are_compared_for_up_and_connect(self):
         with patch.dict(os.environ):
@@ -1006,7 +1052,7 @@ class BootstrapTests(unittest.TestCase):
                 stop_manager=lambda: manager_calls.append("manager"),
             )
         self.assertEqual(manager_calls, [])
-        self.assertEqual(caught.exception.details, {"stop_authority_lost": True})
+        self.assertIsNone(caught.exception.details)
         self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
         self.assertEqual(
             json.loads(self.paths.instance_lock_path.read_text()),
@@ -1239,11 +1285,27 @@ class BootstrapTests(unittest.TestCase):
     def test_installer_manager_failure_reports_known_runtime_stop(self):
         self._configure()
         def manager_failure():
-            raise RuntimeError("manager stop failed")
+            raise BootstrapError("manager stop failed", details={"safe": False, "blocker": "service"})
         with self.assertRaises(BootstrapError) as caught:
             down(self.paths, self.boundary, stop_manager=manager_failure)
-        self.assertEqual(caught.exception.details, {"stop_completed": True})
+        self.assertEqual(caught.exception.details, {"cause_details": {"safe": False, "blocker": "service"}})
         self.assertIn("manager stop failed", str(caught.exception))
+
+    def test_stop_owner_error_details_are_downstream_context(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        manager_calls = []
+
+        def uncertain_stop(**_kwargs):
+            raise BootstrapError("stop handoff failed", details={"safe": False, "blocker": "owner"})
+
+        self.boundary.stop_owner = uncertain_stop
+        with self.assertRaises(BootstrapError) as caught:
+            down(self.paths, self.boundary, stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(caught.exception.details, {
+            "cause_details": {"safe": False, "blocker": "owner"},
+        })
+        self.assertEqual(manager_calls, [])
 
     def test_same_controller_stop_retry_revalidates_completed_owner_absence(self):
         root = self._configure()
@@ -1255,7 +1317,7 @@ class BootstrapTests(unittest.TestCase):
 
         with self.assertRaisesRegex(BootstrapError, "manager unavailable") as caught:
             down(self.paths, self.boundary, stop_manager=manager_failure)
-        self.assertEqual(caught.exception.details, {"stop_completed": True})
+        self.assertIsNone(caught.exception.details)
 
         def retry_manager():
             with sqlite3.connect(root / "realm.sqlite3", timeout=0.02) as connection:
@@ -1323,7 +1385,7 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(BootstrapError, "manager unavailable") as caught:
             down(self.paths, self.boundary,
                  stop_manager=lambda: (_ for _ in ()).throw(RuntimeError("manager unavailable")))
-        self.assertEqual(caught.exception.details, {"stop_completed": True})
+        self.assertIsNone(caught.exception.details)
         self.assertFalse(self.paths.discovery_path.exists())
         self.assertFalse(self.paths.instance_lock_path.exists())
 
@@ -1537,14 +1599,14 @@ class BootstrapTests(unittest.TestCase):
             self._add_running_task(root)
             self.paths.bootstrap_lock_path.unlink(missing_ok=True)
             watched = (
-                database, Path(str(database) + "-wal"), Path(str(database) + "-shm"),
                 self.paths.discovery_path, self.paths.instance_lock_path,
                 self.paths.credentials_dir / "astrid.json",
             )
             before = {path: path.read_bytes() for path in watched if path.exists()}
             stop_calls = self.boundary.restart_calls
-            self.assertIn(Path(str(database) + "-wal"), before)
-            self.assertIn(Path(str(database) + "-shm"), before)
+            self.assertTrue(Path(str(database) + "-wal").exists())
+            self.assertTrue(Path(str(database) + "-shm").exists())
+            committed_before = tuple(owner_connection.iterdump())
             for force_collection in (False, True):
                 with self.subTest(force_collection=force_collection):
                     def observe(root):
@@ -1558,6 +1620,9 @@ class BootstrapTests(unittest.TestCase):
                     self.assertEqual(caught.exception.details["task_count"], 1)
                     self.assertEqual(stop_calls, self.boundary.restart_calls)
                     self.assertFalse(self.paths.bootstrap_lock_path.exists())
+                    # WAL/SHM bookkeeping is allowed; realm data and owner
+                    # publications must remain unchanged on refusal.
+                    self.assertEqual(committed_before, tuple(owner_connection.iterdump()))
                     after = {path: path.read_bytes() for path in watched if path.exists()}
                     self.assertEqual(before.keys(), after.keys())
                     for path, contents in before.items():
