@@ -1484,6 +1484,10 @@ class WorkspaceClient:
         _, _, body = self._request("GET", f"/v1/executors/{_path_part(executor_id)}")
         return Executor.from_json(self._json(body))
 
+    def get_task_settlement(self, task_id: str) -> Mapping[str, Any]:
+        _, _, body = self._request("GET", f"/v1/control/tasks/{_path_part(task_id)}/settlement")
+        return self._json(body)
+
     def get_local_worker_generation(self) -> Mapping[str, Any]:
         _, _, body = self._request("GET", "/v1/control/local-worker/generation")
         return self._json(body)
@@ -1493,8 +1497,10 @@ class WorkspaceClient:
         _, _, body = self._request("POST", "/v1/control/local-worker/start", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})
         return self._json(body)
 
-    def relinquish_local_worker(self, executor_incarnation: str, evidence_digest: str) -> Mapping[str, Any]:
+    def relinquish_local_worker(self, executor_incarnation: str, evidence_digest: str, *, expected_task_ids: list[str] | None = None) -> Mapping[str, Any]:
         payload = {"executor_incarnation": executor_incarnation, "evidence_digest": evidence_digest}
+        if expected_task_ids is not None:
+            payload["expected_task_ids"] = list(expected_task_ids)
         _, _, body = self._request("POST", "/v1/control/local-worker/relinquish", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})
         return self._json(body)
 

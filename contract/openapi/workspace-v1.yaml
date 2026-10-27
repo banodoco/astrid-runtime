@@ -725,6 +725,11 @@ paths:
       operationId: getExecutor
       parameters: [ { name: executor_id, in: path, required: true, schema: { type: string, minLength: 1 } } ]
       responses: { '200': { description: Exact owner-observed executor, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/control/tasks/{task_id}/settlement:
+    get:
+      operationId: getTaskSettlement
+      parameters: [ { name: task_id, in: path, required: true, schema: { type: string, minLength: 1 } } ]
+      responses: { '200': { description: Owner-only exact task settlement observation using lifecycle blockers, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/TaskSettlement' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
   /v1/control/local-worker/generation:
     get:
       operationId: getLocalWorkerGeneration

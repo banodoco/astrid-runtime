@@ -87,6 +87,12 @@ def parser() -> argparse.ArgumentParser:
     start_worker.add_argument("--profile", default="astrid", choices=["astrid"])
     start_worker.add_argument("--expected-workspace-uuid", required=True)
 
+    tasks = sub.add_parser("tasks", help="manage named Runtime tasks")
+    tasks_sub = tasks.add_subparsers(dest="tasks_command", required=True)
+    clear = tasks_sub.add_parser("clear", help="cancel and settle exact named task ids")
+    clear.add_argument("task_ids", nargs="+", help="exact task ids to clear")
+    _read_args(clear)
+
     workspace = sub.add_parser("workspace", help="explicitly inspect, create, or attach the sole workspace")
     workspace_sub = workspace.add_subparsers(dest="workspace_command", required=True)
     workspace_inspect = workspace_sub.add_parser("inspect", help="read-only canonical workspace inspection")
@@ -257,7 +263,7 @@ def _emit_ready(result: BootstrapResult, *, json_mode: bool) -> None:
         print(f"\nOpen {result.door_origin}")
 
 
-def _credential(paths: RuntimePaths) -> str:
+def _credential(paths: RuntimePaths, *, advise_start: bool = True) -> str:
     # Product traffic uses the Astrid-scoped credential in app support.  An
     # operator command needs the daemon-issued owner credential, which is
     # scoped to admin/worker lifecycle operations and remains inside the
@@ -271,6 +277,8 @@ def _credential(paths: RuntimePaths) -> str:
             raise BootstrapError(f"Runtime owner credential access refused: {exc}") from exc
         token = ""
     if not token:
+        if not advise_start:
+            raise BootstrapError("No Runtime owner credential is available; tasks clear requires an existing owner and will not start Runtime.")
         raise BootstrapError("No runtime owner credential is available; run astrid-runtime up --profile astrid.")
     return token
 
@@ -445,9 +453,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         paths = _paths(args)
     except (OSError, ValueError) as exc:
+        if args.command == "tasks" and args.tasks_command == "clear":
+            from .task_clear import _error_row, _result
+            outcomes = {task_id: _error_row(task_id, "failed", str(exc)) for task_id in args.task_ids}
+            _emit(_result(args.task_ids, outcomes), json_mode=args.json)
+            return 1
         _emit({"ok": False, "error": str(exc)}, json_mode=True)
         return 1
-    if args.command not in {"workspace", "doctor", "status"}:
+    if args.command not in {"workspace", "doctor", "status", "tasks"}:
         # Any other command may stop or signal the Runtime it manages, so it
         # follows the installed process-control setting from the start.
         try:
@@ -489,6 +502,16 @@ def main(argv: list[str] | None = None) -> int:
         result = doctor(paths, LocalRuntimeBoundary())
         _emit(result, json_mode=args.json)
         return 0 if result["healthy"] else 1
+    if args.command == "tasks" and args.tasks_command == "clear":
+        from .task_clear import clear_tasks
+
+        result = clear_tasks(
+            paths, args.task_ids,
+            credential_reader=lambda current: _credential(current, advise_start=False),
+            client_factory=_client,
+        )
+        _emit(result, json_mode=args.json)
+        return 0 if result["ok"] else 1
     if args.command == "run":
         config = _config(args, paths)
         try:

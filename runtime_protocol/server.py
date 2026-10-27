@@ -966,6 +966,21 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             "/v1/control/local-worker/start", "/v1/control/local-worker/relinquish",
         }) or (method == "GET" and path == "/v1/control/local-worker/generation")
 
+    def _is_task_settlement_control(self):
+        path = [unquote(x) for x in urlsplit(getattr(self, "path", "")).path.split("/") if x]
+        return (getattr(self, "command", None) == "GET" and len(path) == 5
+                and path[:3] == ["v1", "control", "tasks"] and path[4] == "settlement")
+
+    def _task_settlement_control(self):
+        identity = self._identity("admin")
+        if identity.get("actor") != "owner":
+            raise ForbiddenError("task settlement requires the Runtime owner actor")
+        daemon = getattr(self.server, "daemon_runtime", None)
+        if daemon is None:
+            raise ConflictError("task settlement requires daemon ownership")
+        task_id = unquote(urlsplit(self.path).path.split("/")[4])
+        return self._send(200, daemon.task_settlement(task_id, identity=identity))
+
     def _is_remote_credential_control(self):
         path = [unquote(x) for x in urlsplit(getattr(self, "path", "")).path.split("/") if x]
         return getattr(self, "command", None) == "POST" and len(path) == 4 and path[:2] == ["v1", "tasks"] and path[3] == "remote-credential"
@@ -981,10 +996,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, daemon.local_worker_generation(identity=identity))
         body = self._body()
         if urlsplit(self.path).path.endswith("/relinquish"):
-            if not isinstance(body, dict) or set(body) != {"executor_incarnation", "evidence_digest"}:
+            if (not isinstance(body, dict) or not {"executor_incarnation", "evidence_digest"} <= set(body)
+                    or set(body) - {"executor_incarnation", "evidence_digest", "expected_task_ids"}
+                    or ("expected_task_ids" in body and body["expected_task_ids"] is None)):
                 raise ProtocolError("exact local Worker generation fields are required")
             return self._send(200, daemon.relinquish_local_worker(
                 body["executor_incarnation"], body["evidence_digest"], identity=identity,
+                expected_task_ids=body.get("expected_task_ids"),
             ))
         if not isinstance(body, dict) or set(body) != {"profile_id", "expected_workspace_uuid"}:
             raise ProtocolError("profile_id and expected_workspace_uuid are the only accepted launch fields")
@@ -1007,7 +1025,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._prefetched_body = None
             self._defer_response = True
             try:
-                if self._is_local_worker_control():
+                if self._is_task_settlement_control():
+                    self._task_settlement_control()
+                elif self._is_local_worker_control():
                     # Process preparation and OS observation are deliberately
                     # outside the SQLite mutex. Credential authentication and
                     # publication use CredentialStore's short internal lock.

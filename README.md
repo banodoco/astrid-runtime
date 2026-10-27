@@ -31,6 +31,31 @@ The repository contains the first independently runnable neutral-runtime slice. 
 
 The runtime owns durable structured state, task/lease semantics, capability registration, append-only CAS accounting, verified backup/restore/replacement, and the language-neutral protocol. Product repositories consume generated clients and never open its database or storage directly.
 
+## Clearing named tasks
+
+`astrid-runtime tasks clear <task-id> [<task-id> ...]` uses the selected live
+Runtime's owner credential. It cancels only the exact named tasks through the
+canonical task API, then confirms that each is terminal with no remaining
+lifecycle blockers. `--json` reports an outcome for each supplied id, including
+repeated and unknown ids. It exits zero only when all named tasks are settled
+or confirmed already settled, and never starts a Runtime to clear tasks.
+
+Local host-only Worker tasks require the owner's retained process handle and
+positive child ACK plus completed wait. Relinquishing a Worker requires naming
+all its outstanding tasks; a refusal reports additional required ids. Interrupted
+cleanup retries the exact named set and generation using durable stop proof.
+Uncertain stop proof, expired initial leases, or unsupported external work
+remain explicit failures. `cancel_requested` does not mean cleared. An unnamed
+task can still block `down` after a successful clear of other tasks.
+
+When handing this action to someone else, provide both **Copy for your agent**
+(inspect the named blockers and clear only the explicitly selected ids) and
+**Run it yourself** (`astrid-runtime tasks clear <task-id> ...`). Until the
+installer's terminal shim is available, use the selected installation's Python
+with `-I -m astrid_runtime tasks clear <task-id> ...`, preserving that
+installation's data and support arguments. Pinokio users use its Stop/Update
+buttons for the subsequent lifecycle action.
+
 ## Client contract releases
 
 `generators/release.json` owns the contract version. Run

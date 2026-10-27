@@ -114,6 +114,18 @@ def render_python_client(manifest_path: Path = MANIFEST) -> str:
 def render_typescript_client() -> str:
     """Render the source-frame thumbnail operations into the typed TS client."""
     source = _regular(TYPESCRIPT_CLIENT_OUTPUT, "TypeScript client").decode("utf-8")
+    settlement_method = '  async getTaskSettlement(taskId: string): Promise<{ task_id: string; state: string; settled: boolean; blockers: Record<string, unknown>[]; task: Task }> { return this.json((await this.request("GET", `/v1/control/tasks/${encodeURIComponent(taskId)}/settlement`)).body) }'
+    if "  async getTaskSettlement(" in source:
+        source = "\n".join(settlement_method if line.startswith("  async getTaskSettlement(") else line for line in source.split("\n"))
+    else:
+        source = source.replace("  async getLocalWorkerGeneration(", settlement_method + "\n  async getLocalWorkerGeneration(", 1)
+    source = source.replace(
+        'async relinquishLocalWorker(executorIncarnation: string, evidenceDigest: string):',
+        'async relinquishLocalWorker(executorIncarnation: string, evidenceDigest: string, expectedTaskIds?: string[]):',
+    ).replace(
+        'JSON.stringify({ executor_incarnation: executorIncarnation, evidence_digest: evidenceDigest })',
+        'JSON.stringify({ executor_incarnation: executorIncarnation, evidence_digest: evidenceDigest, ...(expectedTaskIds === undefined ? {} : { expected_task_ids: expectedTaskIds }) })',
+    )
     child_authority_types = (
         'export interface ChildAuthorityChild { child_id: string; capability_id: string; capability_digest: string }\n'
         'export interface DerivedInputDescriptor { name: string; output_port: string; filename: string; object_id: string; size: number; media_type: string }\n'
