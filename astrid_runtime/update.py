@@ -1,7 +1,8 @@
-"""Read-only F1 admission. Execution/capability publication belongs to F1b/c.
+"""F1 admission, durable acceptance and read-only job status.
 
-Preparation runs in the selected installation, so a standalone Runtime has no
-agent import dependency. This module never stops an owner or writes a journal.
+Preparation and short record updates run in the selected installation, so a
+standalone Runtime has no agent import dependency. Runtime never stops an owner
+or writes installer records or the C2 journal itself.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -65,14 +67,37 @@ def _json(path, snapshots):
 
 
 class UpdateAdmission:
-    def __init__(self, daemon):
+    def __init__(self, daemon, launcher=None):
         self.daemon = daemon
+        # Production has no native transient-job adapter until F1c. Tests and
+        # the standalone worker harness may inject one without advertising a
+        # capability on ordinary Runtime instances.
+        self.launcher = launcher if launcher is not None else getattr(daemon, "update_launcher", None)
         self._lock = threading.Lock()
 
     def status(self):
-        # Bounded and independent of workspace/schema negotiation. No disk,
-        # network, recovery, job creation or eligibility probing on GET.
-        return {"available": False, "state": "none", "reason": "updater-unavailable"}
+        return read_update_status(Path.home(), available=self.launcher is not None)
+
+    def _helper(self, python, agent, runtime, payload):
+        script = ("import sys; sys.path[:0]=sys.argv[1:3]; "
+                  "from astrid.installer.update_job import main; main()")
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"ASTRID_INSTALL_MANIFEST_URL", "PYTHONPATH", "PYTHONHOME"}}
+        result = subprocess.run([str(python), "-I", "-B", "-c", script, str(agent), str(runtime)],
+                                input=json.dumps(payload), text=True, capture_output=True,
+                                timeout=300, env=env)
+        failure_reason = "update-record-failed" if payload.get("action") == "accept" else "inputs-unavailable"
+        failure_message = ("The update request could not be saved safely." if failure_reason == "update-record-failed"
+                           else "Update inputs are unavailable or invalid.")
+        if result.returncode:
+            raise UpdateRefusal(failure_reason, failure_message)
+        try:
+            value = json.loads(result.stdout)
+        except (TypeError, json.JSONDecodeError):
+            raise UpdateRefusal(failure_reason, failure_message) from None
+        if not isinstance(value, dict):
+            raise UpdateRefusal(failure_reason, failure_message)
+        return value
 
     def _selection(self):
         daemon = self.daemon
@@ -167,38 +192,34 @@ class UpdateAdmission:
             raise UpdateRefusal("update-busy", "An update request is already being prepared.")
         try:
             selection_path, snapshots, python, agent, runtime, installed = self._selection()
-            with self._installer_idle(selection_path):
-                # C1 owns the blocker report and the final destructive fence.
-                # This is only its read-only preflight; no stop authority here.
-                assert_interruption_safe(self.daemon.root)
-                # The trusted OS temp base may be an alias (e.g. /var on macOS).
-                # Canonicalize only that base; selected paths and input files
-                # still pass the strict link and byte-identity checks below.
-                temporary_base = Path(tempfile.gettempdir()).resolve(strict=True)
-                with tempfile.TemporaryDirectory(prefix="astrid-update-", dir=temporary_base) as temporary:
-                    platform.private_directory(Path(temporary))
-                    request = {"directory": temporary, "installed_release": installed,
+            selected_record = json.loads(snapshots[selection_path])
+            root = Path(selected_record["program_root"])
+            data = Path(selected_record["data_root"])
+            old_version_name = snapshots[root / "current"].decode("utf-8").strip()
+            old_version = json.loads(snapshots[root / "versions" / old_version_name / "version.json"])
+            temporary_base = Path(tempfile.gettempdir()).resolve(strict=True)
+            temporary = Path(tempfile.mkdtemp(prefix="astrid-update-", dir=temporary_base))
+            platform.private_directory(temporary)
+            accepted = False
+            operation_id = None
+            try:
+                with self._installer_idle(selection_path):
+                    # C1 owns the blocker report and the final destructive fence.
+                    # This is only its read-only preflight; no stop authority here.
+                    assert_interruption_safe(self.daemon.root)
+                    request = {"directory": str(temporary), "installed_release": installed,
                                "manifest_url": MANIFEST_URL,
                                "bootstrap_url": WINDOWS_BOOTSTRAP_URL if sys.platform == "win32" else BOOTSTRAP_URL}
-                    script = ("import sys; sys.path[:0]=sys.argv[1:3]; "
-                              "from astrid.installer.update_job import main; main()")
-                    env = {key: value for key, value in os.environ.items()
-                           if key not in {"ASTRID_INSTALL_MANIFEST_URL", "PYTHONPATH", "PYTHONHOME"}}
-                    result = subprocess.run([str(python), "-I", "-B", "-c", script, str(agent), str(runtime)],
-                                            input=json.dumps(request), text=True, capture_output=True,
-                                            timeout=300, env=env)
-                    if result.returncode:
-                        raise UpdateRefusal("inputs-unavailable", "Update inputs are unavailable or invalid.")
+                    metadata = self._helper(python, agent, runtime, request)
                     # Validate selected bytes again in the parent at the point
                     # of consumption; helper metadata is not upstream verification.
-                    metadata = json.loads(result.stdout)
                     from hashlib import sha256
-                    for name in ("manifest", "bootstrap"):
-                        path = Path(temporary) / name
+                    for input_name in ("manifest", "bootstrap"):
+                        path = temporary / input_name
                         if not platform.is_owner_only(path):
                             raise ValueError("selected input is no longer private")
                         raw = _bytes(path, limit=2 * MAX_METADATA_BYTES)
-                        if sha256(raw).hexdigest() != metadata[name + "_sha256"]:
+                        if sha256(raw).hexdigest() != metadata[input_name + "_sha256"]:
                             raise ValueError("selected input changed")
                     target = metadata["release"]
                     if type(target) is not int or target <= installed:
@@ -206,9 +227,50 @@ class UpdateAdmission:
                     for path, raw in snapshots.items():
                         if _bytes(path) != raw:
                             raise ValueError("selected installation changed during preparation")
-                    # There is deliberately no launcher/capability until F1b/c
-                    # provide a complete independent execution path.
-                    raise UpdateRefusal("updater-unavailable", "The update launcher is not installed. Run the install line to update Astrid.")
+                    if self.launcher is None:
+                        raise UpdateRefusal("updater-unavailable", "The update launcher is not installed. Run the install line to update Astrid.")
+                    from uuid import uuid4
+                    operation_id = uuid4().hex
+                    job_name = "astrid-update-" + operation_id
+                    log_path = root / "logs" / (job_name + ".log")
+                    durable = {
+                        "action": "accept", "root": str(root), "data_root": str(data),
+                        "selection_path": str(selection_path), "old_instance_id": self.daemon.instance_id,
+                        "old_identity": self.daemon.startup_identity, "old_version": old_version,
+                        "metadata": {
+                            "manifest_path": str(temporary / "manifest"),
+                            "bootstrap_path": str(temporary / "bootstrap"),
+                            "manifest_sha256": metadata["manifest_sha256"],
+                            "bootstrap_sha256": metadata["bootstrap_sha256"],
+                            "release": target,
+                        },
+                        "job_name": job_name, "operation_id": operation_id, "log_path": str(log_path),
+                    }
+                # The helper owns the K2 lock/write. Release the F1a read-only
+                # probe lock first so accept can reacquire the real installer lock.
+                try:
+                    job = self._helper(python, agent, runtime, durable)
+                    accepted = True
+                except Exception:
+                    current = _read_bounded_object(root / "install.json") or {}
+                    current_job = current.get("update_job")
+                    if isinstance(current_job, dict) and current_job.get("operation_id") == operation_id:
+                        accepted = True
+                        raise UpdateRefusal("accept-acknowledgement-unknown", "The update request was saved; check update status before taking another action.") from None
+                    raise
+                # Launcher acknowledgement can be lost after OS acceptance.
+                # Keep the durable job active and never retry it here.
+                try:
+                    self.launcher(job)
+                except Exception:
+                    raise UpdateRefusal("launch-acknowledgement-unknown", "The update was accepted; check update status before taking another action.") from None
+                return {"accepted": True, "state": job.get("state", "accepted"),
+                        "operation_id": operation_id, "message": "Update accepted."}
+            finally:
+                # Inputs belong to the durable job after acceptance; cleanup
+                # remains with the worker/job lifecycle owner.
+                if not accepted:
+                    shutil.rmtree(temporary, ignore_errors=True)
         except ConflictError:
             raise
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
@@ -221,3 +283,142 @@ def update_admission(daemon):
     if daemon is None:
         raise AuthorizationError("update owner context is unavailable")
     return daemon.update_admission
+
+
+_JOB_STATES = {"accepted", "active", "updated", "rolled_back", "failed", "recovery-needed"}
+def _read_bounded_object(path):
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_METADATA_BYTES:
+            return None
+        raw = path.read_bytes()
+        if len(raw) > MAX_METADATA_BYTES:
+            return None
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def read_update_status(home=None, *, available=False):
+    """Read the authoritative accepted job and C2 journal without recovery."""
+    def none():
+        result = {"available": bool(available), "state": "none"}
+        if not available:
+            result["reason"] = "updater-unavailable"
+        return result
+
+    def recovery_needed():
+        return {"available": bool(available), "state": "recovery-needed", "result": "Recovery needed."}
+
+    home = Path(home) if home is not None else Path.home()
+    selected = _read_bounded_object(_install_record_path(home)) or {}
+    if selected.get("owner") != "haus.astrid.runtime":
+        return none()
+    root_text = selected.get("program_root")
+    if not isinstance(root_text, str) or not Path(root_text).is_absolute():
+        return none()
+    try:
+        root = _path(root_text)
+    except (OSError, ValueError):
+        return none()
+    try:
+        install_path = _path(str(root / "install.json"))
+    except (OSError, ValueError):
+        return none()
+    install = _read_bounded_object(install_path)
+    if install is None:
+        return recovery_needed()
+    if (install.get("owner") != "haus.astrid.runtime"
+            or install.get("data_root") != selected.get("data_root")):
+        return recovery_needed()
+    job = install.get("update_job")
+    journal_path = root / "update-transaction.json"
+    journal_exists = journal_path.exists() or journal_path.is_symlink()
+    transaction = _read_bounded_object(journal_path) if journal_exists else None
+    journal_corrupt = (journal_exists and (transaction is None
+                       or not isinstance(transaction.get("step"), str) or not transaction.get("step")))
+    if not isinstance(job, dict):
+        if journal_corrupt or (transaction and transaction.get("step") not in {"complete", "rolled_back"}):
+            return recovery_needed()
+        return none()
+    state = job.get("state")
+    if state not in _JOB_STATES:
+        state = "recovery-needed"
+    operation_id = job.get("operation_id")
+    if not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+        state = "recovery-needed"
+    transaction = transaction or {}
+    step = transaction.get("step")
+    terminal_steps = {"complete", "rolled_back"}
+    journal_job = transaction.get("update_job")
+    if isinstance(journal_job, dict) and "operation_id" in journal_job:
+        matched = (journal_job.get("operation_id") == operation_id
+                   and (job.get("transaction_id") is None
+                        or job.get("transaction_id") == transaction.get("operation_id")))
+    else:
+        matched = (job.get("transaction_id") is not None
+                   and job.get("transaction_id") == transaction.get("operation_id"))
+    if journal_corrupt:
+        state = "recovery-needed"
+    elif step and step not in terminal_steps:
+        state = "active" if matched and _installer_lock_held(home) else "recovery-needed"
+    elif step in terminal_steps and matched and state in {"accepted", "active"}:
+        # C2 finished but its durable F1 result did not. A held installer lock
+        # means the worker still owns the final result write; after release,
+        # report the unresolved handoff without inferring success or rollback.
+        state = "active" if _installer_lock_held(home) else "recovery-needed"
+    outcome = state if state in {"updated", "rolled_back", "failed"} else None
+    api_state = "active" if state in {"accepted", "active"} else "terminal" if outcome else state
+    result = "Recovery needed." if state == "recovery-needed" else job.get("result") or job.get("message") or (outcome or api_state)
+    if not isinstance(result, str):
+        result = state
+    result = " ".join(result.split())[:240]
+    output = {"available": bool(available), "state": api_state, "operation_id": str(operation_id or "")[:80],
+              "result": result}
+    if outcome:
+        output["outcome"] = outcome
+    for key in ("target_release", "accepted_at"):
+        if isinstance(job.get(key), (int, str)):
+            output[key] = job[key]
+    log = job.get("log_path")
+    if isinstance(log, str) and Path(log).is_absolute():
+        try:
+            log_path = Path(os.path.abspath(log))
+            if log_path.is_relative_to(root):
+                safe = True
+                for candidate in (log_path, *log_path.parents):
+                    if candidate == root:
+                        break
+                    if candidate.exists() or candidate.is_symlink():
+                        if candidate.is_symlink():
+                            safe = False
+                            break
+                if (safe and len(str(log_path)) <= 1024 and log_path.is_file() and not log_path.is_symlink()
+                        and stat.S_ISREG(log_path.stat().st_mode) and platform.is_owner_only(log_path)):
+                    output["log_path"] = str(log_path)
+        except (OSError, ValueError):
+            pass
+    if state == "none":
+        output.pop("result", None)
+    return output
+
+
+def _installer_lock_held(home):
+    parent = _install_record_path(Path(home)).parent
+    if sys.platform == "win32":
+        parent = parent / "Astrid Installer"
+    lock_path = parent / "astrid-install.lock"
+    if lock_path.is_symlink() or not lock_path.is_file():
+        return False
+    try:
+        _path(str(lock_path))
+        with lock_path.open("r+b") as stream:
+            try:
+                platform.lock_file(stream.fileno(), blocking=False)
+            except BlockingIOError:
+                return True
+            platform.unlock_file(stream.fileno())
+            return False
+    except (OSError, ValueError):
+        # Inability to determine lock ownership is not evidence of a worker.
+        return False

@@ -290,7 +290,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         admission = update_admission(self.server.daemon_runtime)
         if self.command == "GET":
             return self._send(200, admission.status())
-        admission.request()
+        return self._send(202, admission.request())
 
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
