@@ -359,3 +359,19 @@ def test_git_worktree_dot_git_file_is_supported(tmp_path: Path) -> None:
     assert (linked / ".git").is_file()
     identity = _capture(linked, agent)
     assert identity["dirty"] is False
+
+
+def test_checkout_root_admission_is_absolute_and_does_not_capture_contents(tmp_path, monkeypatch):
+    from runtime_protocol import source_identity
+
+    root = _repo(tmp_path / "source")
+    assert source_identity.validate_checkout_root(root) == root.resolve()
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SourceIdentityError, match="absolute"):
+        source_identity.validate_checkout_root(Path("source"))
+    nested = root / "nested"
+    nested.mkdir()
+    with pytest.raises(SourceIdentityError, match="not the root"):
+        source_identity.validate_checkout_root(nested)
+    monkeypatch.setattr(source_identity, "_head", lambda *_: pytest.fail("admission must not capture HEAD"))
+    assert source_identity.validate_checkout_root(root) == root.resolve()

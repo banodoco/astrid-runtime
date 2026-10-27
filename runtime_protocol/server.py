@@ -316,9 +316,6 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 health["runtime_instance_id"] = getattr(
                     daemon, "startup_identity_instance_id", None
                 )
-                operation_id = getattr(daemon, "installer_operation_id", None)
-                if operation_id is not None:
-                    health["installer_operation_id"] = operation_id
                 health["identity"] = getattr(daemon, "startup_identity", None)
                 health["services"] = daemon.service_status()
             return self._send(200, health)
@@ -355,9 +352,6 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             daemon = getattr(self.server, "daemon_runtime", None)
             if owner_probe and daemon is not None:
                 resource["runtime_instance_id"] = getattr(daemon, "startup_identity_instance_id", None)
-                operation_id = getattr(daemon, "installer_operation_id", None)
-                if operation_id is not None:
-                    resource["installer_operation_id"] = operation_id
             return self._send(200, resource)
         if path == ["v1", "doctor"] and method == "GET":
             self._identity("admin")

@@ -328,35 +328,67 @@ def test_real_cli_lost_response_retry_observes_durable_lost_without_second_event
         daemon.stop()
 
 
-def test_external_clear_refuses_attempt_changed_after_canonical_cancellation(tmp_path, monkeypatch, capsys):
-    import copy
-    from astrid_runtime import task_clear
+def test_real_cli_abandon_retry_uses_same_generated_client_key(tmp_path, monkeypatch, capsys):
+    from astrid_runtime_client import ApiError, WorkspaceClient
+
     _paths, daemon = _live_owner(tmp_path, monkeypatch)
     try:
         task_id, _attempt = _external_cli_task(daemon)
-        original = task_clear._typed_control
+        original = WorkspaceClient.abandon_task
+        requests = []
+
+        def abandon(client, requested_id, body, *, idempotency_key):
+            requests.append((requested_id, body, idempotency_key))
+            if len(requests) == 1:
+                raise ApiError(0, "transport_error", "simulated lost request before commit")
+            return original(client, requested_id, body, idempotency_key=idempotency_key)
+
+        monkeypatch.setattr(WorkspaceClient, "abandon_task", abandon)
+        assert cli.main(["tasks", "clear", task_id, "--json"]) == 1
+        first = json.loads(capsys.readouterr().out)["outcomes"][0]
+        assert first["outcome"] == "unresolved"
+        assert "simulated lost request" in first["abandon_error"]
+        assert cli.main(["tasks", "clear", task_id, "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["outcomes"][0]["outcome"] == "lost"
+        assert len(requests) == 2 and requests[0] == requests[1]
+        # Keep the pre-refactor route/body hash so an interrupted old caller's
+        # request has the same replay identity after updating Runtime.
+        route = f"/v1/control/tasks/{task_id}/abandon"
+        expected_key = "tasks-clear-abandon-" + hashlib.sha256(json.dumps(
+            [route, requests[0][1]], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        assert requests[0][2] == expected_key
+        assert daemon.service.store.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE task_id=? AND kind='task.abandoned'", (task_id,),
+        ).fetchone()[0] == 1
+    finally:
+        daemon.stop()
+
+
+def test_external_clear_refuses_attempt_changed_after_canonical_cancellation(tmp_path, monkeypatch, capsys):
+    import copy
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task_id, _attempt = _external_cli_task(daemon)
+        original = daemon.task_settlement
         abandon_calls = []
         observations = 0
 
-        def raced_control(client):
-            request = original(client)
+        def raced_settlement(requested_id, *, identity):
+            nonlocal observations
+            value = original(requested_id, identity=identity)
+            observations += 1
+            if observations >= 2:
+                value = copy.deepcopy(value)
+                value["task"]["attempt_id"] = "different-new-attempt"
+                value["task"]["execution_binding"]["attempt_id"] = "different-new-attempt"
+            return value
 
-            def control(method, route, body=None):
-                nonlocal observations
-                if method == "POST" and route.endswith("/abandon"):
-                    abandon_calls.append(body)
-                value = request(method, route, body)
-                if method == "GET" and route.endswith("/settlement"):
-                    observations += 1
-                    if observations >= 2:
-                        value = copy.deepcopy(value)
-                        value["task"]["attempt_id"] = "different-new-attempt"
-                        value["task"]["execution_binding"]["attempt_id"] = "different-new-attempt"
-                return value
+        def abandon(*args, **kwargs):
+            abandon_calls.append((args, kwargs))
+            raise AssertionError("changed attempt must not be abandoned")
 
-            return control
-
-        monkeypatch.setattr(task_clear, "_typed_control", raced_control)
+        monkeypatch.setattr(daemon, "task_settlement", raced_settlement)
+        monkeypatch.setattr(daemon.service, "abandon_task", abandon)
         assert cli.main(["tasks", "clear", task_id, "--json"]) == 1
         row = json.loads(capsys.readouterr().out)["outcomes"][0]
         assert row["outcome"] == "unresolved" and "changed" in row["abandon_error"]
@@ -537,6 +569,45 @@ def test_missing_owner_credential_fails_all_ids_before_mutation(tmp_path, monkey
         daemon.stop()
 
 
+def test_real_cli_missing_generated_client_reports_every_input(tmp_path, monkeypatch, capsys):
+    import sys
+
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task = _task(daemon)
+        before = list(daemon.service.store.conn.iterdump())
+        monkeypatch.setitem(sys.modules, "astrid_runtime_client", None)
+        assert cli.main(["tasks", "clear", task["id"], task["id"], "--json"]) == 1
+        result = json.loads(capsys.readouterr().out)
+        assert [row["outcome"] for row in result["outcomes"]] == ["failed", "failed"]
+        assert "generated workspace client is unavailable" in result["outcomes"][0]["error"]
+        assert result["outcomes"][1]["repeated"] is True
+        assert list(daemon.service.store.conn.iterdump()) == before
+    finally:
+        daemon.stop()
+
+
+def test_real_cli_missing_generated_method_fails_without_transport_fallback(tmp_path, monkeypatch, capsys):
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task = _task(daemon)
+        calls = []
+
+        class OutdatedClient:
+            def cancel_task(self, *args, **kwargs):
+                calls.append((args, kwargs))
+
+        monkeypatch.setattr(cli, "_client", lambda _: OutdatedClient())
+        before = list(daemon.service.store.conn.iterdump())
+        assert cli.main(["tasks", "clear", task["id"], "missing", "--json"]) == 1
+        result = json.loads(capsys.readouterr().out)
+        assert [row["outcome"] for row in result["outcomes"]] == ["failed", "failed"]
+        assert calls == []
+        assert list(daemon.service.store.conn.iterdump()) == before
+    finally:
+        daemon.stop()
+
+
 def test_no_owner_discovery_does_not_start_runtime_or_mutate(tmp_path, monkeypatch, capsys):
     paths = RuntimePaths.sandbox(tmp_path / "home")
     paths.ensure_support_dirs()
@@ -548,70 +619,63 @@ def test_no_owner_discovery_does_not_start_runtime_or_mutate(tmp_path, monkeypat
     assert not paths.discovery_path.exists()
 
 
-def test_control_preflight_completes_for_every_unique_id_before_cancel(tmp_path):
-    from astrid_runtime.task_clear import ControlError, clear_tasks
+@pytest.fixture
+def clear_paths(tmp_path):
+    paths = RuntimePaths.sandbox(tmp_path / "home")
+    paths.ensure_support_dirs()
+    paths.discovery_path.write_text(json.dumps({"endpoint": "http://127.0.0.1:1"}))
+    return paths
+
+
+def test_control_preflight_completes_for_every_unique_id_before_cancel(clear_paths):
+    from astrid_runtime.task_clear import clear_tasks
+    from astrid_runtime_client import ApiError
 
     calls = []
+
     class Client:
         def cancel_task(self, task_id, **kwargs):
             calls.append(("cancel", task_id))
-    def control(method, route, body=None):
-        calls.append(("control", method, route))
-        if route.endswith("/missing/settlement"):
-            raise ControlError("unknown", status=404)
-        if route.endswith("/settlement"):
-            task_id = route.split("/")[-2]
+
+        def get_task_settlement(self, task_id):
+            calls.append(("settlement", task_id))
+            if task_id == "missing":
+                raise ApiError(404, "not_found", "unknown")
             return {"task_id": task_id, "state": "queued", "settled": False, "blockers": [],
                     "task": {"task_id": task_id, "state": "queued", "version": 1}}
-        raise ControlError("no local Worker", status=404)
-    paths = RuntimePaths.sandbox(tmp_path / "home")
-    result = clear_tasks(paths, ["one", "missing", "one"], credential_reader=lambda _: "owner",
-                         client_factory=lambda _: Client(), control_request=control)
+
+    result = clear_tasks(clear_paths, ["one", "missing", "one"], credential_reader=lambda _: "owner",
+                         client_factory=lambda _: Client())
     first_cancel = next(i for i, item in enumerate(calls) if item[0] == "cancel")
-    preflight = [item for item in calls[:first_cancel] if item[0] == "control"]
-    assert preflight == [
-        ("control", "GET", "/v1/control/tasks/one/settlement"),
-        ("control", "GET", "/v1/control/tasks/missing/settlement"),
-    ]
+    assert calls[:first_cancel] == [("settlement", "one"), ("settlement", "missing")]
     assert result["ok"] is False
     assert [row["outcome"] for row in result["outcomes"]] == ["unresolved", "unknown", "unresolved"]
 
 
-def test_terminal_state_without_owner_settlement_proof_is_not_success(tmp_path):
+def test_terminal_state_without_owner_settlement_proof_is_not_success(clear_paths):
     from astrid_runtime.task_clear import clear_tasks
 
     calls = []
+
     class Client:
         def cancel_task(self, task_id, **kwargs):
             calls.append(("cancel", task_id))
-    def control(method, route, body=None):
-        calls.append((method, route, body))
-        if route.endswith("/settlement"):
-            return {"task_id": "terminal-unsettled", "state": "cancelled", "settled": False,
-                    "blockers": [{"task_id": "terminal-unsettled", "blocker_kind": "unsettled_attempt"}],
-                    "task": {"task_id": "terminal-unsettled", "state": "cancelled", "version": 3}}
-        raise AssertionError(route)
-    result = clear_tasks(RuntimePaths.sandbox(tmp_path / "home"), ["terminal-unsettled"],
-                         credential_reader=lambda _: "owner", client_factory=lambda _: Client(),
-                         control_request=control)
+
+        def get_task_settlement(self, task_id):
+            calls.append(("settlement", task_id))
+            return {"task_id": task_id, "state": "cancelled", "settled": False,
+                    "blockers": [{"task_id": task_id, "blocker_kind": "unsettled_attempt"}],
+                    "task": {"task_id": task_id, "state": "cancelled", "version": 3}}
+
+    result = clear_tasks(clear_paths, ["terminal-unsettled"],
+                         credential_reader=lambda _: "owner", client_factory=lambda _: Client())
     assert result["ok"] is False
     assert result["outcomes"][0]["outcome"] == "unresolved"
     assert result["outcomes"][0]["state"] == "cancelled"
     assert not any(item[0] == "cancel" for item in calls)
 
 
-def test_worker_conflict_details_normalize_raw_and_typed_error_shapes():
-    from astrid_runtime.task_clear import _control_details
-
-    details = {"required_task_ids": ["worker-task"]}
-    assert _control_details(details) == details
-    assert _control_details({
-        "code": "conflict", "message": "local Worker has unlisted outstanding tasks",
-        "details": details,
-    }) == details
-
-
-def test_active_local_worker_handoff_is_exact_and_never_called_when_already_settled(tmp_path):
+def test_active_local_worker_handoff_is_exact_and_never_called_when_already_settled(clear_paths):
     from astrid_runtime.task_clear import clear_tasks
 
     calls = []
@@ -619,63 +683,70 @@ def test_active_local_worker_handoff_is_exact_and_never_called_when_already_sett
         "executor_id": "astrid-pack-host", "executor_incarnation": "inc",
         "verification": {"evidence_digest": "digest"},
     }
-    class Client:
-        def cancel_task(self, task_id, **kwargs): calls.append(("cancel", task_id))
     settled = set()
-    def control(method, route, body=None):
-        calls.append((method, route, body))
-        if route.endswith("/generation"):
+
+    class Client:
+        def cancel_task(self, task_id, **kwargs):
+            calls.append(("cancel", task_id))
+
+        def get_local_worker_generation(self):
             return {"executor_incarnation": "inc", "evidence_digest": "digest", "state": "active"}
-        if route.endswith("/relinquish"):
-            assert body["expected_task_ids"] == ["named", "other"]
+
+        def relinquish_local_worker(self, incarnation, evidence, *, expected_task_ids):
+            calls.append(("relinquish", incarnation, evidence, expected_task_ids))
+            settled.update(expected_task_ids)
             return {"state": "relinquished"}
-        if route.endswith("/settlement"):
-            task_id = route.split("/")[-2]
-            if any(entry[0] == "POST" and entry[1].endswith("/relinquish") for entry in calls):
-                settled.add(task_id)
+
+        def get_task_settlement(self, task_id):
             return {"task_id": task_id, "state": "cancelled", "settled": task_id in settled,
                     "blockers": [], "task": {"task_id": task_id, "state": "running", "version": 2,
                                                "execution_binding": execution_binding}}
-        raise AssertionError(route)
-    paths = RuntimePaths.sandbox(tmp_path / "home")
-    result = clear_tasks(paths, ["named", "other"], credential_reader=lambda _: "owner",
-                         client_factory=lambda _: Client(), control_request=control)
-    assert result["ok"] is True
-    handoff = [entry for entry in calls if entry[1].endswith("/relinquish")]
-    assert len(handoff) == 1
-    assert handoff[0][2]["expected_task_ids"] == ["named", "other"]
+
+    client = Client()
+    for _ in range(2):
+        result = clear_tasks(clear_paths, ["named", "other", "named"], credential_reader=lambda _: "owner",
+                             client_factory=lambda _: client)
+        assert result["ok"] is True
+    assert [entry for entry in calls if entry[0] == "relinquish"] == [
+        ("relinquish", "inc", "digest", ["named", "other"]),
+    ]
 
 
-def test_unrelated_named_blocker_makes_exact_worker_handoff_refuse(tmp_path):
-    from astrid_runtime.task_clear import ControlError, clear_tasks
+@pytest.mark.parametrize("details", [
+    {"required_task_ids": ["other-worker-task"]},
+    {"required_task_ids": ["other-worker-task"], "details": {"diagnostic": "preserve nested detail"}},
+])
+def test_unrelated_named_blocker_makes_exact_worker_handoff_refuse(clear_paths, details):
+    from astrid_runtime.task_clear import clear_tasks
+    from astrid_runtime_client import ApiError
 
-    calls = []
     execution_binding = {
         "executor_id": "astrid-pack-host", "executor_incarnation": "inc",
         "verification": {"evidence_digest": "digest"},
     }
+
     class Client:
-        def cancel_task(self, task_id, **_kwargs): calls.append(("cancel", task_id))
-    def control(method, route, body=None):
-        calls.append((method, route, body))
-        if route.endswith("/generation"):
+        def cancel_task(self, task_id, **_kwargs):
+            pass
+
+        def get_local_worker_generation(self):
             return {"executor_incarnation": "inc", "evidence_digest": "digest", "state": "active"}
-        if route.endswith("/relinquish"):
-            raise ControlError("local Worker has unlisted outstanding tasks", status=409,
-                               details={"required_task_ids": ["other-worker-task"]})
-        if route.endswith("/settlement"):
-            task_id = route.split("/")[-2]
+
+        def relinquish_local_worker(self, incarnation, evidence, *, expected_task_ids):
+            raise ApiError(409, "conflict", "local Worker has unlisted outstanding tasks", details=details)
+
+        def get_task_settlement(self, task_id):
             return {"task_id": task_id, "state": "cancel_requested", "settled": False,
                     "blockers": [{"task_id": task_id, "blocker_kind": "unsettled_attempt"}],
                     "task": {"task_id": task_id, "state": "running", "version": 1,
                              "execution_binding": execution_binding}}
-        raise AssertionError(route)
-    result = clear_tasks(RuntimePaths.sandbox(tmp_path / "home"), ["named"],
-                         credential_reader=lambda _: "owner", client_factory=lambda _: Client(),
-                         control_request=control)
+
+    result = clear_tasks(clear_paths, ["named"],
+                         credential_reader=lambda _: "owner", client_factory=lambda _: Client())
     assert result["ok"] is False
     assert result["outcomes"][0]["outcome"] == "unresolved"
     assert "unlisted outstanding" in result["outcomes"][0]["worker_handoff_error"]
+    assert result["outcomes"][0]["worker_handoff_details"] == details
 
 
 def _cli_paths_for_daemon(tmp_path, monkeypatch, daemon):
