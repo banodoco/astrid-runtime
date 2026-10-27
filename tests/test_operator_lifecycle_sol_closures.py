@@ -415,9 +415,12 @@ def test_installer_stop_refuses_pid_birth_without_retained_foreground_handle(tmp
     record = {"pid": 51515, "birth_id": "birth", "realm_id": "realm",
               "realm_root": str(realm_root.resolve())}
     called = []
+    authority = []
     with pytest.raises(BootstrapError, match="retained child identity is incomplete"):
-        installer_stop(paths, boundary, recorded_foreground=record, stop_manager=lambda: called.append(True))
+        installer_stop(paths, boundary, recorded_foreground=record,
+                       stop_manager=lambda: called.append(True), record_stop_authority=authority.append)
     assert called == []
+    assert authority == []
 
 
 def test_installer_stop_terminates_real_retained_child_and_leaves_external_child_alone(tmp_path):
@@ -445,13 +448,31 @@ def test_installer_stop_terminates_real_retained_child_and_leaves_external_child
         record = {"pid": retained.pid, "birth_id": birth, "process": retained,
                   "realm_id": "realm", "realm_root": str(realm_root.resolve())}
         callbacks = []
+        authority = []
+
+        def record_authority(value):
+            assert retained.poll() is None
+            authority.append(value)
+
         result = installer_stop(
             paths, boundary, recorded_foreground=record,
             stop_manager=lambda: callbacks.append(True),
+            record_stop_authority=record_authority,
         )
         assert result["runtime"]["exit_evidence"] == "retained_child_stopped"
         assert retained.poll() is not None
         assert callbacks == [True]
+        assert authority[0]["pid"] == retained.pid
+        # New C1 controller, with neither the Popen nor an in-memory receipt.
+        fresh = LocalRuntimeBoundary()
+        result = installer_stop(
+            paths, fresh, recorded_foreground={key: value for key, value in record.items() if key != "process"},
+            recovery_owner=authority[0],
+            recovery_realm={"realm_id": "realm", "realm_root": str(realm_root.resolve())},
+            stop_manager=lambda: callbacks.append(True),
+        )
+        assert result["runtime"] is None
+        assert callbacks == [True, True]
 
         external_birth = boundary.process_birth_identity(external.pid)
         external_record = {"pid": external.pid, "birth_id": external_birth,
@@ -460,6 +481,7 @@ def test_installer_stop_terminates_real_retained_child_and_leaves_external_child
         with pytest.raises(BootstrapError, match="session leader|Job Object custody"):
             boundary.stop_recorded_foreground(
                 recorded_foreground=external_record, realm_id="realm", realm_root=realm_root,
+                record_custody_authority=lambda: pytest.fail("authority before custody admission"),
             )
         assert external.poll() is None
     finally:

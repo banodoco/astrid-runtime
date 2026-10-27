@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 from .dirfd import filesystem as os
 from . import platform
 from . import cancellation
@@ -74,6 +75,10 @@ class RuntimeDaemon:
         self.reboot_allowlist = reboot_allowlist
         self.admission_timeout = admission_timeout
         self.instance_id = uuid.uuid4().hex
+        operation_id = os.environ.pop("ASTRID_INSTALLER_OPERATION_ID", None)
+        if operation_id is not None and not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+            raise ValueError("ASTRID_INSTALLER_OPERATION_ID must be 32 lowercase hexadecimal characters")
+        self.installer_operation_id = operation_id
         self._identity_runtime_checkout = runtime_checkout
         self._identity_agent_checkout = agent_checkout
         self._startup_identity = None
@@ -291,9 +296,11 @@ class RuntimeDaemon:
         self._write_epoch_floor(owner["runtime_epoch"])
         self.catalog.register(realm_id=self.service.realm["id"], display_name=self.service.realm["display_name"], data_root=str(self.root), owner=owner, runtime_epoch=owner["runtime_epoch"], runtime_instance_id=self.instance_id, readiness="ready")
         birth_id = process_birth_identity()
+        owner_binding = ({"installer_operation_id": self.installer_operation_id}
+                         if self.installer_operation_id is not None else {})
         if self.owner_lock:
-            atomic_json_write(self.owner_lock, {"pid": os.getpid(), "process_birth_id": birth_id, "runtime_instance_id": self.instance_id, "realm_id": self.service.realm["id"], "realm_root": str(self.root)})
-        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.startup_identity_instance_id, identity=self.startup_identity, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_credential_pending=bool(self.local_worker_profiles), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES), **({"door_endpoint": self.door_endpoint, "door_origin": self.door.origin} if self.door_httpd else {}))
+            atomic_json_write(self.owner_lock, {"pid": os.getpid(), "process_birth_id": birth_id, "runtime_instance_id": self.instance_id, "realm_id": self.service.realm["id"], "realm_root": str(self.root), **owner_binding})
+        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.startup_identity_instance_id, identity=self.startup_identity, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_credential_pending=bool(self.local_worker_profiles), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES), **owner_binding, **({"door_endpoint": self.door_endpoint, "door_origin": self.door.origin} if self.door_httpd else {}))
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="astrid-runtime-protocol", daemon=True)
         self.thread.start()
         if self.door_httpd is not None:

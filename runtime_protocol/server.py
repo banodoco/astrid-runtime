@@ -296,6 +296,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 health["runtime_instance_id"] = getattr(
                     daemon, "startup_identity_instance_id", None
                 )
+                operation_id = getattr(daemon, "installer_operation_id", None)
+                if operation_id is not None:
+                    health["installer_operation_id"] = operation_id
                 health["identity"] = getattr(daemon, "startup_identity", None)
                 health["services"] = daemon.service_status()
             return self._send(200, health)
@@ -325,8 +328,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, self.runtime.handshake({"authenticated_actor": identity["actor"], "authenticated_scopes": identity.get("scopes", []), "requested_scopes": []}))
         if path == ["v1", "realm"] and method == "GET":
             self._identity("projects:read")
-            return self._send(200, self.runtime.realm_resource(identity_probe=True)
-                              if self._is_owner_identity_probe() else self.runtime.realm_resource())
+            owner_probe = self._is_owner_identity_probe()
+            resource = dict(self.runtime.realm_resource(identity_probe=True)
+                            if owner_probe else self.runtime.realm_resource())
+            daemon = getattr(self.server, "daemon_runtime", None)
+            if owner_probe and daemon is not None:
+                resource["runtime_instance_id"] = getattr(daemon, "startup_identity_instance_id", None)
+                operation_id = getattr(daemon, "installer_operation_id", None)
+                if operation_id is not None:
+                    resource["installer_operation_id"] = operation_id
+            return self._send(200, resource)
         if path == ["v1", "doctor"] and method == "GET":
             self._identity("admin")
             return self._send(200, self.runtime.doctor())

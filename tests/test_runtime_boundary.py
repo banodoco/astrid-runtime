@@ -386,6 +386,30 @@ def test_boundary_lost_relinquish_ack_advances_only_from_durable_readback(tmp_pa
     assert boundary._process is child
 
 
+@pytest.mark.parametrize("operation_id", [None, "c" * 32])
+def test_windows_spawn_passes_only_current_operation_binding(tmp_path, monkeypatch, operation_id):
+    from astrid_runtime import runtime_boundary as module
+
+    child = _CustodyChild()
+    observed = {}
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    monkeypatch.setattr("runtime_protocol.windows_handoff.python_executable", lambda executable: executable)
+    def spawn(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return child
+    monkeypatch.setattr(module.platform, "spawn_tree", spawn)
+    boundary = LocalRuntimeBoundary()
+    boundary._installer_operation_id = operation_id
+    monkeypatch.setenv("ASTRID_INSTALLER_OPERATION_ID", "stale")
+    process, broker = boundary._spawn_runtime(
+        ["/isolated/python", "-m", "runtime_protocol"], support_root=tmp_path, stdout=None,
+    )
+    assert process is child and broker is None
+    assert observed["kwargs"]["env"].get("ASTRID_INSTALLER_OPERATION_ID") == operation_id
+    assert observed["kwargs"]["env"].get("ASTRID_INSTALLER_OPERATION_ID") != "stale"
+
+
 def test_boundary_unknown_commit_retains_controller_and_child(tmp_path, monkeypatch):
     from astrid_runtime.bootstrap import BootstrapCustodyUncertain
     module, authority, actors, _, _ = _runtime_handoff_fixture(tmp_path, monkeypatch)
@@ -592,6 +616,11 @@ def test_boundary_birth_uses_shared_platform_identity(monkeypatch, outcome):
         if outcome == "unknown": raise OSError("observation denied")
         return None if outcome == "absent" else {"pid": pid, "uid": 501, "parent_pid": 41, "birth_id": "proc-start-ticks:19"}
     monkeypatch.setattr(platform, "process_identity", observe)
+    if outcome == "unknown":
+        with pytest.raises(BootstrapError, match="identity remains uncertain"):
+            LocalRuntimeBoundary.process_birth_identity(123)
+        assert calls == [(123, 1.0)]
+        return
     assert LocalRuntimeBoundary.process_birth_identity(123) == ("proc-start-ticks:19" if outcome == "live" else None)
     assert calls == [(123, 1.0)]
 
