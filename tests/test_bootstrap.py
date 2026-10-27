@@ -22,6 +22,7 @@ from astrid_runtime.bootstrap import (
     CompatibilityError,
     DuplicateOwnerError,
     LegacyRootCollisionError,
+    RestoreSelection,
     SourceProfile,
     _rollback_failed_bootstrap,
     bootstrap,
@@ -341,6 +342,42 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(json.loads(source_manifest.read_text()), PROFILE.as_dict())
         self.assertEqual(stat.S_IMODE(source_manifest.stat().st_mode), 0o600)
 
+    def _restore_selection_fixture(self, *, realm_id="restore-realm", missing_catalog=True):
+        realm_root = self._configure(realm_id=realm_id)
+        retained_catalog = self.paths.catalog_path.read_bytes()
+        self.paths.discovery_path.unlink(missing_ok=True)
+        self.paths.instance_lock_path.unlink(missing_ok=True)
+        install_root = Path(self.temp.name) / "install"
+        backup_root = install_root / "backups" / "backup-1"
+        backup_catalog = backup_root / "support" / "runtime" / "catalog.json"
+        backup_catalog.parent.mkdir(parents=True, exist_ok=True)
+        journal_path = install_root / "update-transaction.json"
+        selection_path = Path(self.temp.name) / "astrid-install.json"
+        for stale in (journal_path, selection_path, backup_catalog):
+            if os.path.lexists(str(stale)):
+                stale.unlink()
+        backup_catalog.write_bytes(retained_catalog)
+        journal_path.write_text(json.dumps({
+            "format": "astrid-install-update/v1", "step": "recovering",
+            "operation_id": "a" * 32, "transaction_kind": "migration",
+            "data_root": str(self.paths.app_support),
+            "realm": {"realm_id": realm_id, "realm_root": str(realm_root)},
+            "backup": {"kind": "runtime", "root": str(backup_root)},
+        }))
+        selection_path.write_text(json.dumps({
+            "owner": "haus.astrid.runtime", "program_root": str(install_root),
+            "data_root": str(self.paths.app_support), "realm_id": realm_id,
+            "realm_root": str(realm_root),
+        }))
+        if missing_catalog:
+            self.paths.catalog_path.unlink()
+        return {
+            "selection": RestoreSelection(journal_path=journal_path, selection_path=selection_path),
+            "journal_path": journal_path, "selection_path": selection_path,
+            "backup_catalog": backup_catalog, "backup_root": backup_root,
+            "realm_root": realm_root, "retained_catalog": retained_catalog,
+        }
+
     def test_second_launch_reconnects_same_owner_and_actor(self):
         self._configure()
         first = bootstrap(self.paths, self.boundary, self.config)
@@ -480,6 +517,251 @@ class BootstrapTests(unittest.TestCase):
             installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
             self.assertEqual(shared_stop.call_count, 3)
         self.assertEqual(self.boundary.restart_calls, 3)
+
+    def test_restore_selection_repairs_missing_catalog_after_fenced_manager(self):
+        fixture = self._restore_selection_fixture(realm_id="restore-realm")
+        retained_catalog = fixture["retained_catalog"]
+        selection = fixture["selection"]
+        self.assertTrue(preflight_stop(self.paths, restore_selection=selection)["safe"])
+        self.assertFalse(self.paths.catalog_path.exists())
+        order = []
+
+        def manager_callback(catalog_expected):
+            order.append(("manager", self.paths.catalog_path.exists()))
+            lock_probe = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; from runtime_protocol.platform import file_lock; "
+                 "p=sys.argv[1]; "
+                 "\ntry: file_lock(p, blocking=False).__enter__()"
+                 "\nexcept BlockingIOError: raise SystemExit(7)"
+                 "\nraise SystemExit(0)", str(self.paths.bootstrap_lock_path)],
+                check=False,
+            )
+            self.assertEqual(lock_probe.returncode, 7)
+            connection = sqlite3.connect(fixture["realm_root"] / "realm.sqlite3", timeout=0.02)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("BEGIN IMMEDIATE")
+            finally:
+                connection.close()
+
+        result = down(
+            self.paths, self.boundary, restore_selection=selection,
+            stop_manager=lambda: manager_callback(False),
+        )
+
+        self.assertEqual(order, [("manager", False)])
+        self.assertTrue(result["catalog_restored"])
+        self.assertEqual(json.loads(self.paths.catalog_path.read_text()), json.loads(retained_catalog))
+
+        # A valid live catalog may carry metadata written during the pending
+        # update. C1 confirms its selected realm and leaves that metadata intact.
+        live_catalog = json.loads(self.paths.catalog_path.read_text())
+        live_catalog["realms"][0]["display_name"] = "Current selection metadata"
+        self.paths.catalog_path.write_text(json.dumps(live_catalog))
+        second = down(self.paths, self.boundary, restore_selection=selection,
+                      stop_manager=lambda: manager_callback(True))
+        self.assertFalse(second["catalog_restored"])
+        self.assertEqual(json.loads(self.paths.catalog_path.read_text())["realms"][0]["display_name"],
+                         "Current selection metadata")
+        self.assertEqual(order, [("manager", False), ("manager", True)])
+
+    def test_normal_down_still_refuses_missing_catalog(self):
+        self._configure()
+        self.paths.discovery_path.unlink(missing_ok=True)
+        self.paths.instance_lock_path.unlink(missing_ok=True)
+        self.paths.catalog_path.unlink()
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary)
+
+    def test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes(self):
+        for index, mutation in enumerate((
+            "journal", "selection", "wrong_data_root", "wrong_realm_root",
+            "retained_catalog", "live_catalog", "bad_live_catalog", "live_catalog_link",
+            "bad_backup_catalog", "missing_realm",
+            "foreign_realm", "selection_link", "journal_link", "backup_catalog_link",
+            "realm_root_link",
+        )):
+            with self.subTest(mutation=mutation):
+                fixture = self._restore_selection_fixture(
+                    realm_id=f"restore-realm-{index}",
+                    missing_catalog=mutation not in {"live_catalog", "bad_live_catalog", "live_catalog_link"},
+                )
+                selection = fixture["selection"]
+                if mutation == "journal":
+                    fixture["journal_path"].write_text("{")
+                elif mutation == "selection":
+                    fixture["selection_path"].write_text("not-json")
+                elif mutation == "wrong_data_root":
+                    value = json.loads(fixture["selection_path"].read_text())
+                    value["data_root"] = str(Path(self.temp.name) / "other-data")
+                    fixture["selection_path"].write_text(json.dumps(value))
+                elif mutation == "wrong_realm_root":
+                    value = json.loads(fixture["selection_path"].read_text())
+                    value["realm_root"] = str(fixture["realm_root"].parent)
+                    fixture["selection_path"].write_text(json.dumps(value))
+                elif mutation == "retained_catalog":
+                    value = json.loads(fixture["backup_catalog"].read_text())
+                    value["selected_realm_id"] = "foreign-realm"
+                    fixture["backup_catalog"].write_text(json.dumps(value))
+                elif mutation == "live_catalog":
+                    value = json.loads(self.paths.catalog_path.read_text())
+                    value["selected_realm_id"] = "foreign-realm"
+                    self.paths.catalog_path.write_text(json.dumps(value))
+                elif mutation == "bad_backup_catalog":
+                    fixture["backup_catalog"].write_text("not-json")
+                elif mutation == "bad_live_catalog":
+                    self.paths.catalog_path.write_text("not-json")
+                elif mutation == "live_catalog_link":
+                    self.paths.catalog_path.unlink()
+                    self.paths.catalog_path.symlink_to(fixture["backup_catalog"])
+                elif mutation == "missing_realm":
+                    import shutil
+                    shutil.rmtree(fixture["realm_root"])
+                elif mutation == "foreign_realm":
+                    value = json.loads(fixture["selection_path"].read_text())
+                    value["realm_id"] = "foreign-realm"
+                    fixture["selection_path"].write_text(json.dumps(value))
+                    value = json.loads(fixture["journal_path"].read_text())
+                    value["realm"]["realm_id"] = "foreign-realm"
+                    fixture["journal_path"].write_text(json.dumps(value))
+                    value = json.loads(fixture["backup_catalog"].read_text())
+                    value["selected_realm_id"] = "foreign-realm"
+                    value["realms"][0]["realm_id"] = "foreign-realm"
+                    fixture["backup_catalog"].write_text(json.dumps(value))
+                elif mutation == "selection_link":
+                    fixture["selection_path"].unlink()
+                    fixture["selection_path"].symlink_to(fixture["journal_path"])
+                elif mutation == "journal_link":
+                    fixture["journal_path"].unlink()
+                    fixture["journal_path"].symlink_to(fixture["backup_catalog"])
+                elif mutation == "backup_catalog_link":
+                    fixture["backup_catalog"].unlink()
+                    fixture["backup_catalog"].symlink_to(fixture["journal_path"])
+                elif mutation == "realm_root_link":
+                    link = Path(self.temp.name) / "realm-root-link"
+                    link.symlink_to(fixture["realm_root"], target_is_directory=True)
+                    value = json.loads(fixture["selection_path"].read_text())
+                    value["realm_root"] = str(link)
+                    fixture["selection_path"].write_text(json.dumps(value))
+
+                watched = (fixture["journal_path"], fixture["selection_path"],
+                           fixture["backup_catalog"], self.paths.catalog_path)
+                before = {path: path.read_bytes() for path in watched
+                          if path.exists() and not path.is_symlink()}
+                manager_calls = []
+                with self.assertRaises(BootstrapError):
+                    down(self.paths, self.boundary, restore_selection=selection,
+                         stop_manager=lambda: manager_calls.append(True))
+                self.assertEqual(manager_calls, [])
+                self.assertEqual(before, {path: path.read_bytes() for path in watched
+                                          if path.exists() and not path.is_symlink()})
+                if self.paths.catalog_path.is_symlink():
+                    self.paths.catalog_path.unlink()
+
+    def test_restore_selection_refuses_any_publication_and_fence_race(self):
+        for index, publication in enumerate(("discovery", "instance_lock")):
+            with self.subTest(publication=publication):
+                fixture = self._restore_selection_fixture(realm_id=f"restore-pub-{index}")
+                path = getattr(self.paths, "discovery_path" if publication == "discovery"
+                               else "instance_lock_path")
+                path.write_text(json.dumps({"pid": 99999999, "runtime_instance_id": "unknown"}))
+                before = (fixture["journal_path"].read_bytes(), fixture["backup_catalog"].read_bytes())
+                manager_calls = []
+                with self.assertRaisesRegex(BootstrapError, "publications are present"):
+                    down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                         stop_manager=lambda: manager_calls.append(True))
+                self.assertEqual(manager_calls, [])
+                self.assertFalse(self.paths.catalog_path.exists())
+                self.assertEqual(before, (fixture["journal_path"].read_bytes(),
+                                          fixture["backup_catalog"].read_bytes()))
+
+        fixture = self._restore_selection_fixture(realm_id="restore-fence-race")
+        manager_calls = []
+
+        @contextmanager
+        def refusing_fence(_realm_root):
+            raise BootstrapError("busy at final fence")
+            yield  # pragma: no cover
+
+        with patch("astrid_runtime.bootstrap.interruption_fence", refusing_fence):
+            with self.assertRaisesRegex(BootstrapError, "busy at final fence"):
+                down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                     stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(manager_calls, [])
+        self.assertFalse(self.paths.catalog_path.exists())
+
+        fixture = self._restore_selection_fixture(realm_id="restore-publication-race")
+        real_fence = bootstrap_module.interruption_fence
+
+        @contextmanager
+        def publishing_fence(realm_root):
+            with real_fence(realm_root) as report:
+                self.paths.discovery_path.write_text(json.dumps({"pid": 123456789}))
+                yield report
+
+        manager_calls = []
+        with patch("astrid_runtime.bootstrap.interruption_fence", publishing_fence):
+            with self.assertRaisesRegex(BootstrapError, "discovery changed before stop"):
+                down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                     stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(manager_calls, [])
+        self.assertFalse(self.paths.catalog_path.exists())
+        self.paths.discovery_path.unlink()
+
+        fixture = self._restore_selection_fixture(realm_id="restore-pre-manager-race")
+        original_shared_stop = bootstrap_module._fenced_stop_and_manager
+
+        def publishing_before_manager(*args, **kwargs):
+            validate = kwargs["validate_stop"]
+
+            def changed_validate():
+                self.paths.instance_lock_path.write_text(json.dumps({"pid": 123456789}))
+                validate()
+
+            kwargs["validate_stop"] = changed_validate
+            return original_shared_stop(*args, **kwargs)
+
+        manager_calls = []
+        with patch("astrid_runtime.bootstrap._fenced_stop_and_manager", publishing_before_manager):
+            with self.assertRaisesRegex(BootstrapError, "publications are present"):
+                down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                     stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(manager_calls, [])
+        self.assertFalse(self.paths.catalog_path.exists())
+        self.paths.instance_lock_path.unlink()
+
+    def test_restore_selection_busy_preflight_refuses_before_manager(self):
+        fixture = self._restore_selection_fixture(realm_id="restore-busy")
+        before = (fixture["journal_path"].read_bytes(), fixture["backup_catalog"].read_bytes())
+        manager_calls = []
+        with patch("astrid_runtime.bootstrap.inspect_interruption_state",
+                   return_value={"safe": False, "running_tasks": [{"task_id": "busy"}]}):
+            with self.assertRaisesRegex(BootstrapError, "work is active"):
+                down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                     stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(manager_calls, [])
+        self.assertFalse(self.paths.catalog_path.exists())
+        self.assertEqual(before, (fixture["journal_path"].read_bytes(),
+                                  fixture["backup_catalog"].read_bytes()))
+
+    def test_restore_catalog_publication_failure_replays_from_retained_snapshot(self):
+        fixture = self._restore_selection_fixture(realm_id="restore-write-replay")
+        manager_calls = []
+        with patch("astrid_runtime.bootstrap.atomic_write_json", side_effect=OSError("simulated kill")):
+            with self.assertRaisesRegex(OSError, "simulated kill"):
+                down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                     stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(manager_calls, [True])
+        self.assertFalse(self.paths.catalog_path.exists())
+        journal_before = fixture["journal_path"].read_bytes()
+        backup_before = fixture["backup_catalog"].read_bytes()
+        result = down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                      stop_manager=lambda: manager_calls.append(True))
+        self.assertTrue(result["catalog_restored"])
+        self.assertEqual(manager_calls, [True, True])
+        self.assertEqual(fixture["journal_path"].read_bytes(), journal_before)
+        self.assertEqual(fixture["backup_catalog"].read_bytes(), backup_before)
 
     def test_restart_and_down_share_unreconciled_attempt_refusal(self):
         root = self._configure()
