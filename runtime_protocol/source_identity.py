@@ -139,6 +139,15 @@ def _worktree_rows(root: Path, paths: list[bytes], *, allow_directories: bool) -
         elif stat.S_ISDIR(mode):
             if not allow_directories:
                 raise SourceIdentityError(f"untracked source directory is unsupported: {path}")
+            # Git can omit a nested checkout replacing an indexed file from
+            # untracked enumeration entirely. Refuse its marker without walking
+            # the directory or treating ordinary directory replacements as repos.
+            try:
+                (path / ".git").lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise SourceIdentityError(f"nested source checkout is unsupported: {path}")
             rows.append((relative, b"040000", b""))
         else:
             raise SourceIdentityError(f"unsupported source filesystem entry: {path}")
