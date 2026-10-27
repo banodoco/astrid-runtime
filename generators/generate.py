@@ -114,7 +114,16 @@ def render_python_client(manifest_path: Path = MANIFEST) -> str:
 def render_typescript_client() -> str:
     """Render the source-frame thumbnail operations into the typed TS client."""
     source = _regular(TYPESCRIPT_CLIENT_OUTPUT, "TypeScript client").decode("utf-8")
-    settlement_method = '  async getTaskSettlement(taskId: string): Promise<{ task_id: string; state: string; settled: boolean; blockers: Record<string, unknown>[]; task: Task }> { return this.json((await this.request("GET", `/v1/control/tasks/${encodeURIComponent(taskId)}/settlement`)).body) }'
+    abandon_types = ('export interface TaskAbandonRequest { expected_task_version: number; attempt_id: string; lease_id: string; fence: number; runtime_epoch: number; execution_binding: NonNullable<Task["execution_binding"]>; reason: string }\n'
+        'export interface TaskAbandonResult { task_id: string; run_id: string; attempt_id: string; disposition: "lost"; reason: string; remote_stop_confirmed: false; billing_stop_confirmed: false; task: Task }')
+    if 'export interface TaskAbandonRequest ' not in source:
+        source = source.replace('export interface ObjectLocation', abandon_types + '\nexport interface ObjectLocation', 1)
+    abandon_method = '  async abandonTask(taskId: string, body: TaskAbandonRequest, idempotencyKey: string): Promise<MutationResult<TaskAbandonResult>> { return this.mutation<TaskAbandonResult>((await this.request("POST", `/v1/control/tasks/${encodeURIComponent(taskId)}/abandon`, new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body) }'
+    if '  async abandonTask(' in source:
+        source = '\n'.join(abandon_method if line.startswith('  async abandonTask(') else line for line in source.split('\n'))
+    else:
+        source = source.replace('  async getLocalWorkerGeneration(', abandon_method + '\n  async getLocalWorkerGeneration(', 1)
+    settlement_method = '  async getTaskSettlement(taskId: string): Promise<{ task_id: string; state: string; settled: boolean; blockers: Record<string, unknown>[]; task: Task; lost_disposition?: { event_id: string; attempt_id: string; reason: string } }> { return this.json((await this.request("GET", `/v1/control/tasks/${encodeURIComponent(taskId)}/settlement`)).body) }'
     if "  async getTaskSettlement(" in source:
         source = "\n".join(settlement_method if line.startswith("  async getTaskSettlement(") else line for line in source.split("\n"))
     else:

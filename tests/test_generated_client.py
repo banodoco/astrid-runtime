@@ -27,6 +27,70 @@ def _patch_opener(monkeypatch, open_response):
     )
 
 
+def test_generated_abandon_client_roundtrips_exact_identity_receipt_and_wire_schema(tmp_path):
+    from jsonschema import Draft202012Validator
+    from referencing import Registry, Resource
+    import yaml
+    from tests.test_tasks_clear import _external_cli_task
+
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start()
+    try:
+        task_id, attempt = _external_cli_task(daemon)
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        client.cancel_task(task_id, idempotency_key="client-abandon-cancel")
+        observed = client.get_task_settlement(task_id)["task"]
+        body = {"expected_task_version": observed["version"], "attempt_id": attempt["attempt_id"],
+            **{key: attempt[key] for key in ("lease_id", "fence", "runtime_epoch")},
+            "execution_binding": observed["execution_binding"], "reason": "owner clears provider uncertainty"}
+        result = client.abandon_task(task_id, body, idempotency_key="client-abandon")
+        assert result["disposition"] == "lost" and result["task"]["state"] == "failed"
+        assert result.receipt["command_kind"] == "task.abandon"
+        assert client.abandon_task(task_id, body, idempotency_key="client-abandon") == result
+        base = Path(__file__).parents[1]
+        schemas = [json.loads((base / "contract/schemas" / name).read_text()) for name in ("task.json", "task-abandon.json", "worker.json")]
+        document = yaml.safe_load((base / "contract/openapi/workspace-v1.yaml").read_text())
+        document.update({"$id": "https://astrid.haus/workspace/v1/workspace-v1.yaml", "$schema": schemas[0]["$schema"]})
+        registry = Registry().with_resources((item["$id"], Resource.from_contents(item)) for item in [*schemas, document])
+        Draft202012Validator(schemas[1], registry=registry).validate(body)
+        response_schema = {"$id": document["$id"], "components": document["components"],
+                           **document["components"]["schemas"]["TaskAbandonMutation"]}
+        Draft202012Validator(response_schema, registry=registry).validate({
+            "data": {key: value for key, value in result.items() if key != "receipt"}, "receipt": result.receipt})
+        settlement = client.get_task_settlement(task_id)
+        lost = settlement["lost_disposition"]
+        assert lost["attempt_id"] == attempt["attempt_id"] and lost["reason"] == body["reason"]
+        event = daemon.service.store.conn.execute("SELECT kind FROM events WHERE id=?", (lost["event_id"],)).fetchone()
+        assert event["kind"] == "task.abandoned"
+        worker = schemas[2]
+        settlement_schema = {"$id": worker["$id"], "definitions": worker["definitions"],
+                             **worker["definitions"]["TaskSettlement"]}
+        validator = Draft202012Validator(settlement_schema, registry=registry)
+        validator.validate(settlement)
+        assert list(validator.iter_errors({**settlement, "lost_disposition": {"reason": "untrusted"}}))
+        for field in ("event_id", "attempt_id", "reason"):
+            incomplete = {key: value for key, value in lost.items() if key != field}
+            assert list(validator.iter_errors({**settlement, "lost_disposition": incomplete})), field
+            for malformed in (None, "", 123, True, [], {}):
+                invalid = {**lost, field: malformed}
+                assert list(validator.iter_errors({**settlement, "lost_disposition": invalid})), (field, malformed)
+        for malformed in (None, [], "lost", {**lost, "reason": "x" * 4097}):
+            assert list(validator.iter_errors({**settlement, "lost_disposition": malformed})), malformed
+        for field, value in (("extra", None), ("", None),
+                             ("remote_stop_confirmed", True), ("billing_stop_confirmed", True),
+                             ("remote_stop_confirmed", False), ("billing_stop_confirmed", False)):
+            invalid = {**lost, field: value}
+            errors = list(validator.iter_errors({**settlement, "lost_disposition": invalid}))
+            assert any(error.validator == "additionalProperties" for error in errors), (field, value)
+        daemon.service.retry_task(task_id, idempotency_key="client-abandon-retry")
+        retried = client.get_task_settlement(task_id)
+        assert "lost_disposition" not in retried
+        validator.validate(retried)
+    finally:
+        daemon.stop()
+
+
 class _AcquisitionStream(io.BytesIO):
     def __init__(self, body, chunk=None):
         super().__init__(body)

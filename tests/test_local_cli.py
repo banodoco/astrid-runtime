@@ -79,6 +79,20 @@ def test_tasks_clear_parser_help_mentions_exact_named_ids(capsys):
     assert "exact task ids" in capsys.readouterr().out
 
 
+def test_tasks_clear_text_output_names_lost_and_remote_limits(tmp_path, monkeypatch, capsys):
+    from tests.test_tasks_clear import _external_cli_task, _live_owner
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task_id, _attempt = _external_cli_task(daemon)
+        assert cli.main(["tasks", "clear", task_id]) == 0
+        output = capsys.readouterr().out
+        assert task_id in output and '"outcome": "lost"' in output
+        assert '"remote_stop_confirmed": false' in output
+        assert '"billing_stop_confirmed": false' in output
+    finally:
+        daemon.stop()
+
+
 def test_tasks_clear_paths_failure_still_reports_every_input_occurrence(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_paths", lambda _args: (_ for _ in ()).throw(ValueError("bad support root")))
     assert cli.main(["tasks", "clear", "one", "one", "--json"]) == 1

@@ -275,6 +275,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
+        if method == "POST" and len(path) == 5 and path[:3] == ["v1", "control", "tasks"] and path[4] == "abandon":
+            identity = self._identity("admin")
+            if identity.get("actor") != "owner":
+                raise ForbiddenError("task abandon requires the Runtime owner actor")
+            return self._send(200, self.runtime.abandon_task(path[3], self._body(),
+                idempotency_key=self._idempotency_key(), identity=identity))
         if path == ["v1", "health"]:
             health = dict(self.runtime.health(identity_probe=True) if self._is_owner_identity_probe()
                           else self.runtime.health())

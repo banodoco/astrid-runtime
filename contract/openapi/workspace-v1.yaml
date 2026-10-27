@@ -730,6 +730,13 @@ paths:
       operationId: getTaskSettlement
       parameters: [ { name: task_id, in: path, required: true, schema: { type: string, minLength: 1 } } ]
       responses: { '200': { description: Owner-only exact task settlement observation using lifecycle blockers, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/TaskSettlement' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/control/tasks/{task_id}/abandon:
+    post:
+      operationId: abandonTask
+      description: Explicit owner actor with admin scope only. Canonical cancel must remain provider_state_unknown. Records lost disposition without confirming remote execution or billing stopped.
+      parameters: [ { name: task_id, in: path, required: true, schema: { type: string, minLength: 1 } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/task-abandon.json' } } } }
+      responses: { '200': { description: Durable owner lost disposition and committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/TaskAbandonMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/control/local-worker/generation:
     get:
       operationId: getLocalWorkerGeneration
@@ -1429,6 +1436,13 @@ components:
           additionalProperties: false
           required: [receipt_id, command_kind, idempotency_key, request_hash, project_id, project_seq, event_ids, result, created_at]
           properties: { receipt_id: { type: string }, command_kind: { type: string }, idempotency_key: { type: string }, request_hash: { type: string }, project_id: { type: string }, project_seq: { type: array, minItems: 2, maxItems: 2, items: { type: integer, minimum: 1 } }, event_ids: { type: array, items: { type: string } }, result: {}, created_at: { type: string } }
+    TaskAbandonMutation:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { $ref: './schemas/task-abandon.json#/definitions/AbandonResult' }
+        receipt: { $ref: '#/components/schemas/CommittedMutation/properties/receipt' }
     RecoverableSnapshotPublication:
       type: object
       additionalProperties: false
