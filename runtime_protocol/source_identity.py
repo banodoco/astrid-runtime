@@ -12,7 +12,7 @@ class SourceIdentityError(ValueError):
     """The requested source checkouts could not be observed reliably."""
 
 
-def _git(root: Path, *args: str) -> bytes:
+def _git(root: Path, *args: str, input: bytes | None = None) -> bytes:
     # The explicit checkout paths are the source of truth. Inherited Git
     # variables can redirect -C to a different index, worktree, or object store.
     env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
@@ -20,7 +20,8 @@ def _git(root: Path, *args: str) -> bytes:
         result = subprocess.run(
             ["git", "-C", os.fspath(root), *args],
             env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if input is None else None,
+            input=input,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True,
@@ -38,25 +39,8 @@ def _frame(hasher: "hashlib._Hash", label: bytes, value: bytes) -> None:
     hasher.update(value)
 
 
-def _untracked(root: Path) -> list[tuple[bytes, bytes]]:
-    raw = _git(root, "ls-files", "--others", "--exclude-standard", "-z")
-    paths = sorted(path for path in raw.split(b"\0") if path)
-    entries: list[tuple[bytes, bytes]] = []
-    for relative in paths:
-        try:
-            path = root / os.fsdecode(relative)
-            info = path.lstat()
-            if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
-                raise SourceIdentityError(f"unsupported untracked filesystem entry: {path}")
-            kind, payload = _read_entry(path, info)
-            # Track executable state while deliberately excluding timestamps and ownership.
-            mode = b"executable" if stat.S_ISREG(info.st_mode) and info.st_mode & 0o111 else b"ordinary"
-            entries.append((relative, kind + b"\0" + mode + b"\0" + payload))
-        except SourceIdentityError:
-            raise
-        except OSError as exc:
-            raise SourceIdentityError(f"cannot read untracked source entry: {root / os.fsdecode(relative)}") from exc
-    return entries
+def _untracked(root: Path) -> list[bytes]:
+    return [path for path in _git(root, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0") if path]
 
 
 def _head(root: Path) -> str:
@@ -110,60 +94,56 @@ def validate_checkout_root(root: Path) -> Path:
     return root
 
 
-def _same_file_state(before: os.stat_result, after: os.stat_result) -> bool:
-    """Check that a path was stable while its bytes or link target were read."""
-    fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
-    return all(getattr(before, field) == getattr(after, field) for field in fields)
-
-
-def _read_entry(path: Path, info: os.stat_result) -> tuple[bytes, bytes]:
-    """Read a regular file or symlink and reject changes during the read."""
-    if stat.S_ISREG(info.st_mode):
-        kind, payload = b"file", path.read_bytes()
-    elif stat.S_ISLNK(info.st_mode):
-        kind, payload = b"symlink", os.fsencode(os.readlink(path))
-    else:
-        raise SourceIdentityError(f"unsupported source filesystem entry: {path}")
-    try:
-        after = path.lstat()
-    except OSError as exc:
-        raise SourceIdentityError(f"source entry changed during identity capture: {path}") from exc
-    if not _same_file_state(info, after):
-        raise SourceIdentityError(f"source entry changed during identity capture: {path}")
-    return kind, payload
-
-
-def _tracked_inventory(root: Path) -> list[tuple[bytes, bytes]]:
-    """Read current tracked filesystem entries directly, bypassing clean filters."""
-    paths = sorted(path for path in _git(root, "ls-files", "-z").split(b"\0") if path)
-    result: list[tuple[bytes, bytes]] = []
+def _blob_ids(root: Path, paths: list[bytes]) -> list[bytes]:
+    """Hash regular files in bounded argv batches, without filters or object writes."""
+    result: list[bytes] = []
+    batch: list[str] = []
+    size = 0
     for relative in paths:
+        if batch and (len(batch) == 64 or size + len(relative) > 8192):
+            result.extend(_git(root, "hash-object", "--no-filters", "--", *batch).splitlines())
+            batch, size = [], 0
+        batch.append("./" + os.fsdecode(relative))
+        size += len(relative) + 3
+    if batch:
+        result.extend(_git(root, "hash-object", "--no-filters", "--", *batch).splitlines())
+    if len(result) != len(paths):
+        raise SourceIdentityError(f"Git returned incomplete raw blob hashes at {root}")
+    return result
+
+
+def _worktree_rows(root: Path, paths: list[bytes], *, allow_directories: bool) -> list[tuple[bytes, bytes, bytes]]:
+    """Frame path/type/mode metadata around Git's raw blob hashes.
+
+    One metadata observation per path is enough here: capture_source_identity
+    compares two complete observations, including hashes, of both checkouts.
+    Symlinks hash their link text, never the referent (which may not exist).
+    Only tracked replacements can be directories: Git may enumerate an entire
+    untracked nested checkout as one directory, hiding its source files.
+    """
+    rows = []
+    regular = []
+    for relative in sorted(set(paths)):
         path = root / os.fsdecode(relative)
         try:
-            info = path.lstat()
+            mode = path.lstat().st_mode
         except FileNotFoundError:
-            result.append((relative, b"missing"))
+            rows.append((relative, b"missing", b""))
             continue
-        except OSError as exc:
-            raise SourceIdentityError(f"cannot inspect tracked source entry: {path}") from exc
-        try:
-            if stat.S_ISREG(info.st_mode):
-                kind, payload = _read_entry(path, info)
-            elif stat.S_ISLNK(info.st_mode):
-                kind, payload = _read_entry(path, info)
-            elif stat.S_ISDIR(info.st_mode):
-                # A tracked file can be replaced by a directory in the worktree;
-                # Git reports its children separately as untracked entries.
-                kind, payload = b"directory", b""
-            else:
-                raise SourceIdentityError(f"unsupported tracked filesystem entry: {path}")
-        except SourceIdentityError:
-            raise
-        except OSError as exc:
-            raise SourceIdentityError(f"cannot read tracked source entry: {path}") from exc
-        mode = b"executable" if stat.S_ISREG(info.st_mode) and info.st_mode & 0o111 else b"ordinary"
-        result.append((relative, kind + b"\0" + mode + b"\0" + payload))
-    return result
+        if stat.S_ISREG(mode):
+            rows.append((relative, b"100755" if mode & 0o111 else b"100644", b""))
+            regular.append(relative)
+        elif stat.S_ISLNK(mode):
+            oid = _git(root, "hash-object", "--no-filters", "--stdin", input=os.fsencode(os.readlink(path))).strip()
+            rows.append((relative, b"120000", oid))
+        elif stat.S_ISDIR(mode):
+            if not allow_directories:
+                raise SourceIdentityError(f"untracked source directory is unsupported: {path}")
+            rows.append((relative, b"040000", b""))
+        else:
+            raise SourceIdentityError(f"unsupported source filesystem entry: {path}")
+    hashes = dict(zip(regular, _blob_ids(root, regular)))
+    return [(path, mode, hashes.get(path, oid)) for path, mode, oid in rows]
 
 
 def _capture_repo(root_arg: Path) -> tuple[str, bytes, bool, tuple]:
@@ -189,17 +169,14 @@ def _capture_repo(root_arg: Path) -> tuple[str, bytes, bool, tuple]:
             raise SourceIdentityError(f"submodules or unsupported tree entries are not supported: {root}")
         expected_rows.append((relative, mode, oid))
     expected_rows.sort(key=lambda item: item[0])
-    try:
-        unknown = sorted(_untracked(root), key=lambda item: item[0])
-        tracked = _tracked_inventory(root)
-        after_index = _git(root, "ls-files", "--stage", "-z")
-        after_tracked = _tracked_inventory(root)
-        after_unknown = sorted(_untracked(root), key=lambda item: item[0])
-        after_head = _head(root)
-    except UnicodeError as exc:
-        raise SourceIdentityError(f"invalid Git identity data at {root}") from exc
-    if (head, index, tracked, unknown) != (after_head, after_index, after_tracked, after_unknown):
-        raise SourceIdentityError(f"source checkout changed during identity capture: {root}")
+    unknown = _worktree_rows(root, _untracked(root), allow_directories=False)
+    tracked_paths = [row.split(b"\t", 1)[1] for row in index.split(b"\0") if row]
+    tracked = _worktree_rows(root, tracked_paths, allow_directories=True)
+    for _, mode, oid in tracked + unknown:
+        if mode in (b"100644", b"100755", b"120000") and (
+            len(oid) != len(head) or any(c not in b"0123456789abcdef" for c in oid)
+        ):
+            raise SourceIdentityError(f"Git returned an invalid raw blob hash at {root}")
     index_rows = []
     for record in index.split(b"\0"):
         if not record:
@@ -209,39 +186,15 @@ def _capture_repo(root_arg: Path) -> tuple[str, bytes, bool, tuple]:
         index_rows.append((relative, mode, oid, stage))
     index_rows.sort()
     expected_index = [(relative, mode, oid, b"0") for relative, mode, oid in expected_rows]
-    # Derive dirty state from logical index rows and raw filesystem entries.
-    # Git status output can vary with presentation and diff configuration.
-    dirty = bool(unknown or index_rows != expected_index)
-    object_format = _git(root, "rev-parse", "--show-object-format").strip().decode("ascii")
-    if object_format not in ("sha1", "sha256"):
-        raise SourceIdentityError(f"unsupported Git object format at {root}: {object_format}")
-    tracked_by_path = dict(tracked)
-    if set(tracked_by_path) != {relative for relative, _, _ in expected_rows}:
-        dirty = True
-    else:
-        for relative, mode, oid in expected_rows:
-            row = tracked_by_path[relative]
-            if row == b"missing":
-                dirty = True
-                break
-            actual_kind, actual_mode, payload = row.split(b"\0", 2)
-            expected_kind = b"symlink" if mode == b"120000" else b"file"
-            expected_mode = b"executable" if mode == b"100755" else b"ordinary"
-            blob_header = b"blob " + str(len(payload)).encode("ascii") + b"\0"
-            actual_oid = hashlib.new(object_format, blob_header + payload).hexdigest().encode("ascii")
-            if actual_kind != expected_kind or actual_mode != expected_mode or actual_oid != oid:
-                dirty = True
-                break
+    dirty = bool(unknown or index_rows != expected_index or tracked != expected_rows)
     digest = hashlib.sha256()
     for relative, mode, oid, stage in index_rows:
         _frame(digest, b"index-row", b"\0".join((relative, mode, oid, stage)))
-    for relative, payload in tracked:
-        _frame(digest, b"tracked-path", relative)
-        _frame(digest, b"tracked-entry", payload)
-    for relative, payload in unknown:
-        _frame(digest, b"untracked-path", relative)
-        _frame(digest, b"untracked-entry", payload)
-    signature = (head, index_rows, tuple(tracked), tuple(unknown))
+    for label, rows in ((b"tracked", tracked), (b"untracked", unknown)):
+        for relative, mode, oid in rows:
+            _frame(digest, label + b"-path", relative)
+            _frame(digest, label + b"-entry", b"\0".join((mode, oid)))
+    signature = (head, index_rows, flags, tuple(tracked), tuple(unknown))
     return head, digest.digest(), dirty, signature
 
 

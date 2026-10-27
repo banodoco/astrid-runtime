@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 from astrid_runtime import BootstrapConfig, BootstrapError, LocalRuntimeBoundary, RuntimePaths, SourceProfile, bootstrap, configure_workspace, connect
 from astrid_runtime.bootstrap import restart
 from astrid_runtime_client import WorkspaceClient
+from runtime_protocol.source_identity import SourceIdentityError
 
 
 def _config() -> BootstrapConfig:
@@ -164,7 +165,8 @@ def test_real_subprocess_stale_discovery_recovers_without_new_realm(tmp_path, ow
         boundary.stop()
 
 
-def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkeypatch):
+@pytest.mark.parametrize("clean_filter", [False, True])
+def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkeypatch, clean_filter):
     """Both live-owner entrypoints refuse an edited source tree before writes."""
     monkeypatch.delenv("ASTRID_INSTALL_RELEASE", raising=False)
     monkeypatch.delenv("ASTRID_INSTALL_MANAGED_BY", raising=False)
@@ -178,6 +180,17 @@ def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkey
         ("runtime_protocol", "astrid_runtime", "packages/python/astrid_runtime_client"),
     )
     _git_checkout(product_checkout)
+    if clean_filter:
+        def git(*args):
+            return subprocess.run(["git", "-C", str(product_checkout), *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        (product_checkout / ".gitattributes").write_text("tracked.txt filter=canonical\n")
+        (product_checkout / "tracked.txt").write_text("x\n")
+        git("config", "filter.canonical.clean", "tr ab x")
+        git("config", "filter.canonical.smudge", "cat")
+        git("add", ".gitattributes", "tracked.txt")
+        git("commit", "-qm", "configure clean filter")
     profile = SourceProfile(
         profile="astrid", runtime_checkout=str(runtime_checkout),
         source_checkout=str(product_checkout), capability_digest="caps-v1",
@@ -197,28 +210,31 @@ def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkey
         assert original_discovery["runtime_instance_id"] == first.runtime_instance_id
         assert original_identity["dirty"] is False
 
-        (product_checkout / "tracked.txt").write_text("edited product checkout", encoding="utf-8")
+        (product_checkout / "tracked.txt").write_text(
+            "a\n" if clean_filter else "edited product checkout", encoding="utf-8",
+        )
+        if clean_filter:
+            assert git("status", "--porcelain") == ""
         authority_before = {path: path.read_bytes() for path in _authority_files(paths)}
-        with pytest.raises(BootstrapError) as caught:
-            bootstrap(paths, LocalRuntimeBoundary(), config)
-        assert str(caught.value) == (
-            "An older Astrid is still running. Restart it after its running tasks finish."
-        )
-        assert authority_before == {path: path.read_bytes() for path in _authority_files(paths)}
-        assert first_boundary._process is not None and first_boundary._process.poll() is None
-        live = first_boundary.owner_startup_identity(
-            endpoint=first.endpoint, instance_id=first.runtime_instance_id,
-        )
-        assert live["runtime_instance_id"] == first.runtime_instance_id
-        assert live["identity"] == original_identity
+        def unexpected_operation(*_args, **_kwargs):
+            pytest.fail("identity refusal attempted an owner operation or actor connection")
 
-        with pytest.raises(BootstrapError) as caught:
-            connect(paths, LocalRuntimeBoundary(), config)
-        assert str(caught.value) == (
-            "An older Astrid is still running. Restart it after its running tasks finish."
-        )
-        assert authority_before == {path: path.read_bytes() for path in _authority_files(paths)}
-        assert first_boundary._process is not None and first_boundary._process.poll() is None
+        with monkeypatch.context() as refusal:
+            for method in ("start", "connect", "stop_owner", "restart"):
+                refusal.setattr(LocalRuntimeBoundary, method, unexpected_operation)
+            for entrypoint in (bootstrap, connect):
+                with pytest.raises(BootstrapError) as caught:
+                    entrypoint(paths, LocalRuntimeBoundary(), config)
+                assert str(caught.value) == (
+                    "An older Astrid is still running. Restart it after its running tasks finish."
+                )
+                assert authority_before == {path: path.read_bytes() for path in _authority_files(paths)}
+                assert first_boundary._process is not None and first_boundary._process.poll() is None
+                live = first_boundary.owner_startup_identity(
+                    endpoint=first.endpoint, instance_id=first.runtime_instance_id,
+                )
+                assert live["runtime_instance_id"] == first.runtime_instance_id
+                assert live["identity"] == original_identity
 
         restart_boundary = LocalRuntimeBoundary()
         restart_boundary.prepare_restart(
@@ -248,3 +264,63 @@ def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkey
         if restart_boundary is not None:
             _stop_unfinished(restart_boundary)
         _stop_unfinished(first_boundary)
+
+
+@pytest.mark.parametrize("checkout", ["runtime", "agent"])
+def test_linux_loopback_untracked_nested_checkout_refuses_up_and_connect(tmp_path, monkeypatch, checkout):
+    """Unsupported nested checkouts refuse both callers before any owner work."""
+    monkeypatch.delenv("ASTRID_INSTALL_RELEASE", raising=False)
+    monkeypatch.delenv("ASTRID_INSTALL_MANAGED_BY", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    runtime_checkout = tmp_path / "source-runtime"
+    product_checkout = tmp_path / "source-product"
+    _git_checkout(
+        runtime_checkout, Path(__file__).resolve().parents[1],
+        ("runtime_protocol", "astrid_runtime", "packages/python/astrid_runtime_client"),
+    )
+    _git_checkout(product_checkout)
+    profile = SourceProfile(
+        profile="astrid", runtime_checkout=str(runtime_checkout),
+        source_checkout=str(product_checkout), capability_digest="caps-v1",
+    )
+    config = BootstrapConfig(source_profile=profile)
+    paths = RuntimePaths.sandbox(tmp_path / "support")
+    boundary = LocalRuntimeBoundary()
+    try:
+        configure_workspace(
+            paths, boundary, config, mode="create",
+            realm_root=paths.realms_dir / "explicit-realm", realm_id="explicit-realm",
+        )
+        first = bootstrap(paths, boundary, config)
+        original_identity = json.loads(paths.discovery_path.read_text())["identity"]
+        authority_before = {path: path.read_bytes() for path in _authority_files(paths)}
+        root = runtime_checkout if checkout == "runtime" else product_checkout
+        nested = root / "local-plugin"
+        _git_checkout(nested)
+        assert subprocess.check_output([
+            "git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z",
+        ]) == b"local-plugin/\0"
+
+        def unexpected_operation(*_args, **_kwargs):
+            pytest.fail("unverified source identity attempted an owner operation or actor connection")
+
+        with monkeypatch.context() as refusal:
+            for method in ("start", "connect", "stop_owner", "restart"):
+                refusal.setattr(LocalRuntimeBoundary, method, unexpected_operation)
+            for content in ("baseline", "edited plugin source\n"):
+                (nested / "tracked.txt").write_text(content, encoding="utf-8")
+                for entrypoint in (bootstrap, connect):
+                    with pytest.raises(BootstrapError, match="Requested Runtime identity could not be verified") as caught:
+                        entrypoint(paths, LocalRuntimeBoundary(), config)
+                    assert isinstance(caught.value.__cause__, SourceIdentityError)
+                    assert "untracked source directory" in str(caught.value.__cause__)
+                    assert authority_before == {path: path.read_bytes() for path in _authority_files(paths)}
+                    assert boundary._process is not None and boundary._process.poll() is None
+                    live = boundary.owner_startup_identity(
+                        endpoint=first.endpoint, instance_id=first.runtime_instance_id,
+                    )
+                    assert live["runtime_instance_id"] == first.runtime_instance_id
+                    assert live["identity"] == original_identity
+    finally:
+        _stop_unfinished(boundary)
