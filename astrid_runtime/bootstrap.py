@@ -120,6 +120,8 @@ class RuntimeBoundary(Protocol):
 
     def health(self, *, endpoint: str, pid: int, instance_id: str) -> bool: ...
 
+    def owner_startup_identity(self, *, endpoint: str, instance_id: str) -> Mapping[str, Any] | None: ...
+
     def endpoint_metadata(self, *, endpoint: str, credential_file: Path) -> Mapping[str, Any]: ...
 
     def validate_owner(self, *, endpoint: str, pid: int, instance_id: str,
@@ -839,17 +841,6 @@ def _capture_requested_identity(source: SourceProfile) -> dict[str, Any]:
         raise BootstrapError("Requested Runtime identity could not be verified.") from exc
 
 
-def _require_matching_owner_identity(
-    *,
-    instance_id: str,
-    requested_identity: Mapping[str, Any],
-    owner_health: Any,
-) -> None:
-    _validated_matching_owner_identity(
-        owner_health, instance_id=instance_id, requested_identity=requested_identity,
-    )
-
-
 def _validated_matching_owner_identity(
     owner_health: Any,
     *,
@@ -860,17 +851,10 @@ def _validated_matching_owner_identity(
         observed = validate_live_owner_identity(owner_health, instance_id=instance_id)
         requested = normalize_startup_identity(requested_identity)
     except (StartupIdentityError, OSError, RuntimeError, TypeError, ValueError):
-        raise BootstrapError(IDENTITY_REFUSAL_MESSAGE) from None
+        raise BootstrapError(IDENTITY_REFUSAL_MESSAGE, details={"code": "identity_mismatch"}) from None
     if observed != requested:
-        raise BootstrapError(IDENTITY_REFUSAL_MESSAGE)
+        raise BootstrapError(IDENTITY_REFUSAL_MESSAGE, details={"code": "identity_mismatch"})
     return observed
-
-
-def _owner_health(boundary: RuntimeBoundary, *, endpoint: str, instance_id: str) -> Any:
-    read_identity = getattr(boundary, "owner_startup_identity", None)
-    if not callable(read_identity):
-        return None
-    return read_identity(endpoint=endpoint, instance_id=instance_id)
 
 
 def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig) -> BootstrapResult:
@@ -922,19 +906,12 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                     "A different runtime owner is active for the selected realm; "
                     "stop it before retrying astrid-runtime up --profile astrid."
                 )
-            owner_health = _owner_health(boundary, endpoint=endpoint, instance_id=instance_id)
-            if owner_health is not None:
-                _require_matching_owner_identity(
-                    instance_id=instance_id,
-                    requested_identity=requested_identity, owner_health=owner_health,
-                )
             if not boundary.health(endpoint=endpoint, pid=int(pid), instance_id=instance_id):
                 raise BootstrapError("The selected runtime owner is unhealthy; next action: " + RECONFIGURE_NEXT_ACTION)
-            if owner_health is None:
-                _require_matching_owner_identity(
-                    instance_id=instance_id,
-                    requested_identity=requested_identity, owner_health=None,
-                )
+            _validated_matching_owner_identity(
+                boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
+                instance_id=instance_id, requested_identity=requested_identity,
+            )
             if realm is None or str(realm.get("realm_id")) != str(discovery["active_realm"]):
                 raise BootstrapError("Discovery does not match the selected catalog realm; run astrid-runtime doctor.")
             configure = getattr(boundary, "configure_source", None)
@@ -1039,10 +1016,10 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     if not healthy:
         _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise BootstrapError("Runtime started but failed health check; next action: " + RECONFIGURE_NEXT_ACTION)
-    owner_health = _owner_health(boundary, endpoint=endpoint, instance_id=instance_id)
     try:
         owner_identity = _validated_matching_owner_identity(
-            owner_health, instance_id=instance_id, requested_identity=requested_identity,
+            boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
+            instance_id=instance_id, requested_identity=requested_identity,
         )
     except BootstrapError:
         _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
@@ -1136,19 +1113,12 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
         raise BootstrapError("Runtime discovery is incomplete; run astrid-runtime restart --profile astrid.") from exc
     if not _pid_alive(boundary, pid) or not boundary.validate_owner(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path):
         raise BootstrapError("Runtime discovery is stale or owned by another process; run astrid-runtime up --profile astrid.")
-    owner_health = _owner_health(boundary, endpoint=endpoint, instance_id=instance_id)
-    if owner_health is not None:
-        _require_matching_owner_identity(
-            instance_id=instance_id,
-            requested_identity=requested_identity, owner_health=owner_health,
-        )
     if not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id):
         raise BootstrapError("The selected runtime is unhealthy; run astrid-runtime restart --profile astrid.")
-    if owner_health is None:
-        _require_matching_owner_identity(
-            instance_id=instance_id,
-            requested_identity=requested_identity, owner_health=None,
-        )
+    _validated_matching_owner_identity(
+        boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
+        instance_id=instance_id, requested_identity=requested_identity,
+    )
     if str(realm.get("realm_id")) != str(discovery.get("active_realm")):
         raise BootstrapError("Discovery does not match the selected catalog realm; run astrid-runtime doctor.")
     actor_id, token = _credential(paths)
