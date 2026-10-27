@@ -189,7 +189,7 @@ class LiveDiscovery:
         self.path = _safe_path(path, "discovery path")
 
     def publish(self, **fields):
-        allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "realm_root", "runtime_instance_id", "identity", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "worker_credential_file", "worker_credential_pending", "worker_actor", "worker_scopes", "door_endpoint", "door_origin", "installer_operation_id"}
+        allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "realm_root", "runtime_instance_id", "identity", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "worker_credential_file", "worker_credential_pending", "worker_actor", "worker_scopes", "door_endpoint", "door_origin"}
         value = {k: fields[k] for k in allowed if k in fields}
         if platform.sys.platform == "win32":
             from astrid_runtime.io import atomic_write_json
