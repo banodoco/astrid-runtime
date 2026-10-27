@@ -119,33 +119,44 @@ def test_allowed_health_read_and_response_headers(tmp_path, prefix):
 
 
 def test_health_reports_pinokio_only_as_a_door_extension(tmp_path, monkeypatch):
+    monkeypatch.delenv("ASTRID_INSTALL_RELEASE", raising=False)
+    monkeypatch.delenv("ASTRID_INSTALL_MANAGED_BY", raising=False)
     world = start_door_world(tmp_path)
     try:
-        monkeypatch.delenv("ASTRID_INSTALL_MANAGED_BY", raising=False)
         reply = world.call(f"{API_RUNTIME}/v1/health")
         assert reply.status == 200
         assert "install" not in reply.json()
 
-        monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "other")
-        reply = world.call(f"{API_RUNTIME}/v1/health")
-        assert reply.status == 200
-        assert "install" not in reply.json()
-
-        monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "Pinokio")
-        reply = world.call(f"{API_RUNTIME}/v1/health")
-        assert reply.status == 200
-        assert "install" not in reply.json()
-
+        # The live door follows the owner's startup snapshot; changing the
+        # process environment after startup cannot change its marker.
+        monkeypatch.setenv("ASTRID_INSTALL_RELEASE", "8")
         monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "pinokio")
         reply = world.call(f"{API_RUNTIME}/v1/health")
         assert reply.status == 200
+        assert "install" not in reply.json()
+
+        pinokio_root = tmp_path / "pinokio"
+        pinokio_root.mkdir()
+        monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "pinokio")
+    finally:
+        world.stop()
+
+    pinokio_world = start_door_world(pinokio_root)
+    try:
+        reply = pinokio_world.call(f"{API_RUNTIME}/v1/health")
+        assert reply.status == 200
         assert reply.json()["install"] == {"managed_by": "pinokio"}
 
-        status, body = world.owner("GET", "/v1/health")
+        monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "other")
+        reply = pinokio_world.call(f"{API_RUNTIME}/v1/health")
+        assert reply.status == 200
+        assert reply.json()["install"] == {"managed_by": "pinokio"}
+
+        status, body = pinokio_world.owner("GET", "/v1/health")
         assert status == 200
         assert "install" not in json.loads(body)
     finally:
-        world.stop()
+        pinokio_world.stop()
 
 
 def test_realm_read_through_the_door(tmp_path):

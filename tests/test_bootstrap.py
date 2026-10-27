@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from astrid_runtime.bootstrap import (
     BootstrapConfig,
@@ -35,6 +36,7 @@ PROFILE = SourceProfile(
     source_checkout="/checkouts/astrid",
     capability_digest="caps-v1",
 )
+NATIVE_IDENTITY = {"release": 0, "managed_by": None}
 
 
 class FakeConnection:
@@ -65,6 +67,8 @@ class FakeBoundary:
         self.valid_owner = True
         self.next_pid = 41001
         self.restart_calls = 0
+        self.live_identity = dict(NATIVE_IDENTITY)
+        self.live_instance_id = None
 
     def start(self, **kwargs):
         self.calls.append("start")
@@ -75,6 +79,7 @@ class FakeBoundary:
         pid = self.next_pid
         self.next_pid += 1
         self.alive.add(pid)
+        self.live_instance_id = f"instance-{pid}"
         return {
             "endpoint": "http://127.0.0.1:43100",
             "pid": pid,
@@ -102,6 +107,16 @@ class FakeBoundary:
 
     def health(self, **kwargs):
         return kwargs["pid"] in self.alive
+
+    def owner_startup_identity(self, *, endpoint, instance_id):
+        return {
+            "runtime_instance_id": self.live_instance_id or instance_id,
+            "identity": (
+                dict(self.live_identity)
+                if isinstance(self.live_identity, dict)
+                else self.live_identity
+            ),
+        }
 
     def validate_owner(self, **kwargs):
         return self.valid_owner
@@ -132,6 +147,12 @@ class FakeBoundary:
 
 class BootstrapTests(unittest.TestCase):
     def setUp(self):
+        self.identity_env = patch.dict(os.environ, {
+            "ASTRID_INSTALL_RELEASE": "0",
+            "ASTRID_INSTALL_MANAGED_BY": "",
+        })
+        self.identity_env.start()
+        self.addCleanup(self.identity_env.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.paths = RuntimePaths.sandbox(self.temp.name)
         self.boundary = FakeBoundary()
@@ -162,6 +183,118 @@ class BootstrapTests(unittest.TestCase):
         self.boundary.calls.clear()
         self.boundary.creates.clear()
         return root
+
+    def _assert_identity_refusal_preserves_state(
+        self, *, case_name, path, source_profile, expected_identity, observed_identity,
+        bad_instance_id=None,
+    ):
+        case_root = Path(self.temp.name) / case_name
+        self.paths = RuntimePaths.sandbox(case_root)
+        self.boundary = FakeBoundary()
+        self.boundary.live_identity = dict(expected_identity)
+        self.config = BootstrapConfig(source_profile=source_profile)
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        files = (
+            self.paths.catalog_path,
+            self.paths.source_profiles_dir / "astrid.json",
+            self.paths.discovery_path,
+            self.paths.instance_lock_path,
+            self.paths.credentials_dir / "astrid.json",
+        )
+        before = {file: file.read_bytes() for file in files}
+        side_effect_counts = (
+            len(self.boundary.starts), len(self.boundary.connects),
+            len(self.boundary.provisions), len(self.boundary.handshakes),
+            self.boundary.restart_calls,
+        )
+        self.boundary.live_identity = observed_identity
+        if bad_instance_id is not None:
+            self.boundary.live_instance_id = bad_instance_id
+        with self.assertRaises(BootstrapError) as caught:
+            if path == "connect":
+                connect(self.paths, self.boundary, self.config)
+            else:
+                bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(
+            str(caught.exception),
+            "An older Astrid is still running. Run `astrid-runtime restart`; it waits for running tasks.",
+        )
+        self.assertEqual(before, {file: file.read_bytes() for file in files})
+        self.assertEqual(
+            side_effect_counts,
+            (len(self.boundary.starts), len(self.boundary.connects),
+             len(self.boundary.provisions), len(self.boundary.handshakes),
+             self.boundary.restart_calls),
+        )
+
+    @staticmethod
+    def _git_checkout(root: Path) -> None:
+        root.mkdir(parents=True)
+        subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+        (root / "tracked.txt").write_text("baseline", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-qm", "baseline"], check=True)
+
+    def test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes(self):
+        expected = dict(NATIVE_IDENTITY)
+        cases = (
+            ("release", {"release": 1, "managed_by": None}),
+            ("managed_by", {"release": 0, "managed_by": "pinokio"}),
+            ("missing", None),
+            ("malformed", {"release": -1, "managed_by": None}),
+            ("extra-field", {"release": 0, "managed_by": None, "dirty": False}),
+        )
+        for path in ("up", "connect"):
+            for name, observed in cases:
+                with self.subTest(path=path, field=name):
+                    self._assert_identity_refusal_preserves_state(
+                        case_name=f"{path}-{name}", path=path, source_profile=PROFILE,
+                        expected_identity=expected, observed_identity=observed,
+                    )
+            with self.subTest(path=path, field="owner-binding"):
+                self._assert_identity_refusal_preserves_state(
+                    case_name=f"{path}-owner-binding", path=path, source_profile=PROFILE,
+                    expected_identity=expected, observed_identity=expected,
+                    bad_instance_id="different-owner",
+                )
+
+    def test_source_identity_fields_are_compared_for_up_and_connect(self):
+        with patch.dict(os.environ):
+            os.environ.pop("ASTRID_INSTALL_RELEASE", None)
+            os.environ.pop("ASTRID_INSTALL_MANAGED_BY", None)
+            runtime = Path(self.temp.name) / "source-runtime"
+            agent = Path(self.temp.name) / "source-agent"
+            self._git_checkout(runtime)
+            self._git_checkout(agent)
+            (agent / "untracked.txt").write_text("dirty", encoding="utf-8")
+            source_profile = SourceProfile(
+                profile="astrid", runtime_checkout=str(runtime), source_checkout=str(agent),
+                capability_digest="caps-v1",
+            )
+            from astrid_runtime.identity import requested_startup_identity
+
+            expected = requested_startup_identity(source_profile)
+            changed_runtime_head = {**expected, "runtime_head": "f" * 40}
+            changed_agent_head = {**expected, "agent_head": "e" * 40}
+            changed_dirty = {**expected, "dirty": False}
+            changed_hash = {**expected, "dirty_hash": "a" * 64}
+            cases = (
+                ("runtime_head", changed_runtime_head),
+                ("agent_head", changed_agent_head),
+                ("dirty", changed_dirty),
+                ("dirty_hash", changed_hash),
+            )
+            for path in ("up", "connect"):
+                for name, observed in cases:
+                    with self.subTest(path=path, field=name):
+                        self._assert_identity_refusal_preserves_state(
+                            case_name=f"source-{path}-{name}", path=path,
+                            source_profile=source_profile, expected_identity=expected,
+                            observed_identity=observed,
+                        )
 
     def test_first_launch_writes_catalog_discovery_without_synthesizing_activation(self):
         self._configure()
@@ -261,11 +394,21 @@ class BootstrapTests(unittest.TestCase):
         )
         connection.commit()
         connection.close()
-        with self.assertRaisesRegex(BootstrapError, "active or unreconciled"):
+        discovery_before = self.paths.discovery_path.read_bytes()
+        active_pid = json.loads(discovery_before)["pid"]
+        with self.assertRaisesRegex(BootstrapError, "active or unreconciled") as caught:
             restart(self.paths, self.boundary, self.config)
+        self.assertEqual(caught.exception.details["unreconciled_attempts"][0]["attempt_id"], "a")
+        self.assertEqual(caught.exception.details["unreconciled_attempts"][0]["task_id"], "t")
         with self.assertRaisesRegex(BootstrapError, "active or unreconciled"):
             down(self.paths, self.boundary)
         self.assertEqual(self.boundary.restart_calls, 0)
+        self.assertIn(active_pid, self.boundary.alive)
+        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
+        connection = sqlite3.connect(root / "realm.sqlite3")
+        self.assertEqual(connection.execute("SELECT status FROM runs WHERE id='r'").fetchone(), ("running",))
+        self.assertEqual(connection.execute("SELECT status FROM tasks WHERE id='t'").fetchone(), ("queued",))
+        connection.close()
 
     def test_down_refuses_wrong_endpoint_instance_without_signal(self):
         self._configure()
@@ -701,3 +844,54 @@ def test_bootstrap_uncertain_incumbent_probe_preserves_authority():
         assert len(case.boundary.starts) == starts
     finally:
         case.tearDown()
+
+
+def test_restart_cli_preserves_named_lifecycle_blockers(monkeypatch, tmp_path, capsys):
+    import astrid_runtime.cli as cli
+
+    home = tmp_path / "home"
+    data_root = tmp_path / "support"
+    paths = RuntimePaths.current(home, data_root=data_root)
+    paths.ensure_support_dirs()
+    realm_root = paths.realms_dir / "realm"
+    realm_root.mkdir()
+    paths.catalog_path.write_text(json.dumps({
+        "version": 1,
+        "selected_realm_id": "realm",
+        "realms": [{
+            "realm_id": "realm", "display_name": "Realm", "data_root": str(realm_root),
+        }],
+        "source_profiles": {},
+    }))
+    paths.discovery_path.write_text(json.dumps({"pid": 123, "active_realm": "realm"}))
+    manifest = tmp_path / "source-profile.json"
+    manifest.write_text(json.dumps({
+        "profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": "/source",
+    }))
+    monkeypatch.setenv("ASTRID_RUNTIME_SOURCE_MANIFEST", str(manifest))
+
+    class Boundary:
+        def prepare_restart(self, **_kwargs):
+            return None
+
+    blockers = {
+        "safe": False,
+        "active_tasks": [{"task_id": "task-17", "status": "running"}],
+        "unreconciled_attempts": [{"attempt_id": "attempt-4", "task_id": "task-17"}],
+        "claimed_or_stale_bindings": [{"binding_id": "binding-9", "task_id": "task-17", "status": "claimed"}],
+        "unreleased_reservations": [{"task_id": "task-17", "resource_key": "gpu:0", "lease_token": "lease-3"}],
+    }
+    monkeypatch.setattr(cli, "LocalRuntimeBoundary", Boundary)
+    monkeypatch.setattr(
+        cli, "restart",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            BootstrapError("runtime lifecycle refused while work is active or unreconciled", details=blockers)
+        ),
+    )
+
+    assert cli.main(["restart", "--data-root", str(data_root), "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["details"]["active_tasks"][0]["task_id"] == "task-17"
+    assert payload["error"]["details"]["unreconciled_attempts"][0]["attempt_id"] == "attempt-4"
+    assert payload["error"]["details"]["claimed_or_stale_bindings"][0]["binding_id"] == "binding-9"
+    assert payload["error"]["details"]["unreleased_reservations"][0]["resource_key"] == "gpu:0"

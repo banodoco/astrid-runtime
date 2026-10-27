@@ -252,7 +252,7 @@ def test_core_fixtures_validate_against_closed_schemas() -> None:
 
 def test_health_schema_has_exact_closed_runtime_identity_contract() -> None:
     schema = json.loads((ROOT / "contract/schemas/health.json").read_text())
-    fields = ["status", "protocol", "schema_digest", "runtime_epoch", "runtime_session_id", "runtime_instance_id"]
+    fields = ["status", "protocol", "schema_digest", "runtime_epoch", "runtime_session_id", "runtime_instance_id", "identity"]
     assert schema["additionalProperties"] is False
     assert list(schema["required"]) == fields
     assert list(schema["properties"]) == [*fields, "services"]
@@ -264,10 +264,18 @@ def test_health_schema_has_exact_closed_runtime_identity_contract() -> None:
         "runtime_epoch": 1,
         "runtime_session_id": "runtime-session-1",
         "runtime_instance_id": "runtime-instance-1",
+        "identity": {"release": 7, "managed_by": "pinokio"},
     }
     assert not list(Draft202012Validator(schema).iter_errors(value))
+    source_identity = {
+        "release": 0, "managed_by": "source", "runtime_head": "a" * 40,
+        "agent_head": "b" * 40, "dirty": True, "dirty_hash": "c" * 64,
+    }
+    assert not list(Draft202012Validator(schema).iter_errors({**value, "identity": source_identity}))
     assert list(Draft202012Validator(schema).iter_errors({**value, "extra": True}))
     assert list(Draft202012Validator(schema).iter_errors({key: item for key, item in value.items() if key != "runtime_instance_id"}))
+    assert list(Draft202012Validator(schema).iter_errors({**value, "identity": {"release": True, "managed_by": "pinokio"}}))
+    assert not list(Draft202012Validator(schema).iter_errors({**value, "identity": None}))
 
 
 def test_closed_schemas_reject_unknown_fields() -> None:

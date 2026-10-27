@@ -61,11 +61,13 @@ class Health:
     runtime_epoch: int
     runtime_session_id: str
     runtime_instance_id: str
+    identity: Mapping[str, Any] | None
     services: tuple[ServiceStatus, ...] = ()
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Health":
-        return cls(status=value["status"], protocol=value["protocol"], schema_digest=value["schema_digest"], runtime_epoch=int(value.get("runtime_epoch", 0)), runtime_session_id=value["runtime_session_id"], runtime_instance_id=value["runtime_instance_id"], services=tuple(ServiceStatus.from_json(item) for item in value.get("services", ())))
+        identity = value["identity"]
+        return cls(status=value["status"], protocol=value["protocol"], schema_digest=value["schema_digest"], runtime_epoch=int(value.get("runtime_epoch", 0)), runtime_session_id=value["runtime_session_id"], runtime_instance_id=value["runtime_instance_id"], identity=dict(identity) if isinstance(identity, Mapping) else None, services=tuple(ServiceStatus.from_json(item) for item in value.get("services", ())))
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)

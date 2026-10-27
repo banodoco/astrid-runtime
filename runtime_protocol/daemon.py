@@ -23,6 +23,7 @@ from .door import CHAT_FILE_NAME, open_door
 from .errors import ConflictError, NotFoundError, ProtocolError
 from .server import RuntimeHTTPServer, RuntimeHandler
 from .service import RuntimeService
+from .startup_identity import capture_startup_identity
 from .store import realm_admission_fence
 from .util import atomic_json_write, now
 
@@ -54,7 +55,7 @@ def _authority_path(value, label):
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, services=None, log_directory=None):
+    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, services=None, log_directory=None, runtime_checkout=None, agent_checkout=None):
         if ":" in host:
             raise ValueError("runtime daemon requires IPv4 loopback; IPv6 is not supported yet")
         if host not in ("127.0.0.1", "localhost"):
@@ -73,6 +74,10 @@ class RuntimeDaemon:
         self.reboot_allowlist = reboot_allowlist
         self.admission_timeout = admission_timeout
         self.instance_id = uuid.uuid4().hex
+        self._identity_runtime_checkout = runtime_checkout
+        self._identity_agent_checkout = agent_checkout
+        self._startup_identity = None
+        self._startup_identity_instance_id = None
         self.service = None
         self.httpd = None
         self.thread = None
@@ -120,9 +125,27 @@ class RuntimeDaemon:
     def start(self):
         if self.httpd:
             return self
+        if self._startup_identity_instance_id == self.instance_id:
+            self.instance_id = uuid.uuid4().hex
         self._start(rotate_credentials=False)
         self._cleanup_completed_replacement()
         return self
+
+    @property
+    def startup_identity(self):
+        import copy
+        return copy.deepcopy(self._startup_identity)
+
+    @property
+    def startup_identity_instance_id(self):
+        return self._startup_identity_instance_id
+
+    def _bind_startup_identity(self):
+        if self._startup_identity_instance_id != self.instance_id:
+            self._startup_identity = capture_startup_identity(
+                runtime_checkout=self._identity_runtime_checkout,
+                agent_checkout=self._identity_agent_checkout)
+            self._startup_identity_instance_id = self.instance_id
 
     def _catalog_owner_valid(self, proof):
         return self.service is not None and self.service.validate_catalog_admission(proof)
@@ -235,6 +258,7 @@ class RuntimeDaemon:
         atomic_json_write(self._epoch_floor_path(), {"format_version": 1, "runtime_epoch_floor": floor})
 
     def _start(self, *, rotate_credentials=False):
+        self._bind_startup_identity()
         cancellation.check()
         # Fix signalling policy from Runtime support before anything is spawned.
         process_control.configure_from(self.support_root)
@@ -269,7 +293,7 @@ class RuntimeDaemon:
         birth_id = process_birth_identity()
         if self.owner_lock:
             atomic_json_write(self.owner_lock, {"pid": os.getpid(), "process_birth_id": birth_id, "runtime_instance_id": self.instance_id, "realm_id": self.service.realm["id"], "realm_root": str(self.root)})
-        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.instance_id, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_credential_pending=bool(self.local_worker_profiles), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES), **({"door_endpoint": self.door_endpoint, "door_origin": self.door.origin} if self.door_httpd else {}))
+        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.startup_identity_instance_id, identity=self.startup_identity, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_credential_pending=bool(self.local_worker_profiles), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES), **({"door_endpoint": self.door_endpoint, "door_origin": self.door.origin} if self.door_httpd else {}))
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="astrid-runtime-protocol", daemon=True)
         self.thread.start()
         if self.door_httpd is not None:

@@ -55,6 +55,26 @@
       }
     },
     {
+      "name": "health.json",
+      "trailing_newline": false,
+      "value": {
+        "identity": {
+          "agent_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "dirty": true,
+          "dirty_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "managed_by": "source",
+          "release": 0,
+          "runtime_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "protocol": "workspace.v1",
+        "runtime_epoch": 1,
+        "runtime_instance_id": "runtime-instance-1",
+        "runtime_session_id": "runtime-session-1",
+        "schema_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "status": "ok"
+      }
+    },
+    {
       "name": "managed-object.json",
       "value": {
         "created_at": "2026-08-30T00:00:00Z",

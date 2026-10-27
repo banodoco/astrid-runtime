@@ -133,7 +133,7 @@ def test_generated_client_smoke_and_scoped_handshake() -> None:
     def transport(method, path, headers, body):
         calls.append((method, path, headers, body))
         if path == "/v1/health":
-            return 200, {}, json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1, "runtime_session_id": "runtime-session-1", "runtime_instance_id": "runtime-instance-1"}).encode()
+            return 200, {}, json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1, "runtime_session_id": "runtime-session-1", "runtime_instance_id": "runtime-instance-1", "identity": {"release": 0, "managed_by": None}}).encode()
         if path == "/v1/handshake":
             return 200, {}, json.dumps({"protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "session_id": "session-1", "actor_id": "actor-1", "realm_id": "realm-1", "scopes": ["realm:read", "project:write"]}).encode()
         if path == "/v1/projects" and method == "POST":
@@ -512,7 +512,7 @@ def test_client_applies_bounded_timeout_to_stdlib_transport(monkeypatch) -> None
             return False
 
         def read(self):
-            return json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1, "runtime_session_id": "runtime-session-1", "runtime_instance_id": "runtime-instance-1"}).encode()
+            return json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1, "runtime_session_id": "runtime-session-1", "runtime_instance_id": "runtime-instance-1", "identity": {"release": 0, "managed_by": None}}).encode()
 
     def urlopen(request, *, timeout):
         observed["timeout"] = timeout
