@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gc
 import os
 from pathlib import Path
 import stat
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing, contextmanager
 from unittest.mock import patch
 
 from astrid_runtime.bootstrap import (
@@ -24,9 +26,12 @@ from astrid_runtime.bootstrap import (
     connect,
     down,
     doctor,
+    installer_stop,
+    preflight_stop,
     restart,
 )
 from astrid_runtime.paths import RuntimePaths
+from runtime_protocol.lifecycle import inspect_interruption_state
 from runtime_protocol.store import RealmStore
 
 
@@ -183,6 +188,14 @@ class BootstrapTests(unittest.TestCase):
         self.boundary.calls.clear()
         self.boundary.creates.clear()
         return root
+
+    def _add_running_task(self, realm_root, task_id="task-busy"):
+        with closing(sqlite3.connect(realm_root / "realm.sqlite3")) as connection, connection:
+            connection.execute(
+                "INSERT INTO tasks (id, run_id, capability, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, "run-busy", "test-capability", "running", "2026-10-27T00:00:00Z", "2026-10-27T00:00:00Z"),
+            )
 
     def _assert_identity_refusal_preserves_state(
         self, *, case_name, path, source_profile, expected_identity, observed_identity,
@@ -396,12 +409,14 @@ class BootstrapTests(unittest.TestCase):
         connection.close()
         discovery_before = self.paths.discovery_path.read_bytes()
         active_pid = json.loads(discovery_before)["pid"]
-        with self.assertRaisesRegex(BootstrapError, "active or unreconciled") as caught:
+        with self.assertRaisesRegex(BootstrapError, "Astrid is busy") as caught:
             restart(self.paths, self.boundary, self.config)
         self.assertEqual(caught.exception.details["unreconciled_attempts"][0]["attempt_id"], "a")
         self.assertEqual(caught.exception.details["unreconciled_attempts"][0]["task_id"], "t")
-        with self.assertRaisesRegex(BootstrapError, "active or unreconciled"):
+        with self.assertRaisesRegex(BootstrapError, "Astrid is busy") as caught:
             down(self.paths, self.boundary)
+        self.assertEqual(caught.exception.details["unreconciled_attempts"][0]["attempt_id"], "a")
+        self.assertEqual(caught.exception.details["unreconciled_attempts"][0]["task_id"], "t")
         self.assertEqual(self.boundary.restart_calls, 0)
         self.assertIn(active_pid, self.boundary.alive)
         self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
@@ -469,6 +484,560 @@ class BootstrapTests(unittest.TestCase):
         result = down(self.paths, self.boundary)
         self.assertEqual(result["status"], "stopped")
         self.assertEqual(observed, [7])
+
+    def test_installer_stop_runs_runtime_then_manager_under_same_fence(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        order = []
+        original_stop = self.boundary.stop_owner
+
+        def stop_owner(**kwargs):
+            order.append("runtime")
+            return original_stop(**kwargs)
+
+        def stop_manager():
+            order.append("manager")
+            connection = sqlite3.connect(root / "realm.sqlite3", timeout=0.02)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("BEGIN IMMEDIATE")
+            finally:
+                connection.close()
+
+        self.boundary.stop_owner = stop_owner
+        result = installer_stop(self.paths, self.boundary, stop_manager=stop_manager)
+        self.assertEqual(order, ["runtime", "manager"])
+        self.assertEqual(result["status"], "stopped")
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_installer_manager_failure_reports_known_runtime_stop(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        discovery_before = self.paths.discovery_path.read_bytes()
+
+        def manager_failure():
+            raise RuntimeError("manager stop failed")
+
+        with self.assertRaises(BootstrapError) as caught:
+            installer_stop(self.paths, self.boundary, stop_manager=manager_failure)
+        self.assertEqual(caught.exception.details, {"stop_completed": True})
+        self.assertIn("manager stop failed", str(caught.exception))
+        # Recovery can distinguish the known Runtime stop from an uncertain one.
+        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
+
+    def test_same_controller_stop_retry_revalidates_completed_owner_absence(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        called = []
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append("first"))
+        self.boundary.process_birth_identity = lambda _pid: None
+
+        def retry_manager():
+            with sqlite3.connect(root / "realm.sqlite3", timeout=0) as connection:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("BEGIN IMMEDIATE")
+            called.append("retry")
+
+        installer_stop(self.paths, self.boundary, stop_manager=retry_manager)
+        self.assertEqual(called, ["first", "retry"])
+        self.assertEqual(self.boundary.restart_calls, 1)
+        # A receipt is tied to the exact controller. A fresh invocation cannot
+        # infer absence from files removed by a previous installer process.
+        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+            installer_stop(self.paths, FakeBoundary(), stop_manager=lambda: called.append("new"))
+        self.assertEqual(called, ["first", "retry"])
+
+    def test_same_controller_receipt_never_authorizes_reused_or_unknown_pid(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        called = []
+        self.boundary.process_birth_identity = lambda _pid: "replacement"
+        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
+        self.assertEqual(called, [])
+
+    def test_completed_owner_receipt_retires_legacy_foreground_on_retry(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        foreground = {"pid": discovery["pid"], "birth_id": discovery["process_birth_id"]}
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
+                       recorded_foreground=foreground)
+        self.boundary.process_birth_identity = lambda _pid: None
+        calls = []
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"),
+                       recorded_foreground=foreground)
+        self.assertEqual(calls, ["manager"])
+        self.assertEqual(self.boundary.restart_calls, 1)
+
+    def test_completed_owner_receipt_does_not_mistake_candidate_for_old_foreground(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        old = json.loads(self.paths.discovery_path.read_text())
+        foreground = {"pid": old["pid"], "birth_id": old["process_birth_id"]}
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None,
+                       recorded_foreground=foreground)
+
+        candidate_pid = 41099
+        candidate_birth = "candidate-birth"
+        candidate_instance = "candidate-instance"
+        candidate = {
+            **old, "pid": candidate_pid, "process_birth_id": candidate_birth,
+            "runtime_instance_id": candidate_instance,
+        }
+        self.paths.discovery_path.write_text(json.dumps(candidate))
+        self.paths.instance_lock_path.write_text(json.dumps({
+            **candidate, "realm_id": "configured-realm",
+        }))
+        self.boundary.alive.add(candidate_pid)
+        self.boundary.live_instance_id = candidate_instance
+        self.boundary.endpoint_metadata = lambda **_kwargs: {
+            "runtime_instance_id": candidate_instance, "realm_id": "configured-realm",
+        }
+        self.boundary.process_birth_identity = lambda pid: (
+            None if pid == int(old["pid"]) else candidate_birth
+        )
+        calls = []
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: calls.append(True),
+                       recorded_foreground=foreground)
+        self.assertEqual(calls, [True])
+        self.assertEqual(self.boundary.restart_calls, 2)
+
+    def test_manager_failure_after_owner_removes_ads_keeps_retry_receipt(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        def owner_exits(**kwargs):
+            self.boundary.restart_calls += 1
+            self.boundary.alive.discard(kwargs["pid"])
+            self.paths.discovery_path.unlink()
+            self.paths.instance_lock_path.unlink()
+            self.boundary.process_birth_identity = lambda _pid: None
+            return {"status": "stopped"}
+        self.boundary.stop_owner = owner_exits
+        with self.assertRaisesRegex(BootstrapError, "manager unavailable") as caught:
+            installer_stop(
+                self.paths, self.boundary,
+                stop_manager=lambda: (_ for _ in ()).throw(RuntimeError("manager unavailable")),
+            )
+        self.assertEqual(caught.exception.details, {"stop_completed": True})
+        receipt = self.boundary._installer_stop_receipt
+        calls = []
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: calls.append("retry"))
+        self.assertIs(self.boundary._installer_stop_receipt, receipt)
+        self.assertEqual(calls, ["retry"])
+        self.assertEqual(self.boundary.restart_calls, 1)
+
+    def test_unsafe_discovery_path_revokes_completed_stop_receipt(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+
+        for unsafe_kind in ("symlink", "directory"):
+            with self.subTest(unsafe_kind=unsafe_kind):
+                calls = []
+                installer_stop(self.paths, self.boundary,
+                               stop_manager=lambda: calls.append("manager"))
+                self.boundary.process_birth_identity = lambda _pid: None
+                self.assertEqual(calls, ["manager"])
+
+                if unsafe_kind == "symlink":
+                    replacement = Path(self.temp.name) / "replacement-discovery.json"
+                    replacement.write_text(json.dumps({"pid": 49999}), encoding="utf-8")
+                    self.paths.discovery_path.symlink_to(replacement)
+                else:
+                    self.paths.discovery_path.mkdir()
+
+                stopped = self.boundary.restart_calls
+                with patch("astrid_runtime.bootstrap.remove_file") as cleanup:
+                    with self.assertRaises(BootstrapError):
+                        installer_stop(self.paths, self.boundary,
+                                       stop_manager=lambda: calls.append("unsafe"))
+                    cleanup.assert_not_called()
+                self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
+                self.assertEqual(calls, ["manager"])
+                self.assertEqual(self.boundary.restart_calls, stopped)
+
+                if unsafe_kind == "symlink":
+                    self.paths.discovery_path.unlink()
+                else:
+                    self.paths.discovery_path.rmdir()
+                with patch("astrid_runtime.bootstrap.remove_file") as cleanup:
+                    with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+                        installer_stop(self.paths, self.boundary,
+                                       stop_manager=lambda: calls.append("retry"))
+                    cleanup.assert_not_called()
+                self.assertEqual(calls, ["manager"])
+                self.assertEqual(self.boundary.restart_calls, stopped)
+
+                # Recreate the owner for the next subcase with a fresh controller
+                # receipt while keeping this test's teardown isolated.
+                if unsafe_kind == "symlink":
+                    bootstrap(self.paths, self.boundary, self.config)
+
+    def test_post_mutex_receipt_validation_failures_revoke_authority(self):
+        import importlib
+
+        bootstrap_module = importlib.import_module("astrid_runtime.bootstrap")
+        failure_points = (
+            "mutex_entry", "selected_realm", "catalog_read",
+            "discovery_read", "instance_lock_read",
+        )
+        for failure_point in failure_points:
+            with self.subTest(failure_point=failure_point):
+                self.paths = RuntimePaths.sandbox(Path(self.temp.name) / failure_point)
+                self.boundary = FakeBoundary()
+                self.config = BootstrapConfig(source_profile=PROFILE)
+                self._configure()
+                bootstrap(self.paths, self.boundary, self.config)
+                calls = []
+                installer_stop(self.paths, self.boundary,
+                               stop_manager=lambda: calls.append("manager"))
+                self.boundary.process_birth_identity = lambda _pid: None
+                stop_count = self.boundary.restart_calls
+                original_mutex = bootstrap_module._bootstrap_mutex
+                original_selected = bootstrap_module._selected_stop_realm
+                original_read = bootstrap_module._read_support_json
+                acquired = False
+
+                @contextmanager
+                def fail_mutex_entry(paths):
+                    if failure_point == "mutex_entry":
+                        raise OSError("bootstrap mutex acquisition failed")
+                    with original_mutex(paths):
+                        nonlocal acquired
+                        acquired = True
+                        yield
+
+                def selected_realm(paths):
+                    if acquired and failure_point == "selected_realm":
+                        raise BootstrapError("selected realm context became unreadable")
+                    return original_selected(paths)
+
+                def read_support_json(path):
+                    if acquired and (
+                        (failure_point == "catalog_read" and path == self.paths.catalog_path)
+                        or (failure_point == "discovery_read" and path == self.paths.discovery_path)
+                        or (failure_point == "instance_lock_read" and path == self.paths.instance_lock_path)
+                    ):
+                        raise BootstrapError(f"{failure_point} became unreadable")
+                    return original_read(path)
+
+                with patch.object(bootstrap_module, "_bootstrap_mutex", fail_mutex_entry), \
+                     patch.object(bootstrap_module, "_selected_stop_realm", selected_realm), \
+                     patch.object(bootstrap_module, "_read_support_json", read_support_json):
+                    expected = (OSError if failure_point == "mutex_entry" else BootstrapError)
+                    with self.assertRaisesRegex(expected, "failed|unreadable"):
+                        installer_stop(self.paths, self.boundary,
+                                       stop_manager=lambda: calls.append("uncertain"))
+
+                self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
+                self.assertEqual(calls, ["manager"])
+                self.assertEqual(self.boundary.restart_calls, stop_count)
+                with patch("astrid_runtime.bootstrap.remove_file") as cleanup:
+                    with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+                        installer_stop(self.paths, self.boundary,
+                                       stop_manager=lambda: calls.append("retry"))
+                    cleanup.assert_not_called()
+                self.assertEqual(calls, ["manager"])
+                self.assertEqual(self.boundary.restart_calls, stop_count)
+
+    def test_invalid_foreground_identity_cannot_use_completed_receipt(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        self.boundary.process_birth_identity = lambda _pid: None
+        called = []
+        bad_foreground = {"pid": discovery["pid"] + 1, "birth_id": discovery["process_birth_id"]}
+        with self.assertRaisesRegex(BootstrapError, "custody handoff"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True),
+                           recorded_foreground=bad_foreground)
+        self.assertEqual(called, [])
+
+    def test_observed_replacement_invalidates_old_receipt_for_later_absence(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        replacement = {
+            "pid": 41999, "process_birth_id": "replacement-birth",
+            "runtime_instance_id": "replacement-instance",
+            "active_realm": "configured-realm",
+            "realm_root": str((self.paths.realms_dir / "configured-realm").resolve()),
+        }
+        self.paths.discovery_path.write_text(json.dumps(replacement))
+        with self.assertRaises(BootstrapError):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        self.paths.discovery_path.unlink()
+        self.paths.instance_lock_path.unlink(missing_ok=True)
+        self.boundary.process_birth_identity = lambda _pid: None
+        called = []
+        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+        self.assertEqual(called, [])
+
+    def test_replacement_seen_before_busy_refusal_invalidates_receipt(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        self.boundary.process_birth_identity = lambda _pid: None
+        self._add_running_task(root)
+        self.paths.discovery_path.write_text("{malformed replacement", encoding="utf-8")
+        watched = (root / "realm.sqlite3", self.paths.discovery_path,
+                   self.paths.instance_lock_path)
+        before = {path: path.read_bytes() for path in watched if path.exists()}
+        with self.assertRaisesRegex(BootstrapError, "Astrid is busy"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("manager called"))
+        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
+        self.assertEqual(before, {path: path.read_bytes() for path in watched if path.exists()})
+        with sqlite3.connect(root / "realm.sqlite3") as connection:
+            connection.execute("UPDATE tasks SET status='completed'")
+        self.paths.discovery_path.unlink()
+        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("stale receipt reused"))
+
+    def test_receipt_retry_rechecks_process_absence_under_final_fence(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        self.boundary.process_birth_identity = lambda _pid: None
+        original_fence = __import__("astrid_runtime.bootstrap", fromlist=["interruption_fence"]).interruption_fence
+
+        for observed, pattern in (("replacement", "identity changed under the final fence"),
+                                  (OSError("identity lookup failed"), "absence could not be established under the final fence")):
+            with self.subTest(observed=observed):
+                called = []
+                # The pre-fence absence observation used the original lambda;
+                # the first lookup inside the injected fence is the recheck.
+                observations = 1
+
+                @contextmanager
+                def raced_fence(realm_root):
+                    with original_fence(realm_root) as report:
+                        def observe(_pid):
+                            nonlocal observations
+                            observations += 1
+                            if observations == 1:
+                                return None
+                            if isinstance(observed, Exception):
+                                raise observed
+                            return observed
+                        self.boundary.process_birth_identity = observe
+                        yield report
+
+                with patch("astrid_runtime.bootstrap.interruption_fence", side_effect=raced_fence):
+                    with self.assertRaisesRegex(BootstrapError, pattern):
+                        installer_stop(self.paths, self.boundary,
+                                       stop_manager=lambda: called.append("manager"))
+                self.assertEqual(called, [])
+                self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
+                # Restore a known-absent observer and create fresh receipt for
+                # the next subcase without authorizing a signal.
+                self.boundary.process_birth_identity = lambda _pid: None
+                self.boundary._installer_stop_receipt = {
+                    "support_root": self.paths.runtime_support.resolve(),
+                    "realm_id": "configured-realm",
+                    "realm_root": (self.paths.realms_dir / "configured-realm").resolve(),
+                    "pid": 41001, "process_birth_id": "synthetic:instance-41001:41001",
+                    "runtime_instance_id": "instance-41001",
+                }
+                if hasattr(self.boundary, "_installer_stop_receipt_invalidated"):
+                    del self.boundary._installer_stop_receipt_invalidated
+
+    def test_receipt_identity_lookup_failure_revokes_receipt(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        self.boundary.process_birth_identity = lambda _pid: (_ for _ in ()).throw(OSError("lookup denied"))
+        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("manager called"))
+        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
+        self.boundary.process_birth_identity = lambda _pid: None
+        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("stale receipt reused"))
+
+    def test_lock_only_unknown_identity_revokes_receipt_before_later_disappearance(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        marker = self.paths.instance_lock_path.read_bytes()
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        self.paths.instance_lock_path.write_bytes(marker)
+        self.boundary.process_birth_identity = lambda _pid: (_ for _ in ()).throw(OSError("lookup denied"))
+        with self.assertRaises(BootstrapError):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("manager called"))
+        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
+        self.paths.instance_lock_path.unlink()
+        self.boundary.process_birth_identity = lambda _pid: None
+        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("stale receipt reused"))
+
+    def test_reused_identity_in_matching_publication_revokes_receipt(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        discovery = self.paths.discovery_path.read_bytes()
+        marker = self.paths.instance_lock_path.read_bytes()
+        installer_stop(self.paths, self.boundary, stop_manager=lambda: None)
+        self.paths.discovery_path.write_bytes(discovery)
+        self.paths.instance_lock_path.write_bytes(marker)
+        self.boundary.process_birth_identity = lambda _pid: "replacement-birth"
+        with self.assertRaisesRegex(BootstrapError, "owner process identity changed"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("manager called"))
+        self.assertTrue(getattr(self.boundary, "_installer_stop_receipt_invalidated", False))
+        self.paths.discovery_path.unlink()
+        self.paths.instance_lock_path.unlink()
+        self.boundary.process_birth_identity = lambda _pid: None
+        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: self.fail("stale receipt reused"))
+
+    def test_installer_preflight_busy_preserves_owner_and_skips_manager(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        self._add_running_task(root)
+        before = {
+            path: path.read_bytes()
+            for path in (self.paths.discovery_path, self.paths.instance_lock_path)
+        }
+        self.paths.bootstrap_lock_path.unlink(missing_ok=True)
+        called = []
+        with self.assertRaises(BootstrapError) as caught:
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+        self.assertIn("Astrid is busy (1 tasks running)", str(caught.exception))
+        self.assertEqual(caught.exception.details["task_count"], 1)
+        self.assertEqual(caught.exception.details["blockers"][0]["task_id"], "task-busy")
+        self.assertEqual(called, [])
+        self.assertEqual(self.boundary.restart_calls, 0)
+        # Busy preflight occurs before Runtime acquires/creates its mutex.
+        self.assertFalse(self.paths.bootstrap_lock_path.exists())
+        self.assertEqual(before, {
+            path: path.read_bytes()
+            for path in (self.paths.discovery_path, self.paths.instance_lock_path)
+        })
+
+    def test_down_busy_preflight_does_not_create_bootstrap_lock_or_mutate_state(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        database = root / "realm.sqlite3"
+        # FakeBoundary has no real owner's SQLite connection. Hold one open
+        # explicitly so WAL/SHM lifetime does not depend on garbage collection
+        # of the task writer (a Connection context manager only commits).
+        with closing(sqlite3.connect(database)) as owner_connection:
+            owner_connection.execute("SELECT COUNT(*) FROM tasks").fetchone()
+            self._add_running_task(root)
+            self.paths.bootstrap_lock_path.unlink(missing_ok=True)
+            watched = (
+                database, Path(str(database) + "-wal"), Path(str(database) + "-shm"),
+                self.paths.discovery_path, self.paths.instance_lock_path,
+                self.paths.credentials_dir / "astrid.json",
+            )
+            before = {path: path.read_bytes() for path in watched if path.exists()}
+            stop_calls = self.boundary.restart_calls
+            self.assertIn(Path(str(database) + "-wal"), before)
+            self.assertIn(Path(str(database) + "-shm"), before)
+            for force_collection in (False, True):
+                with self.subTest(force_collection=force_collection):
+                    def observe(root):
+                        if force_collection:
+                            gc.collect()
+                        return inspect_interruption_state(root)
+
+                    with patch("astrid_runtime.bootstrap.inspect_interruption_state", side_effect=observe):
+                        with self.assertRaisesRegex(BootstrapError, "Astrid is busy") as caught:
+                            down(self.paths, self.boundary)
+                    self.assertEqual(caught.exception.details["task_count"], 1)
+                    self.assertEqual(stop_calls, self.boundary.restart_calls)
+                    self.assertFalse(self.paths.bootstrap_lock_path.exists())
+                    after = {path: path.read_bytes() for path in watched if path.exists()}
+                    self.assertEqual(before.keys(), after.keys())
+                    for path, contents in before.items():
+                        self.assertEqual(contents, after[path], str(path))
+
+    def test_installer_final_fence_catches_work_after_read_only_preflight(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        called = []
+        original_preflight = preflight_stop
+        inserted = False
+
+        def raced_preflight(paths):
+            nonlocal inserted
+            report = original_preflight(paths)
+            if not inserted:
+                inserted = True
+                self._add_running_task(root, "task-raced")
+            return report
+
+        with patch("astrid_runtime.bootstrap.preflight_stop", side_effect=raced_preflight):
+            with self.assertRaises(BootstrapError) as caught:
+                installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+        self.assertIn("Astrid is busy (1 tasks running)", str(caught.exception))
+        self.assertEqual(caught.exception.details["blockers"][0]["task_id"], "task-raced")
+        self.assertEqual(called, [])
+        self.assertEqual(self.boundary.restart_calls, 0)
+
+    def test_installer_stop_missing_owner_evidence_never_authorizes_manager(self):
+        self._configure()
+        called = []
+
+        def stop_manager():
+            called.append(True)
+
+        with self.assertRaisesRegex(BootstrapError, "no owner identity"):
+            installer_stop(self.paths, self.boundary, stop_manager=stop_manager)
+        self.assertEqual(called, [])
+
+    def test_installer_stop_refuses_corrupt_discovery_before_callback(self):
+        self._configure()
+        self.paths.discovery_path.write_text("{broken", encoding="utf-8")
+        called = []
+        with self.assertRaises(BootstrapError):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+        self.assertEqual(called, [])
+
+    def test_installer_stop_cleans_only_proven_dead_publication(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        self.boundary.alive.discard(int(discovery["pid"]))
+        self.boundary.process_birth_identity = lambda _pid: None
+        called = []
+        result = installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(called, [True])
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_installer_stop_unknown_process_observation_never_proves_absence(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        self.boundary.alive.discard(int(discovery["pid"]))
+
+        def uncertain(_pid):
+            raise OSError("process observation denied")
+
+        self.boundary.process_birth_identity = uncertain
+        before = self.paths.discovery_path.read_bytes()
+        called = []
+        with self.assertRaisesRegex(BootstrapError, "absence could not be established"):
+            installer_stop(self.paths, self.boundary, stop_manager=lambda: called.append(True))
+        self.assertEqual(called, [])
+        self.assertEqual(self.paths.discovery_path.read_bytes(), before)
+
+    def test_installer_stop_preserves_changed_discovery_after_absent_owner(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        self.boundary.alive.discard(int(discovery["pid"]))
+        self.boundary.process_birth_identity = lambda _pid: None
+        replacement = {"pid": 998877, "runtime_instance_id": "new", "active_realm": "configured-realm"}
+
+        def stop_manager():
+            self.paths.discovery_path.write_text(json.dumps(replacement), encoding="utf-8")
+
+        with self.assertRaisesRegex(BootstrapError, "discovery changed"):
+            installer_stop(self.paths, self.boundary, stop_manager=stop_manager)
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
 
     def test_down_never_cleans_up_new_owner_published_during_stop(self):
         root = self._configure()

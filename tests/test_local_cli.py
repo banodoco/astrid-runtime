@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from astrid_runtime import cli
+from astrid_runtime.bootstrap import BootstrapError
 from astrid_runtime.paths import RuntimePaths
 
 
@@ -67,3 +68,41 @@ def test_reboot_is_safe_disabled_and_resume_is_typed(monkeypatch, tmp_path, caps
     resume_args = ["resume", "--home", str(tmp_path), "--checkpoint-id", "c", "--nonce", "n", "--authorization", "n", "--runtime-epoch", "7", "--json"]
     assert cli.main(resume_args) == 0
     assert fake.calls[-1][0] == "resume"
+
+
+def test_down_cli_json_preserves_complete_bootstrap_refusal_details(monkeypatch, tmp_path, capsys):
+    paths = RuntimePaths.current(tmp_path / "home", data_root=tmp_path / "support")
+    paths.ensure_support_dirs()
+    realm_root = paths.realms_dir / "realm"
+    realm_root.mkdir()
+    paths.catalog_path.write_text(json.dumps({
+        "version": 1,
+        "selected_realm_id": "realm",
+        "realms": [{"realm_id": "realm", "display_name": "Realm", "data_root": str(realm_root)}],
+        "source_profiles": {},
+    }))
+    paths.discovery_path.write_text(json.dumps({"pid": 123, "active_realm": "realm"}))
+    (paths.source_profiles_dir / "astrid.json").write_text(json.dumps({
+        "profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": "/source",
+    }))
+
+    class Boundary:
+        def prepare_restart(self, **_kwargs):
+            return None
+
+    details = {
+        "safe": False,
+        "blockers": [{"task_id": "task-17", "kind": "test", "state": "running",
+                      "created_at": "2026-10-27T00:00:00Z", "age_seconds": 12,
+                      "blocker_kind": "running_task"}],
+        "task_count": 1,
+        "headline": "Astrid is busy (1 tasks running). Try again when they finish.",
+        "message": "Astrid is busy (1 tasks running). Try again when they finish.\ntask-17 [running_task; test; running; age 12s]",
+    }
+    monkeypatch.setattr(cli, "LocalRuntimeBoundary", Boundary)
+    monkeypatch.setattr(cli, "down", lambda *_args: (_ for _ in ()).throw(
+        BootstrapError(details["message"], details=details)
+    ))
+    assert cli.main(["down", "--data-root", str(paths.app_support), "--json"]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == {"message": details["message"], "details": details}
