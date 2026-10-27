@@ -272,6 +272,26 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 and urlsplit(getattr(self, "path", "")).path in {"/v1/health", "/v1/realm"}
                 and getattr(self, "headers", {}).get("X-Astrid-Owner-Identity") == "1")
 
+    def _require_update_context(self):
+        raise AuthorizationError("updates require the trusted browser door")
+
+    def _update_route(self):
+        self.close_connection = True
+        self._require_update_context()
+        expected = {"/v1/update": "POST", "/v1/update/status": "GET"}
+        if self.path not in expected or self.command != expected[self.path]:
+            raise ProtocolError("exact update path and method required; no parameters")
+        if any(self._header_values(name) for name in ("Transfer-Encoding", "Content-Encoding", "Trailer")):
+            raise ProtocolError("update requests do not accept encoded or ambiguous framing")
+        lengths = self._header_values("Content-Length")
+        if (self.command == "POST" or lengths) and (len(lengths) != 1 or lengths[0] != "0"):
+            raise ProtocolError("update requests require zero body bytes")
+        from astrid_runtime.update import update_admission
+        admission = update_admission(self.server.daemon_runtime)
+        if self.command == "GET":
+            return self._send(200, admission.status())
+        admission.request()
+
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
@@ -313,7 +333,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             from .daemon import WORKER_ACTOR
             if actor == WORKER_ACTOR:
                 raise ConflictError("the shared Worker actor requires exact owner credential control")
-            scopes = ["handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write"]
+            from .door import PRODUCT_SCOPES
+            scopes = list(PRODUCT_SCOPES)
             self.server.credentials.provision_static(actor, token, scopes)  # type: ignore[attr-defined]
             return self._send(201, {"actor_id": actor, "scope": scope})
         if path == ["v1", "handshake"] and method == "POST":
@@ -1051,7 +1072,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._prefetched_body = None
             self._defer_response = True
             try:
-                if self._is_task_settlement_control():
+                if urlsplit(getattr(self, "path", "")).path.startswith("/v1/update"):
+                    # Admission and network preparation never hold the shared SQLite writer.
+                    self._update_route()
+                elif self._is_task_settlement_control():
                     self._task_settlement_control()
                 elif self._is_local_worker_control():
                     # Process preparation and OS observation are deliberately
