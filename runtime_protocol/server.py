@@ -344,23 +344,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "diagnostics"] and method == "GET":
             self._identity("projects:read")
             from astrid_runtime.diagnostics import diagnostics_report
-            from astrid_runtime.bootstrap import doctor as runtime_doctor
             from astrid_runtime.paths import RuntimePaths
             paths = RuntimePaths.current(data_root=self.runtime.support_root.parent if self.runtime.support_root else None)
-            from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
-            query = parse_qs(urlsplit(self.path).query)
-            app_build = query.get("app_build", [None])[0]
-            app_release = query.get("app_release", [None])[0]
-            if not isinstance(app_build, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,160}", app_build):
-                app_build = None
-            if not isinstance(app_release, str) or not re.fullmatch(r"\d{1,12}", app_release):
-                app_release = None
-            report = diagnostics_report(
-                paths,
-                runtime_doctor(paths, LocalRuntimeBoundary()),
-                app_build=app_build,
-                app_release=app_release,
-            )
+            health = self.runtime.health()
+            support = {"state": health.get("status", "unknown"), "healthy": health.get("status") == "ok"}
+            report = diagnostics_report(paths, support)
             return self._send(200, {"report": report})
         if path == ["v1", "realm", "tombstone"] and method == "POST":
             self._identity("admin")

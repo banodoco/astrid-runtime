@@ -63,21 +63,14 @@ def test_report_includes_identity_update_runtime_and_disk_details(tmp_path):
     platform.owner_only(runtime_log.parent, directory=True)
     platform.owner_only(runtime_log)
     report = diagnostics_report(paths, {"healthy": True, "state": "healthy"})
-    assert "App build: unavailable (not supplied by the App)" in report
-    assert "App release: unavailable (not supplied by the App)" in report
+    assert "App build:" not in report
+    assert "App release:" not in report
     assert "build-sha" not in report
     assert "B1 identity: managed_by=source; release=8" in report
     assert "Runtime support state: healthy (healthy=True)" in report
     assert "Last update result: rolled_back" in report
     assert "installer output" in report and "launcher output" in report
     assert "Retained back-end copies: 5 bytes" in report
-
-
-def test_report_accepts_actual_app_build_and_release_from_settings(tmp_path):
-    paths = RuntimePaths.sandbox(tmp_path / "home")
-    report = diagnostics_report(paths, {"healthy": True}, app_build="app-build-123", app_release=12)
-    assert "App build: app-build-123" in report
-    assert "App release: 12" in report
 
 
 def test_source_checkout_includes_owner_only_launcher_log(tmp_path):

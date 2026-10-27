@@ -23,6 +23,7 @@ from .bootstrap import (
 )
 from .io import atomic_write_json, remove_file
 from .paths import RuntimePaths
+from .refusal import refusal_from
 from .relocation import _reject_live_pack_host, relocate
 from runtime_protocol.upgrade import (
     DEFAULT_UPGRADE_TIMEOUT_SECONDS,
@@ -91,18 +92,18 @@ def _assert_idle(root: Path) -> dict[str, Any]:
     try:
         report = inspect_interruption_state(root)
         if not report["safe"]:
-            # Keep the lifecycle contract intact across the operator boundary.
-            # The CLI and installer use these normalized fields to make a
-            # decision; callers must not have to recover them from prose.
-            message = str(report.get("message") or report.get("headline") or "Runtime interruption refused while work is active or unreconciled.")
-            raise OperatorUpgradeError(message, details=report)
+            refusal = OperatorUpgradeError(
+                "Runtime interruption refused while work is active or unreconciled.",
+                details=report,
+            )
+            message, details = refusal_from(refusal)
+            raise OperatorUpgradeError(message, details=details)
         return report
     except OperatorUpgradeError:
         raise
     except Exception as exc:
-        details = getattr(exc, "details", None)
-        message = str(details.get("message") or details.get("headline") or str(exc)) if isinstance(details, Mapping) else str(exc)
-        raise OperatorUpgradeError(message, details=details if isinstance(details, Mapping) else None) from exc
+        message, details = refusal_from(exc)
+        raise OperatorUpgradeError(message, details=details) from exc
 
 
 def _is_lifecycle_refusal(exc: BaseException) -> bool:
@@ -267,9 +268,7 @@ def upgrade_workspace(
                     support_root=paths.runtime_support, pid=int(owner["pid"]),
                 )
                 _journal(paths, operation_id=operation_id, state="stopping", realm_id=realm_id, schema_before=kind, idle=idle)
-                # BEGIN IMMEDIATE serializes with admission/claim/settlement.
-                # Hold it across the final identity-checked signal so a claim
-                # cannot land between the idle decision and owner shutdown.
+                # Hold the final identity-checked stop under the interruption fence.
                 try:
                     with interruption_fence(realm_root, timeout_seconds=timeout_seconds) as fenced_idle:
                         stop_owner(
@@ -281,9 +280,8 @@ def upgrade_workspace(
                         stopped = True
                         idle = fenced_idle
                 except Exception as exc:
-                    details = getattr(exc, "details", None)
-                    message = str((details or {}).get("message") or (details or {}).get("headline") or str(exc)) if isinstance(details, Mapping) else str(exc)
-                    raise OperatorUpgradeError(message, details=details if isinstance(details, Mapping) else None) from exc
+                    message, details = refusal_from(exc)
+                    raise OperatorUpgradeError(message, details=details) from exc
                 remove_file(paths.discovery_path)
                 remove_file(paths.instance_lock_path)
             _journal(paths, operation_id=operation_id, state="stopped", realm_id=realm_id, schema_before=kind, idle=idle)
@@ -337,8 +335,7 @@ def upgrade_workspace(
                 paths, journal_root=journal_root, operation_id=operation_id, state=state, realm_id=realm_id,
                 schema_before=kind, activated=activated, error=str(exc), restart_error=restart_error,
             )
-        details = getattr(exc, "details", None)
-        message = str((details or {}).get("message") or (details or {}).get("headline") or str(exc)) if isinstance(details, Mapping) else str(exc)
+        message, details = refusal_from(exc)
         raise OperatorUpgradeError(
             message,
             details=details if isinstance(details, Mapping) else None,

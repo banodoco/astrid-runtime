@@ -29,6 +29,7 @@ from runtime_protocol import cancellation
 from runtime_protocol import process_control
 from runtime_protocol.errors import ConflictError
 from .paths import RuntimePaths
+from .refusal import refusal_from
 from runtime_protocol.lifecycle import interruption_fence, inspect_interruption_state
 from .identity import (
     IDENTITY_REFUSAL_MESSAGE,
@@ -1196,9 +1197,7 @@ def _interrupt_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> d
         process_birth_id = str(discovery["process_birth_id"])
     except (KeyError, TypeError, ValueError) as exc:
         raise BootstrapError("Runtime interruption refused: discovery identity is incomplete.") from exc
-    # Real boundaries must prove liveness.  Tiny in-memory test boundaries do
-    # not have an OS identity provider and are allowed to model the hand-off
-    # without a kernel PID.
+    # Test boundaries without kernel identity can model the hand-off.
     modeled_boundary = getattr(boundary, "process_birth_identity", None) is None
     if not endpoint or not instance_id or not realm_id or not process_birth_id or (not _pid_alive(boundary, pid) and not modeled_boundary):
         raise BootstrapError("Runtime interruption refused: owner is stale or discovery identity is incomplete.")
@@ -1300,8 +1299,7 @@ def _selected_stop_realm(paths: RuntimePaths) -> tuple[dict[str, Any], Path]:
 
 
 def _raise_conflict(exc: ConflictError) -> BootstrapError:
-    details = exc.details if isinstance(exc.details, Mapping) else None
-    message = str((details or {}).get("message") or (details or {}).get("headline") or str(exc))
+    message, details = refusal_from(exc)
     return BootstrapError(message, details=details)
 
 
@@ -1312,8 +1310,11 @@ def preflight_stop(paths: RuntimePaths) -> dict[str, Any]:
     try:
         report = inspect_interruption_state(realm_root)
         if not report.get("safe", False):
-            details = dict(report)
-            message = str(details.get("message") or details.get("headline") or "Runtime interruption refused while work is active or unreconciled.")
+            refusal = BootstrapError(
+                "Runtime interruption refused while work is active or unreconciled.",
+                details=report,
+            )
+            message, details = refusal_from(refusal)
             raise BootstrapError(message, details=details)
         return report
     except BootstrapError:
