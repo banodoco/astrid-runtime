@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -243,146 +245,116 @@ def test_each_blocker_category_refuses_individually(tmp_path, monkeypatch, categ
     assert refusal.value.details["blockers"] == report["blockers"]
 
 
-def test_refusal_on_clean_wal_database_does_not_add_or_change_sidecars(tmp_path):
+def _committed_data(root):
+    with closing(sqlite3.connect(root / "realm.sqlite3")) as db:
+        return tuple(db.iterdump())
+
+
+def test_refusal_on_clean_wal_database_does_not_change_committed_data(tmp_path):
     root = _realm(tmp_path)
-    db_path = root / "realm.sqlite3"
-    db = sqlite3.connect(db_path)
-    _task(db, "busy", status="running")
-    db.commit()
-    db.close()
-    before = {
-        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in root.iterdir()
-        if path.is_file()
-    }
+    with closing(sqlite3.connect(root / "realm.sqlite3")) as db:
+        _task(db, "busy", status="running")
+        db.commit()
+    before = _committed_data(root)
 
     report = inspect_interruption_state(root)
 
-    after = {
-        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in root.iterdir()
-        if path.is_file()
-    }
     assert report["safe"] is False
-    assert after == before
+    assert _committed_data(root) == before
 
 
-def test_read_only_observer_includes_live_wal_work_without_sidecar_mutation(tmp_path):
+def test_read_only_observer_includes_live_wal_work_without_data_mutation(tmp_path):
     root = _realm(tmp_path)
-    db_path = root / "realm.sqlite3"
-    writer = sqlite3.connect(db_path)
+    writer = sqlite3.connect(root / "realm.sqlite3")
     writer.execute("PRAGMA wal_autocheckpoint=0")
     _task(writer, "live-wal", status="running")
     writer.commit()
     assert (root / "realm.sqlite3-wal").stat().st_size > 0
-    before = {
-        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in root.iterdir()
-        if path.is_file()
-    }
+    before = _committed_data(root)
     try:
         report = inspect_interruption_state(root)
-        after = {
-            path.name: (path.read_bytes(), path.stat().st_mtime_ns)
-            for path in root.iterdir()
-            if path.is_file()
-        }
         assert report["safe"] is False
         assert report["blockers"][0]["task_id"] == "live-wal"
-        assert after == before
+        assert _committed_data(root) == before
     finally:
         writer.close()
 
 
-def test_snapshot_retries_when_writer_commits_between_file_captures(tmp_path, monkeypatch):
+def test_read_only_observation_stays_consistent_when_writer_commits(tmp_path, monkeypatch):
     root = _realm(tmp_path)
-    original_capture = lifecycle._capture_database_files
-    injected = False
+    original_report = lifecycle._interruption_report
 
-    def capture_with_writer(path):
-        nonlocal injected
-        snapshot = original_capture(path)
-        if not injected:
-            injected = True
-            writer = sqlite3.connect(path)
+    def report_with_writer(connection):
+        before = original_report(connection)
+        with sqlite3.connect(root / "realm.sqlite3") as writer:
             _task(writer, "raced-writer", status="running")
-            writer.commit()
-            writer.close()
-        return snapshot
+        # All queries in one advisory observation see the same SQLite snapshot.
+        assert original_report(connection) == before
+        return before
 
-    monkeypatch.setattr(lifecycle, "_capture_database_files", capture_with_writer)
+    with monkeypatch.context() as patch:
+        patch.setattr(lifecycle, "_interruption_report", report_with_writer)
+        assert inspect_interruption_state(root)["safe"] is True
     report = inspect_interruption_state(root)
-    assert injected
     assert report["safe"] is False
     assert report["blockers"][0]["task_id"] == "raced-writer"
 
 
-def test_snapshot_retries_when_checkpoint_moves_wal_frames_to_database(tmp_path, monkeypatch):
+def test_read_only_observer_sees_work_after_wal_checkpoint(tmp_path, monkeypatch):
     root = _realm(tmp_path)
-    db_path = root / "realm.sqlite3"
-    writer = sqlite3.connect(db_path)
+    writer = sqlite3.connect(root / "realm.sqlite3")
     writer.execute("PRAGMA wal_autocheckpoint=0")
     _task(writer, "checkpointed", status="running")
     writer.commit()
     assert (root / "realm.sqlite3-wal").stat().st_size > 0
-    writer.close()
-    original_capture = lifecycle._capture_database_files
-    injected = False
+    original_report = lifecycle._interruption_report
 
-    def capture_with_checkpoint(path):
-        nonlocal injected
-        snapshot = original_capture(path)
-        if not injected:
-            injected = True
-            checkpointer = sqlite3.connect(path)
-            checkpointer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            checkpointer.close()
-        return snapshot
+    def report_after_checkpoint(connection):
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return original_report(connection)
 
-    monkeypatch.setattr(lifecycle, "_capture_database_files", capture_with_checkpoint)
-    report = inspect_interruption_state(root)
-    assert injected
-    assert report["safe"] is False
-    assert report["blockers"][0]["task_id"] == "checkpointed"
-
-
-def test_snapshot_that_keeps_changing_fails_closed(tmp_path, monkeypatch):
-    root = _realm(tmp_path)
-    original_capture = lifecycle._capture_database_files
-    sequence = 0
-
-    def perpetually_changing_capture(path):
-        nonlocal sequence
-        snapshot = original_capture(path)
-        sequence += 1
-        snapshot["database"] += str(sequence).encode()
-        return snapshot
-
-    monkeypatch.setattr(lifecycle, "_capture_database_files", perpetually_changing_capture)
-    with pytest.raises(ValidationError, match="database snapshot changed"):
-        inspect_interruption_state(root)
-    assert sequence == 6
-
-
-def test_read_only_refusal_does_not_mutate_database_or_create_sidecars(tmp_path):
-    root = _realm(tmp_path)
-    db_path = root / "realm.sqlite3"
-    db = sqlite3.connect(db_path)
-    _task(db, "busy", status="running")
-    db.commit()
-    db.close()
-    # Keep the prepared WAL shared-memory files present while the read-only
-    # observer runs, so the snapshot checks for mutations rather than setup.
-    keeper = sqlite3.connect(db_path)
-    keeper.execute("SELECT 1 FROM tasks").fetchone()
-    before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in root.iterdir() if path.is_file()}
+    monkeypatch.setattr(lifecycle, "_interruption_report", report_after_checkpoint)
     try:
         report = inspect_interruption_state(root)
-        assert not report["safe"]
-        after = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in root.iterdir() if path.is_file()}
-        assert after == before
+        assert report["safe"] is False
+        assert report["blockers"][0]["task_id"] == "checkpointed"
     finally:
-        keeper.close()
+        writer.close()
+
+
+def test_read_only_observer_uses_query_only_without_file_copies(tmp_path, monkeypatch):
+    root = _realm(tmp_path)
+    original_report = lifecycle._interruption_report
+    original_connect = sqlite3.connect
+    opened = []
+
+    def observe_connect(database, **kwargs):
+        opened.append((database, kwargs))
+        return original_connect(database, **kwargs)
+
+    def read_only_report(connection):
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("DELETE FROM tasks")
+        return original_report(connection)
+
+    monkeypatch.setattr(lifecycle.sqlite3, "connect", observe_connect)
+    monkeypatch.setattr(lifecycle, "_interruption_report", read_only_report)
+    monkeypatch.setattr(Path, "read_bytes", lambda *_: pytest.fail("preflight copied a whole file"))
+    assert inspect_interruption_state(root)["safe"] is True
+    assert opened == [(lifecycle.sqlite_file_uri(root / "realm.sqlite3", mode="ro"), {"uri": True})]
+
+
+def test_read_only_refusal_does_not_mutate_committed_data(tmp_path):
+    root = _realm(tmp_path)
+    with closing(sqlite3.connect(root / "realm.sqlite3")) as db:
+        _task(db, "busy", status="running")
+        db.commit()
+    before = _committed_data(root)
+    with pytest.raises(ConflictError):
+        with interruption_fence(root):
+            pytest.fail("busy realm was admitted")
+    assert _committed_data(root) == before
 
 
 def test_preflight_to_final_check_race_is_refused(tmp_path, monkeypatch):
