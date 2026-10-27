@@ -66,16 +66,29 @@ def _json(path, snapshots):
     return value
 
 
+def _assert_autostart_supported(selected):
+    preferences = selected.get("preferences") if isinstance(selected, dict) else None
+    if isinstance(preferences, dict):
+        autostart = preferences.get("autostart")
+        if autostart is False or (isinstance(autostart, str) and autostart.casefold() == "off"):
+            raise UpdateRefusal(
+                "autostart-off-unsupported",
+                "In-app update is unavailable while saved autostart is off; this installer cannot preserve that choice yet.",
+            )
+
+
 class UpdateAdmission:
     def __init__(self, daemon, launcher=None):
         self.daemon = daemon
-        # Production has no native transient-job adapter until F1c. Tests and
-        # the standalone worker harness may inject one without advertising a
-        # capability on ordinary Runtime instances.
+        # Tests may inject a launcher. Production delegates launch to the
+        # selected installation's Python helper, which owns OS job creation.
         self.launcher = launcher if launcher is not None else getattr(daemon, "update_launcher", None)
         self._lock = threading.Lock()
 
     def status(self):
+        # Do not publish an App execution capability here. F1d owns that
+        # contract; this field still reflects only an explicitly injected
+        # launcher seam until its route/capability handoff is implemented.
         return read_update_status(Path.home(), available=self.launcher is not None)
 
     def _helper(self, python, agent, runtime, payload):
@@ -111,6 +124,7 @@ class UpdateAdmission:
         snapshots = {}
         selection_path = _install_record_path(Path.home())
         selected = _json(selection_path, snapshots)
+        _assert_autostart_supported(selected)
         if selected.get("owner") != "haus.astrid.runtime" or selected.get("uninstalled"):
             raise ValueError("installer ownership required")
         root = _path(selected.get("program_root"))
@@ -193,6 +207,7 @@ class UpdateAdmission:
         try:
             selection_path, snapshots, python, agent, runtime, installed = self._selection()
             selected_record = json.loads(snapshots[selection_path])
+            _assert_autostart_supported(selected_record)
             root = Path(selected_record["program_root"])
             data = Path(selected_record["data_root"])
             old_version_name = snapshots[root / "current"].decode("utf-8").strip()
@@ -227,8 +242,6 @@ class UpdateAdmission:
                     for path, raw in snapshots.items():
                         if _bytes(path) != raw:
                             raise ValueError("selected installation changed during preparation")
-                    if self.launcher is None:
-                        raise UpdateRefusal("updater-unavailable", "The update launcher is not installed. Run the install line to update Astrid.")
                     from uuid import uuid4
                     operation_id = uuid4().hex
                     job_name = "astrid-update-" + operation_id
@@ -261,7 +274,22 @@ class UpdateAdmission:
                 # Launcher acknowledgement can be lost after OS acceptance.
                 # Keep the durable job active and never retry it here.
                 try:
-                    self.launcher(job)
+                    if self.launcher is not None:
+                        launch_result = self.launcher(job)
+                    else:
+                        launch_result = self._helper(
+                            python, agent, runtime,
+                            {"action": "launch", "root": str(root), "operation_id": operation_id},
+                        )
+                    if isinstance(launch_result, dict) and launch_result.get("launch_status") in {"failed", "refused"}:
+                        reason = str(launch_result.get("launch_error") or "The operating system rejected the update job.")
+                        raise UpdateRefusal("launch-failed", "Update launch failed: " + " ".join(reason.split())[:180])
+                    if isinstance(launch_result, dict) and launch_result.get("launch_status") in {"unknown", "launching"}:
+                        raise UpdateRefusal("launch-acknowledgement-unknown", "The update may have launched; check update status before taking another action.")
+                except UpdateRefusal as exc:
+                    if exc.details.get("reason") in {"launch-failed", "updater-unavailable"}:
+                        raise
+                    raise UpdateRefusal("launch-acknowledgement-unknown", "The update was accepted; check update status before taking another action.") from None
                 except Exception:
                     raise UpdateRefusal("launch-acknowledgement-unknown", "The update was accepted; check update status before taking another action.") from None
                 return {"accepted": True, "state": job.get("state", "accepted"),
@@ -285,7 +313,7 @@ def update_admission(daemon):
     return daemon.update_admission
 
 
-_JOB_STATES = {"accepted", "active", "updated", "rolled_back", "failed", "recovery-needed"}
+_JOB_STATES = {"accepted", "launching", "active", "updated", "rolled_back", "failed", "recovery-needed"}
 def _read_bounded_object(path):
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_METADATA_BYTES:
@@ -368,7 +396,7 @@ def read_update_status(home=None, *, available=False):
         # report the unresolved handoff without inferring success or rollback.
         state = "active" if _installer_lock_held(home) else "recovery-needed"
     outcome = state if state in {"updated", "rolled_back", "failed"} else None
-    api_state = "active" if state in {"accepted", "active"} else "terminal" if outcome else state
+    api_state = "active" if state in {"accepted", "launching", "active"} else "terminal" if outcome else state
     result = "Recovery needed." if state == "recovery-needed" else job.get("result") or job.get("message") or (outcome or api_state)
     if not isinstance(result, str):
         result = state
@@ -380,6 +408,40 @@ def read_update_status(home=None, *, available=False):
     for key in ("target_release", "accepted_at"):
         if isinstance(job.get(key), (int, str)):
             output[key] = job[key]
+    job_name = job.get("job_name")
+    if isinstance(job_name, str) and job_name:
+        output["job_name"] = " ".join(job_name.split())[:160]
+    for key, limit in (("launch_status", 80), ("launch_error", 240),
+                       ("cleanup_status", 80), ("cleanup_error", 240)):
+        value = job.get(key)
+        if isinstance(value, str) and value:
+            output[key] = " ".join(value.split())[:limit]
+    residue = job.get("cleanup_residue", job.get("residue"))
+    if isinstance(residue, str) and residue:
+        output["cleanup_residue"] = " ".join(residue.split())[:160]
+    elif isinstance(residue, list):
+        items = [" ".join(item.split())[:120] for item in residue if isinstance(item, str) and item.strip()]
+        if items:
+            output["cleanup_residue"] = items[:5]
+    historical_residue = install.get("update_job_residue")
+    if isinstance(historical_residue, list):
+        rows = []
+        for item in historical_residue[-5:]:
+            if not isinstance(item, dict):
+                continue
+            row = {}
+            for key, limit in (("operation_id", 32), ("cleanup_status", 80),
+                               ("cleanup_error", 200), ("residue", 160)):
+                value = item.get(key)
+                if isinstance(value, str) and value:
+                    row[key] = " ".join(value.split())[:limit]
+            descriptor = item.get("descriptor")
+            if isinstance(descriptor, dict) and isinstance(descriptor.get("name"), str):
+                row["job_name"] = " ".join(descriptor["name"].split())[:160]
+            if row:
+                rows.append(row)
+        if rows:
+            output["owned_residue"] = rows
     log = job.get("log_path")
     if isinstance(log, str) and Path(log).is_absolute():
         try:
