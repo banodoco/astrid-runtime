@@ -124,10 +124,9 @@ def test_diagnostics_route_is_narrow_and_owner_authenticated(tmp_path):
         reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
         assert reply.status == 200, reply.body
         assert "Astrid diagnostics" in reply.json()["report"]
-        app_reply = world.call(f"{API_RUNTIME}/v1/diagnostics?app_build=app-build-123&app_release=12")
-        assert app_reply.status == 200, app_reply.body
-        assert "App build: app-build-123" in app_reply.json()["report"]
-        assert "App release: 12" in app_reply.json()["report"]
+        assert "Runtime support state: ok (healthy=True)" in reply.json()["report"]
+        assert "App build:" not in reply.json()["report"]
+        assert "App release:" not in reply.json()["report"]
         assert world.call(f"{API_RUNTIME}/v1/diagnostics/anything").status == 404
         assert world.call(f"{API_RUNTIME}/v1/doctor").status == 404
     finally:
