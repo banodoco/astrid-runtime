@@ -218,8 +218,10 @@ def test_operator_upgrade_refuses_running_task_before_signaling_owner(tmp_path):
     finally:
         connection.close()
     boundary = _Boundary(paths)
-    with pytest.raises(OperatorUpgradeError, match="work is active"):
+    with pytest.raises(OperatorUpgradeError, match=r"Astrid is busy \(1 tasks running\)\. Try again when they finish\.") as caught:
         upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
+    assert caught.value.details["safe"] is False
+    assert caught.value.details["blockers"][0]["task_id"] == "task"
     assert not any(call[0] == "stop" for call in boundary.calls)
 
 

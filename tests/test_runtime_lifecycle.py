@@ -63,7 +63,7 @@ def test_unsettled_attempt_blocks_even_when_expired_or_uncertain(
     report = inspect_interruption_state(root)
     assert report["safe"] is False
     assert report["unreconciled_attempts"][0]["lease_expired"] is expected_expired
-    with pytest.raises(ConflictError, match="active or unreconciled"):
+    with pytest.raises(ConflictError, match="Astrid is busy"):
         with interruption_fence(root):
             pass
 

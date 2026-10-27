@@ -17,7 +17,7 @@ import secrets
 import shutil
 import stat
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 import uuid
@@ -28,7 +28,7 @@ from runtime_protocol import cancellation
 from runtime_protocol import process_control
 from runtime_protocol.errors import ConflictError
 from .paths import RuntimePaths
-from runtime_protocol.lifecycle import interruption_fence
+from runtime_protocol.lifecycle import interruption_fence, inspect_interruption_state
 from .identity import (
     IDENTITY_REFUSAL_MESSAGE,
     StartupIdentityError,
@@ -1258,8 +1258,17 @@ def _interrupt_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> d
 
 def _interrupt_owner(paths: RuntimePaths, boundary: RuntimeBoundary) -> dict[str, Any]:
     """Serialize owner validation, fencing, signal, and cleanup."""
+    _preflight_owner_interruption(paths)
     with _bootstrap_mutex(paths):
         return _interrupt_owner_locked(paths, boundary)
+
+
+def _preflight_owner_interruption(paths: RuntimePaths) -> None:
+    """Refuse known busy state before acquiring/creating launcher sidecars."""
+    _validate_support_paths(paths)
+    if _read_support_json(paths.discovery_path) is None:
+        raise BootstrapError("No runtime owner is available to interrupt.")
+    preflight_stop(paths)
 
 
 def down(paths: RuntimePaths, boundary: RuntimeBoundary) -> dict[str, Any]:
@@ -1267,10 +1276,551 @@ def down(paths: RuntimePaths, boundary: RuntimeBoundary) -> dict[str, Any]:
     return _interrupt_owner(paths, boundary)
 
 
+def _selected_stop_realm(paths: RuntimePaths) -> tuple[dict[str, Any], Path]:
+    catalog = _read_catalog(paths)
+    realm = _selected_realm(catalog)
+    if realm is None:
+        raise BootstrapError("No selected Runtime realm is available for a safe stop.")
+    root = _canonical_realm_root(str(realm.get("data_root") or ""))
+    return realm, root
+
+
+def _raise_conflict(exc: ConflictError) -> BootstrapError:
+    details = exc.details if isinstance(exc.details, Mapping) else None
+    message = str((details or {}).get("message") or (details or {}).get("headline") or str(exc))
+    return BootstrapError(message, details=details)
+
+
+def preflight_stop(paths: RuntimePaths) -> dict[str, Any]:
+    """Read-only selected-realm interruption check for installer callers."""
+    _validate_support_paths(paths)
+    _realm, realm_root = _selected_stop_realm(paths)
+    try:
+        report = inspect_interruption_state(realm_root)
+        if not report.get("safe", False):
+            details = dict(report)
+            message = str(details.get("message") or details.get("headline") or "Runtime interruption refused while work is active or unreconciled.")
+            raise BootstrapError(message, details=details)
+        return report
+    except BootstrapError:
+        raise
+    except ConflictError as exc:
+        raise _raise_conflict(exc) from exc
+    except Exception as exc:
+        # An unreadable or malformed realm is never evidence that it is idle.
+        raise BootstrapError(str(exc)) from exc
+
+
+def _recorded_owner_identity(
+    value: Mapping[str, Any], *, realm_id: str, realm_root: Path,
+) -> tuple[int, str, str, str]:
+    try:
+        pid = int(value["pid"])
+        birth = str(value["process_birth_id"])
+        instance = str(value["runtime_instance_id"])
+        endpoint = _validate_loopback_endpoint(str(value["endpoint"]))
+        observed_realm = str(value.get("active_realm") or value.get("realm_id") or "")
+        observed_root = _canonical_realm_root(str(value.get("realm_root") or ""))
+    except (KeyError, TypeError, ValueError, BootstrapError) as exc:
+        raise BootstrapError("Runtime interruption refused: discovery or owner identity is incomplete.") from exc
+    if pid <= 0 or not birth or not instance or observed_realm != realm_id or observed_root != realm_root:
+        raise BootstrapError("Runtime interruption refused: discovery does not match the selected workspace.")
+    return pid, birth, instance, endpoint
+
+
+def _validate_published_stop_owner(
+    paths: RuntimePaths, boundary: RuntimeBoundary, realm: Mapping[str, Any], realm_root: Path,
+    discovery: Mapping[str, Any], marker: Mapping[str, Any] | None,
+) -> tuple[int, str, str, str] | None:
+    realm_id = str(realm.get("realm_id") or "")
+    pid, birth, instance_id, endpoint = _recorded_owner_identity(
+        discovery, realm_id=realm_id, realm_root=realm_root,
+    )
+    if marker is not None and not _owner_record_matches(
+        marker, pid=pid, instance_id=instance_id, process_birth_id=birth,
+        realm_id=realm_id, realm_root=realm_root,
+    ):
+        raise BootstrapError("Runtime interruption refused: owner lock changed or does not match discovery.")
+    validate = getattr(boundary, "validate_owner", None)
+    alive = _pid_alive(boundary, pid)
+    if not alive and callable(getattr(boundary, "process_birth_identity", None)):
+        # A missing process incarnation is positive absence only when the OS
+        # identity lookup itself completed and returned no identity.
+        try:
+            absent = boundary.process_birth_identity(pid) is None
+        except Exception as exc:
+            raise BootstrapError("Runtime interruption refused: owner absence could not be established.") from exc
+        if absent:
+            return None
+        raise BootstrapError("Runtime interruption refused: owner process identity changed.")
+    if not alive and getattr(boundary, "process_birth_identity", None) is None:
+        raise BootstrapError("Runtime interruption refused: modeled owner is not live.")
+    if not callable(validate) or not validate(
+        endpoint=endpoint, pid=pid, instance_id=instance_id,
+        owner_lock=paths.instance_lock_path, process_birth_id=birth,
+        expected_realm_id=realm_id, expected_realm_root=realm_root,
+    ):
+        raise BootstrapError("Runtime interruption refused: owner endpoint or process identity failed validation.")
+    endpoint_metadata = getattr(boundary, "endpoint_metadata", None)
+    if not callable(endpoint_metadata):
+        raise BootstrapError("Runtime interruption refused: boundary cannot verify the selected endpoint.")
+    identity = endpoint_metadata(
+        endpoint=endpoint,
+        credential_file=paths.runtime_support / "credentials" / "owner.token",
+    )
+    if (not identity
+            or str(identity.get("runtime_instance_id") or "") != instance_id
+            or str(identity.get("realm_id") or "") != realm_id):
+        raise BootstrapError("Runtime interruption refused: endpoint identity does not match the selected owner.")
+    return pid, birth, instance_id, endpoint
+
+
+def _recorded_foreground_matches_receipt(
+    recorded: Mapping[str, Any], receipt: Any, *, paths: RuntimePaths,
+    realm: Mapping[str, Any], realm_root: Path, boundary: RuntimeBoundary,
+) -> bool:
+    """Recognize only the exact foreground incarnation stopped by this controller.
+
+    Older service records contain only PID and birth id. Those fields are
+    sufficient to compare with a private receipt already bound to this support
+    root and selected realm; they are never sufficient to create a receipt or
+    authorize a signal on their own.
+    """
+    if not isinstance(receipt, Mapping):
+        return False
+    try:
+        pid = int(recorded["pid"])
+        birth = str(recorded["birth_id"])
+        receipt_pid = int(receipt["pid"])
+        receipt_birth = str(receipt["process_birth_id"] or "")
+        if recorded.get("realm_id") not in (None, "", str(realm["realm_id"])):
+            return False
+        recorded_root = recorded.get("realm_root")
+        if recorded_root not in (None, "") and _canonical_realm_root(str(recorded_root)) != realm_root:
+            return False
+    except (KeyError, TypeError, ValueError, BootstrapError):
+        return False
+    if (pid <= 0 or not birth or pid != receipt_pid or birth != receipt_birth
+            or receipt.get("support_root") != paths.runtime_support.resolve()
+            or receipt.get("realm_id") != str(realm["realm_id"])
+            or receipt.get("realm_root") != realm_root):
+        return False
+    try:
+        absent = boundary.process_birth_identity(pid) is None
+    except Exception as exc:
+        _discard_installer_stop_receipt(boundary)
+        raise BootstrapError("Runtime interruption refused: prior foreground absence could not be established.") from exc
+    if not absent:
+        _discard_installer_stop_receipt(boundary)
+    return absent
+
+
+def _publication_matches_receipt(value: Mapping[str, Any], receipt: Mapping[str, Any], *, realm: Mapping[str, Any], realm_root: Path) -> bool:
+    """Return whether an advertisement is the exact incarnation in a receipt."""
+    try:
+        pid = int(value["pid"])
+        birth = str(value.get("process_birth_id") or "")
+        instance = str(value.get("runtime_instance_id") or "")
+        observed_realm = str(value.get("active_realm") or value.get("realm_id") or "")
+        observed_root = _canonical_realm_root(str(value.get("realm_root") or ""))
+    except (KeyError, TypeError, ValueError, BootstrapError):
+        return False
+    return (
+        pid == int(receipt.get("pid", -1))
+        and birth == str(receipt.get("process_birth_id") or "")
+        and (not receipt.get("runtime_instance_id") or instance == receipt.get("runtime_instance_id"))
+        and observed_realm == str(realm.get("realm_id"))
+        and observed_root == realm_root
+        and receipt.get("realm_id") == str(realm.get("realm_id"))
+        and receipt.get("realm_root") == realm_root
+    )
+
+
+def _discard_installer_stop_receipt(boundary: RuntimeBoundary) -> None:
+    """Revoke receipt authority while retaining identity for foreground reconciliation."""
+    try:
+        if isinstance(getattr(boundary, "_installer_stop_receipt", None), Mapping):
+            boundary._installer_stop_receipt_invalidated = True
+    except AttributeError:
+        pass
+
+
+def _invalidate_stale_stop_receipt(paths: RuntimePaths, boundary: RuntimeBoundary) -> None:
+    """Forget prior stop evidence as soon as a nonmatching publication is observed."""
+    receipt = getattr(boundary, "_installer_stop_receipt", None)
+    if not isinstance(receipt, Mapping):
+        return
+    try:
+        _validate_support_paths(paths)
+        realm, realm_root = _selected_stop_realm(paths)
+        publications = (
+            _read_support_json(paths.discovery_path),
+            _read_support_json(paths.instance_lock_path),
+        )
+        if (receipt.get("support_root") != paths.runtime_support.resolve()
+                or receipt.get("realm_id") != str(realm.get("realm_id"))
+                or receipt.get("realm_root") != realm_root):
+            _discard_installer_stop_receipt(boundary)
+            return
+        absent = boundary.process_birth_identity(int(receipt["pid"])) is None
+        if not absent or any(
+            publication is not None and not _publication_matches_receipt(
+                publication, receipt, realm=realm, realm_root=realm_root,
+            )
+            for publication in publications
+        ):
+            _discard_installer_stop_receipt(boundary)
+    except Exception:
+        # Any uncertain support/context/publication observation irrevocably
+        # revokes authority, even if that publication later disappears. The
+        # caller still performs its normal validation to report the refusal.
+        _discard_installer_stop_receipt(boundary)
+
+
+@contextmanager
+def _stop_receipt_validation(boundary: RuntimeBoundary):
+    """Revoke retained authority if stop admission cannot validate its context."""
+    try:
+        yield
+    except Exception:
+        _discard_installer_stop_receipt(boundary)
+        raise
+
+
+def _remember_completed_stop(
+    boundary: RuntimeBoundary, *, paths: RuntimePaths, realm: Mapping[str, Any],
+    realm_root: Path, evidence: Mapping[str, Any] | None,
+) -> None:
+    if evidence is None:
+        return
+    try:
+        pid = int(evidence["pid"])
+        birth = str(evidence.get("process_birth_id") or evidence.get("birth_id") or "")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BootstrapError("Runtime interruption refused: stopped owner identity is incomplete.") from exc
+    if pid <= 0 or not birth:
+        raise BootstrapError("Runtime interruption refused: stopped owner identity is incomplete.")
+    boundary._installer_stop_receipt = {
+        "support_root": paths.runtime_support.resolve(),
+        "realm_id": str(realm["realm_id"]), "realm_root": realm_root,
+        "pid": pid, "process_birth_id": birth,
+        "runtime_instance_id": evidence.get("runtime_instance_id"),
+    }
+    try:
+        delattr(boundary, "_installer_stop_receipt_invalidated")
+    except AttributeError:
+        pass
+
+
+def installer_stop(
+    paths: RuntimePaths,
+    boundary: RuntimeBoundary,
+    *,
+    stop_manager,
+    recorded_foreground: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Stop the selected Runtime owner and then its manager under one fence.
+
+    The manager callback is deliberately zero-argument and runs while both
+    launcher serialization and the realm's SQLite interruption fence remain
+    held. It must only synchronously stop/disable the external manager.
+    """
+    if not callable(stop_manager):
+        raise TypeError("stop_manager must be a zero-argument callback")
+    with ExitStack() as locks:
+        # Guard admission separately from the actual stop/manager callback:
+        # a failed callback must retain a genuinely completed-stop receipt.
+        with _stop_receipt_validation(boundary):
+            _validate_support_paths(paths)
+            # Forget stale same-controller evidence before any preflight refusal can
+            # return. This is in-memory only; no support or workspace files are changed.
+            _invalidate_stale_stop_receipt(paths, boundary)
+            # Avoid creating/acquiring the launcher mutex for a known busy realm. The
+            # final SQLite fence below repeats this observation under serialization.
+            preflight_stop(paths)
+            locks.enter_context(_bootstrap_mutex(paths))
+            _validate_support_paths(paths)
+            realm, realm_root = _selected_stop_realm(paths)
+            discovery = _read_support_json(paths.discovery_path)
+            marker = _read_support_json(paths.instance_lock_path)
+            receipt = getattr(boundary, "_installer_stop_receipt", None)
+            if isinstance(receipt, Mapping) and any(
+                published is not None and not _publication_matches_receipt(
+                    published, receipt, realm=realm, realm_root=realm_root,
+                )
+                for published in (discovery, marker)
+            ):
+                # Keep the local copy only long enough to reconcile the old
+                # foreground record while validating/stopping this newly
+                # published owner. If that handoff does not complete, a later
+                # missing-publication retry cannot fall back to the older receipt.
+                _discard_installer_stop_receipt(boundary)
+            if recorded_foreground is not None and _recorded_foreground_matches_receipt(
+                recorded_foreground, receipt, paths=paths, realm=realm,
+                realm_root=realm_root, boundary=boundary,
+            ):
+                # A completed stop can leave old foreground metadata in the
+                # service record. Retire that evidence only after re-observing
+                # absence of the exact incarnation. Any current publication is
+                # then validated independently below.
+                recorded_foreground = None
+            owner = None
+            if discovery is not None:
+                try:
+                    owner = _validate_published_stop_owner(paths, boundary, realm, realm_root, discovery, marker)
+                except BootstrapError:
+                    if isinstance(receipt, Mapping) and _publication_matches_receipt(
+                        discovery, receipt, realm=realm, realm_root=realm_root,
+                    ):
+                        _discard_installer_stop_receipt(boundary)
+                    raise
+            elif marker is not None:
+                # A lock without discovery is not kill authority. It can only be
+                # treated as absent after proving the recorded incarnation is gone.
+                try:
+                    pid = int(marker["pid"])
+                    birth = str(marker["process_birth_id"])
+                    instance = str(marker["runtime_instance_id"])
+                    marker_realm = str(marker["realm_id"])
+                    marker_root = _canonical_realm_root(str(marker["realm_root"]))
+                except (KeyError, TypeError, ValueError, BootstrapError) as exc:
+                    _discard_installer_stop_receipt(boundary)
+                    raise BootstrapError("Runtime interruption refused: owner lock identity is incomplete.") from exc
+                if (pid <= 0 or not birth or not instance or marker_realm != str(realm.get("realm_id"))
+                        or marker_root != realm_root):
+                    _discard_installer_stop_receipt(boundary)
+                    raise BootstrapError("Runtime interruption refused: owner lock does not match the selected workspace.")
+                recorded_match = False
+                if recorded_foreground is not None:
+                    try:
+                        recorded_match = (
+                            int(recorded_foreground.get("pid", -1)) == pid
+                            and str(recorded_foreground.get("birth_id") or "") == birth
+                            and str(recorded_foreground.get("realm_id") or realm.get("realm_id")) == marker_realm
+                            and _canonical_realm_root(str(recorded_foreground.get("realm_root") or marker_root)) == marker_root
+                        )
+                    except (TypeError, ValueError, BootstrapError):
+                        recorded_match = False
+                if callable(getattr(boundary, "process_birth_identity", None)) and not recorded_match:
+                    if _pid_alive(boundary, pid):
+                        _discard_installer_stop_receipt(boundary)
+                        raise BootstrapError("Runtime interruption refused: live lock owner has no matching discovery.")
+                    try:
+                        if boundary.process_birth_identity(pid) is not None:
+                            _discard_installer_stop_receipt(boundary)
+                            raise BootstrapError("Runtime interruption refused: live lock owner has no matching discovery.")
+                    except BootstrapError:
+                        raise
+                    except Exception as exc:
+                        _discard_installer_stop_receipt(boundary)
+                        raise BootstrapError("Runtime interruption refused: owner absence could not be established.") from exc
+                elif _pid_alive(boundary, pid) and not recorded_match:
+                    _discard_installer_stop_receipt(boundary)
+                    raise BootstrapError("Runtime interruption refused: live lock owner has no matching discovery.")
+            # A retained service child accompanying publication must name that
+            # exact owner. This prevents a stop for one realm being used as cover
+            # for a different child recorded by the installer.
+            if owner is not None and recorded_foreground is not None:
+                owner_pid, owner_birth, _owner_instance, _owner_endpoint = owner
+                try:
+                    foreground_pid = int(recorded_foreground["pid"])
+                    foreground_birth = str(recorded_foreground["birth_id"])
+                    # Legacy service records contain only PID/birth. The selected
+                    # catalog realm supplies missing context; explicit context is
+                    # still compared and rejected when it points elsewhere.
+                    foreground_realm = str(recorded_foreground.get("realm_id") or realm.get("realm_id") or "")
+                    foreground_root = _canonical_realm_root(
+                        str(recorded_foreground.get("realm_root") or realm_root)
+                    )
+                except (KeyError, TypeError, ValueError, BootstrapError) as exc:
+                    raise BootstrapError("Runtime interruption refused: recorded foreground identity is incomplete.") from exc
+                if (foreground_pid != owner_pid or foreground_birth != owner_birth
+                        or foreground_realm != str(realm.get("realm_id")) or foreground_root != realm_root):
+                    raise BootstrapError("Runtime interruption refused: recorded foreground child does not match the selected owner.")
+
+            # When there is no live published owner, a recorded child is accepted
+            # only by a boundary method which checks the retained OS child/custody.
+            foreground = None
+            if owner is None and recorded_foreground is not None:
+                foreground = getattr(boundary, "stop_recorded_foreground", None)
+                if not callable(foreground):
+                    raise BootstrapError("Runtime interruption refused: foreground child has no validated custody handoff.")
+                if str(recorded_foreground.get("realm_id") or realm.get("realm_id")) != str(realm.get("realm_id")):
+                    raise BootstrapError("Runtime interruption refused: foreground child belongs to another realm.")
+                if recorded_foreground.get("realm_root") and _canonical_realm_root(str(recorded_foreground["realm_root"])) != realm_root:
+                    raise BootstrapError("Runtime interruption refused: foreground child belongs to another realm root.")
+
+            if discovery is None and marker is None and recorded_foreground is None:
+                # Missing advertisements alone do not establish an absent process.
+                # In particular, an OS manager may still hold an unpublished owner.
+                # A retry in this same controller can retain positive evidence from
+                # its completed handoff. Revalidate that exact process's absence;
+                # the receipt cannot authorize a signal or survive a new process.
+                if (not isinstance(receipt, Mapping)
+                        or getattr(boundary, "_installer_stop_receipt_invalidated", False)
+                        or receipt.get("support_root") != paths.runtime_support.resolve()
+                        or receipt.get("realm_id") != str(realm["realm_id"])
+                        or receipt.get("realm_root") != realm_root):
+                    raise BootstrapError("Runtime interruption refused: no owner identity or retained child proves a safe stop.")
+                try:
+                    absent = boundary.process_birth_identity(int(receipt["pid"])) is None
+                except Exception as exc:
+                    _discard_installer_stop_receipt(boundary)
+                    raise BootstrapError("Runtime interruption refused: prior owner absence could not be established.") from exc
+                if not absent:
+                    _discard_installer_stop_receipt(boundary)
+                    raise BootstrapError("Runtime interruption refused: prior owner process identity is no longer absent.")
+                receipt_only_retry = True
+            else:
+                receipt_only_retry = False
+        stop_completed = False
+        try:
+            with interruption_fence(realm_root) as final_report:
+                # Recheck publication under both launcher serialization and
+                # the final SQLite fence. A missing/stale read is not authority
+                # if another owner was published before the destructive step.
+                try:
+                    final_discovery = _read_support_json(paths.discovery_path)
+                    final_marker = _read_support_json(paths.instance_lock_path)
+                except Exception:
+                    _discard_installer_stop_receipt(boundary)
+                    raise
+                if final_discovery != discovery:
+                    _discard_installer_stop_receipt(boundary)
+                    raise BootstrapError("Runtime discovery changed before stop; refusing interruption.")
+                if final_marker != marker:
+                    _discard_installer_stop_receipt(boundary)
+                    raise BootstrapError("Runtime owner lock changed before stop; refusing interruption.")
+                if receipt_only_retry:
+                    if getattr(boundary, "_installer_stop_receipt_invalidated", False):
+                        _discard_installer_stop_receipt(boundary)
+                        raise BootstrapError("Runtime interruption refused: prior stop receipt was invalidated by a replacement publication.")
+                    try:
+                        still_absent = boundary.process_birth_identity(int(receipt["pid"])) is None
+                    except Exception as exc:
+                        _discard_installer_stop_receipt(boundary)
+                        raise BootstrapError(
+                            "Runtime interruption refused: prior owner absence could not be established under the final fence."
+                        ) from exc
+                    if not still_absent:
+                        _discard_installer_stop_receipt(boundary)
+                        raise BootstrapError("Runtime interruption refused: prior owner identity changed under the final fence.")
+                stopped = None
+                if owner is not None:
+                    pid, birth, instance_id, endpoint = owner
+                    stop_owner = getattr(boundary, "stop_owner", None)
+                    if not callable(stop_owner):
+                        raise BootstrapError("Runtime boundary lacks the birth-checked stop handoff.")
+                    # First destructive operation: Runtime's existing validated stop.
+                    stopped = stop_owner(
+                        endpoint=endpoint, pid=pid, instance_id=instance_id,
+                        process_birth_id=birth, realm_id=str(realm["realm_id"]),
+                        owner_lock=paths.instance_lock_path,
+                        discovery_path=paths.discovery_path, require_health=False,
+                    )
+                elif foreground is not None:
+                    stopped = foreground(recorded_foreground=recorded_foreground,
+                                         realm_id=str(realm["realm_id"]), realm_root=realm_root)
+                # The stopped owner can remove its own advertisements. A new
+                # identity must never be covered by the old owner's authority,
+                # even if it appears before the manager callback rather than
+                # after it. Preserve the replacement and forbid rollback.
+                for path, expected in ((paths.discovery_path, discovery),
+                                       (paths.instance_lock_path, marker)):
+                    try:
+                        observed = _read_support_json(path)
+                    except Exception:
+                        _discard_installer_stop_receipt(boundary)
+                        raise
+                    if observed is not None and observed != expected:
+                        _discard_installer_stop_receipt(boundary)
+                        raise BootstrapError(
+                            "Runtime owner changed before manager stop; refusing interruption.",
+                            details={"stop_authority_lost": True},
+                        )
+                stop_completed = True
+                # The Runtime owner may remove its own advertisements while
+                # exiting. Retain the exact completed-stop identity before
+                # manager cleanup, since that callback can fail afterward.
+                receipt_evidence = discovery or marker or recorded_foreground
+                if owner is not None:
+                    receipt_evidence = discovery or marker
+                _remember_completed_stop(
+                    boundary, paths=paths, realm=realm, realm_root=realm_root,
+                    evidence=receipt_evidence,
+                )
+                stop_manager()
+        except ConflictError as exc:
+            error = _raise_conflict(exc)
+            if stop_completed:
+                details = dict(error.details or {})
+                details["stop_completed"] = True
+                error = BootstrapError(str(error), details=details)
+            raise error from exc
+        except BootstrapError as exc:
+            if stop_completed:
+                details = dict(exc.details or {})
+                details["stop_completed"] = True
+                raise BootstrapError(str(exc), details=details) from exc
+            raise
+        except Exception as exc:
+            inherited = getattr(exc, "details", None)
+            details = dict(inherited) if isinstance(inherited, Mapping) else {}
+            if stop_completed:
+                details["stop_completed"] = True
+            raise BootstrapError(str(exc), details=details or None) from exc
+
+        # Cleanup is after the manager has synchronously stopped and after the
+        # SQLite fence released. Preserve any replacement identity.
+        try:
+            current_discovery = _read_support_json(paths.discovery_path)
+            current_marker = _read_support_json(paths.instance_lock_path)
+        except Exception:
+            _discard_installer_stop_receipt(boundary)
+            raise
+        if owner is not None:
+            pid, birth, instance_id, _endpoint = owner
+            if current_discovery is not None and not _owner_record_matches(
+                current_discovery, pid=pid, instance_id=instance_id,
+                process_birth_id=birth, realm_id=str(realm["realm_id"]), realm_root=realm_root,
+            ):
+                _discard_installer_stop_receipt(boundary)
+                raise BootstrapError("Runtime owner changed during stop; refusing discovery cleanup.")
+            if current_marker is not None and not _owner_record_matches(
+                current_marker, pid=pid, instance_id=instance_id,
+                process_birth_id=birth, realm_id=str(realm["realm_id"]), realm_root=realm_root,
+            ):
+                _discard_installer_stop_receipt(boundary)
+                raise BootstrapError("Runtime owner changed during stop; refusing owner-lock cleanup.")
+        else:
+            # For absent/stale publications, never unlink a record that was
+            # replaced while the manager callback ran. Equality is used here
+            # because no live-owner stop authority was established.
+            if current_discovery is not None and current_discovery != discovery:
+                _discard_installer_stop_receipt(boundary)
+                raise BootstrapError("Runtime discovery changed during stop; refusing cleanup.")
+            if current_marker is not None and current_marker != marker:
+                _discard_installer_stop_receipt(boundary)
+                raise BootstrapError("Runtime owner lock changed during stop; refusing cleanup.")
+        if current_discovery is not None:
+            remove_file(paths.discovery_path)
+        if current_marker is not None:
+            remove_file(paths.instance_lock_path)
+        evidence = discovery or marker or recorded_foreground
+        if evidence is not None and getattr(boundary, "_installer_stop_receipt", None) is None:
+            _remember_completed_stop(
+                boundary, paths=paths, realm=realm, realm_root=realm_root,
+                evidence=evidence,
+            )
+        return {"status": "stopped", "realm_id": str(realm["realm_id"]),
+                "runtime": stopped, "interruption": final_report}
+
+
 def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
     """Stop under the shared lifecycle fence, then explicitly start again."""
     config = config or BootstrapConfig()
     _validate_support_paths(paths)
+    _preflight_owner_interruption(paths)
     with _bootstrap_mutex(paths):
         _interrupt_owner_locked(paths, boundary)
         result = _bootstrap_locked(paths, boundary, config)

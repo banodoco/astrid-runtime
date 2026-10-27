@@ -540,8 +540,8 @@ class LocalRuntimeBoundary:
         try:
             identity = default_process_identity(int(pid))
             return None if identity is None else str(identity["birth_id"])
-        except CustodyError:
-            return None
+        except CustodyError as exc:
+            raise BootstrapError("Runtime process identity remains uncertain.") from exc
 
     @staticmethod
     def _log_path(support_root: Path) -> Path:
@@ -891,6 +891,47 @@ class LocalRuntimeBoundary:
     def stop_owner(self, **kwargs) -> Mapping[str, Any]:
         """Stop an adopted owner using the same birth/lock fences as restart."""
         return self.restart(**kwargs, start_after_stop=False)
+
+    def stop_recorded_foreground(self, *, recorded_foreground: Mapping[str, Any],
+                                 realm_id: str, realm_root: Path) -> Mapping[str, Any]:
+        """Stop only an exact retained startup child whose custody handle is supplied.
+
+        The caller must retain the Popen returned by the launch boundary. A PID
+        and birth id without that handle are intentionally insufficient.
+        """
+        process = recorded_foreground.get("process")
+        try:
+            pid = int(recorded_foreground["pid"])
+            birth = str(recorded_foreground["birth_id"])
+            observed_realm = str(recorded_foreground["realm_id"])
+            observed_root = Path(str(recorded_foreground["realm_root"])).resolve()
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            raise BootstrapError("Runtime foreground stop refused: retained child identity is incomplete.") from exc
+        if (process is None or not callable(getattr(process, "poll", None))
+                or not callable(getattr(process, "wait", None))):
+            raise BootstrapError("Runtime foreground stop refused: retained child identity is incomplete.")
+        if (int(getattr(process, "pid", 0) or 0) != pid or not birth
+                or observed_realm != str(realm_id)
+                or observed_root != Path(realm_root).resolve()):
+            raise BootstrapError("Runtime foreground stop refused: retained child does not match the selected realm.")
+        if process.poll() is not None:
+            return {"status": "stopped", "realm_id": str(realm_id), "pid": pid,
+                    "exit_evidence": "retained_child_already_exited"}
+        if self.process_birth_identity(pid) != birth:
+            raise BootstrapError("Runtime foreground stop refused: child incarnation changed.")
+        if platform.sys.platform != "win32":
+            try:
+                if platform.process_group(pid) != pid:
+                    raise BootstrapError("Runtime foreground stop refused: child is not its own session leader.")
+            except OSError as exc:
+                raise BootstrapError("Runtime foreground stop refused: child session identity is unavailable.") from exc
+        elif getattr(process, "_runtime_job", None) is None:
+            raise BootstrapError("Runtime foreground stop refused: retained child has no Job Object custody.")
+        platform.stop_tree(process, grace=5.0)
+        if process.poll() is None:
+            raise BootstrapError("Runtime foreground stop remains uncertain after bounded custody cleanup.")
+        return {"status": "stopped", "realm_id": str(realm_id), "pid": pid,
+                "exit_evidence": "retained_child_stopped"}
 
     def prepare_restart(self, *, source_profile: SourceProfile, realm_id: str, realm_root: Path, support_root: Path, pid: int) -> None:
         """Adopt a detached daemon for an operator restart.

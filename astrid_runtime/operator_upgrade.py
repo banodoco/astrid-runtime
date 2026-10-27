@@ -91,15 +91,27 @@ def _assert_idle(root: Path) -> dict[str, Any]:
     try:
         report = inspect_interruption_state(root)
         if not report["safe"]:
-            raise OperatorUpgradeError(
-                "upgrade refused while runtime work is active or unreconciled; reconcile attempts first: "
-                + json.dumps(report, sort_keys=True)
-            )
+            # Keep the lifecycle contract intact across the operator boundary.
+            # The CLI and installer use these normalized fields to make a
+            # decision; callers must not have to recover them from prose.
+            message = str(report.get("message") or report.get("headline") or "Runtime interruption refused while work is active or unreconciled.")
+            raise OperatorUpgradeError(message, details=report)
         return report
     except OperatorUpgradeError:
         raise
     except Exception as exc:
-        raise OperatorUpgradeError(str(exc)) from exc
+        details = getattr(exc, "details", None)
+        message = str(details.get("message") or details.get("headline") or str(exc)) if isinstance(details, Mapping) else str(exc)
+        raise OperatorUpgradeError(message, details=details if isinstance(details, Mapping) else None) from exc
+
+
+def _is_lifecycle_refusal(exc: BaseException) -> bool:
+    """Return whether an error carries the structured lifecycle refusal report."""
+    details = getattr(exc, "details", None)
+    return (
+        isinstance(details, Mapping)
+        and details.get("safe") is False
+    )
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -269,7 +281,9 @@ def upgrade_workspace(
                         stopped = True
                         idle = fenced_idle
                 except Exception as exc:
-                    raise OperatorUpgradeError(str(exc)) from exc
+                    details = getattr(exc, "details", None)
+                    message = str((details or {}).get("message") or (details or {}).get("headline") or str(exc)) if isinstance(details, Mapping) else str(exc)
+                    raise OperatorUpgradeError(message, details=details if isinstance(details, Mapping) else None) from exc
                 remove_file(paths.discovery_path)
                 remove_file(paths.instance_lock_path)
             _journal(paths, operation_id=operation_id, state="stopped", realm_id=realm_id, schema_before=kind, idle=idle)
@@ -305,7 +319,7 @@ def upgrade_workspace(
         # boundary, but report recovery_required if that restart cannot be
         # verified; never describe a restart failure as a data rollback.
         restart_error = None
-        if stopped and not activated:
+        if stopped and not activated and not _is_lifecycle_refusal(exc):
             try:
                 with _bootstrap_mutex(paths):
                     _bootstrap_locked(paths, boundary, config)
@@ -323,7 +337,12 @@ def upgrade_workspace(
                 paths, journal_root=journal_root, operation_id=operation_id, state=state, realm_id=realm_id,
                 schema_before=kind, activated=activated, error=str(exc), restart_error=restart_error,
             )
-        raise OperatorUpgradeError(str(exc)) from exc
+        details = getattr(exc, "details", None)
+        message = str((details or {}).get("message") or (details or {}).get("headline") or str(exc)) if isinstance(details, Mapping) else str(exc)
+        raise OperatorUpgradeError(
+            message,
+            details=details if isinstance(details, Mapping) else None,
+        ) from exc
 
 
 __all__ = ["OperatorUpgradeError", "upgrade_workspace"]
