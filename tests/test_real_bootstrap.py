@@ -13,8 +13,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 
 from astrid_runtime import BootstrapConfig, BootstrapError, LocalRuntimeBoundary, RuntimePaths, SourceProfile, bootstrap, configure_workspace, connect
 from astrid_runtime.bootstrap import restart
+from astrid_runtime import cli
 from astrid_runtime_client import WorkspaceClient
-from runtime_protocol.source_identity import SourceIdentityError
+from runtime_protocol.source_identity import SourceIdentityError, capture_source_identity
 
 
 def _config() -> BootstrapConfig:
@@ -322,5 +323,53 @@ def test_linux_loopback_untracked_nested_checkout_refuses_up_and_connect(tmp_pat
                     )
                     assert live["runtime_instance_id"] == first.runtime_instance_id
                     assert live["identity"] == original_identity
+    finally:
+        _stop_unfinished(boundary)
+
+
+@pytest.mark.parametrize("checkout", ["runtime", "agent"])
+@pytest.mark.parametrize("nested_kind", ["ordinary", "linked"])
+def test_cli_indexed_file_replaced_by_checkout_refuses_live_owner(
+    tmp_path, monkeypatch, capsys, checkout, nested_kind,
+):
+    for name in ("ASTRID_INSTALL_RELEASE", "ASTRID_INSTALL_MANAGED_BY", "ASTRID_RUNTIME_SOURCE_MANIFEST"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    runtime, agent = tmp_path / "runtime", tmp_path / "agent"
+    _git_checkout(runtime, Path(__file__).resolve().parents[1],
+                  ("runtime_protocol", "astrid_runtime", "packages/python/astrid_runtime_client"))
+    _git_checkout(agent)
+    paths = RuntimePaths.current(data_root=tmp_path / "support")
+    config = BootstrapConfig(source_profile=SourceProfile(
+        profile="astrid", runtime_checkout=str(runtime), source_checkout=str(agent), capability_digest="caps-v1",
+    ))
+    boundary = LocalRuntimeBoundary()
+    try:
+        configure_workspace(paths, boundary, config, mode="create", realm_root=paths.realms_dir / "realm", realm_id="realm")
+        first = bootstrap(paths, boundary, config)
+        identity = json.loads(paths.discovery_path.read_text())["identity"]
+        before = {p: p.read_bytes() for p in _authority_files(paths)}
+        root = runtime if checkout == "runtime" else agent
+        nested = root / "tracked.txt"
+        nested.unlink()
+        if nested_kind == "ordinary":
+            _git_checkout(nested)
+        else:
+            other = tmp_path / "other"
+            _git_checkout(other)
+            subprocess.run(["git", "-C", str(other), "worktree", "add", "-qb", "nested", str(nested), "HEAD"], check=True)
+        assert subprocess.check_output(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"]) == b""
+        for content in ("baseline", "edited nested source"):
+            (nested / "tracked.txt").write_text(content)
+            with pytest.raises(SourceIdentityError, match="nested source checkout"):
+                capture_source_identity(runtime, agent)
+            for command in ("up", "connect"):
+                assert cli.main([command, "--data-root", str(paths.app_support), "--hosted-origin", "off", "--json"]) == 1
+                payload = json.loads(capsys.readouterr().out)
+                assert payload["error"] == "Requested Runtime identity could not be verified."
+                assert before == {p: p.read_bytes() for p in _authority_files(paths)}
+                assert boundary._process is not None and boundary._process.poll() is None
+                assert boundary.owner_startup_identity(endpoint=first.endpoint, instance_id=first.runtime_instance_id)["identity"] == identity
     finally:
         _stop_unfinished(boundary)
