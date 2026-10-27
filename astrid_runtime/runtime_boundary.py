@@ -284,6 +284,7 @@ class LocalRuntimeBoundary:
         if source.service_declaration:
             argv += ["--service-declaration", source.service_declaration,
                 "--service-python", python, "--service-source-checkout", source.source_checkout]
+        argv += ["--runtime-checkout", source.runtime_checkout, "--agent-checkout", source.source_checkout]
         argv += ["--log-file", str(self._log_path(support_root))]
         if self._door is not None and "--door-origin" not in argv:
             door, credential_file = self._door
@@ -666,6 +667,10 @@ class LocalRuntimeBoundary:
             and health.get("status") == "ok"
             and health.get("runtime_instance_id") == instance_id
         )
+
+    def owner_startup_identity(self, *, endpoint: str, instance_id: str) -> Mapping[str, Any] | None:
+        """Return canonical health so the caller can validate its owner binding."""
+        return self._http_health_payload(endpoint)
 
     def endpoint_metadata(self, *, endpoint: str, credential_file: Path) -> Mapping[str, Any]:
         """Read endpoint instance and authenticated realm identity without mutation."""
@@ -1168,6 +1173,8 @@ class ForegroundRuntimeBoundary(LocalRuntimeBoundary):
                 python=sys.executable, source_checkout=getattr(source_profile, "source_checkout", ""))
             daemon = RuntimeDaemon(root, support_root=support, display_name=self._display_name,
                 realm_id=realm_id, owner_lock=owner_lock, bootstrap_token_file=token_file,
+                runtime_checkout=getattr(source_profile, "runtime_checkout", None),
+                agent_checkout=getattr(source_profile, "source_checkout", None),
                 admission_timeout=self.admission_timeout_seconds,
                 local_worker_profiles=composition.profiles if composition else None,
                 local_worker_preparer=composition.preparer if composition else None,

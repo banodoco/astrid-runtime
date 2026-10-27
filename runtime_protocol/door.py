@@ -33,7 +33,6 @@ from __future__ import annotations
 import errno
 import http.client
 import json
-import os as process_os
 from .dirfd import filesystem as os
 import re
 import socket
@@ -619,13 +618,14 @@ class DoorHandler(RuntimeHandler):
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):
         # The hosted App uses this door health response to show install-manager
         # guidance. Keep this browser-facing marker out of Runtime's canonical
-        # health contract so the Runtime schema digest remains stable.
+        # health contract; derive it from the published owner snapshot.
         if (
             status == 200
             and self.command == "GET"
             and self.path.split("?", 1)[0] == "/v1/health"
             and isinstance(payload, dict)
-            and process_os.environ.get("ASTRID_INSTALL_MANAGED_BY") == "pinokio"
+            and isinstance(payload.get("identity"), dict)
+            and payload["identity"].get("managed_by") == "pinokio"
         ):
             payload = {**payload, "install": {"managed_by": "pinokio"}}
         return super()._send(

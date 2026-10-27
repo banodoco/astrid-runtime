@@ -89,7 +89,9 @@ def test_source_profile_requires_pinned_runtime_and_rejects_authority_fields() -
         SourceProfile.from_mapping({"profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": "/source", "runtime_command": ["sh", "-c", "evil"]})
 
 
-def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path) -> None:
+def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ASTRID_INSTALL_RELEASE", "0")
+    monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "")
     paths = RuntimePaths.sandbox(tmp_path)
     profile = SourceProfile("astrid", "/runtime", "/source")
 
@@ -113,6 +115,12 @@ def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path) ->
 
         def health(self, **kwargs):
             return True
+
+        def owner_startup_identity(self, *, endpoint, instance_id):
+            return {
+                "runtime_instance_id": "instance",
+                "identity": {"release": 0, "managed_by": None},
+            }
 
         def connect(self, **kwargs):
             raise RuntimeError("handoff failed")

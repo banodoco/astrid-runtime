@@ -278,9 +278,19 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "health"]:
             health = dict(self.runtime.health(identity_probe=True) if self._is_owner_identity_probe()
                           else self.runtime.health())
+            # RuntimeService is also exercised without an owning daemon in
+            # low-level protocol fixtures. Such a response has no startup
+            # identity; real owner listeners replace this with the snapshot.
+            health["identity"] = None
             daemon = getattr(self.server, "daemon_runtime", None)
             if daemon is not None:
-                health["runtime_instance_id"] = daemon.instance_id
+                # Startup identity belongs to one owner instance. Read only
+                # the defensive snapshot captured by RuntimeDaemon.start();
+                # health must never recapture install records or checkouts.
+                health["runtime_instance_id"] = getattr(
+                    daemon, "startup_identity_instance_id", None
+                )
+                health["identity"] = getattr(daemon, "startup_identity", None)
                 health["services"] = daemon.service_status()
             return self._send(200, health)
         if path == ["v1", "credentials"] and method == "POST":

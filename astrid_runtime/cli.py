@@ -518,7 +518,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "connect":
             config = _config(args, paths)
             boundary = LocalRuntimeBoundary()
-            boundary.configure_source(config.resolve_source_profile(paths))
             result = connect(paths, boundary, config)
             _emit(result, json_mode=args.json)
             return 0
@@ -615,7 +614,10 @@ def main(argv: list[str] | None = None) -> int:
             _emit(value, json_mode=args.json)
             return 0
     except (BootstrapError, ValueError, OSError) as exc:
-        _emit({"ok": False, "error": str(exc)}, json_mode=True)
+        error = str(exc)
+        if isinstance(exc, BootstrapError) and exc.details is not None:
+            error = {"message": error, "details": exc.details}
+        _emit({"ok": False, "error": error}, json_mode=True)
         return 1
     except Exception as exc:
         # Generated clients expose typed ApiError; keep that import lazy so
