@@ -118,7 +118,17 @@
         "state": { "type": "string", "minLength": 1 },
         "settled": { "type": "boolean" },
         "blockers": { "type": "array", "items": { "type": "object" } },
-        "task": { "$ref": "task.json" }
+        "task": { "$ref": "task.json" },
+        "lost_disposition": {
+          "description": "Current durable owner-abandon decision; absent after retry or a later terminal event. Never inferred from worker result data.",
+          "type": "object", "additionalProperties": false,
+          "required": ["event_id", "attempt_id", "reason"],
+          "properties": {
+            "event_id": { "type": "string", "minLength": 1 },
+            "attempt_id": { "type": "string", "minLength": 1 },
+            "reason": { "type": "string", "minLength": 1, "maxLength": 4096 }
+          }
+        }
       }
     },
     "LocalWorkerGeneration": {

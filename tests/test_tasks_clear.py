@@ -40,6 +40,347 @@ def _settlement(daemon, task_id):
     return Api(daemon.endpoint, daemon.token).request("GET", f"/v1/control/tasks/{task_id}/settlement")
 
 
+def _external_cli_task(daemon):
+    from tests.test_execution_binding_contract import CAPABILITY, CAPABILITY_DIGEST, _admit, _claim
+    service = daemon.service
+    service.register_capability({"capability_id": CAPABILITY, "definition_digest": CAPABILITY_DIGEST,
+                                 "required_resource_keys": ["external-gpu"]})
+    service.register_executor({"executor_id": "executor-a", "capabilities": [CAPABILITY],
+                               "resource_keys": ["external-gpu"], "max_concurrency": 2},
+                              idempotency_key="cli-external-register")
+    target = {"kind": "runpod", "pod_id": "cli-pod", "provider_account_ref": "account-a"}
+    admitted = _admit(service, "cli-external", target)
+    attempt = _claim(service, "cli-external-claim", target)
+    return admitted["task"]["id"], attempt
+
+
+@pytest.mark.parametrize("json_output", [True, False])
+def test_real_cli_successful_worker_lost_result_is_already_settled(tmp_path, monkeypatch, capsys, json_output):
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task_id, attempt = _external_cli_task(daemon)
+        result = daemon.service.settle_attempt(attempt["attempt_id"], {
+            **{key: attempt[key] for key in ("lease_id", "fence", "runtime_epoch")},
+            "outputs": [], "result": {"disposition": "lost", "reason": "ordinary worker result"},
+        }, idempotency_key="ordinary-worker-lost-result")
+        assert result["data"]["state"] == "succeeded"
+        observation = _settlement(daemon, task_id)
+        assert observation["state"] == "succeeded" and observation["settled"] is True
+        assert "lost_disposition" not in observation
+        before = list(daemon.service.store.conn.iterdump())
+        args = ["tasks", "clear", task_id] + (["--json"] if json_output else [])
+        assert cli.main(args) == 0
+        output = capsys.readouterr().out
+        if json_output:
+            row = json.loads(output)["outcomes"][0]
+            assert row == {"task_id": task_id, "outcome": "already_settled", "state": "succeeded", "repeated": False}
+        else:
+            assert "already_settled" in output and "succeeded" in output
+            assert "lost" not in output
+        assert "remote_stop_confirmed" not in output and "billing_stop_confirmed" not in output
+        assert "ordinary worker result" not in output
+        assert not daemon.service.store.conn.execute(
+            "SELECT 1 FROM events WHERE task_id=? AND kind='task.abandoned'", (task_id,),
+        ).fetchone()
+        assert list(daemon.service.store.conn.iterdump()) == before
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("json_output", [True, False], ids=["json", "text"])
+@pytest.mark.parametrize("path,value", [
+    pytest.param(("valid",), None, id="valid-signal"),
+    pytest.param(("lost_disposition",), {}, id="empty-signal"),
+    pytest.param(("lost_disposition", "extra"), None, id="extra-property"),
+    pytest.param(("lost_disposition", "remote_stop_confirmed"), True, id="extra-remote-stop"),
+    pytest.param(("lost_disposition", "billing_stop_confirmed"), True, id="extra-billing-stop"),
+    pytest.param(("lost_disposition", "remote_stop_confirmed"), False, id="extra-remote-stop-false"),
+    pytest.param(("lost_disposition", "billing_stop_confirmed"), False, id="extra-billing-stop-false"),
+    pytest.param(("lost_disposition", ""), None, id="extra-empty-key"),
+    pytest.param(("task", "state"), "succeeded", id="nested-state-succeeded"),
+    pytest.param(("task", "state"), "cancelled", id="nested-state-cancelled"),
+    pytest.param(("task", "state"), None, id="nested-state-null"),
+    pytest.param(("missing", "task", "state"), None, id="nested-state-missing"),
+    pytest.param(("task", "result", "task_id"), "other-task", id="result-task-mismatch"),
+    pytest.param(("task", "result", "task_id"), None, id="result-task-null"),
+    pytest.param(("task", "result", "task_id"), "", id="result-task-empty"),
+    pytest.param(("task", "result", "task_id"), 123, id="result-task-numeric"),
+    pytest.param(("missing", "task", "result", "task_id"), None, id="result-task-missing"),
+    pytest.param(("task", "result", "run_id"), "other-run", id="result-run-mismatch"),
+    pytest.param(("task", "result", "run_id"), None, id="result-run-null"),
+    pytest.param(("task", "result", "run_id"), "", id="result-run-empty"),
+    pytest.param(("task", "result", "run_id"), 123, id="result-run-numeric"),
+    pytest.param(("missing", "task", "result", "run_id"), None, id="result-run-missing"),
+    pytest.param(("task", "run_id"), None, id="canonical-run-null"),
+    pytest.param(("task", "run_id"), "", id="canonical-run-empty"),
+    pytest.param(("task", "run_id"), " \t", id="canonical-run-blank"),
+    pytest.param(("task", "run_id"), 123, id="canonical-run-numeric"),
+    pytest.param(("missing", "task", "run_id"), None, id="canonical-run-missing"),
+    pytest.param(("lost_disposition",), None, id="null-signal"),
+    pytest.param(("lost_disposition",), [], id="nonmapping-signal"),
+    pytest.param(("lost_disposition", "reason"), None, id="null-reason"),
+    pytest.param(("lost_disposition", "reason"), "", id="empty-reason"),
+    pytest.param(("lost_disposition", "reason"), " \t\n", id="blank-reason"),
+    pytest.param(("lost_disposition", "reason"), "x" * 4097, id="long-reason"),
+    pytest.param(("lost_disposition", "reason"), 123, id="numeric-reason"),
+    pytest.param(("lost_disposition", "event_id"), 123, id="numeric-event"),
+    pytest.param(("lost_disposition", "event_id"), True, id="boolean-event"),
+    pytest.param(("lost_disposition", "event_id"), [], id="array-event"),
+    pytest.param(("lost_disposition", "event_id"), {}, id="object-event"),
+    pytest.param(("lost_disposition", "event_id"), None, id="null-event"),
+    pytest.param(("lost_disposition", "event_id"), "", id="empty-event"),
+    pytest.param(("lost_disposition", "event_id"), "event", id="nondecimal-event"),
+    pytest.param(("lost_disposition", "attempt_id"), 123, id="numeric-attempt"),
+    pytest.param(("lost_disposition", "attempt_id"), True, id="boolean-attempt"),
+    pytest.param(("lost_disposition", "attempt_id"), [], id="array-attempt"),
+    pytest.param(("lost_disposition", "attempt_id"), {}, id="object-attempt"),
+    pytest.param(("lost_disposition", "attempt_id"), None, id="null-attempt"),
+    pytest.param(("lost_disposition", "attempt_id"), "", id="empty-attempt"),
+    pytest.param(("lost_disposition", "attempt_id"), " ", id="blank-attempt"),
+    pytest.param(("lost_disposition", "attempt_id"), "other-attempt", id="mismatched-attempt"),
+    pytest.param(("lost_disposition", "reason"), "other reason", id="mismatched-reason"),
+    pytest.param(("task_id",), "other-task", id="mismatched-settlement-task"),
+    pytest.param(("task", "result"), None, id="null-result"),
+    pytest.param(("task", "result", "disposition"), "ordinary", id="ordinary-result"),
+    pytest.param(("task", "result", "remote_stop_confirmed"), True, id="remote-stop-true"),
+    pytest.param(("task", "result", "remote_stop_confirmed"), 0, id="remote-stop-numeric"),
+    pytest.param(("task", "result", "billing_stop_confirmed"), None, id="billing-stop-null"),
+    pytest.param(("task", "result", "billing_stop_confirmed"), 0, id="billing-stop-numeric"),
+    # The "missing" path prefix removes a property rather than setting it to null.
+    pytest.param(("missing", "lost_disposition", "reason"), None, id="missing-reason"),
+    pytest.param(("missing", "lost_disposition", "event_id"), None, id="missing-event"),
+    pytest.param(("missing", "lost_disposition", "attempt_id"), None, id="missing-attempt"),
+    pytest.param(("missing", "task", "result", "remote_stop_confirmed"), None, id="missing-remote-stop"),
+    pytest.param(("missing", "task", "result", "billing_stop_confirmed"), None, id="missing-billing-stop"),
+])
+def test_real_cli_lost_signal_validation(tmp_path, monkeypatch, capsys, json_output, path, value):
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task_id, attempt = _external_cli_task(daemon)
+        daemon.service.fail_attempt(attempt["attempt_id"], {
+            **{key: attempt[key] for key in ("lease_id", "fence", "runtime_epoch")},
+            "error": {"message": "ordinary worker failure"},
+        }, idempotency_key="ordinary-worker-failure")
+        observed = _settlement(daemon, task_id)
+        assert observed["state"] == "failed" and observed["settled"] is True
+        assert "lost_disposition" not in observed
+        original = daemon.task_settlement
+        injected = []
+
+        def injected_settlement(requested_id, *, identity):
+            response = original(requested_id, identity=identity)
+            response["lost_disposition"] = {"event_id": "123", "attempt_id": attempt["attempt_id"],
+                                            "reason": "owner clears provider uncertainty"}
+            response["task"]["result"] = {"task_id": task_id, "run_id": response["task"]["run_id"],
+                "disposition": "lost", "attempt_id": attempt["attempt_id"],
+                "reason": "owner clears provider uncertainty", "remote_stop_confirmed": False,
+                "billing_stop_confirmed": False}
+            missing = path[0] == "missing"
+            keys = path[1:] if missing else path
+            target = response
+            for key in keys[:-1]:
+                target = target[key]
+            if path == ("valid",):
+                pass
+            elif missing:
+                del target[keys[-1]]
+                if keys == ("task", "run_id"):
+                    del response["task"]["result"]["run_id"]
+            else:
+                target[keys[-1]] = value
+                # Keep both copies equal for malformed types so rejection
+                # proves shape validation as well as cross-record matching.
+                if keys == ("lost_disposition", "reason") and value != "other reason":
+                    response["task"]["result"]["reason"] = value
+                if keys == ("lost_disposition", "attempt_id") and value != "other-attempt":
+                    response["task"]["result"]["attempt_id"] = value
+                if keys == ("task", "run_id"):
+                    response["task"]["result"]["run_id"] = value
+            injected.append(requested_id)
+            return response
+
+        # Inject at the server response boundary; HTTP, the generated client,
+        # owner authorization and the CLI output path remain real.
+        monkeypatch.setattr(daemon, "task_settlement", injected_settlement)
+        before = list(daemon.service.store.conn.iterdump())
+        database_before = daemon.service.store.db_path.read_bytes()
+        assert cli.main(["tasks", "clear", task_id] + (["--json"] if json_output else [])) == 0
+        output = capsys.readouterr().out
+        assert injected == [task_id]
+        expected = {"task_id": task_id, "outcome": "already_settled", "state": "failed", "repeated": False}
+        if path == ("valid",):
+            expected.update(outcome="lost", disposition="lost", reason="owner clears provider uncertainty",
+                            remote_stop_confirmed=False, billing_stop_confirmed=False)
+        if json_output:
+            assert json.loads(output)["outcomes"] == [expected]
+        else:
+            assert json.loads(output.split("outcomes: ", 1)[1]) == [expected]
+        if path != ("valid",):
+            assert "lost" not in output
+            assert "remote_stop_confirmed" not in output and "billing_stop_confirmed" not in output
+        assert not daemon.service.store.conn.execute(
+            "SELECT 1 FROM events WHERE task_id=? AND kind='task.abandoned'", (task_id,),
+        ).fetchone()
+        assert list(daemon.service.store.conn.iterdump()) == before
+        assert daemon.service.store.db_path.read_bytes() == database_before
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("terminal_state", ["succeeded", "failed"])
+def test_real_cli_retry_terminal_result_does_not_inherit_old_owner_abandon(tmp_path, monkeypatch, capsys, terminal_state):
+    from tests.test_execution_binding_contract import _claim
+
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task_id, old_attempt = _external_cli_task(daemon)
+        assert cli.main(["tasks", "clear", task_id, "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["outcomes"][0]["outcome"] == "lost"
+        lost = _settlement(daemon, task_id)["lost_disposition"]
+        assert lost["attempt_id"] == old_attempt["attempt_id"]
+        daemon.service.retry_task(task_id, idempotency_key="retry-abandoned-for-cli")
+        assert "lost_disposition" not in _settlement(daemon, task_id)
+        attempt = _claim(daemon.service, "retry-cli-claim", {
+            "kind": "runpod", "pod_id": "cli-pod", "provider_account_ref": "account-a",
+        })
+        assert attempt["attempt_id"] != old_attempt["attempt_id"]
+        body = {key: attempt[key] for key in ("lease_id", "fence", "runtime_epoch")}
+        worker_result = {"disposition": "lost", "reason": "ordinary worker result"}
+        if terminal_state == "succeeded":
+            daemon.service.settle_attempt(attempt["attempt_id"], {
+                **body, "outputs": [], "result": worker_result,
+            }, idempotency_key="retry-cli-succeeded")
+        else:
+            daemon.service.fail_attempt(attempt["attempt_id"], {
+                **body, "error": worker_result,
+            }, idempotency_key="retry-cli-failed")
+        observation = _settlement(daemon, task_id)
+        assert observation["state"] == terminal_state and observation["settled"] is True
+        assert "lost_disposition" not in observation
+        before = list(daemon.service.store.conn.iterdump())
+        assert cli.main(["tasks", "clear", task_id, "--json"]) == 0
+        row = json.loads(capsys.readouterr().out)["outcomes"][0]
+        assert row == {"task_id": task_id, "outcome": "already_settled", "state": terminal_state, "repeated": False}
+        assert daemon.service.store.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE task_id=? AND kind='task.abandoned'", (task_id,),
+        ).fetchone()[0] == 1
+        assert list(daemon.service.store.conn.iterdump()) == before
+    finally:
+        daemon.stop()
+
+
+def test_real_cli_external_lost_is_distinct_from_cancellation_and_retained_on_replay(tmp_path, monkeypatch, capsys):
+    from runtime_protocol.lifecycle import _interruption_report
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        external_id, attempt = _external_cli_task(daemon)
+        ordinary = _task(daemon, "ordinary-to-cancel")
+        untouched = _task(daemon, "keep-running", capability="clear.keep-running")
+        daemon.service.register_executor({"executor_id": "unrelated-worker", "capabilities": ["clear.keep-running"]})
+        daemon.service.claim_next({"executor_id": "unrelated-worker", "capability_ids": ["clear.keep-running"],
+                                   "runtime_epoch": daemon.service.health()["runtime_epoch"]}, idempotency_key="keep-claim")
+        assert cli.main(["tasks", "clear", external_id, ordinary["id"], external_id, "--json"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert [row["outcome"] for row in result["outcomes"]] == ["lost", "settled", "lost"]
+        assert result["outcomes"][0]["remote_stop_confirmed"] is False
+        assert result["outcomes"][0]["billing_stop_confirmed"] is False
+        assert result["outcomes"][1]["state"] == "cancelled"
+        assert _settlement(daemon, external_id)["settled"] is True
+        assert daemon.service.store.get_task(external_id)["run"]["status"] == "failed"
+        assert daemon.service.store.conn.execute("SELECT settled FROM attempts WHERE id=?", (attempt["attempt_id"],)).fetchone()[0] == 1
+        blockers = _interruption_report(daemon.service.store.conn)["blockers"]
+        assert {row["task_id"] for row in blockers} == {untouched["id"]}
+        before = list(daemon.service.store.conn.iterdump())
+        assert cli.main(["tasks", "clear", external_id, "--json"]) == 0
+        replay = json.loads(capsys.readouterr().out)
+        assert replay["outcomes"][0]["outcome"] == "lost"
+        assert list(daemon.service.store.conn.iterdump()) == before
+    finally:
+        daemon.stop()
+
+
+def test_real_cli_lost_response_retry_observes_durable_lost_without_second_event(tmp_path, monkeypatch, capsys):
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task_id, _attempt = _external_cli_task(daemon)
+        original = daemon.service.abandon_task
+
+        def lose_response(*args, **kwargs):
+            original(*args, **kwargs)
+            raise OSError("simulated response lost after abandon commit")
+
+        monkeypatch.setattr(daemon.service, "abandon_task", lose_response)
+        assert cli.main(["tasks", "clear", task_id, "--json"]) == 1
+        assert json.loads(capsys.readouterr().out)["outcomes"][0]["outcome"] == "unresolved"
+        assert _settlement(daemon, task_id)["settled"] is True
+        monkeypatch.setattr(daemon.service, "abandon_task", original)
+        lost = _settlement(daemon, task_id)["lost_disposition"]
+        daemon.stop()
+        daemon = RuntimeDaemon(_paths.realms_dir / "realm", support_root=_paths.runtime_support, realm_id="realm").start()
+        _cli_paths_for_daemon(tmp_path, monkeypatch, daemon)
+        assert _settlement(daemon, task_id)["lost_disposition"] == lost
+        before = list(daemon.service.store.conn.iterdump())
+        assert cli.main(["tasks", "clear", task_id, "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["outcomes"][0]["outcome"] == "lost"
+        assert daemon.service.store.conn.execute("SELECT COUNT(*) FROM events WHERE task_id=? AND kind='task.abandoned'", (task_id,)).fetchone()[0] == 1
+        assert list(daemon.service.store.conn.iterdump()) == before
+    finally:
+        daemon.stop()
+
+
+def test_external_clear_refuses_attempt_changed_after_canonical_cancellation(tmp_path, monkeypatch, capsys):
+    import copy
+    from astrid_runtime import task_clear
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task_id, _attempt = _external_cli_task(daemon)
+        original = task_clear._typed_control
+        abandon_calls = []
+        observations = 0
+
+        def raced_control(client):
+            request = original(client)
+
+            def control(method, route, body=None):
+                nonlocal observations
+                if method == "POST" and route.endswith("/abandon"):
+                    abandon_calls.append(body)
+                value = request(method, route, body)
+                if method == "GET" and route.endswith("/settlement"):
+                    observations += 1
+                    if observations >= 2:
+                        value = copy.deepcopy(value)
+                        value["task"]["attempt_id"] = "different-new-attempt"
+                        value["task"]["execution_binding"]["attempt_id"] = "different-new-attempt"
+                return value
+
+            return control
+
+        monkeypatch.setattr(task_clear, "_typed_control", raced_control)
+        assert cli.main(["tasks", "clear", task_id, "--json"]) == 1
+        row = json.loads(capsys.readouterr().out)["outcomes"][0]
+        assert row["outcome"] == "unresolved" and "changed" in row["abandon_error"]
+        assert abandon_calls == []
+        assert daemon.service.store.get_task(task_id)["task"]["waiting_reason"] == "provider_state_unknown"
+    finally:
+        daemon.stop()
+
+
+def test_new_canonical_cancel_keeps_lost_terminal_disposition(tmp_path, monkeypatch):
+    from astrid_runtime_client import WorkspaceClient
+    _paths, daemon = _live_owner(tmp_path, monkeypatch)
+    try:
+        task_id, _attempt = _external_cli_task(daemon)
+        assert cli.main(["tasks", "clear", task_id, "--json"]) == 0
+        events = daemon.service.store.conn.execute("SELECT COUNT(*) FROM events WHERE task_id=?", (task_id,)).fetchone()[0]
+        result = WorkspaceClient(daemon.endpoint, daemon.token).cancel_task(task_id, idempotency_key="new-cancel-after-lost")
+        assert result["state"] == "failed" and result["result"]["disposition"] == "lost"
+        assert daemon.service.store.conn.execute("SELECT COUNT(*) FROM events WHERE task_id=?", (task_id,)).fetchone()[0] == events
+        assert daemon.service.store.get_task(task_id)["run"]["status"] == "failed"
+    finally:
+        daemon.stop()
+
+
 def test_parser_help_and_exact_ids():
     args = cli.parser().parse_args(["tasks", "clear", "task-a", "task-b", "--json"])
     assert args.command == "tasks"

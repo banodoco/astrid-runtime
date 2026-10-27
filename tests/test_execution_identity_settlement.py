@@ -120,3 +120,89 @@ def test_settlement_preserves_output_descriptors(tmp_path):
         assert service.task(task["task"]["id"])["task"]["result"]["outputs"] == [expected]
     finally:
         service.close()
+
+
+def test_abandon_settles_evidenced_checkpoint_ancestors_and_fences_consumed_resume_receipt(tmp_path):
+    from tests.test_execution_binding_contract import CAPABILITY, _admit, _claim, _identity, _service
+    from runtime_protocol.errors import LeaseError
+    from runtime_protocol.lifecycle import _interruption_report
+
+    root = tmp_path / "realm"
+    target = {"kind": "runpod", "pod_id": "checkpoint-pod", "provider_account_ref": "account-a"}
+    service = _service(root)
+    try:
+        admitted = _admit(service, "ancestor-task", target)
+        old = _claim(service, "ancestor-claim", target)
+        lease = {key: old[key] for key in ("lease_id", "fence", "runtime_epoch")}
+        prepared = service.prepare_reboot({**lease, "attempt_id": old["attempt_id"]}, identity=_identity(target))
+        checkpoint = service.checkpoint_attempt(old["attempt_id"], {**lease, "nonce": prepared["nonce"],
+            "authorization": prepared["nonce"], "state": {"provider_id": "retained"}}, identity=_identity(target))
+        service.close()
+
+        service = RuntimeService(root)
+        epoch = service.health()["runtime_epoch"]
+        service.register_executor({"executor_id": "executor-a", "capabilities": [CAPABILITY],
+            "runtime_epoch": epoch}, idempotency_key="ancestor-register-restart")
+        resume = {"checkpoint_id": checkpoint["checkpoint_id"], "nonce": prepared["nonce"],
+                  "authorization": prepared["nonce"], "runtime_epoch": epoch}
+        current = service.resume_attempt(resume, identity=_identity(target))["attempt"]
+        task_id = current["task_id"]
+        assert current["attempt_id"] != old["attempt_id"]
+        assert service.resume_attempt(resume, identity=_identity(target))["attempt"]["attempt_id"] == current["attempt_id"]
+        service.cancel_task_canonical(task_id, {}, idempotency_key="ancestor-cancel")
+        observed = service._task_resource(service.store.get_task(task_id))
+        result = service.abandon_task(task_id, {
+            "expected_task_version": observed["version"], "attempt_id": current["attempt_id"],
+            "lease_id": current["lease_id"], "fence": current["fence"], "runtime_epoch": current["runtime_epoch"],
+            "execution_binding": observed["execution_binding"], "reason": "owner loses recovered provider work",
+        }, idempotency_key="ancestor-abandon", identity={"actor": "owner", "scopes": ["admin"]})
+        assert result["data"]["disposition"] == "lost"
+        assert service.store.conn.execute("SELECT COUNT(*) FROM attempts WHERE task_id=? AND settled=0", (task_id,)).fetchone()[0] == 0
+        assert _interruption_report(service.store.conn)["safe"] is True
+        before = list(service.store.conn.iterdump())
+        with pytest.raises(LeaseError, match="abandoned"):
+            service.resume_attempt(resume, identity=_identity(target))
+        with pytest.raises(LeaseError, match="abandoned"):
+            service.heartbeat_attempt(old["attempt_id"], lease, idempotency_key="ancestor-late-heartbeat", identity=_identity(target))
+        assert list(service.store.conn.iterdump()) == before
+        # Historical checkpoint bytes, receipt, and attempt identities survive.
+        assert service.store.conn.execute("SELECT state FROM recovery_checkpoints WHERE id=?", (checkpoint["checkpoint_id"],)).fetchone()[0] == "resumed"
+        assert service.store.conn.execute("SELECT COUNT(*) FROM attempts WHERE task_id=?", (task_id,)).fetchone()[0] == 2
+        service.close()
+        service = RuntimeService(root)
+        service.retry_task(task_id, {}, idempotency_key="ancestor-explicit-retry")
+        resume["runtime_epoch"] = service.health()["runtime_epoch"]
+        before = list(service.store.conn.iterdump())
+        with pytest.raises(LeaseError, match="abandoned"):
+            service.resume_attempt(resume, identity=_identity(target))
+        assert list(service.store.conn.iterdump()) == before
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("unaccounted", ["attempt", "reservation"])
+def test_abandon_refuses_unaccounted_outstanding_identities_atomically(tmp_path, unaccounted):
+    from tests.test_execution_binding_contract import _admit, _claim, _service
+    service = _service(tmp_path / "realm", resource_keys=["gpu"])
+    try:
+        target = {"kind": "runpod", "pod_id": "exact-pod", "provider_account_ref": "account-a"}
+        admitted = _admit(service, "unaccounted-task", target)
+        attempt = _claim(service, "unaccounted-claim", target)
+        task_id = admitted["task"]["id"]
+        service.cancel_task_canonical(task_id, {}, idempotency_key="unaccounted-cancel")
+        observed = service._task_resource(service.store.get_task(task_id))
+        if unaccounted == "attempt":
+            service.store.conn.execute("INSERT INTO attempts(id,task_id,lease_id,fence,executor_id,lease_expires_at,settled,runtime_epoch) "
+                "SELECT 'unaccounted-attempt',task_id,'unaccounted-lease',fence+50,executor_id,lease_expires_at,0,runtime_epoch "
+                "FROM attempts WHERE id=?", (attempt["attempt_id"],))
+        else:
+            service.store.conn.execute("UPDATE reservations SET lease_token='unaccounted-lease' WHERE task_id=?", (task_id,))
+        before = list(service.store.conn.iterdump())
+        with pytest.raises(ConflictError, match="additional unsettled|reservation identity"):
+            service.abandon_task(task_id, {"expected_task_version": observed["version"],
+                "attempt_id": attempt["attempt_id"], **{key: attempt[key] for key in ("lease_id", "fence", "runtime_epoch")},
+                "execution_binding": observed["execution_binding"], "reason": "owner clears exact attempt"},
+                idempotency_key="unaccounted-abandon", identity={"actor": "owner", "scopes": ["admin"]})
+        assert list(service.store.conn.iterdump()) == before
+    finally:
+        service.close()

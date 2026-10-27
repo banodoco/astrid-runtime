@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrid.haus/workspace/v1/schemas/task-abandon.json",
+  "title": "Owner external attempt abandon",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["expected_task_version", "attempt_id", "lease_id", "fence", "runtime_epoch", "execution_binding", "reason"],
+  "properties": {
+    "expected_task_version": {"type": "integer", "minimum": 1},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "lease_id": {"type": "string", "minLength": 1},
+    "fence": {"type": "integer", "minimum": 1},
+    "runtime_epoch": {"type": "integer", "minimum": 1},
+    "execution_binding": {"$ref": "task.json#/definitions/ExecutionBinding"},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "\\S"}
+  },
+  "definitions": {
+    "AbandonResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_id", "run_id", "attempt_id", "disposition", "reason", "remote_stop_confirmed", "billing_stop_confirmed", "task"],
+      "properties": {
+        "task_id": {"type": "string", "minLength": 1},
+        "run_id": {"type": "string", "minLength": 1},
+        "attempt_id": {"type": "string", "minLength": 1},
+        "disposition": {"const": "lost"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "\\S"},
+        "remote_stop_confirmed": {"const": false},
+        "billing_stop_confirmed": {"const": false},
+        "task": {"$ref": "task.json"}
+      }
+    }
+  }
+}

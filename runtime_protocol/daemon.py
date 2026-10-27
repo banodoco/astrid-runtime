@@ -840,9 +840,27 @@ class RuntimeDaemon:
             state = value["task"]["status"]
             blockers = [row for row in _interruption_report(self.service.store.conn)["blockers"]
                         if row["task_id"] == task_id]
-            return {"task_id": task_id, "state": "succeeded" if state == "completed" else state,
+            result = {"task_id": task_id, "state": "succeeded" if state == "completed" else state,
                     "settled": state in {"completed", "failed", "cancelled"} and not blockers,
                     "blockers": blockers, "task": self.service._task_resource(value)}
+            # Worker result bodies are arbitrary data. Only the current durable
+            # owner decision can identify lost; retry ends that disposition even
+            # if a later worker result uses the same words.
+            if state == "failed":
+                event = self.service.store.conn.execute(
+                    "SELECT id, kind, payload_json FROM events WHERE task_id=? "
+                    "AND kind IN ('task.abandoned', 'task.retried', 'task.completed', "
+                    "'task.failed', 'task.cancelled') ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if event and event["kind"] == "task.abandoned":
+                    payload = json.loads(event["payload_json"])
+                    if payload.get("actor") == "owner":
+                        result["lost_disposition"] = {
+                            "event_id": str(event["id"]), "attempt_id": payload["attempt_id"],
+                            "reason": payload["reason"],
+                        }
+            return result
 
     def local_worker_generation(self, *, identity):
         """Read the exact local generation held by this owner, including a pending stop."""
