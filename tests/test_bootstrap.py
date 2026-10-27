@@ -236,7 +236,7 @@ class BootstrapTests(unittest.TestCase):
                 bootstrap(self.paths, self.boundary, self.config)
         self.assertEqual(
             str(caught.exception),
-            "An older Astrid is still running. Run `astrid-runtime restart`; it waits for running tasks.",
+            "An older Astrid is still running. Restart it after its running tasks finish.",
         )
         self.assertEqual(before, {file: file.read_bytes() for file in files})
         self.assertEqual(

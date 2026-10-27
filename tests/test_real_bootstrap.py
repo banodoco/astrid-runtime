@@ -202,7 +202,7 @@ def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkey
         with pytest.raises(BootstrapError) as caught:
             bootstrap(paths, LocalRuntimeBoundary(), config)
         assert str(caught.value) == (
-            "An older Astrid is still running. Run `astrid-runtime restart`; it waits for running tasks."
+            "An older Astrid is still running. Restart it after its running tasks finish."
         )
         assert authority_before == {path: path.read_bytes() for path in _authority_files(paths)}
         assert first_boundary._process is not None and first_boundary._process.poll() is None
@@ -215,7 +215,7 @@ def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkey
         with pytest.raises(BootstrapError) as caught:
             connect(paths, LocalRuntimeBoundary(), config)
         assert str(caught.value) == (
-            "An older Astrid is still running. Run `astrid-runtime restart`; it waits for running tasks."
+            "An older Astrid is still running. Restart it after its running tasks finish."
         )
         assert authority_before == {path: path.read_bytes() for path in _authority_files(paths)}
         assert first_boundary._process is not None and first_boundary._process.poll() is None
