@@ -324,6 +324,27 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "doctor"] and method == "GET":
             self._identity("admin")
             return self._send(200, self.runtime.doctor())
+        if path == ["v1", "diagnostics"] and method == "GET":
+            self._identity("projects:read")
+            from astrid_runtime.diagnostics import diagnostics_report
+            from astrid_runtime.bootstrap import doctor as runtime_doctor
+            from astrid_runtime.paths import RuntimePaths
+            paths = RuntimePaths.current(data_root=self.runtime.support_root.parent if self.runtime.support_root else None)
+            from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+            query = parse_qs(urlsplit(self.path).query)
+            app_build = query.get("app_build", [None])[0]
+            app_release = query.get("app_release", [None])[0]
+            if not isinstance(app_build, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,160}", app_build):
+                app_build = None
+            if not isinstance(app_release, str) or not re.fullmatch(r"\d{1,12}", app_release):
+                app_release = None
+            report = diagnostics_report(
+                paths,
+                runtime_doctor(paths, LocalRuntimeBoundary()),
+                app_build=app_build,
+                app_release=app_release,
+            )
+            return self._send(200, {"report": report})
         if path == ["v1", "realm", "tombstone"] and method == "POST":
             self._identity("admin")
             return self._send(200, self.runtime.tombstone(self._body()))
@@ -1036,6 +1057,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     # Boundary identity probes use independent read-only
                     # snapshots while a lifecycle fence blocks the writer.
                     # Ordinary health/realm reads retain writer serialization.
+                    self._route()
+                elif getattr(self, "command", None) == "GET" and urlsplit(getattr(self, "path", "")).path == "/v1/diagnostics":
+                    # Support diagnostics performs independent owner-boundary
+                    # probes; it must not hold the serialized SQLite section.
                     self._route()
                 elif self._is_remote_credential_control() or self._is_binary_io():
                     # Both routes own short store sections. Transfer, hashing,

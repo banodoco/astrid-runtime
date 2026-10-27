@@ -150,6 +150,7 @@ def _entry(methods: str, template: str) -> tuple[frozenset[str], tuple[str, ...]
 
 WORKSPACE_ROUTES = (
     _entry("GET", "/v1/health"),
+    _entry("GET", "/v1/diagnostics"),
     _entry("POST", "/v1/handshake"),
     _entry("GET", "/v1/realm"),
     _entry("GET,PUT", "/v1/app-state/user/:"),
