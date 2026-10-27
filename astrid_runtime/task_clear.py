@@ -4,21 +4,19 @@ from __future__ import annotations
 
 import json
 import hashlib
-import urllib.error
-import urllib.request
 import uuid
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 from typing import Any, Mapping
 
-from .bootstrap import _read_support_json, _validate_loopback_endpoint, _validate_support_paths
-from .loopback_http import urlopen_loopback
+from .bootstrap import _read_support_json, _validate_support_paths
 from runtime_protocol.daemon import WORKER_ACTOR
 
 
 TERMINAL_STATES = {"succeeded", "completed", "failed", "cancelled"}
 
 
-def _abandon_key(route, body):
+def _abandon_key(task_id, body):
+    route = f"/v1/control/tasks/{quote(task_id, safe='')}/abandon"
     # Exact response-loss replay binds the observed incarnation and decision.
     return "tasks-clear-abandon-" + hashlib.sha256(json.dumps(
         [route, body], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -55,114 +53,32 @@ def _lost_row(task_id, settlement):
             "remote_stop_confirmed": False, "billing_stop_confirmed": False}
 
 
-class ControlError(RuntimeError):
-    def __init__(self, message: str, *, status: int | None = None, details: Any = None):
-        super().__init__(message)
-        self.status = status
-        self.details = details
-
-
-def _control(paths, token: str, method: str, route: str, body: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
-    discovery = _read_support_json(paths.discovery_path)
-    if not discovery or not discovery.get("endpoint"):
-        raise ControlError("No live Runtime discovery is available; tasks clear will not start Runtime.")
-    endpoint = _validate_loopback_endpoint(str(discovery["endpoint"])).rstrip("/")
-    payload = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    if payload is not None:
-        headers["Content-Type"] = "application/json"
-    if method == "POST" and route.endswith("/abandon"):
-        headers["Idempotency-Key"] = _abandon_key(route, body)
-    request = urllib.request.Request(endpoint + route, data=payload, method=method, headers=headers)
-    try:
-        with urlopen_loopback(request, timeout=30) as response:
-            result = json.loads(response.read(1024 * 1024).decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            details = json.loads(exc.read(1024 * 1024).decode("utf-8"))
-        except Exception:
-            details = {"message": str(exc)}
-        message = details.get("message") if isinstance(details, Mapping) else None
-        raise ControlError(str(message or details), status=exc.code, details=details) from exc
-    except (OSError, ValueError) as exc:
-        raise ControlError(str(exc)) from exc
-    if not isinstance(result, Mapping):
-        raise ControlError("Runtime returned invalid owner-control metadata.")
-    return result
-
-
 def _error_row(task_id: str, outcome: str, error: str, **extra: Any) -> dict[str, Any]:
     return {"task_id": task_id, "outcome": outcome, "error": error, **extra}
 
 
-def _control_details(value: Any) -> Mapping[str, Any]:
-    """Normalize typed-client detail maps and raw HTTP error envelopes."""
-    if not isinstance(value, Mapping):
-        return {}
-    details = value.get("details", value)
-    if isinstance(details, Mapping) and isinstance(details.get("error"), Mapping):
-        details = details["error"].get("details", details["error"])
-    return details if isinstance(details, Mapping) else {}
-
-
-def _typed_control(client):
-    if not all(hasattr(client, name) for name in (
-        "get_task_settlement", "get_local_worker_generation", "relinquish_local_worker", "abandon_task",
-    )):
-        return None
-
-    def request(method: str, route: str, body: Mapping[str, Any] | None = None):
-        try:
-            if method == "GET" and route.endswith("/settlement"):
-                task_id = unquote(route.rsplit("/tasks/", 1)[1].rsplit("/settlement", 1)[0])
-                return client.get_task_settlement(task_id)
-            if method == "GET" and route == "/v1/control/local-worker/generation":
-                return client.get_local_worker_generation()
-            if method == "POST" and route.endswith("/abandon"):
-                task_id = unquote(route.rsplit("/tasks/", 1)[1].rsplit("/abandon", 1)[0])
-                return client.abandon_task(task_id, body, idempotency_key=_abandon_key(route, body))
-            if method == "POST" and route == "/v1/control/local-worker/relinquish":
-                return client.relinquish_local_worker(
-                    str(body["executor_incarnation"]), str(body["evidence_digest"]),
-                    expected_task_ids=list(body["expected_task_ids"]),
-                )
-            raise ControlError("Unsupported owner-control operation.")
-        except ControlError:
-            raise
-        except Exception as exc:
-            raise ControlError(str(exc), status=getattr(exc, "status", None),
-                               details=getattr(exc, "details", None)) from exc
-
-    return request
-
-
-def clear_tasks(paths, task_ids: list[str], *, credential_reader, client_factory, control_request=None) -> dict[str, Any]:
+def clear_tasks(paths, task_ids: list[str], *, credential_reader, client_factory) -> dict[str, Any]:
     """Clear only named tasks and report one stable result per input occurrence."""
     unique_ids = list(dict.fromkeys(task_ids))
     outcomes: dict[str, dict[str, Any]] = {}
     try:
         token = credential_reader(paths)
         if not isinstance(token, str) or not token.isascii() or any(ord(char) < 0x20 or ord(char) == 0x7f for char in token):
-            raise ControlError("Runtime owner credential is malformed.")
-        if control_request is None:
-            _validate_support_paths(paths)
-            discovery = _read_support_json(paths.discovery_path)
-            if not discovery or not discovery.get("endpoint"):
-                raise ControlError("No live Runtime owner is available; tasks clear will not start Runtime.")
+            raise RuntimeError("Runtime owner credential is malformed.")
+        _validate_support_paths(paths)
+        discovery = _read_support_json(paths.discovery_path)
+        if not discovery or not discovery.get("endpoint"):
+            raise RuntimeError("No live Runtime owner is available; tasks clear will not start Runtime.")
         client = client_factory(paths)
-        if control_request is None:
-            control_request = _typed_control(client)
-            if control_request is None:
-                control_request = lambda method, route, body=None: _control(paths, token, method, route, body)
+        from astrid_runtime_client import ApiError
+
         # Complete owner authorization and settlement preflight for every id
         # before issuing any canonical cancellation mutation.
         observations: dict[str, Mapping[str, Any] | None] = {}
         for task_id in unique_ids:
             try:
-                observations[task_id] = control_request(
-                    "GET", f"/v1/control/tasks/{quote(task_id, safe='')}/settlement"
-                )
-            except ControlError as exc:
+                observations[task_id] = client.get_task_settlement(task_id)
+            except ApiError as exc:
                 if exc.status == 404:
                     observations[task_id] = None
                 else:
@@ -206,7 +122,7 @@ def clear_tasks(paths, task_ids: list[str], *, credential_reader, client_factory
         if outcomes.get(task_id, {}).get("outcome") in {"unknown", "failed", "already_settled", "lost"}:
             continue
         try:
-            current = control_request("GET", f"/v1/control/tasks/{quote(task_id, safe='')}/settlement")
+            current = client.get_task_settlement(task_id)
             if current.get("settled") is True:
                 outcomes[task_id] = _lost_row(task_id, current) or {"task_id": task_id, "outcome": "settled", "state": current.get("state")}
             else:
@@ -225,7 +141,7 @@ def clear_tasks(paths, task_ids: list[str], *, credential_reader, client_factory
     # relinquish. Replay it with the same full id set even if tasks settled.
     if named_worker_tasks:
         try:
-            generation = control_request("GET", "/v1/control/local-worker/generation")
+            generation = client.get_local_worker_generation()
             state = str(generation.get("state") or "")
             incarnation = generation.get("executor_incarnation")
             evidence = generation.get("evidence_digest")
@@ -251,25 +167,23 @@ def clear_tasks(paths, task_ids: list[str], *, credential_reader, client_factory
                 for task_id in unresolved_worker:
                     outcomes[task_id]["worker_handoff_error"] = "named task execution binding does not match the current local Worker generation"
             if (pending_replay and matching_named) or can_relinquish_active:
-                control_request("POST", "/v1/control/local-worker/relinquish", {
-                    "executor_incarnation": incarnation,
-                    "evidence_digest": evidence,
-                    "expected_task_ids": unique_ids,
-                })
+                client.relinquish_local_worker(
+                    incarnation, evidence, expected_task_ids=unique_ids,
+                )
                 for task_id in unresolved:
                     if task_id not in matching_named:
                         continue
-                    current = control_request("GET", f"/v1/control/tasks/{quote(task_id, safe='')}/settlement")
+                    current = client.get_task_settlement(task_id)
                     if current.get("settled") is True:
                         outcomes[task_id] = {"task_id": task_id, "outcome": "settled", "state": current.get("state"),
                                              "worker_relinquished": True}
                     else:
                         outcomes[task_id] = {"task_id": task_id, "outcome": "unresolved", "state": current.get("state"),
                                              "blockers": current.get("blockers", [])}
-        except ControlError as exc:
+        except ApiError as exc:
             if exc.status != 404:
                 affected = unresolved or named_worker_tasks
-                details = _control_details(exc.details)
+                details = exc.details
                 for task_id in affected:
                     outcomes[task_id]["worker_handoff_error"] = str(exc)
                     if details:
@@ -294,8 +208,7 @@ def clear_tasks(paths, task_ids: list[str], *, credential_reader, client_factory
         if outcomes.get(task_id, {}).get("outcome") != "unresolved":
             continue
         try:
-            route = f"/v1/control/tasks/{quote(task_id, safe='')}"
-            current = control_request("GET", route + "/settlement")
+            current = client.get_task_settlement(task_id)
             task = current.get("task", {})
             binding = task.get("execution_binding")
             if (task.get("state") != "cancel_requested" or task.get("waiting_reason") != "provider_state_unknown"
@@ -317,8 +230,8 @@ def clear_tasks(paths, task_ids: list[str], *, credential_reader, client_factory
                     "lease_id": binding["lease_id"], "fence": binding["fence"],
                     "runtime_epoch": task["runtime_epoch"], "execution_binding": dict(binding),
                     "reason": "Owner tasks clear abandoned unresolved external execution; remote execution and billing may continue."}
-            control_request("POST", route + "/abandon", body)
-            final = control_request("GET", route + "/settlement")
+            client.abandon_task(task_id, body, idempotency_key=_abandon_key(task_id, body))
+            final = client.get_task_settlement(task_id)
             lost = _lost_row(task_id, final)
             if final.get("settled") is True and lost:
                 outcomes[task_id] = lost
@@ -326,8 +239,8 @@ def clear_tasks(paths, task_ids: list[str], *, credential_reader, client_factory
                 outcomes[task_id]["abandon_error"] = "owner abandon did not confirm a settled lost disposition"
         except Exception as exc:
             outcomes[task_id]["abandon_error"] = str(exc)
-            details = _control_details(getattr(exc, "details", None))
-            if details:
+            details = getattr(exc, "details", None)
+            if isinstance(details, Mapping) and details:
                 outcomes[task_id]["abandon_details"] = dict(details)
 
     return _result(task_ids, outcomes)
