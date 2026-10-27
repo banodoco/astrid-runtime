@@ -1006,7 +1006,7 @@ class BootstrapTests(unittest.TestCase):
                 stop_manager=lambda: manager_calls.append("manager"),
             )
         self.assertEqual(manager_calls, [])
-        self.assertEqual(caught.exception.details, {"stop_authority_lost": True})
+        self.assertIsNone(caught.exception.details)
         self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
         self.assertEqual(
             json.loads(self.paths.instance_lock_path.read_text()),
@@ -1239,11 +1239,27 @@ class BootstrapTests(unittest.TestCase):
     def test_installer_manager_failure_reports_known_runtime_stop(self):
         self._configure()
         def manager_failure():
-            raise RuntimeError("manager stop failed")
+            raise BootstrapError("manager stop failed", details={"safe": False, "blocker": "service"})
         with self.assertRaises(BootstrapError) as caught:
             down(self.paths, self.boundary, stop_manager=manager_failure)
-        self.assertEqual(caught.exception.details, {"stop_completed": True})
+        self.assertEqual(caught.exception.details, {"cause_details": {"safe": False, "blocker": "service"}})
         self.assertIn("manager stop failed", str(caught.exception))
+
+    def test_stop_owner_error_details_are_downstream_context(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        manager_calls = []
+
+        def uncertain_stop(**_kwargs):
+            raise BootstrapError("stop handoff failed", details={"safe": False, "blocker": "owner"})
+
+        self.boundary.stop_owner = uncertain_stop
+        with self.assertRaises(BootstrapError) as caught:
+            down(self.paths, self.boundary, stop_manager=lambda: manager_calls.append(True))
+        self.assertEqual(caught.exception.details, {
+            "cause_details": {"safe": False, "blocker": "owner"},
+        })
+        self.assertEqual(manager_calls, [])
 
     def test_same_controller_stop_retry_revalidates_completed_owner_absence(self):
         root = self._configure()
@@ -1255,7 +1271,7 @@ class BootstrapTests(unittest.TestCase):
 
         with self.assertRaisesRegex(BootstrapError, "manager unavailable") as caught:
             down(self.paths, self.boundary, stop_manager=manager_failure)
-        self.assertEqual(caught.exception.details, {"stop_completed": True})
+        self.assertIsNone(caught.exception.details)
 
         def retry_manager():
             with sqlite3.connect(root / "realm.sqlite3", timeout=0.02) as connection:
@@ -1323,7 +1339,7 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(BootstrapError, "manager unavailable") as caught:
             down(self.paths, self.boundary,
                  stop_manager=lambda: (_ for _ in ()).throw(RuntimeError("manager unavailable")))
-        self.assertEqual(caught.exception.details, {"stop_completed": True})
+        self.assertIsNone(caught.exception.details)
         self.assertFalse(self.paths.discovery_path.exists())
         self.assertFalse(self.paths.instance_lock_path.exists())
 
