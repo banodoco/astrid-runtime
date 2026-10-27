@@ -484,8 +484,8 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"ok": False, "error": str(exc)}, json_mode=True)
             return 1
     if args.command == "doctor":
-        # Doctor is read-only but must still use the concrete process boundary
-        # to distinguish a live, matching owner from a stale/reused PID.
+        # Doctor uses the concrete boundary's authenticated endpoint identity;
+        # local PID visibility is only a secondary diagnostic.
         result = doctor(paths, LocalRuntimeBoundary())
         _emit(result, json_mode=args.json)
         return 0 if result["healthy"] else 1

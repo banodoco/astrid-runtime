@@ -227,7 +227,8 @@ class BootstrapTests(unittest.TestCase):
         result = restart(self.paths, self.boundary, self.config)
         self.assertEqual(result.status, "restarted")
         self.assertEqual(result.realm_id, first.realm_id)
-        self.assertEqual(self.boundary.restart_calls, 1)
+        # The old owner is already absent; restart must not signal a reused PID.
+        self.assertEqual(self.boundary.restart_calls, 0)
 
     def test_restart_and_down_share_unreconciled_attempt_refusal(self):
         root = self._configure()
@@ -358,6 +359,7 @@ class BootstrapTests(unittest.TestCase):
     def test_legacy_collision_refuses_parallel_empty_realm_with_exact_action(self):
         legacy = self.paths.home / ".astrid"
         legacy.mkdir(parents=True)
+        (legacy / "astrid.sqlite3").touch()
         with self.assertRaises(LegacyRootCollisionError) as caught:
             bootstrap(self.paths, self.boundary, self.config)
         self.assertIn("Legacy realm roots are unsupported", str(caught.exception))
@@ -701,3 +703,103 @@ def test_bootstrap_uncertain_incumbent_probe_preserves_authority():
         assert len(case.boundary.starts) == starts
     finally:
         case.tearDown()
+
+
+class StaleOwnerTests(unittest.TestCase):
+    setUp = BootstrapTests.setUp
+    tearDown = BootstrapTests.tearDown
+    _configure = BootstrapTests._configure
+    """Exercise reclamation using an occupied PID, without signalling it."""
+
+    def _occupied_pid(self, *, observation="different"):
+        from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+        self._configure()
+        first = bootstrap(self.paths, self.boundary, self.config)
+        for path in (self.paths.discovery_path, self.paths.instance_lock_path):
+            record = json.loads(path.read_text())
+            record["pid"] = os.getpid()
+            path.write_text(json.dumps(record))
+        expected = json.loads(self.paths.discovery_path.read_text())["process_birth_id"]
+        # The reused PID is a real live process. Birth observations for newly
+        # launched fake owners still use their synthetic test marker.
+        self.boundary.is_pid_alive = lambda pid: pid == os.getpid() or pid in self.boundary.alive
+        self.boundary.process_birth_identity = lambda pid: (
+            (None if observation == "unknown" else expected if observation == "same"
+             else LocalRuntimeBoundary.process_birth_identity(pid)) if pid == os.getpid() else None)
+        self.boundary.valid_owner = False
+        return first
+
+    def test_up_reclaims_reused_pid_without_signalling(self):
+        first = self._occupied_pid()
+        second = bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(first.realm_id, second.realm_id)
+        self.assertEqual(len(self.boundary.starts), 2)
+        self.assertEqual(self.boundary.restart_calls, 0)
+        self.assertNotEqual(json.loads(self.paths.instance_lock_path.read_text())["pid"], os.getpid())
+
+    def test_down_reclaims_reused_pid_without_signalling(self):
+        self._occupied_pid()
+        result = down(self.paths, self.boundary)
+        self.assertEqual(result["status"], "stopped")
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
+        self.assertEqual(self.boundary.restart_calls, 0)
+
+    def test_up_reclaims_stale_lock_without_discovery(self):
+        self._occupied_pid()
+        self.paths.discovery_path.unlink()
+        bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(len(self.boundary.starts), 2)
+
+    def test_unknown_or_matching_owner_is_preserved(self):
+        for observation in ("unknown", "same"):
+            with self.subTest(observation=observation):
+                if self.paths.catalog_path.exists():
+                    self.tearDown()
+                    self.setUp()
+                self._occupied_pid(observation=observation)
+                before = {p: p.read_bytes() for p in (self.paths.discovery_path, self.paths.instance_lock_path)}
+                with self.assertRaises(DuplicateOwnerError):
+                    bootstrap(self.paths, self.boundary, self.config)
+                with self.assertRaises(BootstrapError):
+                    down(self.paths, self.boundary)
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+                self.assertEqual(self.boundary.restart_calls, 0)
+
+    def test_live_lock_protects_owner_despite_stale_discovery(self):
+        self._occupied_pid()
+        marker = json.loads(self.paths.instance_lock_path.read_text())
+        marker["process_birth_id"] = self.boundary.process_birth_identity(os.getpid())
+        self.paths.instance_lock_path.write_text(json.dumps(marker))
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary)
+        self.assertTrue(self.paths.discovery_path.exists())
+        self.assertTrue(self.paths.instance_lock_path.exists())
+
+    def test_up_preserves_genuine_live_owner_lock(self):
+        self._occupied_pid()
+        self.paths.discovery_path.unlink()
+        marker = json.loads(self.paths.instance_lock_path.read_text())
+        marker["process_birth_id"] = self.boundary.process_birth_identity(os.getpid())
+        self.paths.instance_lock_path.write_text(json.dumps(marker))
+        before = self.paths.instance_lock_path.read_bytes()
+        with self.assertRaises(DuplicateOwnerError):
+            bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
+        self.assertEqual(len(self.boundary.starts), 1)
+
+    def test_reclamation_preserves_replacement_records(self):
+        self._occupied_pid()
+        observe = self.boundary.process_birth_identity
+        replacement = json.loads(self.paths.instance_lock_path.read_text())
+        replacement["runtime_instance_id"] = "replacement-instance"
+
+        def replace_during_observation(pid):
+            self.paths.instance_lock_path.write_text(json.dumps(replacement))
+            return observe(pid)
+
+        self.boundary.process_birth_identity = replace_during_observation
+        with self.assertRaisesRegex(BootstrapError, "changed during stale-owner cleanup"):
+            down(self.paths, self.boundary)
+        self.assertTrue(self.paths.discovery_path.exists())
+        self.assertEqual(json.loads(self.paths.instance_lock_path.read_text()), replacement)

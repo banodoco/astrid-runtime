@@ -289,8 +289,8 @@ class BootstrapResult:
 
 
 def _default_legacy_roots(paths: RuntimePaths) -> tuple[Path, ...]:
-    # These are collision signals only; no directory is scanned and no legacy
-    # state is read.  Callers can provide the exact historical root explicitly.
+    # These are collision signals only; no legacy state is read.
+    # ~/.astrid also holds supported credentials and compute profiles.
     return (
         paths.home / ".astrid",
         paths.home / "Astrid" / "projects",
@@ -303,7 +303,15 @@ def _legacy_collision(paths: RuntimePaths, configured: tuple[Path, ...]) -> Path
         root = Path(root).expanduser()
         # lexists is intentional: a dangling legacy symlink is still a
         # collision and must not be bypassed by a stale/empty catalog.
-        if os.path.lexists(str(root)) and (root.is_dir() or root.is_file() or root.is_symlink()):
+        if root == paths.home / ".astrid" and root not in configured and root.is_dir() and not root.is_symlink():
+            # Inspect names only, never open legacy databases or credential files.
+            markers = (
+                "astrid.sqlite3", "workspace.sqlite3", "realm.sqlite3",
+                "projects", "runtime", "realms",
+            )
+            if any(os.path.lexists(str(root / marker)) for marker in markers):
+                return root
+        elif os.path.lexists(str(root)):
             return root
     return None
 
@@ -587,6 +595,38 @@ def _pid_alive(boundary: RuntimeBoundary | None, pid: Any) -> bool:
         raise BootstrapError("Runtime liveness observation remains uncertain.") from exc
 
 
+def _owner_may_be_alive(boundary: RuntimeBoundary, record: Mapping[str, Any]) -> bool:
+    """Only proven absence or a different birth permits stale-record cleanup."""
+    pid = record.get("pid")
+    if not _pid_alive(boundary, pid):
+        return False
+    observe = getattr(boundary, "process_birth_identity", None)
+    expected = record.get("process_birth_id")
+    if not callable(observe) or not expected:
+        return True
+    actual = observe(int(pid))
+    return actual is None or runtime_platform.process_birth_matches(str(expected), actual) is not False
+
+
+def _reclaim_stale_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> bool:
+    """Reclaim only stale advertisements under the launcher mutex; never signal.
+
+    Check both records before removing either: a missing/stale discovery must
+    not hide a live owner in instance.lock. Recheck snapshots so replacement
+    advertisements cannot be removed by an older cleanup attempt.
+    """
+    records = [(path, _read_support_json(path))
+               for path in (paths.discovery_path, paths.instance_lock_path)]
+    present = [(path, record) for path, record in records if record is not None]
+    if not present or any(_owner_may_be_alive(boundary, record) for _, record in present):
+        return False
+    if any(_read_support_json(path) != record for path, record in records):
+        raise BootstrapError("Runtime owner changed during stale-owner cleanup.")
+    for path, _ in present:
+        remove_file(path)
+    return True
+
+
 def _canonical_realm_root(value: str | Path) -> Path:
     raw = Path(value).expanduser()
     if not raw.is_absolute() or _has_symlink_component(raw) or raw.is_symlink():
@@ -828,13 +868,14 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     new_realm = False
     diagnostics: list[str] = []
 
+    _reclaim_stale_owner_locked(paths, boundary)
     discovery = _read_support_json(paths.discovery_path)
     if discovery is not None and discovery.get("active_realm"):
         _compatible(discovery, config, source)
         pid = discovery.get("pid")
         endpoint = str(discovery.get("endpoint", ""))
         instance_id = str(discovery.get("runtime_instance_id", ""))
-        if _pid_alive(boundary, pid):
+        if _owner_may_be_alive(boundary, discovery):
             if not endpoint or not instance_id:
                 raise DuplicateOwnerError(
                     "A runtime owner is active but its discovery record is incomplete; "
@@ -895,7 +936,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     # Never start a second owner while the durable instance lock still points
     # at a live process.
     marker = _read_support_json(paths.instance_lock_path)
-    if marker and _pid_alive(boundary, marker.get("pid")):
+    if marker and _owner_may_be_alive(boundary, marker):
         raise DuplicateOwnerError(
             "A different runtime owner is active for the selected realm; "
             "stop it before retrying astrid-runtime up --profile astrid."
@@ -1083,6 +1124,8 @@ def _owner_record_matches(
 def _interrupt_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> dict[str, Any]:
     """Identity-stop the owner while the caller holds the launcher mutex."""
     _validate_support_paths(paths)
+    if _reclaim_stale_owner_locked(paths, boundary):
+        return {"status": "stopped", "stale_owner": True}
     discovery = _read_support_json(paths.discovery_path)
     if not discovery:
         raise BootstrapError("No runtime owner is available to interrupt.")
@@ -1229,21 +1272,39 @@ def _doctor_observation(paths: RuntimePaths, boundary: RuntimeBoundary | None = 
     # Probed live in this process, evaluated for the configured mode.
     report["process_signalling"] = runtime_platform.process_control_probe(mode=report.get("process_control"))
     if discovery is not None:
-        report["pid_alive"] = bool(_pid_alive(boundary, discovery.get("pid")))
-        if not report["pid_alive"]:
-            report["healthy"] = False
-            report["issues"].append("stale_discovery")
-        elif boundary:
+        # Process visibility is diagnostic only: clients can be in another PID
+        # namespace. Lifecycle operations retain their stricter process fences.
+        try:
+            report["pid_alive"] = bool(_pid_alive(boundary, discovery.get("pid")))
+        except (BootstrapError, OSError):
+            report["pid_alive"] = None
+        if report["pid_alive"] is not True:
+            report["notes"] = ["pid_not_visible"]
+        if boundary:
             try:
-                owner_ok = bool(boundary.validate_owner(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", "")), owner_lock=paths.instance_lock_path, process_birth_id=str(discovery.get("process_birth_id") or "")))
+                metadata = boundary.endpoint_metadata(
+                    endpoint=_validate_loopback_endpoint(str(discovery.get("endpoint", ""))),
+                    credential_file=paths.runtime_support / "credentials" / "owner.token",
+                )
             except Exception:
-                owner_ok = False
-            if not owner_ok:
+                metadata = {}
+            if not metadata:
+                report["healthy"] = False
+                report["issues"].append(
+                    "stale_discovery" if report["pid_alive"] is False else "runtime_unhealthy"
+                )
+            elif (not discovery.get("runtime_instance_id") or not report.get("realm_id")
+                    or metadata.get("runtime_instance_id") != discovery["runtime_instance_id"]
+                    or metadata.get("realm_id") != discovery.get("active_realm")
+                    or metadata.get("realm_id") != report["realm_id"]):
                 report["healthy"] = False
                 report["issues"].append("discovery_identity")
-            elif not boundary.health(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", ""))):
+            elif metadata.get("status") != "ok":
                 report["healthy"] = False
                 report["issues"].append("runtime_unhealthy")
+        elif report["pid_alive"] is not True:
+            report["healthy"] = False
+            report["issues"].append("stale_discovery")
     return report, dict(discovery) if discovery is not None else None
 
 
