@@ -24,6 +24,7 @@ from runtime_protocol.errors import ValidationError
 from runtime_protocol.logs import RotatingLog
 from runtime_protocol.server import RuntimeHandler
 from runtime_protocol.services import ServiceConfiguration, ServiceSpec, ServiceSupervisor, load_service_configuration, parse_services
+import runtime_protocol.services as services_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +59,8 @@ def test_declaration_schema_and_parser_agree_on_portable_example():
     _document(argv=["bad\0argument"]), _document(name="../escape"), _document(name="Example"),
     _document(restart="never"), _document(shell=True), _document(env={"BAD=KEY": "value"}),
     _document(env={"KEY": None}), _document(env={"ASTRID_RUNTIME_JOB_HANDLE": "123"}),
+    _document(env={"ASTRID_RUNTIME_SERVICE_NAME": "pack-host"}),
+    _document(env={"ASTRID_RUNTIME_SERVICE_LAUNCH_ID": "a" * 32}),
     _document(ready={"file": "../chat.json"}), _document(ready={"file": "catalog.json"}),
     _document(ready={"file": "chat.json", "timeout_seconds": 0}),
     _document(ready={"file": "chat.json", "timeout_seconds": float("inf")}),
@@ -87,6 +90,69 @@ def test_unconfigured_services_do_not_read_any_paths_or_spawn(tmp_path, monkeypa
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support")
     assert daemon.services is None and daemon.service_status() == []
     spawn.assert_not_called()
+
+
+def test_supervisor_marks_runtime_owned_service_name_after_configured_env(tmp_path, monkeypatch):
+    spec = ServiceSpec("pack-host", (sys.executable,), "always", {"SERVICE_SETTING": "configured"})
+    supervisor = _supervisor(tmp_path, [spec])
+    monkeypatch.setenv("ASTRID_RUNTIME_SERVICE_NAME", "ambient-spoof")
+    env = supervisor._environment(spec)
+    assert env["ASTRID_RUNTIME_SERVICE_NAME"] == "pack-host"
+    assert env["SERVICE_SETTING"] == "configured"
+    assert "ASTRID_RUNTIME_SERVICE_LAUNCH_ID" not in env
+
+
+def test_pack_host_cleanup_receipts_are_bounded_owner_only_and_preserved(tmp_path):
+    supervisor = _supervisor(tmp_path, [ServiceSpec("pack-host", (sys.executable,), "always")])
+    supervisor._record_service_cleanup("pack-host", 321, "windows-creation:10", "a" * 32)
+    supervisor._record_service_cleanup("pack-host", 654, "windows-creation:20", "b" * 32)
+    receipt = supervisor.support / "pack-host-job-cleanup.json"
+    value = json.loads(receipt.read_text(encoding="utf-8"))
+    assert value == {"version": 1, "service_name": "pack-host", "support_root": str(supervisor.support.resolve()),
+        "receipts": [
+            {"pid": 321, "process_birth_id": "windows-creation:10", "runtime_service_launch_id": "a" * 32,
+                "job_drained": True},
+            {"pid": 654, "process_birth_id": "windows-creation:20", "runtime_service_launch_id": "b" * 32,
+                "job_drained": True},
+        ]}
+
+
+def test_service_cleanup_receipt_history_keeps_latest_64_attempts(tmp_path):
+    supervisor = _supervisor(tmp_path, [ServiceSpec("pack-host", (sys.executable,), "always")])
+    for index in range(65):
+        supervisor._record_service_cleanup("pack-host", index + 1, f"birth:{index}", f"{index:032x}")
+    value = json.loads((supervisor.support / "pack-host-job-cleanup.json").read_text(encoding="utf-8"))
+    assert len(value["receipts"]) == 64
+    assert value["receipts"][0]["runtime_service_launch_id"] == f"{1:032x}"
+    assert value["receipts"][-1]["runtime_service_launch_id"] == f"{64:032x}"
+
+
+def test_pack_host_cleanup_receipt_refuses_corrupt_history_without_overwriting(tmp_path):
+    supervisor = _supervisor(tmp_path, [ServiceSpec("pack-host", (sys.executable,), "always")])
+    receipt = supervisor.support / "pack-host-job-cleanup.json"
+    receipt.write_text("{}", encoding="utf-8")
+    platform.owner_only(receipt)
+    with pytest.raises(OSError, match="unsupported schema"):
+        supervisor._record_service_cleanup("pack-host", 321, "windows-creation:10", "a" * 32)
+    assert receipt.read_text(encoding="utf-8") == "{}"
+
+
+def test_shutdown_retry_publishes_pack_host_cleanup_receipt(tmp_path, monkeypatch):
+    supervisor = _supervisor(tmp_path, [ServiceSpec("pack-host", (sys.executable,), "always")])
+    item = supervisor._services[0]
+    item.process = object()
+    item.cleanup_identity = (321, "windows-creation:10", "a" * 32)
+    monkeypatch.setattr(services_module, "sys", SimpleNamespace(platform="win32"))
+    stopped = []
+    monkeypatch.setattr(platform, "stop_tree", lambda process, **kwargs: stopped.append(process))
+
+    supervisor.stop()
+
+    assert len(stopped) == 1
+    value = json.loads((supervisor.support / "pack-host-job-cleanup.json").read_text(encoding="utf-8"))
+    assert value["receipts"] == [{"pid": 321, "process_birth_id": "windows-creation:10",
+        "runtime_service_launch_id": "a" * 32, "job_drained": True}]
+    assert item.process is None and item.cleanup_identity is None
 
 
 def test_source_profile_selects_one_file_and_preserves_old_profile_digest(tmp_path):
@@ -412,8 +478,10 @@ def test_darwin_tree_cleanup_observes_zombie_before_group_kill_and_wait(monkeypa
 
 def test_windows_exit_observation_keeps_job_for_cleanup(monkeypatch):
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
-    job = SimpleNamespace(close=Mock())
-    child = SimpleNamespace(pid=1234, poll=lambda: 7, _runtime_job=job)
+    job = SimpleNamespace(handle=1, close=Mock(), active_processes=lambda: 0)
+    child = SimpleNamespace(pid=1234, args=["worker"], returncode=7, poll=lambda: 7,
+        wait=Mock(), _runtime_job=job)
+    monkeypatch.setattr(platform, "signal_tree", Mock())
     assert platform.tree_exited(child)
     platform.stop_tree(child)
     job.close.assert_called_once()

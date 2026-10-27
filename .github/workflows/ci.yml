@@ -27,9 +27,15 @@ jobs:
           tests/test_m1_review.py
       - name: Verify native Windows signal and foreground cleanup paths
         run: >-
-          python -m pytest -q
+          python -m pytest -q -m ""
           tests/test_platform_signaling.py
           tests/test_runtime_cli_serve_cleanup.py
+          tests/test_service_stop.py
+      - name: Verify Runtime service cleanup receipt contract
+        run: >-
+          python -m pytest -q -m ""
+          tests/test_profile_services.py
+          -k "cleanup_receipt or shutdown_retry or runtime_owned_service_name or invalid_declaration"
 
   unit:
     runs-on: ${{ matrix.os }}

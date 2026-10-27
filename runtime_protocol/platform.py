@@ -927,6 +927,46 @@ def stop_tree(process, grace=5.0, *, stop_channel=False):
                 pass
         process.wait(timeout=max(2.0, grace))
         return
+    if sys.platform == "win32":
+        if getattr(process, "_runtime_tree_drained", False):
+            process.wait(timeout=max(2.0, grace))
+            return
+        job = getattr(process, "_runtime_job", None)
+        if job is None or not job.handle:
+            raise ProcessLookupError("process has no retained Windows Job Object")
+        deadline = time.monotonic() + max(0.0, grace)
+        if not stop_channel and process.poll() is None:
+            try:
+                signal_tree(process, TERM)
+            except (OSError, ValueError):
+                # Forced cleanup below is authorized only by the retained Job.
+                pass
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        elif stop_channel:
+            # Hidden services have no console. EOF is their cooperative stop
+            # request; allow handlers to finish before forced Job cleanup.
+            time.sleep(max(0.0, deadline - time.monotonic()))
+
+        # The leader may already have exited while descendants remain in the
+        # Job. Always terminate the retained Job and wait for its accounting
+        # count to reach zero before releasing our only cleanup authority.
+        signal_tree(process, KILL)
+        drain_deadline = time.monotonic() + max(10.0, grace)
+        while True:
+            if job.active_processes() == 0:
+                tree_drained(process)
+                process._runtime_tree_drained = True
+                break
+            remaining = drain_deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, max(10.0, grace),
+                    "Windows Job Object did not drain")
+            time.sleep(min(0.05, remaining))
+        process.wait(timeout=max(2.0, grace))
+        return
     try:
         deadline = time.monotonic() + grace
         if process.poll() is None:
@@ -944,16 +984,15 @@ def stop_tree(process, grace=5.0, *, stop_channel=False):
             # Hidden services have no console. EOF is their cooperative stop
             # request; Job termination is the forced escalation.
             time.sleep(max(0.0, deadline - time.monotonic()))
-        if process.poll() is None or sys.platform != "win32":
-            try:
-                signal_tree(process, KILL)
-            except ProcessLookupError:
-                pass
+        try:
+            signal_tree(process, KILL)
+        except ProcessLookupError:
+            pass
         if process.poll() is None:
             process.wait(timeout=max(2.0, grace))
     finally:
         job = getattr(process, "_runtime_job", None)
-        if job:
+        if job and sys.platform != "win32":
             job.close()
 
 
