@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import errno
 import json
-import re
 import uuid
 from runtime_protocol.dirfd import filesystem as os
 from runtime_protocol import platform
@@ -372,11 +371,9 @@ class LocalRuntimeBoundary:
     def _spawn_runtime(self, argv: list[str], *, support_root: Path, stdout):
         """Publish exact child custody before any admission wait can fail."""
         environment = dict(os.environ)
-        operation_id = getattr(self, "_installer_operation_id", None)
-        if operation_id is None:
-            environment.pop("ASTRID_INSTALLER_OPERATION_ID", None)
-        else:
-            environment["ASTRID_INSTALLER_OPERATION_ID"] = operation_id
+        # The former installer transaction binding is never propagated to a
+        # daemon, even when inherited from an older launcher environment.
+        environment.pop("ASTRID_INSTALLER_OPERATION_ID", None)
         if sys.platform != "darwin":
             if sys.platform == "win32":
                 from runtime_protocol.windows_handoff import python_executable
@@ -440,10 +437,6 @@ class LocalRuntimeBoundary:
         owner_lock = self._validate_path(Path(owner_lock), "owner lock")
         support_root = self._validate_path(owner_lock.parent, "runtime support root")
         self._validate_source(source_profile)
-        operation_id = os.environ.get("ASTRID_INSTALLER_OPERATION_ID")
-        if operation_id is not None and not re.fullmatch(r"[0-9a-f]{32}", operation_id):
-            raise BootstrapError("ASTRID_INSTALLER_OPERATION_ID must be 32 lowercase hexadecimal characters.")
-        self._installer_operation_id = operation_id
         # Resolve only after the lexical fence.  No source profile field can
         # replace these neutral authority paths.
         realm_root = realm_root.resolve()
@@ -474,8 +467,6 @@ class LocalRuntimeBoundary:
         try:
             endpoint = self._wait_endpoint(support_root, self._process)
             discovery = self._read_discovery(support_root)
-            if discovery.get("installer_operation_id") != operation_id:
-                raise BootstrapError("Runtime owner launch binding differs from the requested transaction context.")
             identity = default_process_identity(self._process.pid)
             if identity is None:
                 raise BootstrapError("Ready Runtime child disappeared before custody publication.")
@@ -498,7 +489,6 @@ class LocalRuntimeBoundary:
             "pid": self._process.pid,
             "process_birth_id": discovery.get("process_birth_id") or self.process_birth_identity(self._process.pid),
             "runtime_instance_id": discovery.get("runtime_instance_id", ""),
-            **({"installer_operation_id": operation_id} if operation_id is not None else {}),
             "coordinator_epoch": discovery.get("coordinator_epoch"),
             "protocol_version": PROTOCOL_VERSION,
             "schema_version": SCHEMA_VERSION,
@@ -717,10 +707,14 @@ class LocalRuntimeBoundary:
                 realm = json.loads(response.read().decode("utf-8"))
             if not isinstance(realm, Mapping) or not realm.get("realm_id"):
                 return {}
-            if health.get("installer_operation_id") is not None and (
-                realm.get("runtime_instance_id") != health.get("runtime_instance_id")
-                or realm.get("installer_operation_id") != health.get("installer_operation_id")
-            ):
+            # Older supported Runtime releases authenticated `/v1/realm` but
+            # did not include the optional instance id on that resource. The
+            # health snapshot still binds the endpoint to the observed owner;
+            # when realm supplies its own instance id, require it to agree.
+            realm_instance_id = realm.get("runtime_instance_id")
+            if (realm_instance_id is not None
+                    and (health.get("runtime_instance_id") is None
+                         or str(realm_instance_id) != str(health["runtime_instance_id"]))):
                 return {}
             return {**health, "realm_id": str(realm["realm_id"])}
         except (BootstrapError, OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
@@ -907,53 +901,6 @@ class LocalRuntimeBoundary:
     def stop_owner(self, **kwargs) -> Mapping[str, Any]:
         """Stop an adopted owner using the same birth/lock fences as restart."""
         return self.restart(**kwargs, start_after_stop=False)
-
-    def stop_recorded_foreground(self, *, recorded_foreground: Mapping[str, Any],
-                                 realm_id: str, realm_root: Path,
-                                 record_custody_authority=None) -> Mapping[str, Any]:
-        """Stop only an exact retained startup child whose custody handle is supplied.
-
-        The caller must retain the Popen returned by the launch boundary. A PID
-        and birth id without that handle are intentionally insufficient.
-        """
-        process = recorded_foreground.get("process")
-        try:
-            pid = int(recorded_foreground["pid"])
-            birth = str(recorded_foreground["birth_id"])
-            observed_realm = str(recorded_foreground["realm_id"])
-            observed_root = Path(str(recorded_foreground["realm_root"])).resolve()
-        except (KeyError, TypeError, ValueError, OSError) as exc:
-            raise BootstrapError("Runtime foreground stop refused: retained child identity is incomplete.") from exc
-        if (process is None or not callable(getattr(process, "poll", None))
-                or not callable(getattr(process, "wait", None))):
-            raise BootstrapError("Runtime foreground stop refused: retained child identity is incomplete.")
-        if (int(getattr(process, "pid", 0) or 0) != pid or not birth
-                or observed_realm != str(realm_id)
-                or observed_root != Path(realm_root).resolve()):
-            raise BootstrapError("Runtime foreground stop refused: retained child does not match the selected realm.")
-        if process.poll() is None:
-            if self.process_birth_identity(pid) != birth:
-                raise BootstrapError("Runtime foreground stop refused: child incarnation changed.")
-            if platform.sys.platform != "win32":
-                try:
-                    if platform.process_group(pid) != pid:
-                        raise BootstrapError("Runtime foreground stop refused: child is not its own session leader.")
-                except OSError as exc:
-                    raise BootstrapError("Runtime foreground stop refused: child session identity is unavailable.") from exc
-            elif getattr(process, "_runtime_job", None) is None:
-                raise BootstrapError("Runtime foreground stop refused: retained child has no Job Object custody.")
-        if record_custody_authority is not None:
-            if not callable(record_custody_authority):
-                raise BootstrapError("Runtime foreground stop refused: custody authority callback is invalid.")
-            record_custody_authority()
-        if process.poll() is not None:
-            return {"status": "stopped", "realm_id": str(realm_id), "pid": pid,
-                    "exit_evidence": "retained_child_already_exited"}
-        platform.stop_tree(process, grace=5.0)
-        if process.poll() is None:
-            raise BootstrapError("Runtime foreground stop remains uncertain after bounded custody cleanup.")
-        return {"status": "stopped", "realm_id": str(realm_id), "pid": pid,
-                "exit_evidence": "retained_child_stopped"}
 
     def prepare_restart(self, *, source_profile: SourceProfile, realm_id: str, realm_root: Path, support_root: Path, pid: int) -> None:
         """Adopt a detached daemon for an operator restart.

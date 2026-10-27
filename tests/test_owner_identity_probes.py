@@ -40,6 +40,24 @@ def test_boundary_marks_exact_identity_reads_and_preserves_realm_authentication(
     assert requests[1][2]["authorization"] == "Bearer test-owner-credential"
 
 
+def test_endpoint_metadata_rejects_conflicting_realm_instance_identity(tmp_path, monkeypatch):
+    credential = tmp_path / "owner.token"
+    credential.write_text("test-owner-credential")
+    platform.owner_only(credential)
+    endpoint = "http://127.0.0.1:17410"
+
+    def read(request, *, timeout):
+        value = ({"realm_id": "selected-realm", "runtime_instance_id": "other-owner"}
+                 if request.full_url.endswith("/v1/realm") else
+                 {"status": "ok", "runtime_instance_id": "selected-owner"})
+        return io.BytesIO(json.dumps(value).encode())
+
+    monkeypatch.setattr(runtime_boundary, "urlopen_loopback", read)
+    assert LocalRuntimeBoundary().endpoint_metadata(
+        endpoint=endpoint, credential_file=credential,
+    ) == {}
+
+
 @pytest.mark.parametrize("method,path,body,marker", [
     ("GET", "/v1/projects", None, "1"),
     ("POST", "/v1/projects", {"slug": "guarded", "name": "Guarded"}, "1"),
