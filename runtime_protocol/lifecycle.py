@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sqlite3
 import stat
-import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -218,63 +217,21 @@ def _normalized_blocker(
     }
 
 
-def _capture_database_files(database: Path) -> dict[str, bytes | None]:
-    captured: dict[str, bytes | None] = {"database": database.read_bytes()}
-    for sidecar in ("wal", "shm"):
-        path = database.with_name(database.name + f"-{sidecar}")
-        try:
-            mode = path.lstat().st_mode
-        except FileNotFoundError:
-            captured[sidecar] = None
-            continue
-        if not stat.S_ISREG(mode):
-            raise ValidationError(
-                f"cannot establish runtime interruption safety: SQLite {sidecar.upper()} sidecar is invalid"
-            )
-        captured[sidecar] = path.read_bytes()
-    return captured
-
-
 def inspect_interruption_state(root: str | Path) -> dict[str, object]:
-    """Observe lifecycle blockers without creating files, sidecars, or rows."""
+    """Observe committed lifecycle blockers without changing realm data.
+
+    SQLite may maintain WAL/SHM bookkeeping; this advisory observation never
+    authorizes a later stop, which must take a fresh interruption fence.
+    """
     _, database = _regular_database(root)
-    # Even a clean-looking database can gain a WAL between detection and open.
-    # Capture the full source file set twice and inspect only the private copy;
-    # SQLite may update the copy's -shm but never the live realm's sidecars.
-    with tempfile.TemporaryDirectory(prefix="astrid-lifecycle-") as snapshot_dir:
-        snapshot = Path(snapshot_dir) / database.name
-        captured: dict[str, bytes | None] | None = None
-        for _ in range(3):
-            try:
-                first = _capture_database_files(database)
-                second = _capture_database_files(database)
-            except FileNotFoundError:
-                continue
-            if first == second:
-                captured = first
-                break
-        if captured is None:
-            raise ValidationError(
-                "cannot establish runtime interruption safety: database snapshot changed during observation"
-            )
-        wal_bytes = captured["wal"]
-        shm_bytes = captured["shm"]
-        if wal_bytes and not shm_bytes:
-            raise ValidationError(
-                "cannot establish runtime interruption safety: live WAL index is unavailable"
-            )
-        snapshot.write_bytes(captured["database"] or b"")
-        if wal_bytes is not None:
-            snapshot.with_name(snapshot.name + "-wal").write_bytes(wal_bytes)
-        if shm_bytes is not None:
-            snapshot.with_name(snapshot.name + "-shm").write_bytes(shm_bytes)
-        connection = sqlite3.connect(sqlite_file_uri(snapshot), uri=True)
-        connection.row_factory = sqlite3.Row
+    connection = sqlite3.connect(sqlite_file_uri(database), uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
         connection.execute("PRAGMA query_only=ON")
-        try:
-            return _interruption_report(connection)
-        finally:
-            connection.close()
+        connection.execute("BEGIN")
+        return _interruption_report(connection)
+    finally:
+        connection.close()
 
 
 def assert_interruption_safe(root: str | Path) -> dict[str, object]:

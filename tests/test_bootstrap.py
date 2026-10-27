@@ -1553,14 +1553,14 @@ class BootstrapTests(unittest.TestCase):
             self._add_running_task(root)
             self.paths.bootstrap_lock_path.unlink(missing_ok=True)
             watched = (
-                database, Path(str(database) + "-wal"), Path(str(database) + "-shm"),
                 self.paths.discovery_path, self.paths.instance_lock_path,
                 self.paths.credentials_dir / "astrid.json",
             )
             before = {path: path.read_bytes() for path in watched if path.exists()}
             stop_calls = self.boundary.restart_calls
-            self.assertIn(Path(str(database) + "-wal"), before)
-            self.assertIn(Path(str(database) + "-shm"), before)
+            self.assertTrue(Path(str(database) + "-wal").exists())
+            self.assertTrue(Path(str(database) + "-shm").exists())
+            committed_before = tuple(owner_connection.iterdump())
             for force_collection in (False, True):
                 with self.subTest(force_collection=force_collection):
                     def observe(root):
@@ -1574,6 +1574,9 @@ class BootstrapTests(unittest.TestCase):
                     self.assertEqual(caught.exception.details["task_count"], 1)
                     self.assertEqual(stop_calls, self.boundary.restart_calls)
                     self.assertFalse(self.paths.bootstrap_lock_path.exists())
+                    # WAL/SHM bookkeeping is allowed; realm data and owner
+                    # publications must remain unchanged on refusal.
+                    self.assertEqual(committed_before, tuple(owner_connection.iterdump()))
                     after = {path: path.read_bytes() for path in watched if path.exists()}
                     self.assertEqual(before.keys(), after.keys())
                     for path, contents in before.items():
