@@ -27,9 +27,20 @@ jobs:
           tests/test_m1_review.py
       - name: Verify native Windows signal and foreground cleanup paths
         run: >-
-          python -m pytest -q
+          python -m pytest -q -m ""
           tests/test_platform_signaling.py
           tests/test_runtime_cli_serve_cleanup.py
+          tests/test_service_stop.py
+      - name: Verify Runtime service cleanup receipt contract
+        run: >-
+          python -m pytest -q
+          tests/test_profile_services.py::test_supervisor_marks_runtime_owned_service_name_after_configured_env
+          tests/test_profile_services.py::test_pack_host_cleanup_receipts_are_bounded_owner_only_and_preserved
+          tests/test_profile_services.py::test_service_cleanup_receipt_history_keeps_latest_64_attempts
+          tests/test_profile_services.py::test_pack_host_cleanup_receipt_refuses_corrupt_history_without_overwriting
+          tests/test_profile_services.py::test_shutdown_retry_publishes_pack_host_cleanup_receipt
+          'tests/test_profile_services.py::test_invalid_declaration_is_refused[document18]'
+          'tests/test_profile_services.py::test_invalid_declaration_is_refused[document19]'
 
   unit:
     runs-on: ${{ matrix.os }}

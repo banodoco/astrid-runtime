@@ -382,9 +382,9 @@ def _wait_absent(pid):
 
 def test_windows_service_stop_uses_stdin_eof_then_job_cleanup(monkeypatch):
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
-    job = SimpleNamespace(close=Mock())
+    job = SimpleNamespace(handle=1, close=Mock(), active_processes=lambda: 0)
     channel = Mock()
-    process = SimpleNamespace(pid=1234, stdin=channel, _runtime_job=job,
+    process = SimpleNamespace(pid=1234, args=["service"], stdin=channel, _runtime_job=job,
         poll=Mock(return_value=None),
         wait=Mock(side_effect=[subprocess.TimeoutExpired("service", 1), None]))
     events = []

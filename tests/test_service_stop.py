@@ -82,3 +82,39 @@ def test_windows_service_stdin_eof_runs_handler_before_job_cleanup(tmp_path):
             platform.stop_tree(process, grace=0.1, stop_channel=True)
     assert done.read_text() == "eof"
     assert process.returncode == 0
+
+
+@pytest.mark.integration
+@requires_windows_job_object
+def test_windows_stop_tree_drains_descendants_after_leader_exits(tmp_path):
+    pid_file = tmp_path / "child.pid"
+    script = tmp_path / "service.py"
+    script.write_text(
+        "import pathlib,signal,subprocess,sys,time\n"
+        "if hasattr(signal, 'SIGBREAK'): signal.signal(signal.SIGBREAK, signal.SIG_IGN)\n"
+        "if sys.argv[1] == 'child':\n"
+        f" pathlib.Path({str(pid_file)!r}).write_text(str(__import__('os').getpid()))\n"
+        " while True: time.sleep(1)\n"
+        "subprocess.Popen([sys.executable, __file__, 'child'])\n"
+        f"deadline=time.monotonic()+5\nwhile not pathlib.Path({str(pid_file)!r}).exists() and time.monotonic()<deadline: time.sleep(.01)\n"
+        "sys.exit(0)\n",
+        encoding="utf-8")
+    process = platform.spawn_tree([sys.executable, str(script), "root"], hidden=True,
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _wait_for(pid_file)
+        child_pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while not platform.tree_exited(process) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert platform.tree_exited(process), "service root did not exit before stop"
+        platform.stop_tree(process, grace=0.1, stop_channel=True)
+        assert platform.tree_drained(process)
+    finally:
+        job = getattr(process, "_runtime_job", None)
+        if job is not None and job.handle:
+            platform.stop_tree(process, grace=0.1, stop_channel=True)
+    deadline = time.monotonic() + 5
+    while platform.process_identity(child_pid) is not None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert platform.process_identity(child_pid) is None
