@@ -39,6 +39,10 @@ jobs:
           tests/test_profile_services.py::test_service_cleanup_receipt_history_keeps_latest_64_attempts
           tests/test_profile_services.py::test_pack_host_cleanup_receipt_refuses_corrupt_history_without_overwriting
           tests/test_profile_services.py::test_shutdown_retry_publishes_pack_host_cleanup_receipt
+          tests/test_profile_services.py::test_cleanup_receipt_write_failure_retains_identity_and_stop_retries
+          tests/test_profile_services.py::test_pending_cleanup_blocks_replacement_attempt
+          tests/test_profile_services.py::test_cleanup_retry_preserves_on_failure_clean_exit_policy
+          tests/test_profile_services.py::test_cleanup_retry_preserves_readiness_failure_outcome
           'tests/test_profile_services.py::test_invalid_declaration_is_refused[document18]'
           'tests/test_profile_services.py::test_invalid_declaration_is_refused[document19]'
 
