@@ -122,6 +122,8 @@ jobs:
       - run: sh tests/seccomp/run-suite.sh
 
   portability-lifecycle:
+    env:
+      ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     strategy:
       fail-fast: false
       matrix:
@@ -129,12 +131,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Read verified Astrid revision
+        id: astrid-pin
+        run: echo "sha=$(cat tests/astrid-agent.pin)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-agent
+          ref: ${{ steps.astrid-pin.outputs.sha }}
+          path: astrid-agent
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
       - run: python -m pip install -e '.[test]'
       - run: python -m pip install -e packages/python
+      - run: python -m pip install -e "$ASTRID_CHECKOUT"
       - run: >-
           python -m pytest -q -m ""
           tests/test_platform.py

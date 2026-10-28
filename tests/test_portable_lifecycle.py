@@ -114,10 +114,11 @@ def test_real_post_worker_finishes_after_runtime_daemon_process_is_killed(tmp_pa
     program = tmp_path / "program with spaces"
     data = tmp_path / "data with spaces"
     version = program / "versions" / "old"
-    agent_root = ROOT.parent / "astrid-agent"
+    agent_root = Path(os.environ.get("ASTRID_CHECKOUT") or ROOT.parent / "astrid-agent").resolve()
     ready, trigger, worker_result = (tmp_path / "daemon.json", tmp_path / "worker.start",
                                      tmp_path / "worker.json")
     worker_pid = tmp_path / "worker.pid"
+    worker_log = tmp_path / "worker.log"
     worker_script = tmp_path / "update-worker.py"
     worker_script.write_text(f"""\
 import json, pathlib, sys, time
@@ -137,6 +138,7 @@ import contextlib, hashlib, json, os, pathlib, secrets, subprocess, sys, time
 from types import SimpleNamespace
 sys.path[:0] = [{str(ROOT)!r}, {str(agent_root)!r}]
 from astrid_runtime import update
+from astrid.installer.service import install_selection
 from runtime_protocol import platform
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.door import DoorConfig, PRODUCT_SCOPES
@@ -148,7 +150,7 @@ python=version/'python'; python.write_text('')
 profile=version/'profile.json'; profile.write_text(json.dumps({{'profile':'astrid','source_checkout':str(agent),'runtime_checkout':str(runtime)}}))
 old={{'root':str(version),'python':str(python),'profile':str(profile),'identity':{{'release':4,'managed_by':None}},'env':{{'ASTRID_INSTALL_RELEASE':'4','ASTRID_INSTALL_MANAGED_BY':''}}}}
 (version/'version.json').write_text(json.dumps(old)); (program/'current').write_text('old\\n')
-selection=data_home=pathlib.Path(os.environ['XDG_DATA_HOME']); selection=selection/'astrid-install.json'; selection.parent.mkdir(parents=True,exist_ok=True)
+selection=install_selection(home, sys.platform); selection.parent.mkdir(parents=True,exist_ok=True)
 selected={{'owner':'haus.astrid.runtime','program_root':str(program),'data_root':str(data),'realm_root':str(realm),'realm_id':'test-realm'}}
 selection.write_text(json.dumps(selected)); marker=program/'install.json'; marker.write_text(json.dumps({{'owner':'haus.astrid.runtime','data_root':str(data)}}))
 snapshots={{path:path.read_bytes() for path in (selection,program/'current',version/'version.json',profile,marker)}}
@@ -169,7 +171,8 @@ admission._helper=helper
 trigger=pathlib.Path({str(trigger)!r}); result_path=pathlib.Path({str(worker_result)!r}); worker_pid=pathlib.Path({str(worker_pid)!r})
 def launch(job):
     op=job['operation_id']
-    worker=subprocess.Popen([sys.executable,{str(worker_script)!r},str(program),op,{str(trigger)!r},{str(worker_result)!r}],cwd={str(ROOT)!r},env=os.environ.copy(),start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    with open({str(worker_log)!r}, 'w') as log:
+        worker=subprocess.Popen([sys.executable,{str(worker_script)!r},str(program),op,{str(trigger)!r},{str(worker_result)!r}],cwd={str(ROOT)!r},env=os.environ.copy(),start_new_session=True,stdout=log,stderr=subprocess.STDOUT)
     worker_pid.write_text(str(worker.pid))
     return {{'state':'launching','launch_status':'acknowledged'}}
 admission.launcher=launch
@@ -204,6 +207,7 @@ while True: time.sleep(1)
         deadline = time.monotonic() + 20
         while not worker_result.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
+        assert worker_result.exists(), f"worker produced no result: {worker_log.read_text(encoding='utf-8') if worker_log.exists() else 'no worker log'}"
         worker_result_payload = json.loads(worker_result.read_text(encoding="utf-8"))
         assert worker_result_payload["state"] == "failed"
         assert worker_result_payload["operation_id"] == accepted_response["operation_id"]
