@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -11,13 +12,95 @@ from types import SimpleNamespace
 import pytest
 
 from astrid_runtime import update
-from tests.door_helpers import start_door_world
+from tests.door_helpers import DoorWorld, HOSTED, create_realm, start_door_world
+from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.door import DoorConfig
 
 
 def _write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value))
     return path
+
+
+@pytest.mark.integration
+def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_path, monkeypatch):
+    home, root, data = (tmp_path / name for name in ("home", "program", "data"))
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("ASTRID_INSTALL_RELEASE", "4")
+    monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "")
+    folder = root / "versions" / "old"
+    agent, runtime = folder / "agent", folder / "runtime"
+    agent.mkdir(parents=True)
+    runtime.mkdir()
+    python = folder / "bin" / "python"
+    python.parent.mkdir()
+    python.symlink_to(sys.executable)
+    profile = _write(folder / "profile.json", {"profile": "astrid", "source_checkout": str(agent), "runtime_checkout": str(runtime)})
+    identity = {"release": 4, "managed_by": None}
+    _write(folder / "version.json", {"root": str(folder), "python": str(python), "profile": str(profile), "identity": identity})
+    _write(folder / "manifest.json", {"release": 4})
+    (root / "current").write_text("old\n")
+    realm = data / "runtime" / "realms" / "test"
+    create_realm(realm)
+    credential = home / "astrid.json"
+    daemon = RuntimeDaemon(realm, support_root=data / "runtime", door=DoorConfig(origin=HOSTED, port=0, credential_file=credential), agent_checkout=agent, runtime_checkout=runtime).start()
+    world = DoorWorld(tmp_path, daemon, credential)
+    try:
+        record = {"owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data),
+                  "realm_id": daemon.service.realm["id"], "realm_root": str(realm), "identity": identity}
+        selected = _write(update._install_record_path(home), record)
+        marker = _write(root / "install.json", record)
+        world.provision()
+        calls = []
+
+        def helper(selected_python, selected_agent, selected_runtime, payload):
+            assert (selected_python, selected_agent, selected_runtime) == (python, agent, runtime)
+            calls.append(payload)
+            if payload.get("action") == "accept":
+                job = {"operation_id": payload["operation_id"], "state": "accepted"}
+                _write(marker, {**record, "update_job": job})
+                return job
+            if payload.get("action") == "launch":
+                return {"launch_status": "started"}
+            result = {"release": 5}
+            for name in ("manifest", "bootstrap"):
+                path = Path(payload["directory"]) / name
+                path.write_bytes(name.encode())
+                update.platform.owner_only(path)
+                result[name + "_sha256"] = hashlib.sha256(name.encode()).hexdigest()
+            return result
+
+        monkeypatch.setattr(daemon.update_admission, "_helper", helper)
+        monkeypatch.setattr(update, "assert_interruption_safe", lambda _root: None)
+        before = marker.read_bytes()
+        for _ in range(2):
+            response = world.call("/api/runtime/v1/update/status")
+            assert response.status == 200
+            assert response.json() == {"available": True, "state": "none"}
+        assert calls == [] and marker.read_bytes() == before
+        record["preferences"] = {"autostart": False}
+        _write(selected, record)
+        assert world.call("/api/runtime/v1/update/status").json() == {
+            "available": False, "reason": "updater-unavailable", "state": "none"}
+        assert calls == [] and marker.read_bytes() == before
+        del record["preferences"]
+        _write(selected, record)
+        _write(folder / "manifest.json", {"release": 3})
+        assert world.call("/api/runtime/v1/update/status").json()["available"] is False
+        assert calls == [] and marker.read_bytes() == before
+        _write(folder / "manifest.json", {"release": 4})
+        response = world.call("/api/runtime/v1/update", "POST", body=b"")
+        assert response.status == 202
+        operation_id = response.json()["operation_id"]
+        assert [call.get("action") for call in calls] == [None, "accept", "launch"]
+        assert calls[-1]["operation_id"] == operation_id
+        assert world.call("/api/runtime/v1/update/status").json()["operation_id"] == operation_id
+        shutil.rmtree(calls[0]["directory"])
+    finally:
+        world.stop()
 
 
 def test_status_reads_authoritative_job_and_c2_journal_without_recovery(tmp_path):
