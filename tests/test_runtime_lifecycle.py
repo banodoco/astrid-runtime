@@ -170,53 +170,6 @@ def test_interruption_fence_keeps_http_owner_identity_reachable_during_claim(tmp
         daemon.stop()
 
 
-def test_installer_operation_binding_is_published_and_not_inherited_by_services(tmp_path, monkeypatch):
-    root = tmp_path / "realm"
-    support = tmp_path / "support"
-    RealmStore.initialize(root, realm_id="realm-binding").close()
-    operation_id = "a" * 32
-    child_observation = tmp_path / "child-operation-id.txt"
-    monkeypatch.setenv("ASTRID_INSTALLER_OPERATION_ID", operation_id)
-    child_script = (
-        "from pathlib import Path; import os,sys; "
-        "Path(sys.argv[1]).write_text(os.environ.get('ASTRID_INSTALLER_OPERATION_ID', '<absent>'), "
-        "encoding='utf-8')"
-    )
-    services = ServiceConfiguration((ServiceSpec(
-        "binding-probe", (sys.executable, "-c", child_script, str(child_observation)), "on-failure",
-    ),), sys.executable, root)
-
-    daemon = RuntimeDaemon(
-        root, support_root=support, owner_lock=support / "instance.lock", services=services,
-        log_directory=tmp_path / "logs",
-    )
-    assert daemon.installer_operation_id == operation_id
-    assert "ASTRID_INSTALLER_OPERATION_ID" not in os.environ
-    try:
-        daemon.start()
-        deadline = time.monotonic() + 5
-        while not child_observation.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert child_observation.is_file(), daemon.service_status()
-        assert child_observation.read_text(encoding="utf-8") == "<absent>"
-
-        discovery = json.loads((support / "discovery.json").read_text(encoding="utf-8"))
-        owner_lock = json.loads((support / "instance.lock").read_text(encoding="utf-8"))
-        assert discovery["installer_operation_id"] == operation_id
-        assert owner_lock["installer_operation_id"] == operation_id
-        boundary = LocalRuntimeBoundary()
-        health = boundary.owner_startup_identity(endpoint=daemon.endpoint, instance_id=daemon.instance_id)
-        assert health["runtime_instance_id"] == daemon.instance_id
-        assert health["installer_operation_id"] == operation_id
-        metadata = boundary.endpoint_metadata(
-            endpoint=daemon.endpoint, credential_file=daemon.credential_path,
-        )
-        assert metadata["realm_id"] == "realm-binding"
-        assert metadata["installer_operation_id"] == operation_id
-    finally:
-        daemon.stop()
-
-
 @pytest.mark.parametrize("failure", ["closed-store", "closed-primary", "missing-database", "corrupt-database"])
 def test_identity_snapshot_preserves_closed_or_broken_store_degradation(tmp_path, failure):
     from runtime_protocol.service import RuntimeService

@@ -542,7 +542,7 @@ def test_restart_retains_prior_attempt_and_requires_authorized_recovery(tmp_path
         blocked_lifecycle = inspect_interruption_state(root)
         assert blocked_lifecycle["safe"] is False
         assert blocked_lifecycle["unreconciled_attempts"]
-        with pytest.raises(ConflictError, match="active or unreconciled"):
+        with pytest.raises(ConflictError, match="Astrid is busy"):
             assert_interruption_safe(root)
         assert replacement.store.conn.execute(
             "SELECT COUNT(*) FROM attempts WHERE task_id=?", (first["task"]["id"],)
@@ -607,7 +607,7 @@ def test_restart_reconciles_runtime_owned_attempt_before_successor_claim(tmp_pat
             idempotency_key="runtime-owned-old-claim",
         )
         assert old["task_id"] == admitted["task"]["id"]
-        with pytest.raises(ConflictError, match="active or unreconciled"):
+        with pytest.raises(ConflictError, match="Astrid is busy"):
             assert_interruption_safe(root)
     finally:
         service.close()
@@ -755,7 +755,7 @@ def _assert_external_uncertainty_survives_restart(
     assert blocked_lifecycle["unreconciled_attempts"]
     assert blocked_lifecycle["claimed_or_stale_bindings"]
     assert blocked_lifecycle["unreleased_reservations"]
-    with pytest.raises(ConflictError, match="active or unreconciled"):
+    with pytest.raises(ConflictError, match="Astrid is busy"):
         assert_interruption_safe(service.store.root)
 
 
