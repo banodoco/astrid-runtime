@@ -112,7 +112,7 @@ def diagnostics_report(
     lines = [
         "Astrid diagnostics",
         f"Runtime version: {__version__}",
-        f"Install identity: managed_by={identity.get('managed_by', record.get('managed_by', 'unknown'))}; release={identity.get('release', 'unknown')}",
+        f"B1 identity: managed_by={identity.get('managed_by', record.get('managed_by', 'unknown'))}; release={identity.get('release', 'unknown')}",
         f"Runtime support state: {state} (healthy={healthy})",
         f"Last update result: {result}",
         f"Update log: {tx_log_path or '(not available)'}",
