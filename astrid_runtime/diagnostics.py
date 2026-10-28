@@ -15,7 +15,7 @@ from .update import read_update_status
 
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)(\b(?:authorization|proxy-authorization)\b[\"']?\s*[:=]\s*[\"']?(?:bearer\s+)?)[^\"'\s,;}]+"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)(\b(?:cookie|set-cookie)\s*[:=]\s*)[^\r\n]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(\b(?:cookie|set-cookie)[\"']?\s*[:=]\s*)[^\r\n]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)(\b(?:api[_ -]?key|openrouter[_ -]?api[_ -]?key|token|access[_ -]?token|refresh[_ -]?token|password|secret|credential)\b[\"']?\s*[=:]\s*['\"]?)[^\s,;'\"]+"), r"\1[REDACTED]"),
     (re.compile(r"\b(sk-or-v1-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{12,})\b"), "[REDACTED]"),
 )
@@ -88,23 +88,40 @@ def diagnostics_report(
     status = read_update_status(paths.home)
     transaction_path = (program_root / "update-transaction.json") if program_root else _install_record_path(paths.home).parent / "update-transaction.json"
     transaction = _read_json(transaction_path)
-    tx_log = status.get("log_path") or transaction.get("log") or transaction.get("log_path")
-    tx_log_path = Path(tx_log).expanduser() if isinstance(tx_log, str) else transaction_path.with_name("update.log")
+    install = _read_json(program_root / "install.json") if program_root else {}
+    job = install.get("update_job") if isinstance(install.get("update_job"), dict) else {}
+    # Acceptance snapshots the previous transaction while holding the installer
+    # lock. A different direct journal therefore belongs to a later attempt.
+    # Older jobs lack this fact, so retain the historical direct-journal fallback.
+    direct = bool(transaction) and not isinstance(transaction.get("update_job"), dict)
+    later_direct = direct and ("prior_transaction_id" not in job or
+                               transaction.get("operation_id") != job["prior_transaction_id"])
+    use_job = status.get("state") != "none" and not (later_direct and status.get("state") == "terminal")
+    tx_log = (status.get("log_path") if use_job else
+              transaction.get("log_path") or transaction.get("log"))
+    tx_log_path = (Path(tx_log).expanduser() if isinstance(tx_log, str) and tx_log else
+                   None if use_job else platform.log_dir(paths.home) / "install.log")
     launcher_log = (program_root / "logs" / "launcher.log") if program_root else None
     log_path = platform.log_dir(paths.home) / "runtime.log"
     retained = program_root / "versions" if program_root else None
-    result = status.get("result") if status.get("state") != "none" else None
-    result = result or transaction.get("result") or transaction.get("state") or "No update has run yet."
+    result = (status.get("result") or "Update status unavailable.") if use_job else (
+        transaction.get("result") or transaction.get("outcome") or transaction.get("step")
+        or transaction.get("state") or "No update has run yet.")
+    healthy = support.get("healthy", support.get("ok", "unknown"))
+    state = support.get("state") or ("healthy" if healthy is True else "unhealthy" if healthy is False else "unknown")
     lines = [
         "Astrid diagnostics",
         f"Runtime version: {__version__}",
         f"B1 identity: managed_by={identity.get('managed_by', record.get('managed_by', 'unknown'))}; release={identity.get('release', 'unknown')}",
-        f"Runtime support state: {support.get('state', 'unknown')} (healthy={support.get('healthy', 'unknown')})",
+        f"Runtime support state: {state} (healthy={healthy})",
         f"Last update result: {result}",
-        f"Update log: {status.get('log_path') or '(not available)'}",
+        f"Update log: {tx_log_path or '(not available)'}",
         "Installer transaction log:",
-        _tail(tx_log_path, paths.home),
+        _tail(tx_log_path, paths.home) if tx_log_path else "(not available)",
     ]
+    issues = support.get("issues")
+    if isinstance(issues, list) and issues:
+        lines += ["Runtime support issues:", *(f"- {issue}" for issue in issues if isinstance(issue, str))]
     if identity.get("managed_by", record.get("managed_by")) == "source" and launcher_log is not None:
         lines += ["Launcher log:", _tail(launcher_log, paths.home)]
     lines += [f"Retained back-end copies: {(_size(retained) if retained else 0)} bytes"]
