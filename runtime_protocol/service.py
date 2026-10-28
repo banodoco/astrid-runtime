@@ -1298,7 +1298,11 @@ class RuntimeService:
         if not row:
             return
         self._assert_executor_identity(identity, row["executor_id"])
-        self.store.assert_attempt_not_abandoned(row["attempt_id"] if "checkpoint_path" in row.keys() else row["id"])
+        keys = row.keys()
+        # Checkpoint rows name their attempt in attempt_id; attempt rows use id.
+        # A row that names no attempt has no attempt authority to retire.
+        attempt_key = "attempt_id" if "checkpoint_path" in keys else "id"
+        self.store.assert_attempt_not_abandoned(row[attempt_key] if attempt_key in keys else None)
         if identity is None:
             return
         activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
