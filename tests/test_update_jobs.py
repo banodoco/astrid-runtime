@@ -510,3 +510,34 @@ def test_authenticated_update_route_runs_selected_agent_platform_adapter(
             assert "New-ScheduledTaskTrigger" not in task_script
     finally:
         world.stop()
+
+
+def test_post_update_terminal_result_line_reads_back_through_status(tmp_path, monkeypatch):
+    world = start_door_world(tmp_path)
+    try:
+        admission, _, _ = _admission_fixture(tmp_path, monkeypatch, None)
+        admission.daemon = world.daemon
+        world.daemon.update_admission = admission
+        real_helper = admission._helper
+
+        def helper(python, agent, runtime, payload, **kwargs):
+            if payload.get("action") == "launch":
+                return {"launch_status": "started"}
+            return real_helper(python, agent, runtime, payload, **kwargs)
+
+        admission._helper = helper
+        response = world.call("/api/runtime/v1/update", "POST", body=b"")
+        assert response.status == 202
+        operation_id = response.json()["operation_id"]
+        # The launched worker finishes: it records the terminal job and its result line.
+        marker = tmp_path / "program with spaces" / "install.json"
+        record = json.loads(marker.read_text())
+        assert record["update_job"]["operation_id"] == operation_id
+        record["update_job"].update(state="updated", result="line one\nline two")
+        _write(marker, record)
+        status = world.call("/api/runtime/v1/update/status").json()
+        assert status["operation_id"] == operation_id
+        assert status["state"] == "terminal" and status["outcome"] == "updated"
+        assert status["result"] == "line one line two"
+    finally:
+        world.stop()
