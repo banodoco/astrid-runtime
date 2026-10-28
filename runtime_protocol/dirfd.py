@@ -460,7 +460,17 @@ class _WindowsFilesystem:
                 ctypes.memmove(ctypes.addressof(buffer) + _WinNameInformation.FileName.offset, data, len(data))
                 operation = lambda: self._set_information(fd, buffer, 11 if link else (65 if replace else 10))
                 if replace and not link:
-                    _retry_windows_sharing_violation(operation)
+                    try:
+                        _retry_windows_sharing_violation(operation)
+                    except OSError as error:
+                        # SMB and older filesystems may reject the extended class.
+                        # The legacy handle-relative operation remains atomic; if
+                        # an open destination blocks replacement it fails closed.
+                        if getattr(error, "winerror", None) not in (50, 87):
+                            raise
+                        legacy = _WinNameInformation.from_buffer(buffer)
+                        legacy.ReplaceIfExists = True
+                        _retry_windows_sharing_violation(lambda: self._set_information(fd, buffer, 10))
                 else:
                     operation()
             finally:

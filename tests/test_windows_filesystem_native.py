@@ -124,6 +124,8 @@ def test_native_unc_containment_and_publication(extended):
         parent = dirfd.open_directory_chain(spelling)
         dirfd.write_bytes_at(parent, "payload.bin", b"unc-payload")
         assert dirfd.read_bytes_at(parent, "payload.bin") == b"unc-payload"
+        dirfd.write_bytes_at(parent, "payload.bin", b"unc-replaced")
+        assert dirfd.read_bytes_at(parent, "payload.bin") == b"unc-replaced"
         with pytest.raises(OSError):
             dirfd.filesystem.open("../outside", os.O_WRONLY | os.O_CREAT, dir_fd=parent)
         target = Path(spelling) / "receipt.json"

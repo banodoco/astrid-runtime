@@ -290,6 +290,31 @@ def test_windows_rename_and_link_information_use_destination_handle(native_calls
         assert len(data) >= ctypes.sizeof(dirfd._WinNameInformation) + len(destination.encode("utf-16-le"))
 
 
+@pytest.mark.parametrize("code, expected_classes", [(50, [65, 10]), (87, [65, 10]), (5, [65]), (32, [65])])
+def test_windows_replace_falls_back_only_for_unsupported_extended_rename(native_calls, monkeypatch, code, expected_classes):
+    from contextlib import contextmanager
+    @contextmanager
+    def parent(cls, path, dir_fd=None):
+        yield dir_fd, path
+    monkeypatch.setattr(WindowsFilesystem, "_parent", classmethod(parent))
+    monkeypatch.setattr(dirfd, "_retry_windows_sharing_violation", lambda operation: operation())
+    calls = []
+    def set_information(cls, fd, buffer, kind, size=None):
+        calls.append((kind, bytes(buffer)))
+        if kind == 65:
+            error = OSError("rename rejected")
+            error.winerror = code
+            raise error
+    monkeypatch.setattr(WindowsFilesystem, "_set_information", classmethod(set_information))
+    if code in (50, 87):
+        WindowsFilesystem().replace("child", "target", src_dir_fd=_PARENT_FD, dst_dir_fd=20)
+        assert calls[-1][1][0] == 1  # legacy replace, same pinned destination handle
+    else:
+        with pytest.raises(OSError, match="rename rejected"):
+            WindowsFilesystem().replace("child", "target", src_dir_fd=_PARENT_FD, dst_dir_fd=20)
+    assert [kind for kind, _ in calls] == expected_classes
+
+
 @requires_windows_dirfd_adapter
 def test_windows_real_containment_and_parent_creation(tmp_path):
     target = tmp_path / "root" / "nested" / "receipt.json"

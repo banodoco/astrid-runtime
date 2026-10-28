@@ -578,7 +578,11 @@ class RoleCustodyAuthority:
 
     @contextmanager
     def _guard(self, *, exclusive: bool):
-        descriptor = os.open(self.root / "cleanup.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        if sys.platform == "win32":
+            from runtime_protocol.windows_security import open_private_file
+            descriptor = open_private_file(self.root / "cleanup.lock")
+        else:
+            descriptor = os.open(self.root / "cleanup.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             observed = os.fstat(descriptor)
             if not stat.S_ISREG(observed.st_mode) or not platform.is_owner_only(descriptor if sys.platform == "win32" else observed):
