@@ -22,6 +22,8 @@ from astrid_runtime.bootstrap import (
     CompatibilityError,
     DuplicateOwnerError,
     LegacyRootCollisionError,
+    PINOKIO_STOP_BINDING_KEYS,
+    PINOKIO_STOP_HANDOFF_VERSION,
     RestoreSelection,
     SourceProfile,
     _rollback_failed_bootstrap,
@@ -194,6 +196,439 @@ class BootstrapTests(unittest.TestCase):
         self.boundary.calls.clear()
         self.boundary.creates.clear()
         return root
+
+    def _configure_pinokio_selection(self, realm_root):
+        program = Path(self.temp.name) / "program"
+        version_root = program / "versions" / "v1"
+        environment = version_root / "py"
+        runtime_checkout = version_root / "r"
+        source_checkout = version_root / "a"
+        declaration = version_root / "services.json"
+        profile_path = version_root / "profile.json"
+        for directory in (environment / "bin", runtime_checkout, source_checkout):
+            directory.mkdir(parents=True, exist_ok=True)
+        python = environment / "bin" / "python"
+        python.write_text("runtime interpreter fixture\n", encoding="utf-8")
+        declaration.write_text("{}\n", encoding="utf-8")
+        source = SourceProfile(
+            "astrid", str(runtime_checkout), str(source_checkout),
+            runtime_environment=str(environment), source_digest="source-v1",
+            service_declaration=str(declaration),
+        )
+        profile_path.write_text(json.dumps({
+            "profile": "astrid", "runtime_checkout": str(runtime_checkout),
+            "source_checkout": str(source_checkout), "runtime_environment": str(environment),
+            "service_declaration": str(declaration), "source_digest": "source-v1",
+        }), encoding="utf-8")
+        identity = {"release": 9, "managed_by": "pinokio"}
+        version = {
+            "root": str(version_root), "python": str(python), "profile": str(profile_path),
+            "env": {}, "identity": identity,
+        }
+        version_root.mkdir(parents=True, exist_ok=True)
+        (version_root / "version.json").write_text(json.dumps(version), encoding="utf-8")
+        program.mkdir(parents=True, exist_ok=True)
+        (program / "current").write_text("v1\n", encoding="utf-8")
+        data_root = self.paths.app_support
+        (program / "install.json").write_text(json.dumps({
+            "owner": "haus.astrid.runtime", "managed_by": "pinokio",
+            "data_root": str(data_root),
+        }), encoding="utf-8")
+        selection_dir = Path(self.temp.name) / "selected-install"
+        selection_dir.mkdir(parents=True, exist_ok=True)
+        selection = selection_dir / "astrid-install.json"
+        selection.write_text(json.dumps({
+            "owner": "haus.astrid.runtime", "managed_by": "pinokio",
+            "program_root": str(program), "data_root": str(data_root),
+            "realm_id": "configured-realm", "realm_root": str(realm_root),
+            "identity": identity,
+        }), encoding="utf-8")
+        catalog = json.loads(self.paths.catalog_path.read_text(encoding="utf-8"))
+        catalog["source_profiles"]["astrid"] = source.as_dict()
+        self.paths.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+        return selection_dir, source
+
+    def test_pinokio_completed_stop_survives_fresh_down_and_is_revoked_before_launch(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            marker = json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(marker["state"], "completed_stop")
+            self.assertEqual(marker["completed_stop"]["version"], PINOKIO_STOP_HANDOFF_VERSION)
+            self.assertNotIn("owner", marker["completed_stop"])
+            first_marker_bytes = self.paths.instance_lock_path.read_bytes()
+            down(self.paths, self.boundary)
+            self.assertEqual(self.paths.instance_lock_path.read_bytes(), first_marker_bytes)
+
+            bootstrap(self.paths, self.boundary, self.config)
+            current_marker = json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8"))
+            self.assertNotIn("state", current_marker)
+            self.assertEqual(len(self.boundary.starts), 2)
+
+    def test_pinokio_completed_stop_rejects_missing_evidence_and_reused_pid(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            with self.assertRaises(BootstrapError) as missing:
+                down(self.paths, self.boundary)
+            self.assertEqual(missing.exception.details, {"safe": False, "code": "stop_unproven"})
+
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            owner_pid = int(json.loads(self.paths.instance_lock_path.read_text())["pid"])
+            self.boundary.alive.add(owner_pid)
+            with self.assertRaises(BootstrapError) as reused:
+                down(self.paths, self.boundary)
+            self.assertEqual(reused.exception.details, {"safe": False, "code": "stop_unproven"})
+            self.assertFalse(self.paths.instance_lock_path.exists())
+
+            self.boundary.alive.discard(owner_pid)
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            original_probe = self.boundary.is_pid_alive
+
+            def unknown(_pid):
+                raise PermissionError("process observation denied")
+
+            self.boundary.is_pid_alive = unknown
+            manager_calls = []
+            with self.assertRaises(BootstrapError) as uncertain:
+                down(self.paths, self.boundary, stop_manager=lambda: manager_calls.append(True))
+            self.assertEqual(uncertain.exception.details, {"safe": False, "code": "stop_unproven"})
+            self.assertEqual(manager_calls, [])
+            self.assertFalse(self.paths.instance_lock_path.exists())
+            self.boundary.is_pid_alive = original_probe
+
+    def test_pinokio_start_refuses_replayed_completed_marker_with_live_or_unknown_owner(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            owner_pid = int(json.loads(self.paths.instance_lock_path.read_text())["pid"])
+            starts_before = len(self.boundary.starts)
+
+            self.boundary.alive.add(owner_pid)
+            with self.assertRaises(BootstrapError):
+                bootstrap(self.paths, self.boundary, self.config)
+            self.assertEqual(len(self.boundary.starts), starts_before)
+            self.assertFalse(self.paths.instance_lock_path.exists())
+            self.boundary.alive.discard(owner_pid)
+
+            # Recreate a completed lifetime and make the OS observation fail.
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            starts_before = len(self.boundary.starts)
+
+            def unknown(_pid):
+                raise PermissionError("process observation denied")
+
+            self.boundary.is_pid_alive = unknown
+            with self.assertRaises(BootstrapError):
+                bootstrap(self.paths, self.boundary, self.config)
+            self.assertEqual(len(self.boundary.starts), starts_before)
+            self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_pinokio_completed_stop_refuses_malformed_marker_without_callbacks(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            valid = json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8"))
+            mutations = (
+                lambda value: value.update(pid=True),
+                lambda value: value.update(pid=str(value["pid"])),
+                lambda value: value.update(process_birth_id=None),
+                lambda value: value.update(runtime_instance_id=None),
+                lambda value: value["completed_stop"].update(version=True),
+                lambda value: value["completed_stop"].update(unexpected="field"),
+                lambda value: value.update(unexpected="field"),
+            )
+            manager_calls = []
+            starts = self.boundary.restart_calls
+            for mutate in mutations:
+                marker = json.loads(json.dumps(valid))
+                mutate(marker)
+                self.paths.instance_lock_path.write_text(json.dumps(marker), encoding="utf-8")
+                with self.assertRaises(BootstrapError) as caught:
+                    down(self.paths, self.boundary, stop_manager=lambda: manager_calls.append(True))
+                self.assertEqual(caught.exception.details, {"safe": False, "code": "stop_unproven"})
+                self.assertFalse(self.paths.instance_lock_path.exists())
+            self.assertEqual(manager_calls, [])
+            self.assertEqual(self.boundary.restart_calls, starts)
+
+    def test_pinokio_completed_stop_busy_refusal_preserves_marker_and_skips_manager(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            marker = self.paths.instance_lock_path.read_bytes()
+            self._add_running_task(root)
+            manager_calls = []
+            with self.assertRaises(BootstrapError):
+                down(self.paths, self.boundary, stop_manager=lambda: manager_calls.append(True))
+            self.assertEqual(manager_calls, [])
+            self.assertEqual(self.paths.instance_lock_path.read_bytes(), marker)
+
+    def test_pinokio_completed_stop_selection_change_then_revert_cannot_revive_receipt(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            selection_path = selection_dir / "astrid-install.json"
+            before = selection_path.read_bytes()
+            selected = json.loads(before)
+            selected["realm_id"] = "different-realm"
+            selection_path.write_text(json.dumps(selected), encoding="utf-8")
+            with self.assertRaises(BootstrapError) as changed:
+                down(self.paths, self.boundary)
+            self.assertEqual(changed.exception.details, {"safe": False, "code": "stop_unproven"})
+            self.assertFalse(self.paths.instance_lock_path.exists())
+
+            selection_path.write_bytes(before)
+            with self.assertRaises(BootstrapError) as replay:
+                down(self.paths, self.boundary)
+            self.assertEqual(replay.exception.details, {"safe": False, "code": "stop_unproven"})
+
+    def test_pinokio_completed_stop_survives_selected_version_advance_before_new_owner(self):
+        realm_root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(realm_root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            original = json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(original["state"], "completed_stop")
+            self.assertEqual(original["completed_stop"]["binding"]["owner_version_name"], "v1")
+
+            program = Path(original["completed_stop"]["binding"]["program_root"])
+            candidate = program / "versions" / "v2"
+            environment = candidate / "py"
+            runtime_checkout = candidate / "r"
+            source_checkout = candidate / "a"
+            profile_path = candidate / "profile.json"
+            candidate_python = environment / "bin" / "python"
+            for directory in (candidate, candidate_python.parent, runtime_checkout, source_checkout):
+                directory.mkdir(parents=True, exist_ok=True)
+            candidate_python.write_text("candidate Runtime interpreter fixture\n", encoding="utf-8")
+            candidate_profile = {
+                "profile": "astrid", "runtime_checkout": str(runtime_checkout),
+                "source_checkout": str(source_checkout), "runtime_environment": str(environment),
+                "service_declaration": source.service_declaration, "source_digest": "source-v2",
+            }
+            profile_path.write_text(json.dumps(candidate_profile), encoding="utf-8")
+            candidate_identity = {"release": 10, "managed_by": "pinokio"}
+            (candidate / "version.json").write_text(json.dumps({
+                "root": str(candidate), "python": str(candidate_python),
+                "profile": str(profile_path), "env": {}, "identity": candidate_identity,
+            }), encoding="utf-8")
+            (program / "current").write_text("v2\n", encoding="utf-8")
+            selection_path = selection_dir / "astrid-install.json"
+            selected = json.loads(selection_path.read_text(encoding="utf-8"))
+            selected["identity"] = candidate_identity
+            selection_path.write_text(json.dumps(selected), encoding="utf-8")
+
+            # C2 has moved the selected pointer and install identity, but the
+            # actual stopped owner and stable install binding are unchanged.
+            down(self.paths, self.boundary)
+            self.assertEqual(json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8")), original)
+
+    def test_pinokio_completed_stop_refuses_changed_owner_runtime_composition(self):
+        realm_root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(realm_root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            catalog = json.loads(self.paths.catalog_path.read_text(encoding="utf-8"))
+            changed = dict(catalog["source_profiles"]["astrid"])
+            changed["source_digest"] = "different-owner-runtime"
+            catalog["source_profiles"]["astrid"] = changed
+            self.paths.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+            with self.assertRaises(BootstrapError) as refusal:
+                down(self.paths, self.boundary)
+            self.assertEqual(refusal.exception.details, {"safe": False, "code": "stop_unproven"})
+            self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_pinokio_without_profile_or_selection_never_falls_through_to_idle_down(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            catalog = json.loads(self.paths.catalog_path.read_text(encoding="utf-8"))
+            catalog["source_profiles"] = {}
+            self.paths.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+            self.paths.instance_lock_path.unlink()
+            manager_calls = []
+            with self.assertRaises(BootstrapError) as missing_profile:
+                down(self.paths, self.boundary, stop_manager=lambda: manager_calls.append(True))
+            self.assertEqual(missing_profile.exception.details, {"safe": False, "code": "stop_unproven"})
+            self.assertEqual(manager_calls, [])
+
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            (selection_dir / "astrid-install.json").unlink()
+            self.paths.instance_lock_path.unlink()
+            with self.assertRaises(BootstrapError) as missing_selection:
+                down(self.paths, self.boundary, stop_manager=lambda: manager_calls.append(True))
+            self.assertEqual(missing_selection.exception.details, {"safe": False, "code": "stop_unproven"})
+            self.assertEqual(manager_calls, [])
+
+    def test_pinokio_preflight_never_unlinks_replacement_publications(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            replacement_marker = {"pid": 991122, "runtime_instance_id": "replacement"}
+            replacement_discovery = {"pid": 991122, "runtime_instance_id": "replacement"}
+
+            @contextmanager
+            def replace_after_preflight(_paths):
+                self.paths.instance_lock_path.write_text(json.dumps(replacement_marker), encoding="utf-8")
+                self.paths.discovery_path.write_text(json.dumps(replacement_discovery), encoding="utf-8")
+                yield
+
+            manager_calls = []
+            with patch("astrid_runtime.bootstrap._bootstrap_mutex", replace_after_preflight):
+                with self.assertRaises(BootstrapError):
+                    down(self.paths, self.boundary, stop_manager=lambda: manager_calls.append(True))
+            self.assertEqual(manager_calls, [])
+            self.assertEqual(json.loads(self.paths.instance_lock_path.read_text()), replacement_marker)
+            self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement_discovery)
+
+    def test_pinokio_receipt_publication_failure_and_failed_launch_consume_lifetime(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            real_write = bootstrap_module.atomic_write_json
+
+            def fail_receipt(path, value):
+                if Path(path) == self.paths.instance_lock_path and value.get("state") == "completed_stop":
+                    raise OSError("receipt publication failed")
+                return real_write(path, value)
+
+            with patch("astrid_runtime.bootstrap.atomic_write_json", side_effect=fail_receipt):
+                with self.assertRaisesRegex(OSError, "receipt publication failed"):
+                    down(self.paths, self.boundary)
+            current_marker = json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(current_marker.get("state"), "completed_stop")
+            self.assertFalse(self.paths.discovery_path.exists())
+
+            # A launch that never creates a child may re-attest the prior
+            # stopped lifetime only after the boundary explicitly confirms
+            # cleanup and the Runtime fence remains safe.
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            prior = json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8"))
+            self.boundary.stop = lambda: {"children_stopped": True}
+            with patch.object(self.boundary, "start", side_effect=BootstrapError("injected start failure")):
+                with self.assertRaisesRegex(BootstrapError, "injected start failure"):
+                    bootstrap(self.paths, self.boundary, self.config)
+            self.assertEqual(
+                json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8")), prior,
+            )
+
+    def test_aborted_launch_requires_explicit_cleanup_and_safe_fence_to_reattest(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            self.boundary.stop = lambda: None
+            with patch.object(self.boundary, "start", side_effect=BootstrapError("no child")):
+                with self.assertRaisesRegex(BootstrapError, "no child"):
+                    bootstrap(self.paths, self.boundary, self.config)
+            self.assertFalse(self.paths.instance_lock_path.exists())
+
+            # A known cleanup result is still insufficient while the
+            # interruption fence reports active work.
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            self._add_running_task(root, task_id="aborted-launch-busy")
+            self.boundary.stop = lambda: {"children_stopped": True}
+            with patch.object(self.boundary, "start", side_effect=BootstrapError("busy start")):
+                with self.assertRaisesRegex(BootstrapError, "busy start"):
+                    bootstrap(self.paths, self.boundary, self.config)
+            self.assertFalse(self.paths.instance_lock_path.exists())
+
+            # An uncertain cleanup keeps the consumed lifetime revoked and
+            # retains custody rather than claiming the launch was aborted.
+            self.boundary.alive.clear()
+            # Clear the task inserted above so a fresh bootstrap can proceed.
+            with closing(sqlite3.connect(root / "realm.sqlite3")) as connection, connection:
+                connection.execute("DELETE FROM tasks WHERE id='aborted-launch-busy'")
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            from astrid_runtime.bootstrap import BootstrapCustodyUncertain
+
+            def uncertain_cleanup():
+                raise BootstrapError("cleanup unresolved")
+
+            self.boundary.stop = uncertain_cleanup
+            with patch.object(self.boundary, "start", side_effect=BootstrapError("uncertain start")):
+                with self.assertRaises(BootstrapCustodyUncertain):
+                    bootstrap(self.paths, self.boundary, self.config)
+            self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_aborted_launch_does_not_reattest_when_install_binding_changes(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            selected_path = selection_dir / "astrid-install.json"
+            selected = json.loads(selected_path.read_text(encoding="utf-8"))
+            selected["realm_id"] = "replacement-realm"
+            selected_path.write_text(json.dumps(selected), encoding="utf-8")
+            self.boundary.stop = lambda: {"children_stopped": True}
+            with patch.object(self.boundary, "start", side_effect=BootstrapError("binding start")):
+                with self.assertRaisesRegex(BootstrapError, "binding start"):
+                    bootstrap(self.paths, self.boundary, self.config)
+            self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_aborted_launch_preserves_replacement_publications_without_reattesting(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            down(self.paths, self.boundary)
+            replacement = {
+                "pid": 49999, "process_birth_id": "replacement-birth",
+                "runtime_instance_id": "replacement-instance",
+                "active_realm": "configured-realm", "realm_id": "configured-realm",
+                "realm_root": str(root), "endpoint": "http://127.0.0.1:49999",
+            }
+
+            def stop_with_replacement():
+                self.paths.discovery_path.write_text(json.dumps(replacement), encoding="utf-8")
+                return {"children_stopped": True}
+
+            self.boundary.stop = stop_with_replacement
+            with patch.object(self.boundary, "start", side_effect=BootstrapError("replacement start")):
+                with self.assertRaisesRegex(BootstrapError, "replacement start"):
+                    bootstrap(self.paths, self.boundary, self.config)
+            self.assertFalse(self.paths.instance_lock_path.exists())
+            self.assertEqual(json.loads(self.paths.discovery_path.read_text(encoding="utf-8")), replacement)
 
     def _add_running_task(self, realm_root, task_id="task-busy"):
         with closing(sqlite3.connect(realm_root / "realm.sqlite3")) as connection, connection:
@@ -831,6 +1266,49 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(fixture["journal_path"].read_bytes(), journal_before)
         self.assertEqual(fixture["backup_catalog"].read_bytes(), backup_before)
         self.assertEqual(json.loads(self.paths.catalog_path.read_text()), json.loads(backup_before))
+
+    def test_restore_retry_admits_and_consumes_exact_completed_stop_marker(self):
+        fixture = self._restore_selection_fixture(realm_id="restore-completed-marker")
+        selected = json.loads(fixture["selection"].selection_path.read_text(encoding="utf-8"))
+        binding = {}
+        for key in PINOKIO_STOP_BINDING_KEYS:
+            if key.endswith("_sha256"):
+                binding[key] = "0" * 64
+            elif key.endswith("_release"):
+                binding[key] = 9
+            else:
+                binding[key] = str(fixture["journal_path"].parent)
+        binding.update({
+            "program_root": str(fixture["journal_path"].parent),
+            "data_root": str(self.paths.app_support),
+            "realm_id": selected["realm_id"],
+            "realm_root": str(fixture["realm_root"]),
+        })
+        marker = {
+            "pid": 87654321, "process_birth_id": "stopped-birth",
+            "runtime_instance_id": "stopped-instance", "realm_id": selected["realm_id"],
+            "realm_root": str(fixture["realm_root"]), "data_root": str(self.paths.app_support),
+            "state": "completed_stop",
+            "completed_stop": {"version": PINOKIO_STOP_HANDOFF_VERSION, "binding": binding},
+        }
+        self.paths.instance_lock_path.write_text(json.dumps(marker), encoding="utf-8")
+        manager_calls = []
+
+        def fail_manager():
+            manager_calls.append("failed")
+            raise RuntimeError("manager unavailable")
+
+        with self.assertRaisesRegex(BootstrapError, "manager unavailable"):
+            down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                 stop_manager=fail_manager)
+        self.assertEqual(json.loads(self.paths.instance_lock_path.read_text()), marker)
+
+        result = down(self.paths, self.boundary, restore_selection=fixture["selection"],
+                      stop_manager=lambda: manager_calls.append("retry"))
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(manager_calls, ["failed", "retry"])
+        self.assertFalse(self.paths.instance_lock_path.exists())
+        self.assertTrue(self.paths.catalog_path.is_file())
 
     def test_restart_and_down_share_unreconciled_attempt_refusal(self):
         root = self._configure()
@@ -2109,7 +2587,7 @@ def test_bootstrap_uncertain_incumbent_probe_preserves_authority():
 
 
 def test_restart_cli_preserves_named_lifecycle_blockers(monkeypatch, tmp_path, capsys):
-    import astrid_runtime.cli as cli
+    from astrid_runtime import cli
 
     home = tmp_path / "home"
     data_root = tmp_path / "support"
@@ -2157,3 +2635,40 @@ def test_restart_cli_preserves_named_lifecycle_blockers(monkeypatch, tmp_path, c
     assert payload["error"]["details"]["unreconciled_attempts"][0]["attempt_id"] == "attempt-4"
     assert payload["error"]["details"]["claimed_or_stale_bindings"][0]["binding_id"] == "binding-9"
     assert payload["error"]["details"]["unreleased_reservations"][0]["resource_key"] == "gpu:0"
+
+
+def test_down_cli_dispatches_completed_stop_without_discovery(monkeypatch, tmp_path, capsys):
+    from astrid_runtime import cli
+
+    home = tmp_path / "home"
+    data_root = tmp_path / "support"
+    paths = RuntimePaths.current(home, data_root=data_root)
+    paths.ensure_support_dirs()
+    realm_root = paths.realms_dir / "realm"
+    realm_root.mkdir()
+    paths.catalog_path.write_text(json.dumps({
+        "version": 1, "selected_realm_id": "realm",
+        "realms": [{"realm_id": "realm", "display_name": "Realm", "data_root": str(realm_root)}],
+        "source_profiles": {},
+    }))
+    paths.instance_lock_path.write_text(json.dumps({"state": "completed_stop"}))
+    manifest = tmp_path / "source-profile.json"
+    manifest.write_text(json.dumps({
+        "profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": "/source",
+    }))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("ASTRID_RUNTIME_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("ASTRID_RUNTIME_SOURCE_MANIFEST", str(manifest))
+
+    class Boundary:
+        def prepare_restart(self, **_kwargs):
+            raise AssertionError("down should let C1 resolve completed-stop ownership")
+
+    called = []
+    monkeypatch.setattr(cli, "LocalRuntimeBoundary", Boundary)
+    monkeypatch.setattr(cli, "down", lambda *_args, **_kwargs: called.append(True) or {
+        "status": "stopped", "realm_id": "realm",
+    })
+    assert cli.main(["down", "--data-root", str(data_root), "--json"]) == 0
+    assert called == [True]
+    assert json.loads(capsys.readouterr().out)["status"] == "stopped"
