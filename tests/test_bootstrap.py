@@ -525,6 +525,87 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(len(self.boundary.starts), starts + 1)
         self.assertNotIn("state", json.loads(self.paths.instance_lock_path.read_text()))
 
+    def _refuse_stop_before_signal(self):
+        """Leave a live, unchanged owner behind a stop refused before any signal."""
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        pid = int(json.loads(self.paths.instance_lock_path.read_text())["pid"])
+        real = self.boundary.stop_owner
+
+        def refused_before_signal(**_kwargs):
+            # The validate_before_signal refusal: the owner was never signaled.
+            raise BootstrapError("Runtime restart refused: owner identity changed or is stale.")
+
+        self.boundary.stop_owner = refused_before_signal
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary)
+        self.boundary.stop_owner = real
+        self.assertEqual(json.loads(self.paths.instance_lock_path.read_text())["state"], "stopping")
+        self.assertIn(pid, self.boundary.alive)
+        return pid
+
+    def test_presignal_stop_refusal_lets_up_reconnect_to_unchanged_owner(self):
+        self._configure()
+        first = bootstrap(self.paths, self.boundary, self.config)
+        pid = int(json.loads(self.paths.instance_lock_path.read_text())["pid"])
+        live_lock = self.paths.instance_lock_path.read_bytes()
+        starts = len(self.boundary.starts)
+        real = self.boundary.stop_owner
+
+        def refused_before_signal(**_kwargs):
+            raise BootstrapError("Runtime restart refused: owner identity changed or is stale.")
+
+        self.boundary.stop_owner = refused_before_signal
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary)
+        self.boundary.stop_owner = real
+        self.assertEqual(json.loads(self.paths.instance_lock_path.read_text())["state"], "stopping")
+        self.assertIn(pid, self.boundary.alive)
+
+        second = bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(second.status, "reconnected")
+        self.assertEqual(second.runtime_instance_id, first.runtime_instance_id)
+        self.assertEqual(len(self.boundary.starts), starts)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), live_lock)
+
+        calls = []
+        down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, ["manager"])
+        self.assertNotIn(pid, self.boundary.alive)
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_presignal_stop_refusal_retry_down_still_stops_owner(self):
+        pid = self._refuse_stop_before_signal()
+        calls = []
+        down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, ["manager"])
+        self.assertNotIn(pid, self.boundary.alive)
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_stopping_intent_reconnect_admission_requires_the_exact_live_owner(self):
+        pid = self._refuse_stop_before_signal()
+        before = self.paths.instance_lock_path.read_bytes()
+        starts = len(self.boundary.starts)
+        discovery_bytes = self.paths.discovery_path.read_bytes()
+        discovery = json.loads(discovery_bytes)
+        discovery["runtime_instance_id"] = "replacement-instance"
+        self.paths.discovery_path.write_text(json.dumps(discovery))
+        with self.assertRaises(BootstrapError) as replaced:
+            bootstrap(self.paths, self.boundary, self.config)
+        self.assertIn("stopping marker conflicts with a published owner", str(replaced.exception))
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
+        self.assertEqual(len(self.boundary.starts), starts)
+
+        self.paths.discovery_path.write_bytes(discovery_bytes)
+        self.boundary.alive.discard(pid)
+        with self.assertRaises(BootstrapError) as absent:
+            bootstrap(self.paths, self.boundary, self.config)
+        self.assertIn("stopping marker conflicts with a published owner", str(absent.exception))
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
+        self.assertEqual(len(self.boundary.starts), starts)
+
     def test_pinokio_completed_stop_selection_change_then_revert_cannot_revive_receipt(self):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
@@ -2660,7 +2741,8 @@ def test_pack_public_down_uncertainty_preserves_discovery_lock(tmp_path):
                 "realm_root": str(realm), "realm_id": "fixture-realm"}
     paths.catalog_path.write_text(json.dumps({"version": 1, "selected_realm_id": "fixture-realm",
         "realms": [{"realm_id": "fixture-realm", "display_name": "Fixture", "data_root": str(realm)}], "source_profiles": {}}))
-    paths.discovery_path.write_text(json.dumps({**identity, "active_realm": "fixture-realm", "endpoint": "http://127.0.0.1:61217"}))
+    paths.discovery_path.write_text(json.dumps({**identity, "active_realm": "fixture-realm", "endpoint": "http://127.0.0.1:61217",
+        "protocol_version": "workspace.v1", "schema_version": "workspace-schema-v1"}))
     paths.instance_lock_path.write_text(json.dumps(identity))
     before = {str(p.relative_to(tmp_path)): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     boundary = SimpleNamespace(process_birth_identity=lambda _pid: "fixture-birth", is_pid_alive=lambda _pid: True,
@@ -2685,6 +2767,19 @@ def test_pack_public_down_uncertainty_preserves_discovery_lock(tmp_path):
     assert all(after.get(path) == value for path, value in before.items()
                if not path.startswith(realm_prefix) and path != lock_key)
     assert realm.is_dir() and (realm / "realm.sqlite3").is_file()
+    # Follow-up: the uncertain stop left this same owner alive and published, so
+    # a later up reattaches to it instead of refusing on the stopping intent.
+    boundary.health = lambda **_kw: True
+    boundary.owner_startup_identity = lambda **_kw: {
+        "runtime_instance_id": "fixture-instance",
+        "identity": {"release": 0, "managed_by": None},
+    }
+    boundary.connect = lambda **_kw: SimpleNamespace()
+    with patch.dict(os.environ, {"ASTRID_INSTALL_RELEASE": "0", "ASTRID_INSTALL_MANAGED_BY": ""}):
+        second = bootstrap(paths, boundary, BootstrapConfig(source_profile=PROFILE))
+    assert second.status == "reconnected"
+    assert second.runtime_instance_id == "fixture-instance"
+    assert json.loads(paths.instance_lock_path.read_text()) == identity
 
 def test_pack_bootstrap_probe_does_not_replace_boundary_uncertainty(monkeypatch):
     import pytest
