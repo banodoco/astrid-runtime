@@ -9,6 +9,7 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.error
 import urllib.request
@@ -233,6 +234,54 @@ def test_installed_foreground_runtime_owns_discovery_door_and_stops_cleanly(
     assert process.returncode == 0
     assert log_path.is_file()
     assert "door_endpoint" in log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.integration
+def test_installed_foreground_use_down_then_up_again(
+    tmp_path: Path, stage1_runtime_environment: Path,
+):
+    manifest = _manifest(tmp_path)
+    env = _environment(tmp_path)
+    # The offline Runtime wheel fixture contains no optional Agent dependencies.
+    # Supply the test interpreter's dependencies without changing that venv.
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (env.get("PYTHONPATH"), sysconfig.get_path("purelib"))))
+    created = _prepare_workspace(stage1_runtime_environment, manifest, env)
+    assert created.returncode == 0, created.stderr + created.stdout
+    discovery_path = tmp_path / "support" / "runtime" / "discovery.json"
+    for _ in range(2):
+        process = platform.spawn_tree(
+            _command(stage1_runtime_environment, manifest, "run", "--door-port", "0"),
+            cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        try:
+            discovery = _wait_for_discovery(discovery_path, process)
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    assert _door_json(discovery["door_endpoint"], "/api/runtime/v1/realm")["realm_id"] == discovery["active_realm"]
+                    break
+                except (OSError, urllib.error.URLError):
+                    assert time.monotonic() < deadline
+                    time.sleep(0.1)
+            stopped = _down(stage1_runtime_environment, manifest, env)
+            assert stopped.returncode == 0, stopped.stderr + stopped.stdout
+            assert _json_output(stopped)["status"] == "stopped"
+            assert process.wait(timeout=30) == 0
+        finally:
+            if process.poll() is None:
+                _stop_foreground(process)
+    up = subprocess.run(
+        _command(stage1_runtime_environment, manifest, "up", "--wait", "--door-port", "0"),
+        capture_output=True, text=True, timeout=90, env=env,
+    )
+    try:
+        assert up.returncode == 0, up.stderr + up.stdout
+        discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+        assert _door_json(discovery["door_endpoint"], "/api/runtime/v1/realm")["realm_id"] == discovery["active_realm"]
+    finally:
+        if discovery_path.exists():
+            _cleanup_discovered_owner(stage1_runtime_environment, manifest, env, json.loads(discovery_path.read_text(encoding="utf-8")))
 
 
 @pytest.mark.integration
