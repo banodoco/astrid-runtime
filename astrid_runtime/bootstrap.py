@@ -953,7 +953,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     realm = _selected_realm(catalog)
     if realm is None:
         raise BootstrapError("No workspace is configured; explicit create or attach is required before up.")
-    completed_stop_before_launch = _revoke_completed_stop_before_launch(paths, boundary)
+    completed_stop_before_launch = _revoke_completed_stop_before_launch(paths, boundary, realm)
 
     def rollback_failed(**kwargs) -> None:
         _rollback_failed_bootstrap(
@@ -1018,6 +1018,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                     f"restart it to serve {config.door.origin}"
                 )
             worker = _worker_handoff(discovery)
+            _restore_admitted_live_lock(paths)
             return BootstrapResult(
                 "reconnected", realm_id,
                 str(realm.get("display_name", "Astrid Workspace")) if realm else "Astrid Workspace",
@@ -1633,7 +1634,7 @@ def _validate_stopping_marker(marker: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _revoke_completed_stop_before_launch(
-    paths: RuntimePaths, boundary: RuntimeBoundary,
+    paths: RuntimePaths, boundary: RuntimeBoundary, realm: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     marker = _read_support_json(paths.instance_lock_path)
     if marker is None:
@@ -1643,10 +1644,28 @@ def _revoke_completed_stop_before_launch(
     if marker.get("state") == "stopping":
         # Intent evidence is revoked like a completed stop, but only on
         # positive absence; every other outcome leaves the bytes unchanged.
+        # The single exception is a published owner that is still alive and
+        # matches the intent exactly: a stop refused before its first signal
+        # leaves that owner untouched, so launch reconnects to it instead.
+        conflict = "Runtime owner stopping marker conflicts with a published owner; launch refused."
         owner = _validate_stopping_marker(marker)
-        if (str(owner.get("data_root")) != str(paths.app_support)
-                or _read_support_json(paths.discovery_path) is not None):
-            raise BootstrapError("Runtime owner stopping marker conflicts with a published owner; launch refused.")
+        if str(owner.get("data_root")) != str(paths.app_support):
+            raise BootstrapError(conflict)
+        discovery = _read_support_json(paths.discovery_path)
+        if discovery is not None:
+            try:
+                published = _validate_published_stop_owner(
+                    paths, boundary, realm,
+                    _canonical_realm_root(str(realm.get("data_root") or "")),
+                    discovery, marker,
+                )
+            except BootstrapError as exc:
+                raise BootstrapError(conflict) from exc
+            if published is None:
+                raise BootstrapError(conflict)
+            # The lock keeps its stopping form here; the reconnect path in
+            # bootstrap restores the live form once the owner is revalidated.
+            return None
         _require_owner_absent(
             boundary, int(owner["pid"]), str(owner["process_birth_id"]),
             context="before launch",
@@ -1679,6 +1698,19 @@ def _revoke_completed_stop_before_launch(
     # that proves this attempt ended before publication can re-attest it.
     _durable_remove(paths.instance_lock_path)
     return dict(marker)
+
+
+def _restore_admitted_live_lock(paths: RuntimePaths) -> None:
+    """Return a stopping intent, admitted for reconnect, to the live lock form."""
+    marker = _read_support_json(paths.instance_lock_path)
+    if marker is None or marker.get("state") != "stopping":
+        return
+    owner = _validate_stopping_marker(marker)
+    atomic_write_json(paths.instance_lock_path, {
+        key: owner[key] for key in (
+            "pid", "process_birth_id", "runtime_instance_id", "realm_id", "realm_root",
+        )
+    })
 
 
 @contextmanager
