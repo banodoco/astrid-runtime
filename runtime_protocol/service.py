@@ -6903,6 +6903,7 @@ class RuntimeService:
             except FileNotFoundError:
                 pass
             _close_pinned(identity)
+            os.close(root_fd)
 
     def _export_leaf_max_bytes(self):
         """Return the safe direct-leaf budget including the temporary file name."""
