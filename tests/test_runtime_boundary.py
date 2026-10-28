@@ -647,3 +647,24 @@ def test_workspace_inspection_forwards_selected_admission_budget_without_changin
         "--root", str(root), "--json", "--admission-timeout", expected,
     ]
     assert list(root.iterdir()) == []
+
+
+def test_local_boundary_stop_attests_only_successful_exact_child_cleanup():
+    boundary = LocalRuntimeBoundary()
+    assert boundary.stop() == {"children_stopped": True}
+
+    process = SimpleNamespace(poll=lambda: None)
+    boundary._process = process
+    failure = RuntimeError("injected cleanup uncertainty")
+
+    def uncertain(_process):
+        raise failure
+
+    boundary._terminate = uncertain
+    with pytest.raises(RuntimeError, match="injected cleanup uncertainty"):
+        boundary.stop()
+    assert boundary._process is process
+
+    boundary._terminate = lambda _process: None
+    assert boundary.stop() == {"children_stopped": True}
+    assert boundary._process is None

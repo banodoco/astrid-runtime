@@ -28,7 +28,7 @@ from runtime_protocol import platform as runtime_platform
 from runtime_protocol import cancellation
 from runtime_protocol import process_control
 from runtime_protocol.errors import ConflictError
-from .paths import RuntimePaths
+from .paths import RuntimePaths, _install_record_path
 from .refusal import refusal_from
 from runtime_protocol.lifecycle import interruption_fence, inspect_interruption_state
 from .identity import (
@@ -46,6 +46,14 @@ RUNTIME_VERSION = PROTOCOL_VERSION
 IMPORTER_VERSION = "t5"
 CATALOG_VERSION = 1
 DISCOVERY_VERSION = 1
+PINOKIO_STOP_HANDOFF_VERSION = 1
+PINOKIO_STOP_BINDING_KEYS = frozenset({
+    "program_root", "data_root", "realm_id", "realm_root", "owner_version_root",
+    "owner_version_name", "owner_release", "runtime_checkout", "source_checkout",
+    "runtime_environment", "service_declaration", "source_profile_sha256",
+    "install_marker_sha256", "owner_version_sha256", "profile_sha256",
+    "owner_identity_sha256", "service_declaration_sha256",
+})
 WORKER_ACTOR = "astrid-pack-host"
 WORKER_SCOPES = (
     "handshake",
@@ -95,6 +103,11 @@ class DuplicateOwnerError(BootstrapError):
 
 class CompatibilityError(BootstrapError):
     pass
+
+
+def _pinokio_stop_refusal(message: str, *, code: str = "stop_unproven") -> BootstrapError:
+    """Mark only new Pinokio handoff admissions as safe C1 refusals."""
+    return BootstrapError(message, details={"safe": False, "code": code})
 
 
 class UnsupportedRealmError(BootstrapError):
@@ -695,7 +708,7 @@ def _provision_connection(connection: Any, actor_id: str, token: str, realm_id: 
         cancellation.wait_for(handshake, protocol_version=PROTOCOL_VERSION, schema_version=SCHEMA_VERSION)
 
 
-def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_root: Path, new_realm: bool, credential_before: bytes | None, catalog_before: bytes | None = None, source_before: bytes | None = None, source_profile: str = "astrid", candidate_pid: int | None = None) -> None:
+def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_root: Path, new_realm: bool, credential_before: bytes | None, catalog_before: bytes | None = None, source_before: bytes | None = None, source_profile: str = "astrid", candidate_pid: int | None = None, completed_stop_marker: Mapping[str, Any] | None = None) -> None:
     """Return neutral support state to its pre-launch shape after a failed handoff."""
     # Rollback is allowed to remove only metadata emitted by this candidate.
     # A concurrent/previous owner may still be serving even when its support
@@ -705,11 +718,19 @@ def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *
     # the boundary handle, then fence each support file by its owner marker.
     candidate = getattr(boundary, "_process", None)
     candidate_pid = candidate_pid if candidate_pid is not None else getattr(candidate, "pid", None)
+    try:
+        candidate_publications = {
+            path: _read_support_json(path)
+            for path in (paths.discovery_path, paths.instance_lock_path)
+        }
+    except Exception:
+        candidate_publications = None
     stop = getattr(boundary, "stop", None)
+    cleanup_result = None
     if callable(stop):
         try:
             with cancellation.cleanup_scope():
-                stop()
+                cleanup_result = stop()
         except Exception as exc:
             # Removing any support/credential/catalog/realm state here would
             # strand the owner whose cleanup just failed. Keep its controller
@@ -718,7 +739,9 @@ def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *
     for path in (paths.discovery_path, paths.instance_lock_path):
         try:
             current = _read_support_json(path)
-            if candidate_pid is not None and current is not None:
+            expected = candidate_publications.get(path) if candidate_publications is not None else object()
+            if (candidate_pid is not None and candidate_publications is not None
+                    and current is not None and current == expected):
                 try:
                     owned = int(current.get("pid", 0)) == int(candidate_pid)
                 except (TypeError, ValueError):
@@ -737,21 +760,27 @@ def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *
     except OSError:
         pass
     catalog = paths.catalog_path
+    catalog_restored = False
     try:
         if catalog_before is None:
             remove_file(catalog)
         else:
             catalog.write_bytes(catalog_before)
             owner_only(catalog)
+        catalog_restored = ((not catalog.exists()) if catalog_before is None
+                            else catalog.read_bytes() == catalog_before)
     except OSError:
         pass
     source_manifest = paths.source_profiles_dir / f"{source_profile}.json"
+    source_restored = False
     try:
         if source_before is None:
             remove_file(source_manifest)
         else:
             source_manifest.write_bytes(source_before)
             owner_only(source_manifest)
+        source_restored = ((not source_manifest.exists()) if source_before is None
+                           else source_manifest.read_bytes() == source_before)
     except OSError:
         pass
     # A failed first launch owns this newly allocated root.  Constrain the
@@ -766,6 +795,57 @@ def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *
             shutil.rmtree(realm_root)
         except OSError:
             pass
+    if (completed_stop_marker is not None
+            and isinstance(cleanup_result, Mapping)
+            and cleanup_result.get("children_stopped") is True
+            and catalog_restored and source_restored):
+        _reattest_aborted_launch_stop(
+            paths, boundary, completed_stop_marker, realm_root=realm_root,
+        )
+
+
+def _reattest_aborted_launch_stop(
+    paths: RuntimePaths, boundary: RuntimeBoundary,
+    marker: Mapping[str, Any], *, realm_root: Path,
+) -> bool:
+    """Restore a consumed Stop lifetime only after C1 proves this launch aborted."""
+    try:
+        owner = _validate_completed_stop_marker(marker)
+        if (_read_support_json(paths.discovery_path) is not None
+                or _read_support_json(paths.instance_lock_path) is not None):
+            return False
+        if not realm_root.is_dir() or realm_root.is_symlink():
+            return False
+        _require_owner_absent(
+            boundary, int(owner["pid"]), str(owner["process_birth_id"]),
+            context="while re-attesting an aborted launch",
+        )
+        catalog = _read_catalog(paths)
+        realm = _selected_realm(catalog)
+        if realm is None or _canonical_realm_root(str(realm.get("data_root") or "")) != realm_root:
+            return False
+        binding = _pinokio_stop_binding(paths, realm)
+        if binding is None or dict(marker["completed_stop"]["binding"]) != binding:
+            return False
+        with interruption_fence(realm_root) as report:
+            if not report.get("safe", False):
+                return False
+            if (_read_support_json(paths.discovery_path) is not None
+                    or _read_support_json(paths.instance_lock_path) is not None):
+                return False
+            _require_owner_absent(
+                boundary, int(owner["pid"]), str(owner["process_birth_id"]),
+                context="inside the aborted-launch fence",
+            )
+            current_binding = _pinokio_stop_binding(paths, realm)
+            if current_binding != binding or current_binding != marker["completed_stop"]["binding"]:
+                return False
+            atomic_write_json(paths.instance_lock_path, dict(marker))
+        return True
+    except Exception:
+        # Re-attestation is optional recovery evidence. Any unknown state keeps
+        # the old marker consumed and leaves the original launch error intact.
+        return False
 
 
 def bootstrap(
@@ -873,6 +953,13 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     realm = _selected_realm(catalog)
     if realm is None:
         raise BootstrapError("No workspace is configured; explicit create or attach is required before up.")
+    completed_stop_before_launch = _revoke_completed_stop_before_launch(paths, boundary)
+
+    def rollback_failed(**kwargs) -> None:
+        _rollback_failed_bootstrap(
+            paths, boundary, completed_stop_marker=completed_stop_before_launch,
+            **kwargs,
+        )
     new_realm = False
     diagnostics: list[str] = []
 
@@ -979,7 +1066,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             source_profile=source,
         )
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
         raise
     try:
         endpoint = str(handle["endpoint"])
@@ -991,7 +1078,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             candidate_pid = int(raw_candidate_pid) if raw_candidate_pid is not None else None
         except (TypeError, ValueError):
             candidate_pid = None
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=candidate_pid)
+        rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=candidate_pid)
         raise BootstrapError("Runtime start returned incomplete owner metadata.") from exc
     process_birth_id = str(handle.get("process_birth_id") or handle.get("birth_id") or "")
     if not process_birth_id:
@@ -1006,15 +1093,15 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     try:
         endpoint = _validate_loopback_endpoint(endpoint)
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
+        rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     try:
         healthy = bool(boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id))
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
+        rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     if not healthy:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
+        rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise BootstrapError("Runtime started but failed health check; next action: " + RECONFIGURE_NEXT_ACTION)
     try:
         owner_identity = _validated_matching_owner_identity(
@@ -1022,7 +1109,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             instance_id=instance_id, requested_identity=requested_identity,
         )
     except BootstrapError:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
+        rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     worker = _worker_handoff(handle)
     # The marker contains ownership metadata only and never a credential.
@@ -1032,7 +1119,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         connection = boundary.connect(endpoint=endpoint, credential=token)
         _provision_connection(connection, actor_id, token, realm_id)
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
+        rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     realm["source_profile"] = source.profile
     catalog["source_profiles"][source.profile] = source.as_dict()
@@ -1067,7 +1154,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     try:
         _commit_bootstrap_metadata(paths, source, catalog, discovery_value)
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
+        rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     release = getattr(boundary, "release_owner_custody", None)
     if callable(release):
@@ -1080,7 +1167,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             # generation or roll back advertised metadata on an unknown ACK.
             raise
         except Exception:
-            _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
+            rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
             raise
     return BootstrapResult(
         "started", realm_id, str(realm["display_name"]), endpoint, actor_id,
@@ -1156,6 +1243,392 @@ def _owner_record_matches(
     )
 
 
+def _private_handoff_bytes(path: Path) -> bytes:
+    """Read an owner-owned, canonical regular file used to bind Pinokio state."""
+    target = Path(path).expanduser()
+    if (not target.is_absolute() or _has_symlink_component(target)
+            or target.is_symlink() or not target.is_file()):
+        raise BootstrapError(f"Pinokio stop binding is missing or unsafe: {target}")
+    try:
+        if runtime_platform.sys.platform == "win32":
+            raw = runtime_platform.read_private_file(target)
+        else:
+            fd = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                metadata = os.fstat(fd)
+                if (not stat.S_ISREG(metadata.st_mode)
+                        or not runtime_platform.is_current_user(metadata)):
+                    raise BootstrapError(f"Pinokio stop binding is not an owner-owned regular file: {target}")
+                chunks = bytearray()
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.extend(chunk)
+                raw = bytes(chunks)
+            finally:
+                os.close(fd)
+    except BootstrapError:
+        raise
+    except OSError as exc:
+        raise BootstrapError(f"Pinokio stop binding is unavailable: {target}") from exc
+    return raw
+
+
+def _private_handoff_json(path: Path) -> tuple[bytes, dict[str, Any]]:
+    raw = _private_handoff_bytes(path)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BootstrapError(f"Pinokio stop binding is malformed: {path}") from exc
+    if not isinstance(value, dict):
+        raise BootstrapError(f"Pinokio stop binding must be an object: {path}")
+    return raw, value
+
+
+def _canonical_handoff_path(value: Any, *, label: str, directory: bool | None = None) -> Path:
+    if not isinstance(value, str) or not value:
+        raise BootstrapError(f"Pinokio stop binding has no {label}.")
+    raw = Path(value).expanduser()
+    if not raw.is_absolute() or _has_symlink_component(raw) or raw.is_symlink():
+        raise BootstrapError(f"Pinokio stop binding {label} is not absolute and symlink-free.")
+    try:
+        resolved = raw.resolve(strict=True)
+    except OSError as exc:
+        raise BootstrapError(f"Pinokio stop binding {label} is unavailable.") from exc
+    if resolved != raw:
+        raise BootstrapError(f"Pinokio stop binding {label} is not canonical.")
+    if directory is True and not resolved.is_dir():
+        raise BootstrapError(f"Pinokio stop binding {label} is not a directory.")
+    if directory is False and not resolved.is_file():
+        raise BootstrapError(f"Pinokio stop binding {label} is not a regular file.")
+    return resolved
+
+
+def _pinokio_stop_binding(
+    paths: RuntimePaths, realm: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Derive selected Pinokio identity from Runtime-owned profile/catalog data.
+
+    No caller-supplied path or ambient managed-by flag can create this binding.
+    A service-backed profile is treated as Pinokio only when its selected
+    Version, profile, install marker, and per-user selection record agree.
+    """
+    catalog = _read_catalog(paths)
+    profiles = catalog.get("source_profiles", {})
+    raw_profile = profiles.get("astrid") if isinstance(profiles, Mapping) else None
+    managed_by_env = os.environ.get("ASTRID_INSTALL_MANAGED_BY") == "pinokio"
+    selection_path = _install_record_path(Path(paths.home))
+    selected = None
+    selection_error = None
+    if os.path.lexists(str(selection_path)):
+        try:
+            _selection_raw, selected = _private_handoff_json(selection_path)
+        except BootstrapError as exc:
+            selection_error = exc
+    selected_pinokio = bool(isinstance(selected, Mapping)
+                            and selected.get("owner") == "haus.astrid.runtime"
+                            and selected.get("managed_by") == "pinokio")
+    selected_for_data = False
+    if selected_pinokio:
+        try:
+            selected_for_data = (
+                _canonical_handoff_path(selected.get("data_root"), label="selection data root", directory=True)
+                == paths.app_support
+            )
+        except BootstrapError:
+            selected_for_data = False
+
+    source = None
+    source_error = None
+    if isinstance(raw_profile, Mapping):
+        try:
+            source = SourceProfile.from_mapping(raw_profile, expected_profile="astrid")
+        except BootstrapError as exc:
+            source_error = exc
+    owner_pinokio = False
+    owner_version_error = None
+    if source is not None and source.runtime_environment:
+        try:
+            candidate_environment = _canonical_handoff_path(
+                source.runtime_environment, label="runtime environment", directory=True,
+            )
+            candidate_version_root = _canonical_handoff_path(
+                str(candidate_environment.parent), label="owner Version root", directory=True,
+            )
+            _owner_version_raw, owner_version_probe = _private_handoff_json(
+                candidate_version_root / "version.json",
+            )
+            owner_identity_probe = owner_version_probe.get("identity")
+            owner_pinokio = (isinstance(owner_identity_probe, Mapping)
+                             and owner_identity_probe.get("managed_by") == "pinokio")
+        except BootstrapError as exc:
+            owner_version_error = exc
+    candidate_pinokio = managed_by_env or selected_for_data or owner_pinokio
+    if not candidate_pinokio:
+        # Service-backed source profiles can belong to other Runtime users;
+        # only selected records for this data root or a Pinokio Version prove
+        # that this Runtime is part of a Pinokio installation.
+        return None
+    if source_error is not None:
+        raise source_error
+    if source is None:
+        raise BootstrapError("Runtime Pinokio stop binding is missing the selected source profile.")
+    if selection_error is not None:
+        raise selection_error
+    if not selected_for_data:
+        raise BootstrapError("Runtime Pinokio stop binding has no selected install record for this data root.")
+    if not source.service_declaration:
+        raise BootstrapError("Runtime Pinokio stop binding has no selected service declaration.")
+    if owner_version_error is not None and not owner_pinokio:
+        # Selected Pinokio metadata remains sufficient to make malformed or
+        # missing Version composition a fail-closed refusal.
+        raise owner_version_error
+    if not source.runtime_environment:
+        raise BootstrapError("Runtime Pinokio stop binding has no selected interpreter environment.")
+
+    environment = _canonical_handoff_path(
+        source.runtime_environment, label="runtime environment", directory=True,
+    )
+    owner_version_root = _canonical_handoff_path(
+        str(environment.parent), label="Version root", directory=True,
+    )
+    program_root = _canonical_handoff_path(
+        str(owner_version_root.parent.parent), label="program root", directory=True,
+    )
+    if owner_version_root.parent != program_root / "versions":
+        raise BootstrapError("Runtime Pinokio owner Version is outside the selected program root.")
+    runtime_checkout = _canonical_handoff_path(
+        source.runtime_checkout, label="Runtime checkout", directory=True,
+    )
+    source_checkout = _canonical_handoff_path(
+        source.source_checkout, label="Agent checkout", directory=True,
+    )
+    declaration = _canonical_handoff_path(
+        source.service_declaration, label="service declaration", directory=False,
+    )
+
+    current_path = program_root / "current"
+    current_raw = _private_handoff_bytes(current_path)
+    version_name = current_raw.decode("utf-8").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", version_name):
+        raise BootstrapError("Runtime Pinokio stop binding has an invalid selected Version pointer.")
+    selected_version_root = _canonical_handoff_path(
+        str(program_root / "versions" / version_name), label="selected Version root", directory=True,
+    )
+
+    _marker_raw, install_marker = _private_handoff_json(program_root / "install.json")
+    expected_root = _canonical_realm_root(str(realm.get("data_root") or ""))
+    realm_id = str(realm.get("realm_id") or "")
+    if (selected.get("owner") != "haus.astrid.runtime"
+            or selected.get("managed_by") != "pinokio"
+            or _canonical_handoff_path(selected.get("program_root"), label="selection program root", directory=True) != program_root
+            or _canonical_handoff_path(selected.get("data_root"), label="selection data root", directory=True) != paths.app_support
+            or str(selected.get("realm_id") or "") != realm_id
+            or _canonical_handoff_path(selected.get("realm_root"), label="selection realm root", directory=True) != expected_root):
+        raise BootstrapError("Runtime Pinokio stop binding conflicts with the selected install record.")
+    if (install_marker.get("owner") != "haus.astrid.runtime"
+            or install_marker.get("managed_by") != "pinokio"
+            or _canonical_handoff_path(install_marker.get("data_root"), label="install marker data root", directory=True) != paths.app_support):
+        raise BootstrapError("Runtime Pinokio stop binding conflicts with the program install marker.")
+
+    def read_version(root: Path, *, label: str) -> tuple[bytes, dict[str, Any], dict[str, Any], bytes, Path]:
+        version_raw, version = _private_handoff_json(root / "version.json")
+        if _canonical_handoff_path(version.get("root"), label=f"{label} root", directory=True) != root:
+            raise BootstrapError(f"Runtime Pinokio stop binding has a conflicting {label} record.")
+        identity = version.get("identity")
+        if (not isinstance(identity, Mapping) or identity.get("managed_by") != "pinokio"
+                or type(identity.get("release")) is not int or identity["release"] < 0):
+            raise BootstrapError(f"Runtime Pinokio stop binding has no Pinokio {label} identity.")
+        profile_path = _canonical_handoff_path(version.get("profile"), label=f"{label} profile", directory=False)
+        profile_raw, profile = _private_handoff_json(profile_path)
+        if profile.get("profile") != "astrid":
+            raise BootstrapError(f"Runtime Pinokio stop binding has a non-Astrid {label} profile.")
+        return version_raw, version, dict(identity), profile_raw, profile_path
+
+    owner_version_raw, owner_version, owner_identity, profile_raw, owner_profile_path = read_version(
+        owner_version_root, label="owner Version",
+    )
+    _selected_version_raw, selected_version, selected_identity, _selected_profile_raw, selected_profile_path = read_version(
+        selected_version_root, label="selected Version",
+    )
+    if selected.get("identity") != selected_identity:
+        raise BootstrapError("Runtime Pinokio stop binding conflicts with the selected Version identity.")
+    raw_python = owner_version.get("python")
+    python_path = Path(raw_python).expanduser() if isinstance(raw_python, str) else Path()
+    if (not python_path.is_absolute() or _has_symlink_component(python_path.parent)
+            or python_path.parent.resolve() not in {environment / "bin", environment / "Scripts"}
+            or not python_path.is_file()):
+        raise BootstrapError("Runtime Pinokio stop binding interpreter escapes its environment.")
+    raw_selected_python = selected_version.get("python")
+    selected_python = Path(raw_selected_python).expanduser() if isinstance(raw_selected_python, str) else Path()
+    if (not selected_python.is_absolute() or _has_symlink_component(selected_python.parent)
+            or not selected_python.is_file()):
+        raise BootstrapError("Runtime Pinokio selected interpreter is missing or unsafe.")
+    selected_environment = selected_python.parent.parent
+    if not selected_environment.is_dir():
+        raise BootstrapError("Runtime Pinokio selected interpreter environment is unavailable.")
+    _, version_profile = _private_handoff_json(owner_profile_path)
+    _, selected_profile = _private_handoff_json(selected_profile_path)
+    if selected_profile.get("runtime_environment") != str(selected_environment):
+        raise BootstrapError("Runtime Pinokio selected profile differs from its interpreter environment.")
+    for key, expected in (("runtime_checkout", str(runtime_checkout)),
+                          ("source_checkout", str(source_checkout)),
+                          ("runtime_environment", str(environment)),
+                          ("service_declaration", str(declaration))):
+        if version_profile.get(key) != expected:
+            raise BootstrapError("Runtime Pinokio stop binding differs from the selected Version profile.")
+    if version_profile.get("source_digest", "") != source.source_digest:
+        raise BootstrapError("Runtime Pinokio stop binding source digest differs from the selected Version profile.")
+    declaration_raw = _private_handoff_bytes(declaration)
+    release = owner_identity["release"]
+
+    def digest(raw: bytes) -> str:
+        return hashlib.sha256(raw).hexdigest()
+    stable_marker = {key: install_marker.get(key) for key in ("owner", "managed_by", "data_root")}
+    return {
+        "program_root": str(program_root),
+        "data_root": str(paths.app_support),
+        "realm_id": realm_id,
+        "realm_root": str(expected_root),
+        "owner_version_root": str(owner_version_root),
+        "owner_version_name": owner_version_root.name,
+        "owner_release": release,
+        "runtime_checkout": str(runtime_checkout),
+        "source_checkout": str(source_checkout),
+        "runtime_environment": str(environment),
+        "service_declaration": str(declaration),
+        "source_profile_sha256": source.digest,
+        "install_marker_sha256": digest(json.dumps(stable_marker, sort_keys=True).encode("utf-8")),
+        "owner_version_sha256": digest(owner_version_raw),
+        "profile_sha256": digest(profile_raw),
+        "owner_identity_sha256": digest(json.dumps(owner_identity, sort_keys=True).encode("utf-8")),
+        "service_declaration_sha256": digest(declaration_raw),
+    }
+
+
+def _durable_remove(path: Path) -> None:
+    """Remove one authority marker and persist its directory entry update."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    runtime_platform.fsync_directory(path.parent)
+
+
+def _require_owner_absent(boundary: RuntimeBoundary, pid: int, birth: str, *, context: str) -> None:
+    try:
+        if _pid_alive(boundary, pid):
+            raise BootstrapError(f"Runtime Pinokio stopped owner is still present {context}.")
+        observe_birth = getattr(boundary, "process_birth_identity", None)
+        if callable(observe_birth):
+            observed_birth = observe_birth(pid)
+            if observed_birth is not None:
+                raise BootstrapError(f"Runtime Pinokio stopped owner identity changed {context}.")
+    except BootstrapError:
+        raise
+    except Exception as exc:
+        raise BootstrapError(f"Runtime Pinokio owner absence is unknown {context}.") from exc
+
+
+def _completed_stop_record(
+    paths: RuntimePaths, marker: Mapping[str, Any] | None,
+    binding: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(marker, Mapping) or marker.get("state") != "completed_stop":
+        return None
+    owner = _validate_completed_stop_marker(marker)
+    receipt = marker["completed_stop"]
+    if binding is None or dict(receipt["binding"]) != dict(binding):
+        # A changed selection must permanently retire this lifetime; otherwise
+        # a later filesystem revert could make old evidence useful again.
+        _durable_remove(paths.instance_lock_path)
+        raise BootstrapError("Runtime Pinokio completed-stop binding changed; refusing interruption.")
+    if str(owner.get("data_root") or "") != str(paths.app_support):
+        _durable_remove(paths.instance_lock_path)
+        raise BootstrapError("Runtime Pinokio completed-stop data root changed; refusing interruption.")
+    return {**owner, "binding": dict(binding)}
+
+
+def _validate_completed_stop_marker(marker: Mapping[str, Any]) -> dict[str, Any]:
+    receipt = marker.get("completed_stop")
+    if (set(marker) != {"pid", "process_birth_id", "runtime_instance_id", "realm_id",
+                        "realm_root", "data_root", "state", "completed_stop"}
+            or not isinstance(receipt, Mapping)
+            or set(receipt) != {"version", "binding"}
+            or type(receipt.get("version")) is not int
+            or receipt.get("version") != PINOKIO_STOP_HANDOFF_VERSION
+            or not isinstance(receipt.get("binding"), Mapping)
+            or set(receipt["binding"]) != PINOKIO_STOP_BINDING_KEYS):
+        raise BootstrapError("Runtime Pinokio completed-stop marker is malformed; refusing interruption.")
+    owner = dict(marker)
+    pid = owner.get("pid")
+    birth = owner.get("process_birth_id")
+    instance = owner.get("runtime_instance_id")
+    realm_id = owner.get("realm_id")
+    realm_root_raw = owner.get("realm_root")
+    data_root = owner.get("data_root")
+    if (type(pid) is not int or pid <= 0
+            or any(not isinstance(value, str) or not value
+                   for value in (birth, instance, realm_id, realm_root_raw, data_root))):
+        raise BootstrapError("Runtime Pinokio completed-stop owner identity is malformed.")
+    try:
+        realm_root = _canonical_realm_root(realm_root_raw)
+        _canonical_handoff_path(data_root, label="completed-stop data root", directory=True)
+    except BootstrapError as exc:
+        raise BootstrapError("Runtime Pinokio completed-stop owner identity is malformed.") from exc
+    if not _owner_record_matches(owner, pid=pid, instance_id=instance,
+                                 process_birth_id=birth, realm_id=realm_id,
+                                 realm_root=realm_root):
+        raise BootstrapError("Runtime Pinokio completed-stop owner identity is malformed.")
+    for key, value in receipt["binding"].items():
+        if key.endswith("_sha256"):
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise BootstrapError("Runtime Pinokio completed-stop binding digest is malformed.")
+        elif key.endswith("_release"):
+            if type(value) is not int or value < 0:
+                raise BootstrapError("Runtime Pinokio completed-stop binding release is malformed.")
+        elif not isinstance(value, str) or not value:
+            raise BootstrapError("Runtime Pinokio completed-stop binding field is malformed.")
+    return owner
+
+
+def _revoke_completed_stop_before_launch(
+    paths: RuntimePaths, boundary: RuntimeBoundary,
+) -> dict[str, Any] | None:
+    marker = _read_support_json(paths.instance_lock_path)
+    if marker is None:
+        return None
+    if marker.get("state") is None:
+        return None
+    if marker.get("state") != "completed_stop":
+        raise BootstrapError("Runtime owner lock has an unknown state; launch refused.")
+    try:
+        owner = _validate_completed_stop_marker(marker)
+    except (KeyError, TypeError, ValueError, BootstrapError):
+        _durable_remove(paths.instance_lock_path)
+        raise BootstrapError("Runtime Pinokio completed-stop marker is malformed; launch refused.")
+    if str(owner.get("data_root") or "") != str(paths.app_support):
+        _durable_remove(paths.instance_lock_path)
+        raise BootstrapError("Runtime Pinokio completed-stop data root changed; launch refused.")
+    discovery = _read_support_json(paths.discovery_path)
+    if discovery is not None:
+        _durable_remove(paths.instance_lock_path)
+        raise _pinokio_stop_refusal("Runtime Pinokio completed-stop marker conflicts with a published owner.")
+    try:
+        _require_owner_absent(
+            boundary, int(owner["pid"]), str(owner["process_birth_id"]),
+            context="before launch",
+        )
+    except BootstrapError as exc:
+        _durable_remove(paths.instance_lock_path)
+        raise _pinokio_stop_refusal(str(exc)) from exc
+    # This is intentionally before boundary.start. Only a later C1 cleanup
+    # that proves this attempt ended before publication can re-attest it.
+    _durable_remove(paths.instance_lock_path)
+    return dict(marker)
+
+
 @contextmanager
 def _downstream_stop_errors():
     """Keep post-admission failure details from looking like lifecycle refusal."""
@@ -1186,6 +1659,8 @@ def _fenced_stop_and_manager(
     owner: tuple[int, str, str, str] | None, stop_manager=None,
     stop_foreground=None, validate_stop=None, stale_owner_identity=None,
     allow_missing_realm: bool = False,
+    completed_stop_binding: Mapping[str, Any] | None = None,
+    retained_completed_stop: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Stop an admitted owner and its manager while the caller holds the mutex."""
     try:
@@ -1240,6 +1715,10 @@ def _fenced_stop_and_manager(
                         owner_lock=paths.instance_lock_path,
                         discovery_path=paths.discovery_path, require_health=False,
                     )
+                    if completed_stop_binding is not None:
+                        _require_owner_absent(
+                            boundary, pid, birth, context="after Runtime stop",
+                        )
                 elif stop_foreground is not None:
                     stopped = stop_foreground()
                 # The stopped owner can remove its own advertisements. A new
@@ -1260,6 +1739,26 @@ def _fenced_stop_and_manager(
                 # that substitutes for the SQLite fence.
                 if validate_stop is not None:
                     validate_stop()
+                if stale_owner_identity is not None:
+                    stale_pid, stale_birth = stale_owner_identity
+                    try:
+                        if _pid_alive(boundary, stale_pid):
+                            raise BootstrapError(
+                                "Runtime interruption refused: stale owner process is present immediately before manager stop."
+                            )
+                        observe_birth = getattr(boundary, "process_birth_identity", None)
+                        if callable(observe_birth):
+                            observed_birth = observe_birth(stale_pid)
+                            if observed_birth is not None:
+                                raise BootstrapError(
+                                    "Runtime interruption refused: stale owner identity changed immediately before manager stop."
+                                )
+                    except BootstrapError:
+                        raise
+                    except Exception as exc:
+                        raise BootstrapError(
+                            "Runtime interruption refused: owner absence could not be re-established immediately before manager stop."
+                        ) from exc
                 if stop_manager is not None:
                     stop_manager()
     except ConflictError as exc:
@@ -1298,7 +1797,36 @@ def _fenced_stop_and_manager(
                 raise BootstrapError("Runtime owner lock changed during stop; refusing cleanup.")
         if current_discovery is not None:
             remove_file(paths.discovery_path)
-        if current_marker is not None:
+        if owner is not None and completed_stop_binding is not None:
+            if marker is None:
+                raise BootstrapError("Runtime completed-stop publication lacks the stopped owner marker.")
+            owner_record = {
+                "pid": int(owner[0]),
+                "process_birth_id": str(owner[1]),
+                "runtime_instance_id": str(owner[2]),
+                "realm_id": str(realm_id),
+                "realm_root": str(realm_root),
+                "data_root": str(paths.app_support),
+            }
+            _require_owner_absent(
+                boundary, int(owner[0]), str(owner[1]), context="before receipt publication",
+            )
+            atomic_write_json(paths.instance_lock_path, {
+                **owner_record,
+                "state": "completed_stop",
+                "completed_stop": {
+                    "version": PINOKIO_STOP_HANDOFF_VERSION,
+                    "binding": dict(completed_stop_binding),
+                },
+            })
+        elif retained_completed_stop is not None:
+            # A fresh Runtime process may repeat canonical down after the
+            # session owner already exited. Keep the same marker until a new
+            # launch attempt invalidates this owner lifetime.
+            observed = _read_support_json(paths.instance_lock_path)
+            if observed != marker:
+                raise BootstrapError("Runtime completed-stop marker changed during retry; refusing cleanup.")
+        elif current_marker is not None:
             remove_file(paths.instance_lock_path)
     return {"status": "stopped", "realm_id": realm_id,
             "runtime": stopped, "interruption": final_report}
@@ -1452,7 +1980,8 @@ def _restore_selection_snapshot(
         "backup_catalog_path": backup_catalog_path,
         "backup_catalog_bytes": backup_catalog_bytes,
         "catalog": retained, "live_catalog_bytes": live_catalog_bytes,
-        "realm_id": realm_id, "realm_root": realm_root, "data_root": data_root,
+        "program_root": program_root, "realm_id": realm_id,
+        "realm_root": realm_root, "data_root": data_root,
         "realm_absent": realm_absent,
     }
 
@@ -1461,7 +1990,7 @@ def _validate_restore_snapshot(paths: RuntimePaths, selection: RestoreSelection,
                                snapshot: Mapping[str, Any]) -> None:
     current = _restore_selection_snapshot(paths, selection)
     for key in ("journal_bytes", "selection_bytes", "backup_catalog_bytes", "live_catalog_bytes",
-                "realm_id", "realm_root", "realm_absent"):
+                "program_root", "realm_id", "realm_root", "realm_absent"):
         if current.get(key) != snapshot.get(key):
             raise BootstrapError("Restore metadata changed during Runtime interruption; refusing recovery.")
     _inspect_restore_realm(current)
@@ -1475,10 +2004,22 @@ def _selected_restore_snapshot(paths: RuntimePaths, selection: RestoreSelection)
     return snapshot
 
 
-def _require_restore_publications_absent(paths: RuntimePaths) -> None:
-    if (_read_support_json(paths.discovery_path) is not None
-            or _read_support_json(paths.instance_lock_path) is not None):
+def _require_restore_publications_absent(
+    paths: RuntimePaths, *, expected_completed_marker: Mapping[str, Any] | None = None,
+) -> None:
+    discovery = _read_support_json(paths.discovery_path)
+    marker = _read_support_json(paths.instance_lock_path)
+    if discovery is not None:
         raise BootstrapError("Restore recovery refuses while Runtime owner publications are present.")
+    if marker is None and expected_completed_marker is None:
+        return
+    if (marker is not None and expected_completed_marker is not None
+            and marker == expected_completed_marker
+            and marker.get("state") == "completed_stop"):
+        return
+    if marker is not None:
+        raise BootstrapError("Restore recovery refuses while Runtime owner publications are present.")
+    raise BootstrapError("Restore recovery owner marker changed during admission.")
 
 
 def _inspect_restore_realm(snapshot: Mapping[str, Any]) -> None:
@@ -1504,23 +2045,68 @@ def _interrupt_owner_locked(
     _validate_support_paths(paths)
     if restore_selection is not None:
         snapshot = _selected_restore_snapshot(paths, restore_selection)
-        _require_restore_publications_absent(paths)
+        marker = _read_support_json(paths.instance_lock_path)
+        if (marker is not None and marker.get("state") == "completed_stop"
+                and _read_support_json(paths.discovery_path) is not None):
+            _durable_remove(paths.instance_lock_path)
+            raise _pinokio_stop_refusal("Runtime completed-stop marker conflicts with an active discovery.")
+        retained_completed_stop = None
+        if marker is not None:
+            if marker.get("state") != "completed_stop":
+                raise BootstrapError("Restore recovery refuses while Runtime owner publications are present.")
+            try:
+                retained_completed_stop = _validate_completed_stop_marker(marker)
+            except BootstrapError as exc:
+                _durable_remove(paths.instance_lock_path)
+                raise _pinokio_stop_refusal(str(exc)) from exc
+            binding = marker["completed_stop"]["binding"]
+            if (retained_completed_stop.get("data_root") != str(snapshot["data_root"])
+                    or retained_completed_stop.get("realm_id") != str(snapshot["realm_id"])
+                    or _canonical_realm_root(str(retained_completed_stop.get("realm_root") or ""))
+                    != Path(snapshot["realm_root"])
+                    or binding.get("data_root") != str(snapshot["data_root"])
+                    or binding.get("realm_id") != str(snapshot["realm_id"])
+                    or binding.get("realm_root") != str(snapshot["realm_root"])
+                    or binding.get("program_root") != str(snapshot["program_root"])):
+                _durable_remove(paths.instance_lock_path)
+                raise _pinokio_stop_refusal("Runtime completed-stop marker conflicts with restore selection.")
+            try:
+                _require_owner_absent(
+                    boundary, int(retained_completed_stop["pid"]),
+                    str(retained_completed_stop["process_birth_id"]),
+                    context="during restore admission",
+                )
+            except BootstrapError as exc:
+                _durable_remove(paths.instance_lock_path)
+                raise _pinokio_stop_refusal(str(exc)) from exc
+        _require_restore_publications_absent(
+            paths, expected_completed_marker=marker,
+        )
         realm_absent = bool(snapshot["realm_absent"])
 
         def validate_restore() -> None:
             _validate_restore_snapshot(paths, restore_selection, snapshot)
-            _require_restore_publications_absent(paths)
+            _require_restore_publications_absent(paths, expected_completed_marker=marker)
+            if retained_completed_stop is not None:
+                _require_owner_absent(
+                    boundary, int(retained_completed_stop["pid"]),
+                    str(retained_completed_stop["process_birth_id"]),
+                    context="immediately before restore manager stop",
+                )
 
         result = _fenced_stop_and_manager(
             paths, boundary, realm_id=str(snapshot["realm_id"]),
-            realm_root=Path(snapshot["realm_root"]), discovery=None, marker=None,
+            realm_root=Path(snapshot["realm_root"]), discovery=None, marker=marker,
             owner=None, stop_manager=stop_manager, stop_foreground=stop_foreground,
             validate_stop=validate_restore, allow_missing_realm=realm_absent,
+            retained_completed_stop=retained_completed_stop,
         )
         with _downstream_stop_errors():
             validate_restore()
             if snapshot["live_catalog_bytes"] is None:
                 atomic_write_json(paths.catalog_path, snapshot["catalog"])
+            if retained_completed_stop is not None:
+                _durable_remove(paths.instance_lock_path)
         return {"status": "stopped", "realm_id": snapshot["realm_id"],
                 "idle": result["interruption"],
                 "catalog_restored": snapshot["live_catalog_bytes"] is None}
@@ -1528,10 +2114,65 @@ def _interrupt_owner_locked(
     realm, realm_root = _selected_stop_realm(paths)
     discovery = _read_support_json(paths.discovery_path)
     marker = _read_support_json(paths.instance_lock_path)
+    if marker is not None and marker.get("state") == "completed_stop" and discovery is not None:
+        _durable_remove(paths.instance_lock_path)
+        raise _pinokio_stop_refusal("Runtime completed-stop marker conflicts with an active discovery.")
+    try:
+        pinokio_binding = _pinokio_stop_binding(paths, realm)
+    except BootstrapError as exc:
+        if discovery is not None:
+            # A staged candidate Runtime can own a temporary live process
+            # before its Version pointer commits. Its ordinary exact-owner C1
+            # stop remains valid, but it cannot mint stopped-install evidence.
+            pinokio_binding = None
+        else:
+            if marker is not None and marker.get("state") == "completed_stop":
+                _durable_remove(paths.instance_lock_path)
+            raise _pinokio_stop_refusal(str(exc)) from exc
     owner = None
     stale_owner_identity = None
-    if discovery is None and marker is not None:
+    retained_completed_stop = None
+    if discovery is None and marker is not None and marker.get("state") == "completed_stop":
+        if pinokio_binding is None:
+            _durable_remove(paths.instance_lock_path)
+            raise _pinokio_stop_refusal("Runtime completed-stop marker has no selected Pinokio installation.")
+        try:
+            retained_completed_stop = _completed_stop_record(paths, marker, pinokio_binding)
+        except BootstrapError as exc:
+            _durable_remove(paths.instance_lock_path)
+            raise _pinokio_stop_refusal(str(exc)) from exc
+        try:
+            stale_pid = int(retained_completed_stop["pid"])
+            stale_birth = str(retained_completed_stop["process_birth_id"])
+            stale_instance = str(retained_completed_stop["runtime_instance_id"])
+            if _pid_alive(boundary, stale_pid):
+                _durable_remove(paths.instance_lock_path)
+                raise _pinokio_stop_refusal("Runtime Pinokio completed-stop owner is present; refusing interruption.")
+            observe_birth = getattr(boundary, "process_birth_identity", None)
+            if callable(observe_birth):
+                observed_birth = observe_birth(stale_pid)
+                if observed_birth is not None:
+                    _durable_remove(paths.instance_lock_path)
+                    raise _pinokio_stop_refusal(
+                        "Runtime Pinokio completed-stop owner identity changed; refusing interruption."
+                    )
+            if (str(retained_completed_stop.get("realm_id")) != str(realm.get("realm_id"))
+                    or _canonical_realm_root(str(retained_completed_stop.get("realm_root") or "")) != realm_root
+                    or not stale_birth or not stale_instance):
+                _durable_remove(paths.instance_lock_path)
+                raise _pinokio_stop_refusal("Runtime Pinokio completed-stop owner no longer matches the selected realm.")
+        except BootstrapError:
+            _durable_remove(paths.instance_lock_path)
+            raise
+        except Exception as exc:
+            _durable_remove(paths.instance_lock_path)
+            raise _pinokio_stop_refusal(
+                "Runtime Pinokio completed-stop owner absence could not be established."
+            ) from exc
+    elif discovery is None and marker is not None:
         raise BootstrapError("Runtime interruption refused: owner lock has no matching discovery.")
+    elif discovery is None and marker is None and pinokio_binding is not None:
+        raise _pinokio_stop_refusal("Runtime Pinokio interruption refused: no owner or completed-stop evidence.")
     if discovery is not None:
         owner = _validate_published_stop_owner(
             paths, boundary, realm, realm_root, discovery, marker,
@@ -1541,7 +2182,7 @@ def _interrupt_owner_locked(
                 discovery, realm_id=str(realm["realm_id"]), realm_root=realm_root,
             )
             stale_owner_identity = (stale_pid, stale_birth)
-    elif marker is not None:
+    elif marker is not None and retained_completed_stop is None:
         raise BootstrapError("Runtime interruption refused: owner lock identity is incomplete.")
 
     if owner is not None:
@@ -1562,11 +2203,39 @@ def _interrupt_owner_locked(
     elif stop_foreground is not None and not callable(stop_foreground):
         raise TypeError("stop_foreground must be a zero-argument callback")
 
+    def validate_stop_context() -> None:
+        if pinokio_binding is None:
+            return
+        try:
+            current_binding = _pinokio_stop_binding(paths, realm)
+        except BootstrapError as exc:
+            raise _pinokio_stop_refusal(str(exc)) from exc
+        if current_binding != pinokio_binding:
+            if retained_completed_stop is not None:
+                _durable_remove(paths.instance_lock_path)
+            raise _pinokio_stop_refusal("Runtime Pinokio stop binding changed before manager stop.")
+        if retained_completed_stop is None:
+            return
+        if _read_support_json(paths.instance_lock_path) != marker:
+            raise BootstrapError("Runtime completed-stop marker changed before manager stop.")
+        try:
+            _require_owner_absent(
+                boundary, int(retained_completed_stop["pid"]),
+                str(retained_completed_stop["process_birth_id"]),
+                context="immediately before manager stop",
+            )
+        except BootstrapError as exc:
+            _durable_remove(paths.instance_lock_path)
+            raise _pinokio_stop_refusal(str(exc)) from exc
+
     result = _fenced_stop_and_manager(
         paths, boundary, realm_id=str(realm["realm_id"]), realm_root=realm_root,
         discovery=discovery, marker=marker, owner=owner, stop_manager=stop_manager,
         stop_foreground=stop_foreground if owner is None else None,
         stale_owner_identity=stale_owner_identity,
+        completed_stop_binding=pinokio_binding if owner is not None else None,
+        retained_completed_stop=retained_completed_stop,
+        validate_stop=validate_stop_context if pinokio_binding is not None else None,
     )
     return {"status": "stopped", "realm_id": str(realm["realm_id"]),
             "idle": result["interruption"]}
@@ -1593,15 +2262,22 @@ def _preflight_owner_interruption(
     discovery = _read_support_json(paths.discovery_path)
     marker = _read_support_json(paths.instance_lock_path)
     if restore_selection is not None:
-        _require_restore_publications_absent(paths)
+        _require_restore_publications_absent(paths, expected_completed_marker=marker)
     elif discovery is None and marker is not None:
-        raise BootstrapError("Runtime interruption refused: owner lock has no matching discovery.")
+        if marker.get("state") != "completed_stop":
+            raise BootstrapError("Runtime interruption refused: owner lock has no matching discovery.")
     elif discovery is not None and marker is None:
         raise BootstrapError("Runtime interruption refused: owner lock does not match discovery.")
-    elif discovery is None and marker is None:
+    elif discovery is None and marker is None and restore_selection is None:
         # No publication is a valid idle-stop state. The selected realm still
         # has to be readable and clear before sidecar serialization begins.
-        pass
+        realm, _root = _selected_stop_realm(paths)
+        try:
+            pinokio_binding = _pinokio_stop_binding(paths, realm)
+        except BootstrapError as exc:
+            raise _pinokio_stop_refusal(str(exc)) from exc
+        if pinokio_binding is not None:
+            raise _pinokio_stop_refusal("Runtime Pinokio interruption refused: no owner or completed-stop evidence.")
     if restore_selection is None:
         preflight_stop(paths)
     else:
@@ -1647,7 +2323,8 @@ def preflight_stop(
         raise TypeError("restore_selection must be a RestoreSelection")
     if restore_selection is not None:
         snapshot = _selected_restore_snapshot(paths, restore_selection)
-        _require_restore_publications_absent(paths)
+        marker = _read_support_json(paths.instance_lock_path)
+        _require_restore_publications_absent(paths, expected_completed_marker=marker)
         realm_root = Path(snapshot["realm_root"])
         if snapshot["realm_absent"]:
             return {"safe": True, "realm_absent": True}
@@ -1719,6 +2396,8 @@ def _validate_published_stop_owner(
     realm_root: Path, discovery: Mapping[str, Any], marker: Mapping[str, Any] | None,
 ) -> tuple[int, str, str, str] | None:
     realm_id = str(realm.get("realm_id") or "")
+    if marker is not None and marker.get("state") is not None:
+        raise BootstrapError("Runtime interruption refused: owner lock has an unknown state.")
     pid, birth, instance_id, endpoint = _recorded_owner_identity(
         discovery, realm_id=realm_id, realm_root=realm_root,
     )

@@ -833,9 +833,10 @@ class LocalRuntimeBoundary:
             raise failure from exc
 
     def stop(self, **_kwargs):
-        if self._process:
-            anchor = getattr(self._process, "_runtime_owner_released_anchor", None)
-            if anchor is not None and self._process.poll() is None:
+        process = self._process
+        if process is not None:
+            anchor = getattr(process, "_runtime_owner_released_anchor", None)
+            if anchor is not None and process.poll() is None:
                 broker = self._process._runtime_custody_broker
                 ack = self._commit_owner_transition(
                     broker.role_authority, kind="claim", actor=broker.cleanup_actor,
@@ -843,10 +844,11 @@ class LocalRuntimeBoundary:
                     owner_epoch=broker.owner_epoch, sealed=anchor,
                 )
                 broker.custody_generation = ack["generation"]
-                del self._process._runtime_owner_released_anchor
-            self._terminate(self._process)
+                del process._runtime_owner_released_anchor
+            self._terminate(process)
             self._process = None
         self._bootstrap_credential = None
+        return {"children_stopped": True}
 
     def _commit_owner_transition(self, authority: RoleCustodyAuthority, *, kind: str,
                                  actor: AuthenticatedCleanupActor, generation: int,
@@ -1228,7 +1230,10 @@ class ForegroundRuntimeBoundary(LocalRuntimeBoundary):
             raise BootstrapError("Runtime readiness was revoked")
 
     def stop(self, **kwargs):
-        if self.daemon is not None:
-            daemon, self.daemon = self.daemon, None
+        daemon = self.daemon
+        if daemon is not None:
             daemon.stop()
+            self.daemon = None
+            self._custody = None
         self._bootstrap_credential = None
+        return {"children_stopped": True}

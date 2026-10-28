@@ -551,17 +551,22 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"restart", "down"}:
             config = _config(args, paths)
             boundary = LocalRuntimeBoundary()
-            source = config.resolve_source_profile(paths)
+            config.resolve_source_profile(paths)
             catalog = _read_catalog(paths)
             realm_id = str(catalog.get("selected_realm_id") or "")
             realm = next((item for item in catalog.get("realms", []) if str(item.get("realm_id")) == realm_id), None)
             discovery = _read_support_json(paths.discovery_path) or {}
-            if not realm or not discovery.get("pid"):
+            if not realm:
                 raise BootstrapError("No selected runtime owner to restart; run astrid-runtime up --profile astrid.")
-            boundary.prepare_restart(source_profile=source, realm_id=realm_id, realm_root=Path(str(realm["data_root"])), support_root=paths.runtime_support, pid=int(discovery["pid"]))
             if args.command == "restart":
+                if not discovery.get("pid"):
+                    raise BootstrapError("No selected runtime owner to restart; run astrid-runtime up --profile astrid.")
                 _emit_ready(restart(paths, boundary, config), json_mode=args.json)
             else:
+                # A fresh controller may repeat canonical down after the exact
+                # Runtime owner was already stopped. Let C1 validate and admit
+                # its retained completed-stop marker (or safely refuse when
+                # no such evidence exists) instead of requiring discovery here.
                 _emit(down(paths, boundary), json_mode=args.json)
             return 0
         if args.command == "status":
