@@ -10,7 +10,7 @@ from typing import Any
 from runtime_protocol import platform
 
 from . import __version__
-from .paths import RuntimePaths, _install_record_path
+from .paths import INSTALL_RECORD_OWNER, RuntimePaths, _install_record_path
 from .update import read_update_status
 
 _SECRET_PATTERNS = (
@@ -72,7 +72,7 @@ def _tail(path: Path, home: Path, limit: int = 80) -> str:
 
 def _install_info(paths: RuntimePaths) -> tuple[dict[str, Any], Path | None]:
     record = _read_json(_install_record_path(paths.home))
-    if record.get("owner") != "haus.astrid.runtime":
+    if record.get("owner") != INSTALL_RECORD_OWNER:
         return {}, None
     root = record.get("program_root")
     candidate = Path(root).expanduser() if isinstance(root, str) and root else None
@@ -112,7 +112,7 @@ def diagnostics_report(
     lines = [
         "Astrid diagnostics",
         f"Runtime version: {__version__}",
-        f"B1 identity: managed_by={identity.get('managed_by', record.get('managed_by', 'unknown'))}; release={identity.get('release', 'unknown')}",
+        f"Install identity: managed_by={identity.get('managed_by', record.get('managed_by', 'unknown'))}; release={identity.get('release', 'unknown')}",
         f"Runtime support state: {state} (healthy={healthy})",
         f"Last update result: {result}",
         f"Update log: {tx_log_path or '(not available)'}",

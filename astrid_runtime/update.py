@@ -22,7 +22,7 @@ from runtime_protocol import platform
 from runtime_protocol.errors import AuthorizationError, ConflictError
 from runtime_protocol.lifecycle import assert_interruption_safe
 from .identity import normalize_startup_identity
-from .paths import _install_record_path
+from .paths import INSTALL_RECORD_OWNER, _install_record_path
 
 MANIFEST_URL = "https://astrid.haus/install-manifest.json"
 BOOTSTRAP_URL = "https://astrid.haus/install"
@@ -130,7 +130,7 @@ class UpdateAdmission:
         selection_path = _install_record_path(Path.home())
         selected = _json(selection_path, snapshots)
         _assert_autostart_supported(selected)
-        if selected.get("owner") != "haus.astrid.runtime" or selected.get("uninstalled"):
+        if selected.get("owner") != INSTALL_RECORD_OWNER or selected.get("uninstalled"):
             raise ValueError("installer ownership required")
         root = _path(selected.get("program_root"))
         data = _path(selected.get("data_root"))
@@ -140,7 +140,7 @@ class UpdateAdmission:
             raise ValueError("selected workspace does not match the live owner")
         marker = _json(root / "install.json", snapshots)
         for record in (selected, marker):
-            if (record.get("owner") != "haus.astrid.runtime" or record.get("managed_by") is not None
+            if (record.get("owner") != INSTALL_RECORD_OWNER or record.get("managed_by") is not None
                     or _path(record.get("data_root")) != data):
                 raise ValueError("installer owner, management or data root mismatch")
         journal = root / "update-transaction.json"
@@ -186,10 +186,7 @@ class UpdateAdmission:
 
     @contextmanager
     def _installer_idle(self, selection_path):
-        parent = selection_path.parent
-        if sys.platform == "win32":
-            parent = parent / "Astrid Installer"
-        lock_path = parent / "astrid-install.lock"
+        lock_path = _installer_lock_path(selection_path)
         # Do not create installer state on refusal. An absent lock has no
         # active holder; future execution must reacquire the real installer lock.
         if not lock_path.exists() and not lock_path.is_symlink():
@@ -345,7 +342,7 @@ def read_update_status(home=None, *, available=False):
 
     home = Path(home) if home is not None else Path.home()
     selected = _read_bounded_object(_install_record_path(home)) or {}
-    if selected.get("owner") != "haus.astrid.runtime":
+    if selected.get("owner") != INSTALL_RECORD_OWNER:
         return none()
     root_text = selected.get("program_root")
     if not isinstance(root_text, str) or not Path(root_text).is_absolute():
@@ -361,7 +358,7 @@ def read_update_status(home=None, *, available=False):
     install = _read_bounded_object(install_path)
     if install is None:
         return recovery_needed()
-    if (install.get("owner") != "haus.astrid.runtime"
+    if (install.get("owner") != INSTALL_RECORD_OWNER
             or install.get("data_root") != selected.get("data_root")):
         return recovery_needed()
     job = install.get("update_job")
@@ -470,11 +467,15 @@ def read_update_status(home=None, *, available=False):
     return output
 
 
-def _installer_lock_held(home):
-    parent = _install_record_path(Path(home)).parent
+def _installer_lock_path(selection_path):
+    parent = selection_path.parent
     if sys.platform == "win32":
         parent = parent / "Astrid Installer"
-    lock_path = parent / "astrid-install.lock"
+    return parent / "astrid-install.lock"
+
+
+def _installer_lock_held(home):
+    lock_path = _installer_lock_path(_install_record_path(Path(home)))
     if lock_path.is_symlink() or not lock_path.is_file():
         return False
     try:
