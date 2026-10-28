@@ -140,7 +140,7 @@ requires_posix_private_modes = _declare(
 ).mark()
 requires_windows_token_process_times = _declare(
     "windows-token-process-times", "sys_platform != 'win32'",
-    "Windows token and process-time APIs", (), no_ci=NO_WINDOWS_CI,
+    "Windows token and process-time APIs", ("windows-realm-publication",),
 ).mark()
 requires_posix_process_groups = _declare(
     "posix-process-groups", "sys_platform == 'win32'",
@@ -152,19 +152,19 @@ requires_windows_job_object = _declare(
 ).mark()
 requires_windows_dirfd_adapter = _declare(
     "windows-dirfd-adapter", "os_name != 'nt'",
-    "exercises the native Windows dir-fd adapter", (), no_ci=NO_WINDOWS_CI,
+    "exercises the native Windows dir-fd adapter", ("windows-realm-publication",),
 ).mark()
 requires_windows_reparse_point_rejection = _declare(
     "windows-reparse-point-rejection", "os_name != 'nt'",
-    "exercises Windows reparse-point rejection", (), no_ci=NO_WINDOWS_CI,
+    "exercises Windows reparse-point rejection", ("windows-realm-publication",),
 ).mark()
 requires_windows_sqlite_backup = _declare(
     "windows-sqlite-backup", "os_name != 'nt'",
-    "exercises Windows SQLite backup snapshots", (), no_ci=NO_WINDOWS_CI,
+    "exercises Windows SQLite backup snapshots", ("windows-realm-publication",),
 ).mark()
 requires_windows_process_and_lock_apis = _declare(
     "windows-process-and-lock-apis", "os_name != 'nt'",
-    "native Windows process and lock APIs", (), no_ci=NO_WINDOWS_CI,
+    "native Windows process and lock APIs", ("windows-realm-publication",),
 ).mark()
 requires_posix_owner_only_permissions = _declare(
     "posix-owner-only-permissions", "os_name == 'nt'",
@@ -187,7 +187,7 @@ requires_linux_o_path = _declare(
 # only fire on Windows, and only for WinError 1314 (no symlink privilege).
 _WINDOWS_SYMLINKS = _declare(
     "windows-symlink-creation", "os_name == 'nt'",
-    "symlink creation is unavailable for this Windows account", ("unit",),
+    "symlink creation is unavailable for this Windows account", ("unit", "windows-realm-publication"),
     only_error=lambda error: getattr(error, "winerror", None) == 1314,
 )
 # Applied to every ``darwin_native`` test below; the lane is deselected by default

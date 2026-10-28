@@ -31,6 +31,15 @@ jobs:
           tests/test_platform_signaling.py
           tests/test_runtime_cli_serve_cleanup.py
           tests/test_service_stop.py
+      - name: Verify native Windows process, filesystem, and worker handoff APIs
+        run: >-
+          python -m pytest -q -m ""
+          tests/test_platform.py
+          tests/test_platform_filesystem.py
+          tests/test_platform_windows.py
+          tests/test_dirfd_windows.py
+          tests/test_windows_filesystem_native.py
+          tests/test_windows_worker_handoff.py
       - name: Verify Runtime service cleanup receipt contract
         run: >-
           python -m pytest -q

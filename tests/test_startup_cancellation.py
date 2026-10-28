@@ -95,6 +95,10 @@ def test_readiness_cancels_while_request_is_still_pending():
 @pytest.mark.parametrize("stage", ["provision", "handshake"])
 @pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGINT])
 def test_run_cancels_pending_handoff_and_rolls_back(monkeypatch, tmp_path, capsys, stage, stop_signal):
+    import importlib
+
+    bootstrap_module = importlib.import_module("astrid_runtime.bootstrap")
+    monkeypatch.setattr(bootstrap_module, "_capture_requested_identity", lambda _source: {"release": 0, "managed_by": None})
     paths = RuntimePaths.sandbox(tmp_path)
     paths.ensure_support_dirs()
     root = paths.realms_dir / "realm"
