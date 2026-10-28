@@ -297,11 +297,13 @@ def _append_owner_jsonl(path: Path, value: Mapping[str, object]) -> None:
     encoded = _canonical(dict(value)) + b"\n"
     if len(encoded) > FRAME_LIMIT:
         raise CustodyError("custody authority journal record exceeds its hard limit")
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
+    if sys.platform == "win32":
+        from runtime_protocol.windows_security import open_private_file
+        descriptor = open_private_file(path, append=True)
+    else:
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
     try:
         observed = os.fstat(descriptor)
         if (
@@ -330,10 +332,14 @@ def _open_authority_scope_lock(scope_root: Path) -> int:
         or not platform.is_owner_only(root if sys.platform == "win32" else observed_root)
     ):
         raise CustodyError("custody authority scope is not owner-only")
-    descriptor = os.open(
-        root / AUTHORITY_SCOPE_LOCK,
-        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600,
-    )
+    if sys.platform == "win32":
+        from runtime_protocol.windows_security import open_private_file
+        descriptor = open_private_file(root / AUTHORITY_SCOPE_LOCK)
+    else:
+        descriptor = os.open(
+            root / AUTHORITY_SCOPE_LOCK,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
     os.set_inheritable(descriptor, False)
     observed = os.fstat(descriptor)
     if (

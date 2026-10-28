@@ -252,6 +252,28 @@ def private_directory(path):
         _validate_handle(handle)
 
 
+def open_private_file(path, *, append=False):
+    """Create with a protected DACL, or validate an existing retained handle."""
+    import msvcrt
+    _, kernel = _api()
+    with _descriptor(_private_sddl()) as descriptor:
+        attributes = _Attributes(ctypes.sizeof(_Attributes), descriptor, False)
+        handle = kernel.CreateFileW(str(Path(path).absolute()), 0xC0000000 | READ_CONTROL,
+                                    3, ctypes.byref(attributes), 4, 0x00200080, None)
+        if handle == w.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            info = _FileInfo()
+            _check(kernel.GetFileInformationByHandle(handle, ctypes.byref(info)))
+            if info.attributes & (0x400 | 0x10) or info.links != 1:
+                _unsafe("private file must be a singly linked regular file")
+            _validate_handle(handle)
+            return msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY | (os.O_APPEND if append else 0))
+        except BaseException:
+            kernel.CloseHandle(handle)
+            raise
+
+
 def private_temporary(directory, prefix):
     """Create a file with an explicit restricted DACL before writing secrets."""
     import msvcrt

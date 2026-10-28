@@ -279,8 +279,8 @@ def test_windows_rename_and_link_information_use_destination_handle(native_calls
             fs.replace("child", destination, src_dir_fd=_PARENT_FD, dst_dir_fd=20)
         handle, data, kind = native_calls.sets[-1]
         assert handle == native_calls.fd + 1000
-        assert kind == (11 if link else 10)
-        assert data[0] == (0 if link else 1)
+        assert kind == (11 if link else 65)
+        assert int.from_bytes(data[:4], "little") == (0 if link else 3)
         root_offset = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 4
         assert int.from_bytes(data[root_offset:root_offset + ctypes.sizeof(ctypes.c_void_p)], "little") == 1020
         length_offset = dirfd._WinNameInformation.FileNameLength.offset

@@ -450,12 +450,15 @@ class _WindowsFilesystem:
                 # replacing a reparse entry never follows that entry's target.
                 data = name.encode("utf-16-le")
                 buffer = ctypes.create_string_buffer(ctypes.sizeof(_WinNameInformation) + len(data))
-                info = _WinNameInformation.from_buffer(buffer)
-                info.ReplaceIfExists = replace
+                info = (_WinNameInformationEx if replace and not link else _WinNameInformation).from_buffer(buffer)
+                if replace and not link:
+                    info.Flags = 0x1 | 0x2  # REPLACE_IF_EXISTS | POSIX_SEMANTICS
+                else:
+                    info.ReplaceIfExists = False
                 info.RootDirectory = self._api()[1].get_osfhandle(int(parent))
                 info.FileNameLength = len(data)
                 ctypes.memmove(ctypes.addressof(buffer) + _WinNameInformation.FileName.offset, data, len(data))
-                operation = lambda: self._set_information(fd, buffer, 11 if link else 10)
+                operation = lambda: self._set_information(fd, buffer, 11 if link else (65 if replace else 10))
                 if replace and not link:
                     _retry_windows_sharing_violation(operation)
                 else:
@@ -520,6 +523,11 @@ class _WinIoStatus(ctypes.Structure):
 
 class _WinNameInformation(ctypes.Structure):
     _fields_ = [("ReplaceIfExists", ctypes.c_ubyte), ("RootDirectory", ctypes.c_void_p),
+                ("FileNameLength", ctypes.c_uint32), ("FileName", ctypes.c_uint16 * 1)]
+
+
+class _WinNameInformationEx(ctypes.Structure):
+    _fields_ = [("Flags", ctypes.c_uint32), ("RootDirectory", ctypes.c_void_p),
                 ("FileNameLength", ctypes.c_uint32), ("FileName", ctypes.c_uint16 * 1)]
 
 

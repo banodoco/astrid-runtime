@@ -135,3 +135,27 @@ def test_native_unc_containment_and_publication(extended):
         if parent >= 0:
             os.close(parent)
         shutil.rmtree(root)
+
+
+def test_private_file_creation_is_protected_and_existing_unprotected_file_is_refused(tmp_path):
+    from runtime_protocol.windows_security import open_private_file, validate
+    root = tmp_path / "private"
+    platform.private_directory(root)
+    path = root / "custody.lock"
+    descriptor = open_private_file(path)
+    try:
+        validate(descriptor)
+        os.write(descriptor, b"retained")
+    finally:
+        os.close(descriptor)
+    descriptor = open_private_file(path)
+    try:
+        assert os.read(descriptor, 32) == b"retained"
+    finally:
+        os.close(descriptor)
+    # Inherited ACLs are not a substitute for a protected DACL.
+    unsafe = root / "unsafe.lock"
+    unsafe.write_bytes(b"untrusted")
+    with pytest.raises(PermissionError):
+        open_private_file(unsafe)
+    assert unsafe.read_bytes() == b"untrusted"

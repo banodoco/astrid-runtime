@@ -31,6 +31,13 @@ jobs:
           tests/test_platform_signaling.py
           tests/test_runtime_cli_serve_cleanup.py
           tests/test_service_stop.py
+      - name: Provision disposable local SMB share for UNC qualification
+        shell: pwsh
+        run: |
+          $shareRoot = Join-Path $env:RUNNER_TEMP 'astrid-unc'
+          New-Item -ItemType Directory -Path $shareRoot -Force | Out-Null
+          New-SmbShare -Name AstridQualification -Path $shareRoot -FullAccess "$env:USERDOMAIN\$env:USERNAME" | Out-Null
+          "ASTRID_TEST_UNC_ROOT=\\localhost\AstridQualification" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Verify native Windows process, filesystem, and worker handoff APIs
         run: >-
           python -m pytest -q -m ""
@@ -40,6 +47,13 @@ jobs:
           tests/test_dirfd_windows.py
           tests/test_windows_filesystem_native.py
           tests/test_windows_worker_handoff.py
+      - name: Remove disposable SMB share
+        if: always()
+        shell: pwsh
+        run: |
+          if (Get-SmbShare -Name AstridQualification -ErrorAction SilentlyContinue) {
+            Remove-SmbShare -Name AstridQualification -Force
+          }
       - name: Verify Runtime service cleanup receipt contract
         run: >-
           python -m pytest -q

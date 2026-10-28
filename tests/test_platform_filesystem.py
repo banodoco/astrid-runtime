@@ -42,8 +42,10 @@ def test_support_json_publication_has_one_directory_flush_owner(tmp_path, monkey
 
     flushed = []
     monkeypatch.setattr(platform, "fsync_directory", flushed.append)
-    atomic_write_json(tmp_path / "support.json", {"version": 1})
-    assert flushed == [tmp_path]
+    private = tmp_path / "private"
+    platform.private_directory(private)
+    atomic_write_json(private / "support.json", {"version": 1})
+    assert flushed == [private]
 
 
 @requires_windows_dirfd_adapter
