@@ -2052,8 +2052,8 @@ def _restore_selection_snapshot(
     journal_realm = journal.get("realm")
     if not isinstance(journal_realm, Mapping):
         raise BootstrapError("Restore journal does not identify its selected realm.")
-    journal_realm_root = _canonical_metadata_path(
-        Path(str(journal_realm.get("realm_root") or "")), label="journal realm root")
+    journal_realm_root = _canonical_realm_root(_canonical_metadata_path(
+        Path(str(journal_realm.get("realm_root") or "")), label="journal realm root"), allow_missing=True)
     if (program_root != install_root or data_root != journal_data
             or str(journal_realm.get("realm_id") or "") != realm_id
             or journal_realm_root != realm_root

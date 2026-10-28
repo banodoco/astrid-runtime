@@ -34,7 +34,7 @@ from astrid_runtime.bootstrap import (
     preflight_stop,
     restart,
 )
-from astrid_runtime.paths import RuntimePaths
+from astrid_runtime.paths import RuntimePaths, _install_record_path
 from runtime_protocol.lifecycle import inspect_interruption_state
 from runtime_protocol.store import RealmStore
 
@@ -167,7 +167,7 @@ class BootstrapTests(unittest.TestCase):
         self.identity_env.start()
         self.addCleanup(self.identity_env.stop)
         self.temp = tempfile.TemporaryDirectory()
-        self.paths = RuntimePaths.sandbox(self.temp.name)
+        self.paths = RuntimePaths.sandbox(Path(self.temp.name).resolve())
         self.boundary = FakeBoundary()
         self.config = BootstrapConfig(source_profile=PROFILE)
 
@@ -198,7 +198,7 @@ class BootstrapTests(unittest.TestCase):
         return root
 
     def _configure_pinokio_selection(self, realm_root):
-        program = Path(self.temp.name) / "program"
+        program = self.paths.home / "program"
         version_root = program / "versions" / "v1"
         environment = version_root / "py"
         runtime_checkout = version_root / "r"
@@ -234,9 +234,10 @@ class BootstrapTests(unittest.TestCase):
             "owner": "haus.astrid.runtime", "managed_by": "pinokio",
             "data_root": str(data_root),
         }), encoding="utf-8")
-        selection_dir = Path(self.temp.name) / "selected-install"
-        selection_dir.mkdir(parents=True, exist_ok=True)
-        selection = selection_dir / "astrid-install.json"
+        selection_dir = self.paths.home / "selected-install"
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
+            selection = _install_record_path(self.paths.home)
+        selection.parent.mkdir(parents=True, exist_ok=True)
         selection.write_text(json.dumps({
             "owner": "haus.astrid.runtime", "managed_by": "pinokio",
             "program_root": str(program), "data_root": str(data_root),
@@ -246,13 +247,13 @@ class BootstrapTests(unittest.TestCase):
         catalog = json.loads(self.paths.catalog_path.read_text(encoding="utf-8"))
         catalog["source_profiles"]["astrid"] = source.as_dict()
         self.paths.catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
-        return selection_dir, source
+        return selection.parent, source
 
     def test_pinokio_completed_stop_survives_fresh_down_and_is_revoked_before_launch(self):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             marker = json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8"))
@@ -272,7 +273,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             with self.assertRaises(BootstrapError) as missing:
                 down(self.paths, self.boundary)
             self.assertEqual(missing.exception.details, {"safe": False, "code": "stop_unproven"})
@@ -307,7 +308,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             owner_pid = int(json.loads(self.paths.instance_lock_path.read_text())["pid"])
@@ -338,7 +339,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             valid = json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8"))
@@ -368,7 +369,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             marker = self.paths.instance_lock_path.read_bytes()
@@ -434,7 +435,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             died, _real = self._crash_stop_owner(after_signal=True)
             with self.assertRaises(died):
@@ -460,7 +461,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             died, _real = self._crash_stop_owner(after_signal=True)
             with self.assertRaises(died):
@@ -610,7 +611,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             selection_path = selection_dir / "astrid-install.json"
@@ -632,7 +633,7 @@ class BootstrapTests(unittest.TestCase):
         realm_root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(realm_root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             original = json.loads(self.paths.instance_lock_path.read_text(encoding="utf-8"))
@@ -675,7 +676,7 @@ class BootstrapTests(unittest.TestCase):
         realm_root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(realm_root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             catalog = json.loads(self.paths.catalog_path.read_text(encoding="utf-8"))
@@ -692,7 +693,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             catalog = json.loads(self.paths.catalog_path.read_text(encoding="utf-8"))
@@ -718,7 +719,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             replacement_marker = {"pid": 991122, "runtime_instance_id": "replacement"}
@@ -742,7 +743,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             real_write = bootstrap_module.atomic_write_json
 
@@ -776,7 +777,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             self.boundary.stop = lambda: None
@@ -819,7 +820,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             selected_path = selection_dir / "astrid-install.json"
@@ -836,7 +837,7 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
         self.config = BootstrapConfig(source_profile=source)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
             bootstrap(self.paths, self.boundary, self.config)
             down(self.paths, self.boundary)
             replacement = {
@@ -1269,6 +1270,14 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(json.loads(self.paths.catalog_path.read_text())["realms"][0]["display_name"],
                          "Current selection metadata")
         self.assertEqual(order, [("manager", False), ("manager", True)])
+
+    def test_restore_selection_accepts_system_temp_alias(self):
+        root = Path(self.temp.name)
+        if root == root.resolve():
+            self.skipTest("temporary directory has no system path alias")
+        self.paths = RuntimePaths.sandbox(root)
+        fixture = self._restore_selection_fixture(realm_id="restore-alias")
+        self.assertTrue(preflight_stop(self.paths, restore_selection=fixture["selection"])["safe"])
 
     def test_normal_down_still_refuses_missing_catalog(self):
         self._configure()
