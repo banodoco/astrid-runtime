@@ -118,34 +118,104 @@ def test_allowed_health_read_and_response_headers(tmp_path, prefix):
         world.stop()
 
 
-def test_health_reports_pinokio_only_as_a_door_extension(tmp_path, monkeypatch):
+def test_diagnostics_route_is_narrow_and_owner_authenticated(tmp_path):
     world = start_door_world(tmp_path)
     try:
-        monkeypatch.delenv("ASTRID_INSTALL_MANAGED_BY", raising=False)
+        reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
+        assert reply.status == 200, reply.body
+        assert "Astrid diagnostics" in reply.json()["report"]
+        assert "Runtime support state: ready (healthy=True)" in reply.json()["report"]
+        assert "App build:" not in reply.json()["report"]
+        assert "App release:" not in reply.json()["report"]
+        assert world.call(f"{API_RUNTIME}/v1/diagnostics/anything").status == 404
+        assert world.call(f"{API_RUNTIME}/v1/doctor").status == 404
+    finally:
+        world.stop()
+
+
+def test_diagnostics_download_reports_real_doctor_issues(tmp_path):
+    world = start_door_world(tmp_path)
+    try:
+        # The store doctor reads the real catalog and detects invalid JSON.
+        (world.support / "catalog.json").write_text("{invalid", encoding="utf-8")
+        reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
+        assert reply.status == 200, reply.body
+        report = reply.json()["report"]
+        assert "Runtime support state: unhealthy (healthy=False)" in report
+        assert "catalog_invalid" in report
+    finally:
+        world.stop()
+
+
+@pytest.mark.parametrize("step", ["complete", "rolled_back"])
+def test_diagnostics_download_reads_installer_journal_and_log(tmp_path, monkeypatch, step):
+    from astrid_runtime.paths import _install_record_path
+    from runtime_protocol import platform
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    root = tmp_path / "program"
+    root.mkdir()
+    record = _install_record_path(tmp_path / "home")
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(tmp_path / "workspace")}))
+    (root / "install.json").write_text(json.dumps({"owner": "haus.astrid.runtime", "data_root": str(tmp_path / "workspace")}))
+    log = root / "installer.log"
+    log.write_text("installer output\nCookie: sid=secret-cookie\n")
+    platform.owner_only(log)
+    (root / "update-transaction.json").write_text(json.dumps({"step": step, "log_path": str(log)}))
+    world = start_door_world(tmp_path)
+    try:
+        reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
+        assert reply.status == 200, reply.body
+        report = reply.json()["report"]
+        assert f"Last update result: {step}" in report
+        assert "installer output" in report and "[REDACTED]" in report
+        assert "secret-cookie" not in report
+    finally:
+        world.stop()
+
+
+def test_health_reports_pinokio_only_as_a_door_extension(tmp_path, monkeypatch):
+    monkeypatch.delenv("ASTRID_INSTALL_RELEASE", raising=False)
+    monkeypatch.delenv("ASTRID_INSTALL_MANAGED_BY", raising=False)
+    world = start_door_world(tmp_path)
+    try:
         reply = world.call(f"{API_RUNTIME}/v1/health")
         assert reply.status == 200
         assert "install" not in reply.json()
 
-        monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "other")
-        reply = world.call(f"{API_RUNTIME}/v1/health")
-        assert reply.status == 200
-        assert "install" not in reply.json()
-
-        monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "Pinokio")
-        reply = world.call(f"{API_RUNTIME}/v1/health")
-        assert reply.status == 200
-        assert "install" not in reply.json()
-
+        # The live door follows the owner's startup snapshot; changing the
+        # process environment after startup cannot change its marker.
+        monkeypatch.setenv("ASTRID_INSTALL_RELEASE", "8")
         monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "pinokio")
         reply = world.call(f"{API_RUNTIME}/v1/health")
         assert reply.status == 200
+        assert "install" not in reply.json()
+
+        pinokio_root = tmp_path / "pinokio"
+        pinokio_root.mkdir()
+        monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "pinokio")
+    finally:
+        world.stop()
+
+    pinokio_world = start_door_world(pinokio_root)
+    try:
+        reply = pinokio_world.call(f"{API_RUNTIME}/v1/health")
+        assert reply.status == 200
         assert reply.json()["install"] == {"managed_by": "pinokio"}
 
-        status, body = world.owner("GET", "/v1/health")
+        monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "other")
+        reply = pinokio_world.call(f"{API_RUNTIME}/v1/health")
+        assert reply.status == 200
+        assert reply.json()["install"] == {"managed_by": "pinokio"}
+
+        status, body = pinokio_world.owner("GET", "/v1/health")
         assert status == 200
         assert "install" not in json.loads(body)
     finally:
-        world.stop()
+        pinokio_world.stop()
 
 
 def test_realm_read_through_the_door(tmp_path):

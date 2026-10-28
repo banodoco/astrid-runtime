@@ -94,6 +94,7 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
 
     def fake_spawn_tree(argv, *, detached, **kwargs):
         assert detached
+        captured["runtime_argv"] = list(argv)
         return fake_popen(argv, **kwargs)
 
     class FakeBroker:
@@ -103,6 +104,7 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
             pass
 
         def child_environment(self, argv, *, start_new_session):
+            captured["runtime_argv"] = list(argv)
             return {"ASTRID_RUNTIME_CUSTODY_ROLE": "runtime_owner"}
 
         def wait_until_sealed(self):
@@ -112,7 +114,9 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
             pass
 
     boundary = LocalRuntimeBoundary()
-    monkeypatch.setattr(module, "sys", SimpleNamespace(platform=host, exc_info=sys.exc_info))
+    monkeypatch.setattr(module, "sys", SimpleNamespace(
+        platform=host, exc_info=sys.exc_info, executable=sys.executable,
+    ))
     monkeypatch.setattr(custody, "sys", SimpleNamespace(platform=host))
     monkeypatch.setattr(module.platform, "log_dir", lambda: tmp_path / "logs")
     monkeypatch.setattr(module.platform, "spawn_tree", fake_spawn_tree)
@@ -129,7 +133,7 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
         profile="astrid",
         runtime_checkout=str(tmp_path / "runtime-checkout-that-must-not-be-used"),
         source_checkout=str(source_checkout),
-        runtime_command=(sys.executable, "-c", "pass"),
+        runtime_command=(),
         runtime_environment="",
         protocol_version="workspace.v1",
         schema_version="workspace-schema-v1",
@@ -144,8 +148,17 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
     environment = kwargs.get("env", os.environ)
     assert environment.get("PYTHONPATH") == os.environ.get("PYTHONPATH")
     assert not any(str(source_checkout) in str(value) for value in environment.values())
-    assert not any(str(source_checkout) in part for part in captured["argv"])
     assert "PYTHONPATH" not in kwargs
+    argv = captured["runtime_argv"]
+    assert argv[:6] == [sys.executable, "-X", "utf8", "-m", "runtime_protocol", "start"]
+    for option, path in (
+        ("--runtime-checkout", profile.runtime_checkout),
+        ("--agent-checkout", profile.source_checkout),
+    ):
+        option_index = argv.index(option)
+        assert argv[option_index + 1] == path
+        assert [index for index, value in enumerate(argv) if value == path] == [option_index + 1]
+    assert "--service-source-checkout" not in argv
     if host == "linux":
         # Linux launches the daemon directly (spawn_tree) and publishes native
         # custody for the probed identity; Darwin publishes via the broker.

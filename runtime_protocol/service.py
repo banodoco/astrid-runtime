@@ -1298,6 +1298,11 @@ class RuntimeService:
         if not row:
             return
         self._assert_executor_identity(identity, row["executor_id"])
+        keys = row.keys()
+        # Checkpoint rows name their attempt in attempt_id; attempt rows use id.
+        # A row that names no attempt has no attempt authority to retire.
+        attempt_key = "attempt_id" if "checkpoint_path" in keys else "id"
+        self.store.assert_attempt_not_abandoned(row[attempt_key] if attempt_key in keys else None)
         if identity is None:
             return
         activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
@@ -5314,6 +5319,7 @@ class RuntimeService:
                     request["project_id"] = project_id
                 if binding is not None:
                     request["publication_binding"] = binding
+                    self.store.assert_attempt_not_abandoned(binding.get("attempt_id"))
                 request_hash = hashlib.sha256(canonical_json(request).encode()).hexdigest()
                 replay = self._command_replay("object.ingest", aggregate_id, idempotency_key,
                                               request_hash, project_id=project_id)
@@ -7495,6 +7501,37 @@ class RuntimeService:
                 self.store.cancel_task(task_id, record=record)
                 return recorded
 
+    @_durable_mutation
+    def abandon_task(self, task_id, body, *, idempotency_key=None, identity=None):
+        """Owner decision to lose an unresolved attempt; never remote stop proof."""
+        from .daemon import WORKER_ACTOR
+
+        if (not isinstance(identity, dict) or identity.get("actor") != "owner"
+                or "admin" not in identity.get("scopes", [])):
+            raise AuthorizationError("task abandon requires the Runtime owner actor and admin scope")
+        idempotency_key = require_idempotency_key(idempotency_key)
+        fields = ("expected_task_version", "attempt_id", "lease_id", "fence", "runtime_epoch", "execution_binding", "reason")
+        body = _wire_object(body, required=fields, allowed=fields)
+        for field in ("expected_task_version", "fence", "runtime_epoch"):
+            _wire_integer(body, field, positive=True)
+        for field in ("attempt_id", "lease_id", "reason"):
+            _wire_string(body, field)
+        if not body["reason"].strip() or len(body["reason"]) > 4096:
+            raise ValidationError("reason must be nonblank and at most 4096 characters")
+        if not isinstance(body["execution_binding"], dict):
+            raise ValidationError("execution_binding must be an object")
+        current = self.store.get_task(task_id)
+        project_id = current["run"].get("project_id") or "unscoped"
+        request_hash = hashlib.sha256(canonical_json({"task_id": task_id, "body": body}).encode()).hexdigest()
+        replay = self._command_replay("task.abandon", task_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        disposition, event_ids = self.store._abandon_external_attempt(task_id, body,
+            actor=identity["actor"], local_executor_id=WORKER_ACTOR)
+        result = {**disposition, "task": self._task_resource(self.store.get_task(task_id))}
+        return self._command_record("task.abandon", task_id, idempotency_key, request_hash, result,
+            project_id=project_id, event_ids=event_ids, primary_stream_id=current["run"]["id"])
+
     @_verified_mutation
     def retry_task(self, task_id, body=None, *, idempotency_key=None):
         idempotency_key = require_idempotency_key(idempotency_key)
@@ -7727,6 +7764,8 @@ class RuntimeService:
             "task.claim", "claim", idempotency_key, request_hash, with_receipt=False,
         )
         if replayed:
+            if isinstance(replay, dict):
+                self.store.assert_attempt_not_abandoned(replay.get("attempt_id"))
             if isinstance(replay, dict) and replay.get("task_id"):
                 replay_capability = self.store.conn.execute(
                     "SELECT capability FROM tasks WHERE id=?", (replay["task_id"],)
@@ -8836,6 +8875,7 @@ class RuntimeService:
         the nonce persisted by ``prepare_reboot`` for this exact attempt and
         must still be within its short validity window.
         """
+        self.store.assert_attempt_not_abandoned(attempt_id)
         attempt = self.store.conn.execute("SELECT recovery_nonce, recovery_nonce_expires_at, recovery_nonce_used FROM attempts WHERE id=?", (attempt_id,)).fetchone()
         nonce = attempt["recovery_nonce"] if attempt else None
         if "authorization_nonce" in body:
@@ -9107,6 +9147,7 @@ class RuntimeService:
             self._reboot_authorized(body, row["attempt_id"], row["nonce"], allow_consumed=True)
             if row["state"] == "resumed" and row["recovery_receipt_json"]:
                 receipt = json.loads(row["recovery_receipt_json"])
+                self.store.assert_attempt_not_abandoned(receipt["attempt_id"])
                 attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (receipt["attempt_id"],)).fetchone()
                 if attempt:
                     return {"receipt": receipt, "attempt": attempt_resource(attempt)}

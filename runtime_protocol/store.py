@@ -5567,12 +5567,135 @@ class RealmStore:
                                    {"attempt_id": task["attempt_id"], "owned_local_stop_proof": proof_digest})
                 self._refresh_continuations_for_predecessor(task["id"])
 
+    def assert_attempt_not_abandoned(self, attempt_id):
+        """A lost disposition permanently ends this exact attempt's authority.
+
+        Use the append-only event rather than the mutable current task/binding:
+        explicit retry may replace both, while old recovery receipts survive.
+        """
+        if attempt_id and self.conn.execute(
+            "SELECT 1 FROM events WHERE run_id=(SELECT t.run_id FROM attempts a "
+            "JOIN tasks t ON t.id=a.task_id WHERE a.id=?) AND kind='task.abandoned' "
+            "AND (json_extract(payload_json, '$.attempt_id')=? OR EXISTS "
+            "(SELECT 1 FROM json_each(payload_json, '$.settled_attempt_ids') WHERE value=?)) LIMIT 1",
+            (str(attempt_id), str(attempt_id), str(attempt_id)),
+        ).fetchone():
+            raise LeaseError("attempt was abandoned with lost disposition")
+
+    def _abandon_external_attempt(self, task_id, expected, *, actor, local_executor_id):
+        """Validate and retire one exact external attempt in the caller's transaction."""
+        task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None:
+            raise NotFoundError("task not found")
+        binding = self.execution_binding(task_id)
+        attempt = self.conn.execute("SELECT * FROM attempts WHERE id=?", (expected["attempt_id"],)).fetchone()
+        if (task["status"] != "cancel_requested" or task["waiting_reason"] != "provider_state_unknown"
+                or int(task["attempt"] or 0) + 1 != expected["expected_task_version"]
+                or not attempt or attempt["settled"] or not binding
+                or binding.get("status") not in {"claimed", "stale"}
+                or not binding.get("actual_target")
+                or (binding.get("verification") or {}).get("verified") is not True
+                # The local Worker must retain its positive-stop protocol.
+                or task["executor_id"] == local_executor_id
+                or canonical_json(binding) != canonical_json(expected["execution_binding"])):
+            raise ConflictError("task is not the exact unresolved external cancellation", details={"state": task["status"]})
+        identity = {"attempt_id": expected["attempt_id"], "lease_token": expected["lease_id"],
+                    "lease_fence": expected["fence"], "runtime_epoch": expected["runtime_epoch"]}
+        if (any(task[key] != value for key, value in identity.items())
+                or any(attempt[key] != value for key, value in {
+                    "task_id": task_id, "executor_id": task["executor_id"],
+                    "lease_id": expected["lease_id"], "fence": expected["fence"],
+                    "runtime_epoch": expected["runtime_epoch"]}.items())
+                or any(binding.get(key) != value for key, value in {
+                    "task_id": task_id, "run_id": task["run_id"], "attempt_id": attempt["id"], "executor_id": attempt["executor_id"],
+                    "lease_id": attempt["lease_id"], "fence": attempt["fence"],
+                    "runtime_epoch": attempt["runtime_epoch"]}.items())):
+            raise ConflictError("external attempt identity changed")
+        outstanding = {row["id"]: row for row in self.conn.execute(
+            "SELECT * FROM attempts WHERE task_id=? AND settled=0", (task_id,))}
+        # Authorized checkpoint resume retains its predecessor attempt. Only
+        # the durable exact checkpoint/receipt chain may expand settlement to
+        # ancestors; unrelated outstanding identities fail closed.
+        lineage = {attempt["id"]: attempt}
+        checkpoints = self.conn.execute(
+            "SELECT * FROM recovery_checkpoints WHERE task_id=? AND state='resumed' "
+            "AND recovery_receipt_json IS NOT NULL", (task_id,)).fetchall()
+        changed = True
+        while changed:
+            changed = False
+            for checkpoint in checkpoints:
+                receipt = json.loads(checkpoint["recovery_receipt_json"])
+                successor = lineage.get(receipt.get("attempt_id"))
+                if successor is None or checkpoint["attempt_id"] in lineage:
+                    continue
+                prior = self.conn.execute("SELECT * FROM attempts WHERE id=?", (checkpoint["attempt_id"],)).fetchone()
+                if (not prior or prior["task_id"] != task_id or prior["executor_id"] != attempt["executor_id"]
+                        or prior["executor_id"] != checkpoint["executor_id"]
+                        or prior["lease_id"] != checkpoint["lease_id"] or prior["fence"] != checkpoint["fence"]
+                        or prior["runtime_epoch"] != checkpoint["runtime_epoch"]
+                        or prior["fence"] >= successor["fence"]
+                        or receipt.get("runtime_epoch") != successor["runtime_epoch"]
+                        or receipt.get("status") != "resumed"
+                        or receipt.get("task_id") != task_id or receipt.get("checkpoint_id") != checkpoint["id"]):
+                    raise ConflictError("external cancellation checkpoint lineage differs")
+                lineage[prior["id"]] = prior
+                changed = True
+        if set(outstanding) - set(lineage):
+            raise ConflictError("external cancellation has additional unsettled attempts", details={"attempt_ids": sorted(outstanding)})
+        reservations = self.conn.execute(
+            "SELECT * FROM reservations WHERE task_id=? AND released_at IS NULL", (task_id,)).fetchall()
+        for row in reservations:
+            if not any(all(row[key] == value for key, value in {
+                    "executor_id": entry["executor_id"], "lease_token": entry["lease_id"],
+                    "fence": entry["fence"], "runtime_epoch": entry["runtime_epoch"]}.items())
+                    for entry in outstanding.values()):
+                raise ConflictError("external cancellation reservation identity changed")
+        # Refuse rather than silently widening the owner's exact-id authority.
+        # Include descendants from every historical parent attempt as well.
+        pending, seen, active = [task_id], {task_id}, set()
+        while pending:
+            for child in self.delegated_children(pending.pop()):
+                child_id = child["id"]
+                if child_id in seen:
+                    continue
+                seen.add(child_id)
+                pending.append(child_id)
+                child_binding = self.execution_binding(child_id)
+                if (child["status"] not in {"completed", "failed", "cancelled"}
+                        or child["waiting_reason"] == "provider_state_unknown"
+                        or self.conn.execute("SELECT 1 FROM attempts WHERE task_id=? AND settled=0", (child_id,)).fetchone()
+                        or self.conn.execute("SELECT 1 FROM reservations WHERE task_id=? AND released_at IS NULL", (child_id,)).fetchone()
+                        or (child_binding and child_binding["status"] in {"claimed", "stale"})):
+                    active.add(child_id)
+        if active:
+            raise ConflictError("delegated child work must be cleared first", details={"required_task_ids": sorted(active)})
+        timestamp = now()
+        disposition = {"task_id": task_id, "run_id": task["run_id"], "attempt_id": attempt["id"],
+                       "disposition": "lost", "reason": expected["reason"],
+                       "remote_stop_confirmed": False, "billing_stop_confirmed": False}
+        self.contain_delegated_children(task_id, attempt_id=attempt["id"], reason="parent_abandoned")
+        for attempt_id in outstanding:
+            self.conn.execute("UPDATE attempts SET settled=1 WHERE id=?", (attempt_id,))
+        self._release_reservations(task_id, released_at=timestamp)
+        self.conn.execute("UPDATE execution_bindings SET status='released', updated_at=? WHERE task_id=?", (timestamp, task_id))
+        self.conn.execute(
+            "UPDATE tasks SET status='failed', result_json=?, lease_token=NULL, executor_id=NULL, attempt_id=NULL, "
+            "lease_expires_at=NULL, waiting_reason=NULL, lease_fence=lease_fence+1, updated_at=? WHERE id=?",
+            (canonical_json(disposition), timestamp, task_id))
+        self.conn.execute("UPDATE runs SET status='failed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
+        event_id = self._append_event(task["run_id"], task_id, "task.abandoned",
+            {**disposition, "settled_attempt_ids": sorted(outstanding), "actor": actor, "lease_id": attempt["lease_id"], "fence": attempt["fence"],
+             "runtime_epoch": attempt["runtime_epoch"], "execution_binding": binding}, created_at=timestamp)
+        continuation_events = self._refresh_continuations_for_predecessor(task_id)
+        return disposition, [event_id, *continuation_events]
+
     def cancel_task(self, task_id, *, record=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise NotFoundError("task not found")
-            if task["status"] in ("completed", "cancel_requested", "cancelled"):
+            if (task["status"] in ("completed", "cancel_requested", "cancelled")
+                    or (task["status"] == "failed" and json.loads(task["result_json"] or "{}").get("disposition") == "lost")):
                 value = self.get_task(task_id)
                 if record is not None:
                     record(value)

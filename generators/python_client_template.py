@@ -61,11 +61,13 @@ class Health:
     runtime_epoch: int
     runtime_session_id: str
     runtime_instance_id: str
+    identity: Mapping[str, Any] | None
     services: tuple[ServiceStatus, ...] = ()
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Health":
-        return cls(status=value["status"], protocol=value["protocol"], schema_digest=value["schema_digest"], runtime_epoch=int(value.get("runtime_epoch", 0)), runtime_session_id=value["runtime_session_id"], runtime_instance_id=value["runtime_instance_id"], services=tuple(ServiceStatus.from_json(item) for item in value.get("services", ())))
+        identity = value["identity"]
+        return cls(status=value["status"], protocol=value["protocol"], schema_digest=value["schema_digest"], runtime_epoch=int(value.get("runtime_epoch", 0)), runtime_session_id=value["runtime_session_id"], runtime_instance_id=value["runtime_instance_id"], identity=dict(identity) if isinstance(identity, Mapping) else None, services=tuple(ServiceStatus.from_json(item) for item in value.get("services", ())))
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -1482,6 +1484,15 @@ class WorkspaceClient:
         _, _, body = self._request("GET", f"/v1/executors/{_path_part(executor_id)}")
         return Executor.from_json(self._json(body))
 
+    def get_task_settlement(self, task_id: str) -> Mapping[str, Any]:
+        _, _, body = self._request("GET", f"/v1/control/tasks/{_path_part(task_id)}/settlement")
+        return self._json(body)
+
+    def abandon_task(self, task_id: str, body: Mapping[str, Any], *, idempotency_key: str) -> MutationResult:
+        return self._mutation_json(self._request("POST", f"/v1/control/tasks/{_path_part(task_id)}/abandon",
+            body=json.dumps(dict(body), separators=(",", ":")).encode(),
+            headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
     def get_local_worker_generation(self) -> Mapping[str, Any]:
         _, _, body = self._request("GET", "/v1/control/local-worker/generation")
         return self._json(body)
@@ -1491,8 +1502,10 @@ class WorkspaceClient:
         _, _, body = self._request("POST", "/v1/control/local-worker/start", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})
         return self._json(body)
 
-    def relinquish_local_worker(self, executor_incarnation: str, evidence_digest: str) -> Mapping[str, Any]:
+    def relinquish_local_worker(self, executor_incarnation: str, evidence_digest: str, *, expected_task_ids: list[str] | None = None) -> Mapping[str, Any]:
         payload = {"executor_incarnation": executor_incarnation, "evidence_digest": evidence_digest}
+        if expected_task_ids is not None:
+            payload["expected_task_ids"] = list(expected_task_ids)
         _, _, body = self._request("POST", "/v1/control/local-worker/relinquish", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})
         return self._json(body)
 

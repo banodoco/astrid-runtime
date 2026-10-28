@@ -284,6 +284,7 @@ class LocalRuntimeBoundary:
         if source.service_declaration:
             argv += ["--service-declaration", source.service_declaration,
                 "--service-python", python, "--service-source-checkout", source.source_checkout]
+        argv += ["--runtime-checkout", source.runtime_checkout, "--agent-checkout", source.source_checkout]
         argv += ["--log-file", str(self._log_path(support_root))]
         if self._door is not None and "--door-origin" not in argv:
             door, credential_file = self._door
@@ -369,22 +370,24 @@ class LocalRuntimeBoundary:
 
     def _spawn_runtime(self, argv: list[str], *, support_root: Path, stdout):
         """Publish exact child custody before any admission wait can fail."""
+        environment = dict(os.environ)
+        # The former installer transaction binding is never propagated to a
+        # daemon, even when inherited from an older launcher environment.
+        environment.pop("ASTRID_INSTALLER_OPERATION_ID", None)
         if sys.platform != "darwin":
-            options = {}
             if sys.platform == "win32":
                 from runtime_protocol.windows_handoff import python_executable
 
                 # Keep discovery and custody on the interpreter's PID, rather
                 # than the venv redirector that waits for it on Windows.
                 executable = python_executable(argv[0])
-                environment = dict(os.environ)
                 environment.pop("__PYVENV_LAUNCHER__", None)
                 if executable != argv[0]:
                     environment["__PYVENV_LAUNCHER__"] = str(argv[0])
                 argv = [executable, *argv[1:]]
-                options["env"] = environment
             process = platform.spawn_tree(argv, detached=True, stdout=stdout,
-                stderr=subprocess.STDOUT, text=True, close_fds=True, **options)
+                stderr=subprocess.STDOUT, text=True, close_fds=True,
+                env=environment)
             process._runtime_stop_grace = SERVICE_OWNER_STOP_GRACE_SECONDS if "--service-declaration" in argv else 5.0
             process._runtime_boundary_sole_reaper = True
             self._process = process
@@ -402,7 +405,6 @@ class LocalRuntimeBoundary:
             authority_scope_root=scope,
             authority_journal=scope / "retained-authority.jsonl",
         )
-        environment = dict(os.environ)
         environment.update(broker.child_environment(argv, start_new_session=True))
         try:
             process = subprocess.Popen(
@@ -539,8 +541,8 @@ class LocalRuntimeBoundary:
         try:
             identity = default_process_identity(int(pid))
             return None if identity is None else str(identity["birth_id"])
-        except CustodyError:
-            return None
+        except CustodyError as exc:
+            raise BootstrapError("Runtime process identity remains uncertain.") from exc
 
     @staticmethod
     def _log_path(support_root: Path) -> Path:
@@ -667,6 +669,10 @@ class LocalRuntimeBoundary:
             and health.get("runtime_instance_id") == instance_id
         )
 
+    def owner_startup_identity(self, *, endpoint: str, instance_id: str) -> Mapping[str, Any] | None:
+        """Return canonical health so the caller can validate its owner binding."""
+        return self._http_health_payload(endpoint)
+
     def endpoint_metadata(self, *, endpoint: str, credential_file: Path) -> Mapping[str, Any]:
         """Read endpoint instance and authenticated realm identity without mutation."""
         health = self._http_health_payload(endpoint)
@@ -700,6 +706,15 @@ class LocalRuntimeBoundary:
             with urlopen_loopback(request, timeout=self.HEALTH_TIMEOUT_SECONDS) as response:
                 realm = json.loads(response.read().decode("utf-8"))
             if not isinstance(realm, Mapping) or not realm.get("realm_id"):
+                return {}
+            # Older supported Runtime releases authenticated `/v1/realm` but
+            # did not include the optional instance id on that resource. The
+            # health snapshot still binds the endpoint to the observed owner;
+            # when realm supplies its own instance id, require it to agree.
+            realm_instance_id = realm.get("runtime_instance_id")
+            if (realm_instance_id is not None
+                    and (health.get("runtime_instance_id") is None
+                         or str(realm_instance_id) != str(health["runtime_instance_id"]))):
                 return {}
             return {**health, "realm_id": str(realm["realm_id"])}
         except (BootstrapError, OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
@@ -818,9 +833,10 @@ class LocalRuntimeBoundary:
             raise failure from exc
 
     def stop(self, **_kwargs):
-        if self._process:
-            anchor = getattr(self._process, "_runtime_owner_released_anchor", None)
-            if anchor is not None and self._process.poll() is None:
+        process = self._process
+        if process is not None:
+            anchor = getattr(process, "_runtime_owner_released_anchor", None)
+            if anchor is not None and process.poll() is None:
                 broker = self._process._runtime_custody_broker
                 ack = self._commit_owner_transition(
                     broker.role_authority, kind="claim", actor=broker.cleanup_actor,
@@ -828,10 +844,11 @@ class LocalRuntimeBoundary:
                     owner_epoch=broker.owner_epoch, sealed=anchor,
                 )
                 broker.custody_generation = ack["generation"]
-                del self._process._runtime_owner_released_anchor
-            self._terminate(self._process)
+                del process._runtime_owner_released_anchor
+            self._terminate(process)
             self._process = None
         self._bootstrap_credential = None
+        return {"children_stopped": True}
 
     def _commit_owner_transition(self, authority: RoleCustodyAuthority, *, kind: str,
                                  actor: AuthenticatedCleanupActor, generation: int,
@@ -1168,6 +1185,8 @@ class ForegroundRuntimeBoundary(LocalRuntimeBoundary):
                 python=sys.executable, source_checkout=getattr(source_profile, "source_checkout", ""))
             daemon = RuntimeDaemon(root, support_root=support, display_name=self._display_name,
                 realm_id=realm_id, owner_lock=owner_lock, bootstrap_token_file=token_file,
+                runtime_checkout=getattr(source_profile, "runtime_checkout", None),
+                agent_checkout=getattr(source_profile, "source_checkout", None),
                 admission_timeout=self.admission_timeout_seconds,
                 local_worker_profiles=composition.profiles if composition else None,
                 local_worker_preparer=composition.preparer if composition else None,
@@ -1211,7 +1230,10 @@ class ForegroundRuntimeBoundary(LocalRuntimeBoundary):
             raise BootstrapError("Runtime readiness was revoked")
 
     def stop(self, **kwargs):
-        if self.daemon is not None:
-            daemon, self.daemon = self.daemon, None
+        daemon = self.daemon
+        if daemon is not None:
             daemon.stop()
+            self.daemon = None
+            self._custody = None
         self._bootstrap_credential = None
+        return {"children_stopped": True}

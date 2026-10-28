@@ -417,14 +417,16 @@ def test_health_and_typed_operator_status_preserve_service_state(state, code):
     handler = object.__new__(RuntimeHandler)
     handler.path, handler.command = "/v1/health", "GET"
     handler.server = SimpleNamespace(runtime=SimpleNamespace(health=lambda: base),
-        daemon_runtime=SimpleNamespace(instance_id="instance", service_status=lambda: rows))
+        daemon_runtime=SimpleNamespace(startup_identity_instance_id="instance",
+            startup_identity={"release": 0, "managed_by": None}, service_status=lambda: rows))
     handler._send = lambda status, body: (status, body)
     status, value = handler._route()
-    assert status == 200 and value == {**base, "runtime_instance_id": "instance", "services": rows}
+    assert status == 200 and value == {**base, "runtime_instance_id": "instance",
+        "identity": {"release": 0, "managed_by": None}, "services": rows}
     schema = json.loads((ROOT / "contract/schemas/health.json").read_text(encoding="utf-8"))
     Draft202012Validator(schema).validate(value)
     assert operator_cli._json_value(Health.from_json(value))["services"] == rows
-    assert Health.from_json({**base, "runtime_instance_id": "instance"}).services == ()
+    assert Health.from_json({**base, "runtime_instance_id": "instance", "identity": None}).services == ()
 
 
 def test_typed_service_status_accepts_future_response_fields():

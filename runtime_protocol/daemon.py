@@ -23,6 +23,7 @@ from .door import CHAT_FILE_NAME, open_door
 from .errors import ConflictError, NotFoundError, ProtocolError
 from .server import RuntimeHTTPServer, RuntimeHandler
 from .service import RuntimeService
+from .startup_identity import capture_startup_identity
 from .store import realm_admission_fence
 from .util import atomic_json_write, now
 
@@ -54,7 +55,7 @@ def _authority_path(value, label):
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, services=None, log_directory=None):
+    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, services=None, log_directory=None, runtime_checkout=None, agent_checkout=None):
         if ":" in host:
             raise ValueError("runtime daemon requires IPv4 loopback; IPv6 is not supported yet")
         if host not in ("127.0.0.1", "localhost"):
@@ -73,6 +74,12 @@ class RuntimeDaemon:
         self.reboot_allowlist = reboot_allowlist
         self.admission_timeout = admission_timeout
         self.instance_id = uuid.uuid4().hex
+        self._identity_runtime_checkout = runtime_checkout
+        self._identity_agent_checkout = agent_checkout
+        from astrid_runtime.update import UpdateAdmission
+        self.update_admission = UpdateAdmission(self)
+        self._startup_identity = None
+        self._startup_identity_instance_id = None
         self.service = None
         self.httpd = None
         self.thread = None
@@ -120,9 +127,27 @@ class RuntimeDaemon:
     def start(self):
         if self.httpd:
             return self
+        if self._startup_identity_instance_id == self.instance_id:
+            self.instance_id = uuid.uuid4().hex
         self._start(rotate_credentials=False)
         self._cleanup_completed_replacement()
         return self
+
+    @property
+    def startup_identity(self):
+        import copy
+        return copy.deepcopy(self._startup_identity)
+
+    @property
+    def startup_identity_instance_id(self):
+        return self._startup_identity_instance_id
+
+    def _bind_startup_identity(self):
+        if self._startup_identity_instance_id != self.instance_id:
+            self._startup_identity = capture_startup_identity(
+                runtime_checkout=self._identity_runtime_checkout,
+                agent_checkout=self._identity_agent_checkout)
+            self._startup_identity_instance_id = self.instance_id
 
     def _catalog_owner_valid(self, proof):
         return self.service is not None and self.service.validate_catalog_admission(proof)
@@ -235,6 +260,7 @@ class RuntimeDaemon:
         atomic_json_write(self._epoch_floor_path(), {"format_version": 1, "runtime_epoch_floor": floor})
 
     def _start(self, *, rotate_credentials=False):
+        self._bind_startup_identity()
         cancellation.check()
         # Fix signalling policy from Runtime support before anything is spawned.
         process_control.configure_from(self.support_root)
@@ -269,7 +295,7 @@ class RuntimeDaemon:
         birth_id = process_birth_identity()
         if self.owner_lock:
             atomic_json_write(self.owner_lock, {"pid": os.getpid(), "process_birth_id": birth_id, "runtime_instance_id": self.instance_id, "realm_id": self.service.realm["id"], "realm_root": str(self.root)})
-        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.instance_id, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_credential_pending=bool(self.local_worker_profiles), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES), **({"door_endpoint": self.door_endpoint, "door_origin": self.door.origin} if self.door_httpd else {}))
+        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.startup_identity_instance_id, identity=self.startup_identity, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_credential_pending=bool(self.local_worker_profiles), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES), **({"door_endpoint": self.door_endpoint, "door_origin": self.door.origin} if self.door_httpd else {}))
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="astrid-runtime-protocol", daemon=True)
         self.thread.start()
         if self.door_httpd is not None:
@@ -647,7 +673,7 @@ class RuntimeDaemon:
                     or verification.get("evidence_digest") != receipt.get("evidence_digest")):
                 raise ConflictError("local Worker relinquish credential binding changed")
 
-    def relinquish_local_worker(self, executor_incarnation, evidence_digest, *, identity):
+    def relinquish_local_worker(self, executor_incarnation, evidence_digest, *, identity, expected_task_ids=None):
         """Fence, stop, and retire one exact local shared-actor generation.
 
         The checkpoint is intentionally kept through process and credential
@@ -656,6 +682,12 @@ class RuntimeDaemon:
         """
         if not isinstance(executor_incarnation, str) or not executor_incarnation or not isinstance(evidence_digest, str) or not evidence_digest:
             raise ProtocolError("exact local Worker generation is required")
+        if expected_task_ids is not None:
+            if (not isinstance(expected_task_ids, list) or not expected_task_ids
+                    or any(not isinstance(value, str) or not value for value in expected_task_ids)
+                    or len(set(expected_task_ids)) != len(expected_task_ids)):
+                raise ProtocolError("expected_task_ids must contain unique exact task ids")
+            expected_task_ids = sorted(expected_task_ids)
         if not self.local_worker_profiles or self.service is None:
             raise ConflictError("local Worker relinquish requires a configured Runtime owner")
         with self._worker_actor_lock:
@@ -666,6 +698,18 @@ class RuntimeDaemon:
                 checkpoint = self._local_relinquish_state()
                 metadata = self.credentials.actor_metadata(WORKER_ACTOR)
                 receipt = metadata.get("local_launch_receipt") if isinstance(metadata, dict) else None
+                same_checkpoint = checkpoint is not None and (
+                    checkpoint["receipt"].get("executor_incarnation") == executor_incarnation
+                    and checkpoint["receipt"].get("evidence_digest") == evidence_digest)
+                if same_checkpoint and checkpoint.get("expected_task_ids") != expected_task_ids:
+                    raise ConflictError("local Worker relinquish task authority changed")
+                if expected_task_ids is not None:
+                    outstanding = self.service.store._owned_cancellation_rows(WORKER_ACTOR)
+                    additional = outstanding - set(expected_task_ids)
+                    if additional:
+                        raise ConflictError("local Worker has unlisted outstanding tasks", details={"required_task_ids": sorted(additional)})
+                    if not same_checkpoint and not outstanding.intersection(expected_task_ids):
+                        raise ConflictError("no named outstanding task belongs to this local Worker")
                 if checkpoint is not None and checkpoint["state"] != "complete":
                     saved = checkpoint["receipt"]
                     if (saved.get("executor_incarnation") != executor_incarnation
@@ -702,6 +746,8 @@ class RuntimeDaemon:
                         for path in self.credentials._paths(WORKER_ACTOR)
                     }
                     checkpoint = {"version": 1, "state": "fencing", "receipt": dict(receipt), "file_digests": file_digests}
+                    if expected_task_ids is not None:
+                        checkpoint["expected_task_ids"] = expected_task_ids
                     if captured is not None:
                         checkpoint["owned_cancellations"] = captured
                     self._write_local_relinquish(checkpoint)
@@ -780,6 +826,43 @@ class RuntimeDaemon:
                 self.local_worker_launcher = None
                 self._local_worker_deferred = False
             return {"state": "relinquished", "executor_incarnation": executor_incarnation}
+
+    def task_settlement(self, task_id, *, identity):
+        """Observe exact-id settlement through the same authority used by down.
+
+        A terminal task can still own unsettled attempts or resources. This
+        read-only owner control never interprets cancellation as stop proof.
+        """
+        from .lifecycle import _interruption_report
+
+        with self.service.store._mutex:
+            if self.service._require_placement_recovery_owner(identity) != "owner":
+                raise ConflictError("task settlement requires the Runtime owner")
+            value = self.service.store.get_task(task_id)
+            state = value["task"]["status"]
+            blockers = [row for row in _interruption_report(self.service.store.conn)["blockers"]
+                        if row["task_id"] == task_id]
+            result = {"task_id": task_id, "state": "succeeded" if state == "completed" else state,
+                    "settled": state in {"completed", "failed", "cancelled"} and not blockers,
+                    "blockers": blockers, "task": self.service._task_resource(value)}
+            # Worker result bodies are arbitrary data. Only the current durable
+            # owner decision can identify lost; retry ends that disposition even
+            # if a later worker result uses the same words.
+            if state == "failed":
+                event = self.service.store.conn.execute(
+                    "SELECT id, kind, payload_json FROM events WHERE task_id=? "
+                    "AND kind IN ('task.abandoned', 'task.retried', 'task.completed', "
+                    "'task.failed', 'task.cancelled') ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if event and event["kind"] == "task.abandoned":
+                    payload = json.loads(event["payload_json"])
+                    if payload.get("actor") == "owner":
+                        result["lost_disposition"] = {
+                            "event_id": str(event["id"]), "attempt_id": payload["attempt_id"],
+                            "reason": payload["reason"],
+                        }
+            return result
 
     def local_worker_generation(self, *, identity):
         """Read the exact local generation held by this owner, including a pending stop."""

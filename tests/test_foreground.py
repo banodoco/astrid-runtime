@@ -325,6 +325,22 @@ def test_foreground_boundary_requires_door_thread_only_when_door_is_configured()
         boundary.check_running()
 
 
+def test_foreground_boundary_retains_daemon_until_stop_succeeds():
+    from astrid_runtime.runtime_boundary import ForegroundRuntimeBoundary
+
+    boundary = ForegroundRuntimeBoundary()
+    failure = RuntimeError("injected daemon stop failure")
+    daemon = SimpleNamespace(stop=lambda: (_ for _ in ()).throw(failure))
+    boundary.daemon = daemon
+    with pytest.raises(RuntimeError, match="injected daemon stop failure"):
+        boundary.stop()
+    assert boundary.daemon is daemon
+
+    daemon.stop = lambda: None
+    assert boundary.stop() == {"children_stopped": True}
+    assert boundary.daemon is None
+
+
 def test_foreground_constructor_failure_removes_private_bootstrap_token(tmp_path, monkeypatch):
     from astrid_runtime.runtime_boundary import ForegroundRuntimeBoundary
     from runtime_protocol import daemon

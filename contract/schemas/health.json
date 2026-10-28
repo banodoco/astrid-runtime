@@ -3,7 +3,7 @@
   "$id": "https://astrid.haus/workspace/v1/schemas/health.json",
   "title": "Health response",
   "type": "object", "additionalProperties": false,
-  "required": ["status", "protocol", "schema_digest", "runtime_epoch", "runtime_session_id", "runtime_instance_id"],
+  "required": ["status", "protocol", "schema_digest", "runtime_epoch", "runtime_session_id", "runtime_instance_id", "identity"],
   "properties": {
     "status": { "type": "string", "enum": ["ok", "degraded"] },
     "protocol": { "type": "string", "const": "workspace.v1" },
@@ -11,6 +11,32 @@
     "runtime_epoch": { "type": "integer", "minimum": 1 },
     "runtime_session_id": { "type": "string", "minLength": 1 },
     "runtime_instance_id": { "type": "string", "minLength": 1 },
+    "identity": {
+      "description": "Immutable identity captured for the owner bound to runtime_instance_id; null is used only by a raw RuntimeService response with no daemon owner.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["release", "managed_by"],
+          "properties": {
+            "release": { "type": "integer", "minimum": 0 },
+            "managed_by": { "type": ["string", "null"], "enum": [null, "pinokio"] }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["release", "managed_by", "runtime_head", "agent_head", "dirty", "dirty_hash"],
+          "properties": {
+            "release": { "type": "integer", "const": 0 },
+            "managed_by": { "type": "string", "const": "source" },
+            "runtime_head": { "type": "string", "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$" },
+            "agent_head": { "type": "string", "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$" },
+            "dirty": { "type": "boolean" },
+            "dirty_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        }
+      ]
+    },
     "services": {
       "type": "array",
       "items": {
