@@ -2477,6 +2477,7 @@ class BootstrapTests(unittest.TestCase):
     def test_legacy_collision_refuses_parallel_empty_realm_with_exact_action(self):
         legacy = self.paths.home / ".astrid"
         legacy.mkdir(parents=True)
+        (legacy / "astrid.sqlite3").touch()
         with self.assertRaises(LegacyRootCollisionError) as caught:
             bootstrap(self.paths, self.boundary, self.config)
         self.assertIn("Legacy realm roots are unsupported", str(caught.exception))
@@ -2929,3 +2930,144 @@ def test_down_cli_dispatches_completed_stop_without_discovery(monkeypatch, tmp_p
     assert cli.main(["down", "--data-root", str(data_root), "--json"]) == 0
     assert called == [True]
     assert json.loads(capsys.readouterr().out)["status"] == "stopped"
+
+
+class StaleOwnerTests(unittest.TestCase):
+    setUp = BootstrapTests.setUp
+    tearDown = BootstrapTests.tearDown
+    _configure = BootstrapTests._configure
+    """Exercise reclamation using an occupied PID, without signalling it."""
+
+    def _occupied_pid(self, *, observation="different"):
+        from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+        self._configure()
+        first = bootstrap(self.paths, self.boundary, self.config)
+        for path in (self.paths.discovery_path, self.paths.instance_lock_path):
+            record = json.loads(path.read_text())
+            record["pid"] = os.getpid()
+            path.write_text(json.dumps(record))
+        expected = json.loads(self.paths.discovery_path.read_text())["process_birth_id"]
+        # The reused PID is a real live process. Birth observations for newly
+        # launched fake owners still use their synthetic test marker.
+        self.boundary.is_pid_alive = lambda pid: pid == os.getpid() or pid in self.boundary.alive
+        self.boundary.process_birth_identity = lambda pid: (
+            (None if observation == "unknown" else expected if observation == "same"
+             else LocalRuntimeBoundary.process_birth_identity(pid)) if pid == os.getpid() else None)
+        self.boundary.valid_owner = False
+        return first
+
+    def test_up_reclaims_reused_pid_without_signalling(self):
+        first = self._occupied_pid()
+        second = bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(first.realm_id, second.realm_id)
+        self.assertEqual(len(self.boundary.starts), 2)
+        self.assertEqual(self.boundary.restart_calls, 0)
+        self.assertNotEqual(json.loads(self.paths.instance_lock_path.read_text())["pid"], os.getpid())
+
+    def test_down_reclaims_reused_pid_without_signalling(self):
+        self._occupied_pid()
+        result = down(self.paths, self.boundary)
+        self.assertEqual(result["status"], "stopped")
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
+        self.assertEqual(self.boundary.restart_calls, 0)
+
+    def test_up_reclaims_stale_lock_without_discovery(self):
+        self._occupied_pid()
+        self.paths.discovery_path.unlink()
+        bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(len(self.boundary.starts), 2)
+
+    def test_unknown_or_matching_owner_is_preserved(self):
+        for observation in ("unknown", "same"):
+            with self.subTest(observation=observation):
+                if self.paths.catalog_path.exists():
+                    self.tearDown()
+                    self.setUp()
+                self._occupied_pid(observation=observation)
+                before = {p: p.read_bytes() for p in (self.paths.discovery_path, self.paths.instance_lock_path)}
+                with self.assertRaises(DuplicateOwnerError):
+                    bootstrap(self.paths, self.boundary, self.config)
+                with self.assertRaises(BootstrapError):
+                    down(self.paths, self.boundary)
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+                self.assertEqual(self.boundary.restart_calls, 0)
+
+    def test_live_lock_protects_owner_despite_stale_discovery(self):
+        self._occupied_pid()
+        marker = json.loads(self.paths.instance_lock_path.read_text())
+        marker["process_birth_id"] = self.boundary.process_birth_identity(os.getpid())
+        self.paths.instance_lock_path.write_text(json.dumps(marker))
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary)
+        self.assertTrue(self.paths.discovery_path.exists())
+        self.assertTrue(self.paths.instance_lock_path.exists())
+
+    def test_up_preserves_genuine_live_owner_lock(self):
+        self._occupied_pid()
+        self.paths.discovery_path.unlink()
+        marker = json.loads(self.paths.instance_lock_path.read_text())
+        marker["process_birth_id"] = self.boundary.process_birth_identity(os.getpid())
+        self.paths.instance_lock_path.write_text(json.dumps(marker))
+        before = self.paths.instance_lock_path.read_bytes()
+        with self.assertRaises(DuplicateOwnerError):
+            bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
+        self.assertEqual(len(self.boundary.starts), 1)
+
+    def test_reused_pid_cleanup_waits_for_fenced_manager(self):
+        self._occupied_pid()
+        before = {p: p.read_bytes() for p in (self.paths.discovery_path, self.paths.instance_lock_path)}
+        root = self.paths.realms_dir / json.loads(self.paths.discovery_path.read_text())["active_realm"]
+        calls = []
+
+        def manager():
+            self.assertEqual({p: p.read_bytes() for p in before}, before)
+            connection = sqlite3.connect(root / "realm.sqlite3", timeout=0.02)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("BEGIN IMMEDIATE")
+            finally:
+                connection.close()
+            calls.append(True)
+            raise RuntimeError("manager failed")
+
+        with self.assertRaisesRegex(BootstrapError, "manager failed"):
+            down(self.paths, self.boundary, stop_manager=manager)
+        self.assertEqual(calls, [True])
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+
+    def test_reused_pid_birth_change_before_manager_refuses(self):
+        self._occupied_pid()
+        before = {p: p.read_bytes() for p in (self.paths.discovery_path, self.paths.instance_lock_path)}
+        expected = json.loads(before[self.paths.discovery_path])["process_birth_id"]
+        original_fence = bootstrap_module.interruption_fence
+
+        @contextmanager
+        def changing_fence(root):
+            with original_fence(root) as report:
+                self.boundary.process_birth_identity = lambda pid: expected
+                yield report
+
+        calls = []
+        with patch("astrid_runtime.bootstrap.interruption_fence", changing_fence):
+            with self.assertRaisesRegex(BootstrapError, "reused process identity changed"):
+                down(self.paths, self.boundary, stop_manager=lambda: calls.append(True))
+        self.assertEqual(calls, [])
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+
+    def test_reclamation_preserves_replacement_records(self):
+        self._occupied_pid()
+        observe = self.boundary.process_birth_identity
+        replacement = json.loads(self.paths.instance_lock_path.read_text())
+        replacement["runtime_instance_id"] = "replacement-instance"
+
+        def replace_during_observation(pid):
+            self.paths.instance_lock_path.write_text(json.dumps(replacement))
+            return observe(pid)
+
+        self.boundary.process_birth_identity = replace_during_observation
+        with self.assertRaisesRegex(BootstrapError, "changed during stale-owner cleanup"):
+            down(self.paths, self.boundary)
+        self.assertTrue(self.paths.discovery_path.exists())
+        self.assertEqual(json.loads(self.paths.instance_lock_path.read_text()), replacement)
