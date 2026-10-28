@@ -379,6 +379,152 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(manager_calls, [])
             self.assertEqual(self.paths.instance_lock_path.read_bytes(), marker)
 
+    def _crash_stop_owner(self, *, after_signal):
+        """Make the controller die inside stop_owner, optionally after TERM."""
+        real = self.boundary.stop_owner
+
+        class ControllerDied(BaseException):
+            pass
+
+        def crashing(**kwargs):
+            if after_signal:
+                real(**kwargs)
+                # The daemon's own stop clears discovery; it never removes the lock.
+                self.paths.discovery_path.unlink()
+            raise ControllerDied()
+
+        self.boundary.stop_owner = crashing
+        return ControllerDied, real
+
+    def test_stopping_intent_before_signal_lets_retry_stop_still_published_owner(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        pid = int(json.loads(self.paths.instance_lock_path.read_text())["pid"])
+        died, real = self._crash_stop_owner(after_signal=False)
+        with self.assertRaises(died):
+            down(self.paths, self.boundary)
+        intent = json.loads(self.paths.instance_lock_path.read_text())
+        self.assertEqual(intent["state"], "stopping")
+        self.assertEqual(intent["pid"], pid)
+        self.assertEqual(intent["stopping"], {"version": PINOKIO_STOP_HANDOFF_VERSION, "binding": None})
+        self.assertTrue(self.paths.discovery_path.exists())
+        self.assertIn(pid, self.boundary.alive)
+        self.boundary.stop_owner = real
+        calls = []
+        down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, ["manager"])
+        self.assertNotIn(pid, self.boundary.alive)
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_stopping_intent_after_signal_retry_cleans_up_when_owner_absent(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        died, _real = self._crash_stop_owner(after_signal=True)
+        with self.assertRaises(died):
+            down(self.paths, self.boundary)
+        self.assertEqual(json.loads(self.paths.instance_lock_path.read_text())["state"], "stopping")
+        self.assertFalse(self.paths.discovery_path.exists())
+        calls = []
+        down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(calls, ["manager"])
+        self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_pinokio_stopping_intent_after_signal_converts_to_completed_stop(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            died, _real = self._crash_stop_owner(after_signal=True)
+            with self.assertRaises(died):
+                down(self.paths, self.boundary)
+            intent = json.loads(self.paths.instance_lock_path.read_text())
+            self.assertEqual(intent["state"], "stopping")
+            self.assertEqual(set(intent["stopping"]["binding"]), PINOKIO_STOP_BINDING_KEYS)
+            calls = []
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+            self.assertEqual(calls, ["manager"])
+            marker = json.loads(self.paths.instance_lock_path.read_text())
+            self.assertEqual(marker["state"], "completed_stop")
+            self.assertEqual(marker["completed_stop"]["binding"], intent["stopping"]["binding"])
+            self.assertEqual(marker["pid"], intent["pid"])
+            # The converted lock behaves exactly like a retained completed stop.
+            first = self.paths.instance_lock_path.read_bytes()
+            down(self.paths, self.boundary)
+            self.assertEqual(self.paths.instance_lock_path.read_bytes(), first)
+            bootstrap(self.paths, self.boundary, self.config)
+            self.assertNotIn("state", json.loads(self.paths.instance_lock_path.read_text()))
+
+    def test_pinokio_stopping_intent_with_changed_binding_retires_lock_and_refuses(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            died, _real = self._crash_stop_owner(after_signal=True)
+            with self.assertRaises(died):
+                down(self.paths, self.boundary)
+            intent = json.loads(self.paths.instance_lock_path.read_text())
+            intent["stopping"]["binding"]["owner_version_name"] = "v-other"
+            self.paths.instance_lock_path.write_text(json.dumps(intent))
+            calls = []
+            with self.assertRaises(BootstrapError):
+                down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+            self.assertEqual(calls, [])
+            self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_stopping_intent_with_owner_present_or_unknown_refuses_without_manager(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        pid = int(json.loads(self.paths.instance_lock_path.read_text())["pid"])
+        died, _real = self._crash_stop_owner(after_signal=True)
+        with self.assertRaises(died):
+            down(self.paths, self.boundary)
+        before = self.paths.instance_lock_path.read_bytes()
+        calls = []
+        # Still alive (TERM drain, or a reused pid) refuses.
+        self.boundary.alive.add(pid)
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
+        self.boundary.alive.discard(pid)
+        # A reused pid that is not "alive" per the probe but has a birth id refuses.
+        self.boundary.process_birth_identity = lambda observed: "reused" if observed == pid else None
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
+        # Unknown absence refuses.
+        del self.boundary.process_birth_identity
+
+        def unknown(_pid):
+            raise PermissionError("process observation denied")
+
+        self.boundary.is_pid_alive = unknown
+        with self.assertRaises(BootstrapError):
+            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
+        self.assertEqual(calls, [])
+
+    def test_stopping_intent_is_revoked_before_launch_only_on_positive_absence(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        pid = int(json.loads(self.paths.instance_lock_path.read_text())["pid"])
+        died, _real = self._crash_stop_owner(after_signal=True)
+        with self.assertRaises(died):
+            down(self.paths, self.boundary)
+        before = self.paths.instance_lock_path.read_bytes()
+        starts = len(self.boundary.starts)
+        self.boundary.alive.add(pid)
+        with self.assertRaises(BootstrapError):
+            bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(len(self.boundary.starts), starts)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
+        self.boundary.alive.discard(pid)
+        bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(len(self.boundary.starts), starts + 1)
+        self.assertNotIn("state", json.loads(self.paths.instance_lock_path.read_text()))
+
     def test_pinokio_completed_stop_selection_change_then_revert_cannot_revive_receipt(self):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)
@@ -2530,7 +2676,14 @@ def test_pack_public_down_uncertainty_preserves_discovery_lock(tmp_path):
     # the selected realm, without asserting SQLite physical byte stability.
     after = {str(p.relative_to(tmp_path)): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     realm_prefix = str(realm.relative_to(tmp_path)) + "/"
-    assert all(after.get(path) == value for path, value in before.items() if not path.startswith(realm_prefix))
+    lock_key = str(paths.instance_lock_path.relative_to(tmp_path))
+    # The stop failed after the intent was durable: the lock is retained, now
+    # in the Runtime-written stopping form for the same exact owner.
+    intent = json.loads(after[lock_key])
+    assert intent == {**identity, "data_root": str(paths.app_support), "state": "stopping",
+                      "stopping": {"version": 1, "binding": None}}
+    assert all(after.get(path) == value for path, value in before.items()
+               if not path.startswith(realm_prefix) and path != lock_key)
     assert realm.is_dir() and (realm / "realm.sqlite3").is_file()
 
 def test_pack_bootstrap_probe_does_not_replace_boundary_uncertainty(monkeypatch):

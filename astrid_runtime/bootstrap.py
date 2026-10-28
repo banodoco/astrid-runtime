@@ -1581,7 +1581,12 @@ def _validate_completed_stop_marker(marker: Mapping[str, Any]) -> dict[str, Any]
                                  process_birth_id=birth, realm_id=realm_id,
                                  realm_root=realm_root):
         raise BootstrapError("Runtime Pinokio completed-stop owner identity is malformed.")
-    for key, value in receipt["binding"].items():
+    _validate_binding_fields(receipt["binding"])
+    return owner
+
+
+def _validate_binding_fields(binding: Mapping[str, Any]) -> None:
+    for key, value in binding.items():
         if key.endswith("_sha256"):
             if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
                 raise BootstrapError("Runtime Pinokio completed-stop binding digest is malformed.")
@@ -1590,6 +1595,40 @@ def _validate_completed_stop_marker(marker: Mapping[str, Any]) -> dict[str, Any]
                 raise BootstrapError("Runtime Pinokio completed-stop binding release is malformed.")
         elif not isinstance(value, str) or not value:
             raise BootstrapError("Runtime Pinokio completed-stop binding field is malformed.")
+
+
+def _validate_stopping_marker(marker: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the Runtime-written intent form of instance.lock.
+
+    C1 writes it inside the final fence, before the first signal. It is
+    evidence only that C1 admitted and was stopping this exact owner; it is
+    never live health or discovery.
+    """
+    intent = marker.get("stopping")
+    if (set(marker) != {"pid", "process_birth_id", "runtime_instance_id", "realm_id",
+                        "realm_root", "data_root", "state", "stopping"}
+            or marker.get("state") != "stopping"
+            or not isinstance(intent, Mapping)
+            or set(intent) != {"version", "binding"}
+            or type(intent.get("version")) is not int
+            or intent.get("version") != PINOKIO_STOP_HANDOFF_VERSION):
+        raise BootstrapError("Runtime owner stopping marker is malformed; refusing interruption.")
+    binding = intent.get("binding")
+    if binding is not None:
+        if not isinstance(binding, Mapping) or set(binding) != PINOKIO_STOP_BINDING_KEYS:
+            raise BootstrapError("Runtime owner stopping marker is malformed; refusing interruption.")
+        _validate_binding_fields(binding)
+    owner = dict(marker)
+    pid = owner.get("pid")
+    if (type(pid) is not int or pid <= 0
+            or any(not isinstance(owner.get(key), str) or not owner[key]
+                   for key in ("process_birth_id", "runtime_instance_id", "realm_id",
+                               "realm_root", "data_root"))):
+        raise BootstrapError("Runtime owner stopping marker identity is malformed.")
+    try:
+        _canonical_realm_root(owner["realm_root"])
+    except BootstrapError as exc:
+        raise BootstrapError("Runtime owner stopping marker identity is malformed.") from exc
     return owner
 
 
@@ -1600,6 +1639,19 @@ def _revoke_completed_stop_before_launch(
     if marker is None:
         return None
     if marker.get("state") is None:
+        return None
+    if marker.get("state") == "stopping":
+        # Intent evidence is revoked like a completed stop, but only on
+        # positive absence; every other outcome leaves the bytes unchanged.
+        owner = _validate_stopping_marker(marker)
+        if (str(owner.get("data_root")) != str(paths.app_support)
+                or _read_support_json(paths.discovery_path) is not None):
+            raise BootstrapError("Runtime owner stopping marker conflicts with a published owner; launch refused.")
+        _require_owner_absent(
+            boundary, int(owner["pid"]), str(owner["process_birth_id"]),
+            context="before launch",
+        )
+        _durable_remove(paths.instance_lock_path)
         return None
     if marker.get("state") != "completed_stop":
         raise BootstrapError("Runtime owner lock has an unknown state; launch refused.")
@@ -1708,6 +1760,23 @@ def _fenced_stop_and_manager(
                     stop_owner = getattr(boundary, "stop_owner", None)
                     if not callable(stop_owner):
                         raise BootstrapError("Runtime boundary lacks the birth-checked stop handoff.")
+                    # Durable Runtime-written intent, before the first signal:
+                    # if the controller dies after TERM, a retry can prove
+                    # this exact owner was being stopped by C1.
+                    intent = {
+                        "pid": int(pid), "process_birth_id": str(birth),
+                        "runtime_instance_id": str(instance_id),
+                        "realm_id": str(realm_id), "realm_root": str(realm_root),
+                        "data_root": str(paths.app_support), "state": "stopping",
+                        "stopping": {
+                            "version": PINOKIO_STOP_HANDOFF_VERSION,
+                            "binding": (dict(completed_stop_binding)
+                                        if completed_stop_binding is not None else None),
+                        },
+                    }
+                    if final_marker != intent:
+                        atomic_write_json(paths.instance_lock_path, intent)
+                    marker = intent
                     # First destructive operation: Runtime's existing validated stop.
                     stopped = stop_owner(
                         endpoint=endpoint, pid=pid, instance_id=instance_id,
@@ -1826,6 +1895,21 @@ def _fenced_stop_and_manager(
             observed = _read_support_json(paths.instance_lock_path)
             if observed != marker:
                 raise BootstrapError("Runtime completed-stop marker changed during retry; refusing cleanup.")
+            if marker is not None and marker.get("state") == "stopping":
+                _require_owner_absent(
+                    boundary, int(marker["pid"]), str(marker["process_birth_id"]),
+                    context="before receipt publication",
+                )
+                atomic_write_json(paths.instance_lock_path, {
+                    **{key: marker[key] for key in (
+                        "pid", "process_birth_id", "runtime_instance_id", "realm_id",
+                        "realm_root", "data_root")},
+                    "state": "completed_stop",
+                    "completed_stop": {
+                        "version": PINOKIO_STOP_HANDOFF_VERSION,
+                        "binding": dict(retained_completed_stop["binding"]),
+                    },
+                })
         elif current_marker is not None:
             remove_file(paths.instance_lock_path)
     return {"status": "stopped", "realm_id": realm_id,
@@ -2169,6 +2253,26 @@ def _interrupt_owner_locked(
             raise _pinokio_stop_refusal(
                 "Runtime Pinokio completed-stop owner absence could not be established."
             ) from exc
+    elif discovery is None and marker is not None and marker.get("state") == "stopping":
+        # Runtime's own intent: admitted only on positive OS absence of that
+        # exact pid and birth. A present, reused or unknown process refuses
+        # with the lock bytes unchanged.
+        stopping = _validate_stopping_marker(marker)
+        if (stopping["data_root"] != str(paths.app_support)
+                or stopping["realm_id"] != str(realm.get("realm_id"))
+                or _canonical_realm_root(stopping["realm_root"]) != realm_root):
+            raise BootstrapError("Runtime interruption refused: owner stopping marker does not match the selected realm.")
+        _require_owner_absent(
+            boundary, stopping["pid"], stopping["process_birth_id"],
+            context="at stopping-marker admission",
+        )
+        stale_owner_identity = (stopping["pid"], stopping["process_birth_id"])
+        recorded_binding = stopping["stopping"]["binding"]
+        if pinokio_binding is not None:
+            if recorded_binding is None or dict(recorded_binding) != pinokio_binding:
+                _durable_remove(paths.instance_lock_path)
+                raise _pinokio_stop_refusal("Runtime Pinokio stopping-marker binding changed; refusing interruption.")
+            retained_completed_stop = {**stopping, "binding": dict(recorded_binding)}
     elif discovery is None and marker is not None:
         raise BootstrapError("Runtime interruption refused: owner lock has no matching discovery.")
     elif discovery is None and marker is None and pinokio_binding is not None:
@@ -2182,7 +2286,8 @@ def _interrupt_owner_locked(
                 discovery, realm_id=str(realm["realm_id"]), realm_root=realm_root,
             )
             stale_owner_identity = (stale_pid, stale_birth)
-    elif marker is not None and retained_completed_stop is None:
+    elif (marker is not None and retained_completed_stop is None
+          and stale_owner_identity is None):
         raise BootstrapError("Runtime interruption refused: owner lock identity is incomplete.")
 
     if owner is not None:
@@ -2264,7 +2369,7 @@ def _preflight_owner_interruption(
     if restore_selection is not None:
         _require_restore_publications_absent(paths, expected_completed_marker=marker)
     elif discovery is None and marker is not None:
-        if marker.get("state") != "completed_stop":
+        if marker.get("state") not in ("completed_stop", "stopping"):
             raise BootstrapError("Runtime interruption refused: owner lock has no matching discovery.")
     elif discovery is not None and marker is None:
         raise BootstrapError("Runtime interruption refused: owner lock does not match discovery.")
@@ -2396,7 +2501,9 @@ def _validate_published_stop_owner(
     realm_root: Path, discovery: Mapping[str, Any], marker: Mapping[str, Any] | None,
 ) -> tuple[int, str, str, str] | None:
     realm_id = str(realm.get("realm_id") or "")
-    if marker is not None and marker.get("state") is not None:
+    if marker is not None and marker.get("state") == "stopping":
+        _validate_stopping_marker(marker)
+    elif marker is not None and marker.get("state") is not None:
         raise BootstrapError("Runtime interruption refused: owner lock has an unknown state.")
     pid, birth, instance_id, endpoint = _recorded_owner_identity(
         discovery, realm_id=realm_id, realm_root=realm_root,
