@@ -124,11 +124,55 @@ def test_diagnostics_route_is_narrow_and_owner_authenticated(tmp_path):
         reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
         assert reply.status == 200, reply.body
         assert "Astrid diagnostics" in reply.json()["report"]
-        assert "Runtime support state: ok (healthy=True)" in reply.json()["report"]
+        assert "Runtime support state: ready (healthy=True)" in reply.json()["report"]
         assert "App build:" not in reply.json()["report"]
         assert "App release:" not in reply.json()["report"]
         assert world.call(f"{API_RUNTIME}/v1/diagnostics/anything").status == 404
         assert world.call(f"{API_RUNTIME}/v1/doctor").status == 404
+    finally:
+        world.stop()
+
+
+def test_diagnostics_download_reports_real_doctor_issues(tmp_path):
+    world = start_door_world(tmp_path)
+    try:
+        # The store doctor reads the real catalog and detects invalid JSON.
+        (world.support / "catalog.json").write_text("{invalid", encoding="utf-8")
+        reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
+        assert reply.status == 200, reply.body
+        report = reply.json()["report"]
+        assert "Runtime support state: unhealthy (healthy=False)" in report
+        assert "catalog_invalid" in report
+    finally:
+        world.stop()
+
+
+@pytest.mark.parametrize("step", ["complete", "rolled_back"])
+def test_diagnostics_download_reads_installer_journal_and_log(tmp_path, monkeypatch, step):
+    from astrid_runtime.paths import _install_record_path
+    from runtime_protocol import platform
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    root = tmp_path / "program"
+    root.mkdir()
+    record = _install_record_path(tmp_path / "home")
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(tmp_path / "workspace")}))
+    (root / "install.json").write_text(json.dumps({"owner": "haus.astrid.runtime", "data_root": str(tmp_path / "workspace")}))
+    log = root / "installer.log"
+    log.write_text("installer output\nCookie: sid=secret-cookie\n")
+    platform.owner_only(log)
+    (root / "update-transaction.json").write_text(json.dumps({"step": step, "log_path": str(log)}))
+    world = start_door_world(tmp_path)
+    try:
+        reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
+        assert reply.status == 200, reply.body
+        report = reply.json()["report"]
+        assert f"Last update result: {step}" in report
+        assert "installer output" in report and "[REDACTED]" in report
+        assert "secret-cookie" not in report
     finally:
         world.stop()
 

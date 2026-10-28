@@ -16,6 +16,7 @@ SECRETS = [
     '"authorization": "Bearer json-auth-secret"',
     "Cookie: session=cookie-secret",
     "Set-Cookie: sid=set-cookie-secret",
+    '"cookie": "sid=json-cookie-secret"',
     "api_key=api-secret-123",
     "OPENROUTER_API_KEY=sk-or-v1-openroutersecret",
     '"openrouter_api_key": "sk-or-v1-jsonsecret"',
@@ -157,3 +158,81 @@ def test_doctor_text_default_and_json_compatibility(tmp_path, monkeypatch, capsy
     assert "Astrid diagnostics" in capsys.readouterr().out
     assert cli.main(["doctor", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {"healthy": True, "state": "healthy"}
+
+
+def test_real_doctor_issues_are_shown_and_json_unchanged(tmp_path, monkeypatch, capsys):
+    paths = RuntimePaths.sandbox(tmp_path / "home")
+    monkeypatch.setattr(cli, "_paths", lambda _args: paths)
+    assert cli.main(["doctor"]) == 1
+    text = capsys.readouterr().out
+    assert "Runtime support state: unhealthy (healthy=False)" in text
+    assert "catalog_missing" in text
+    assert cli.main(["doctor", "--json"]) == 1
+    assert "catalog_missing" in json.loads(capsys.readouterr().out)["issues"]
+
+
+def test_old_journal_uses_default_install_log_and_step(tmp_path):
+    paths = RuntimePaths.sandbox(tmp_path / "home")
+    root = tmp_path / "program"
+    root.mkdir()
+    record = _install_record_path(paths.home)
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({"owner": "haus.astrid.runtime", "program_root": str(root)}))
+    (root / "update-transaction.json").write_text(json.dumps({"step": "complete"}))
+    log = platform.log_dir(paths.home) / "install.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("legacy installer output")
+    platform.owner_only(log)
+    report = diagnostics_report(paths, {"healthy": True})
+    assert "Last update result: complete" in report
+    assert "legacy installer output" in report
+
+
+def test_direct_journal_wins_over_old_job_and_rejects_public_log(tmp_path):
+    paths = RuntimePaths.sandbox(tmp_path / "home")
+    root = tmp_path / "program"
+    root.mkdir()
+    data = str(tmp_path / "data")
+    record = _install_record_path(paths.home)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"owner": "haus.astrid.runtime", "program_root": str(root), "data_root": data}))
+    old_log = root / "old.log"
+    old_log.write_text("old job output")
+    platform.owner_only(old_log)
+    (root / "install.json").write_text(json.dumps({"owner": "haus.astrid.runtime", "data_root": data, "update_job": {"operation_id": "a" * 32, "state": "updated", "result": "old job", "log_path": str(old_log)}}))
+    log = root / "current.log"
+    log.write_text("private installer output")
+    log.chmod(0o644)
+    (root / "update-transaction.json").write_text(json.dumps({"step": "rolled_back", "log_path": str(log)}))
+    platform.owner_only(record)
+    platform.owner_only(root / "install.json")
+    platform.owner_only(root / "update-transaction.json")
+    report = diagnostics_report(paths, {"healthy": False, "issues": ["bad token=issue-secret"]})
+    assert "Last update result: rolled_back" in report
+    assert "old job output" not in report and "private installer output" not in report
+    assert "log permissions are not owner-only" in report
+    assert "issue-secret" not in report
+
+
+def test_unreadable_current_job_log_does_not_fall_back_to_prior_log(tmp_path):
+    paths = RuntimePaths.sandbox(tmp_path / "home")
+    root = tmp_path / "program"
+    root.mkdir()
+    data = str(tmp_path / "data")
+    record = _install_record_path(paths.home)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"owner": "haus.astrid.runtime", "program_root": str(root), "data_root": data}))
+    old_log = root / "old.log"
+    old_log.write_text("previous output")
+    platform.owner_only(old_log)
+    public_log = root / "job.log"
+    public_log.write_text("current output")
+    public_log.chmod(0o644)
+    (root / "install.json").write_text(json.dumps({"owner": "haus.astrid.runtime", "data_root": data,
+        "update_job": {"operation_id": "a" * 32, "state": "failed", "result": "failed",
+                       "prior_transaction_id": "previous", "log_path": str(public_log)}}))
+    (root / "update-transaction.json").write_text(json.dumps({"operation_id": "previous", "step": "complete", "log_path": str(old_log)}))
+    report = diagnostics_report(paths, {"healthy": True})
+    assert "Last update result: failed" in report
+    assert "Update log: (not available)" in report
+    assert "previous output" not in report and "current output" not in report

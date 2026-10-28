@@ -86,10 +86,15 @@ class UpdateAdmission:
         self._lock = threading.Lock()
 
     def status(self):
-        # Do not publish an App execution capability here. F1d owns that
-        # contract; this field still reflects only an explicitly injected
-        # launcher seam until its route/capability handoff is implemented.
-        return read_update_status(Path.home(), available=self.launcher is not None)
+        # Use the same live-install selection as POST. Production launches via
+        # the selected Agent helper, so an injected launcher is not required.
+        # Selection only reads records; preparation and job creation remain POST-only.
+        try:
+            self._selection()
+            available = True
+        except (UpdateRefusal, OSError, ValueError, KeyError, TypeError):
+            available = False
+        return read_update_status(Path.home(), available=available)
 
     def _helper(self, python, agent, runtime, payload):
         script = ("import sys; sys.path[:0]=sys.argv[1:3]; "

@@ -361,8 +361,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             from astrid_runtime.diagnostics import diagnostics_report
             from astrid_runtime.paths import RuntimePaths
             paths = RuntimePaths.current(data_root=self.runtime.support_root.parent if self.runtime.support_root else None)
-            health = self.runtime.health()
-            support = {"state": health.get("status", "unknown"), "healthy": health.get("status") == "ok"}
+            support = self.runtime.doctor()
             report = diagnostics_report(paths, support)
             return self._send(200, {"report": report})
         if path == ["v1", "realm", "tombstone"] and method == "POST":
