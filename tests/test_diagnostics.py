@@ -67,7 +67,7 @@ def test_report_includes_identity_update_runtime_and_disk_details(tmp_path):
     assert "App build:" not in report
     assert "App release:" not in report
     assert "build-sha" not in report
-    assert "B1 identity: managed_by=source; release=8" in report
+    assert "Install identity: managed_by=source; release=8" in report
     assert "Runtime support state: healthy (healthy=True)" in report
     assert "Last update result: rolled_back" in report
     assert "installer output" in report and "launcher output" in report

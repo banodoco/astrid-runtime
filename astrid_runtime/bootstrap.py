@@ -28,7 +28,7 @@ from runtime_protocol import platform as runtime_platform
 from runtime_protocol import cancellation
 from runtime_protocol import process_control
 from runtime_protocol.errors import ConflictError
-from .paths import RuntimePaths, _install_record_path
+from .paths import INSTALL_RECORD_OWNER, RuntimePaths, _install_record_path
 from .refusal import refusal_from
 from runtime_protocol.lifecycle import interruption_fence, inspect_interruption_state
 from .identity import (
@@ -1328,7 +1328,7 @@ def _pinokio_stop_binding(
         except BootstrapError as exc:
             selection_error = exc
     selected_pinokio = bool(isinstance(selected, Mapping)
-                            and selected.get("owner") == "haus.astrid.runtime"
+                            and selected.get("owner") == INSTALL_RECORD_OWNER
                             and selected.get("managed_by") == "pinokio")
     selected_for_data = False
     if selected_pinokio:
@@ -1421,14 +1421,14 @@ def _pinokio_stop_binding(
     _marker_raw, install_marker = _private_handoff_json(program_root / "install.json")
     expected_root = _canonical_realm_root(str(realm.get("data_root") or ""))
     realm_id = str(realm.get("realm_id") or "")
-    if (selected.get("owner") != "haus.astrid.runtime"
+    if (selected.get("owner") != INSTALL_RECORD_OWNER
             or selected.get("managed_by") != "pinokio"
             or _canonical_handoff_path(selected.get("program_root"), label="selection program root", directory=True) != program_root
             or _canonical_handoff_path(selected.get("data_root"), label="selection data root", directory=True) != paths.app_support
             or str(selected.get("realm_id") or "") != realm_id
             or _canonical_handoff_path(selected.get("realm_root"), label="selection realm root", directory=True) != expected_root):
         raise BootstrapError("Runtime Pinokio stop binding conflicts with the selected install record.")
-    if (install_marker.get("owner") != "haus.astrid.runtime"
+    if (install_marker.get("owner") != INSTALL_RECORD_OWNER
             or install_marker.get("managed_by") != "pinokio"
             or _canonical_handoff_path(install_marker.get("data_root"), label="install marker data root", directory=True) != paths.app_support):
         raise BootstrapError("Runtime Pinokio stop binding conflicts with the program install marker.")
@@ -2042,7 +2042,7 @@ def _restore_selection_snapshot(
     raw_data_root = str(selected.get("data_root") or "")
     realm_id = str(selected.get("realm_id") or "")
     raw_realm_root = str(selected.get("realm_root") or "")
-    if owner != "haus.astrid.runtime":
+    if owner != INSTALL_RECORD_OWNER:
         raise BootstrapError("Restore install selection has an unsupported owner.")
     program_root = _canonical_metadata_path(Path(raw_program_root), label="program root")
     data_root = _canonical_metadata_path(Path(raw_data_root), label="data root")
