@@ -1349,6 +1349,9 @@ def test_runtime_relay_to_generic_host_successor_finalization_cpu(tmp_path, astr
         service = RuntimeService(root / "realm", support_root=support)
         daemon = RuntimeDaemon(root / "realm", support_root=support)
         daemon.service = service; daemon.instance_id = "A"
+        # Mirror RuntimeDaemon._start(): bind the immutable owner identity before
+        # exposing health, even though this fixture owns the HTTP server directly.
+        daemon._bind_startup_identity()
         server = RuntimeHTTPServer(("127.0.0.1", 0), RuntimeHandler)
         daemon.httpd = server; server.runtime = service; server.daemon_runtime = daemon
         events = root / "joined-events.json"; observations = []
@@ -1436,6 +1439,7 @@ def test_runtime_relay_to_generic_host_successor_finalization_cpu(tmp_path, astr
         # Original A connection cannot become fresh B even with correct payload.
         assert adapter.handoff_command(handle, adopt)["status"] == "unresolved"
         actor_state["pid"] = successor.pid; daemon.instance_id = "B"; daemon.local_worker_launcher = launcher_b
+        daemon._bind_startup_identity()
         adopted = daemon.adopt_local_execution_handoff(adopt, receipt); assert adopted["status"] == "ok"
         b_control = preparer_b.adopted_handoff_obligation()
         health = service.health(); runtime = {"endpoint": daemon.endpoint, "protocol": health["protocol"], "schema_digest": health["schema_digest"],
