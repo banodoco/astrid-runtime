@@ -380,3 +380,80 @@ def test_attempt_runtime_clamps_lease_and_old_claim_does_not_poison_retry(servic
     successor = _claim_bounded(service, target, "bounded-successor")
     assert successor["fence"] > old["fence"]
     assert service.task(task_id)["task"]["status"] == "running"
+
+
+@pytest.mark.parametrize("action", ["claim", "heartbeat", "settle"])
+def test_absolute_deadline_boundary_is_exclusive(service, monkeypatch, action):
+    task_id = _admit(service)
+    attempt = _claim(service) if action != "claim" else None
+    boundary = _deadline(service, task_id, remaining=0)
+
+    class BoundaryClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return boundary.astimezone(tz) if tz else boundary.replace(tzinfo=None)
+
+    monkeypatch.setattr("runtime_protocol.store.datetime", BoundaryClock)
+    if action == "claim":
+        assert _claim(service) is None
+        assert service.store.conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+    else:
+        method = service.heartbeat_attempt if action == "heartbeat" else service.settle_attempt
+        with pytest.raises(LeaseError):
+            method(attempt["attempt_id"], _binding(attempt), idempotency_key="at-boundary")
+    _assert_failed(service, task_id, "task_deadline_exceeded", attempt=attempt)
+
+
+@pytest.mark.parametrize("preflight_ending", ["ready", "unavailable", "error"])
+def test_deadline_crossed_during_claim_preflight_is_durable_without_attempt(service, monkeypatch, preflight_ending):
+    task_id = _admit(service)
+    boundary = _deadline(service, task_id, remaining=5)
+    original = service.store.storage_preflight
+
+    class LateClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            late = boundary + timedelta(seconds=1)
+            return late.astimezone(tz) if tz else late.replace(tzinfo=None)
+
+    def preflight(*args, **kwargs):
+        result = original(*args, **kwargs)
+        monkeypatch.setattr("runtime_protocol.store.datetime", LateClock)
+        if preflight_ending == "error":
+            raise OSError("preflight failed after deadline")
+        return {**result, "ok": preflight_ending == "ready"}
+
+    monkeypatch.setattr(service.store, "storage_preflight", preflight)
+    if preflight_ending == "error":
+        with pytest.raises(OSError, match="preflight failed after deadline"):
+            _claim(service)
+    else:
+        assert _claim(service) is None
+    _assert_failed(service, task_id, "task_deadline_exceeded")
+    assert service.store.conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+    assert service.store.get_task(task_id)["task"]["attempt"] == 0
+
+
+def test_claim_deadline_is_original_admission_bound_and_client_compatible(service):
+    import json
+    from pathlib import Path
+
+    from astrid_runtime_client import AttemptFence
+    from jsonschema import Draft202012Validator, FormatChecker
+
+    task_id = _admit(service)
+    expected = datetime.fromisoformat(service.task(task_id)["run"]["created_at"]) + timedelta(seconds=TASK_DEADLINE_SECONDS)
+    old = _claim(service)
+    assert datetime.fromisoformat(old["deadline_at"]) == expected
+    assert AttemptFence.from_json(old).deadline_at == old["deadline_at"]
+    # Existing retained claim receipts remain valid for older Runtime servers.
+    legacy = {key: value for key, value in old.items() if key != "deadline_at"}
+    assert AttemptFence.from_json(legacy).deadline_at is None
+    schema = json.loads((Path(__file__).parents[1] / "contract/schemas/worker.json").read_text())
+    validator = Draft202012Validator(schema["definitions"]["AttemptFence"], format_checker=FormatChecker())
+    validator.validate(old)
+    validator.validate(legacy)
+    service.fail_attempt(old["attempt_id"], {**_binding(old), "error": {"code": "executor_failed"}}, idempotency_key="deadline-fail")
+    service.retry_task(task_id, {}, idempotency_key="deadline-retry")
+    successor = _claim(service, "deadline-successor")
+    assert successor["deadline_at"] == old["deadline_at"]

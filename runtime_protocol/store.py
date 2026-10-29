@@ -3734,6 +3734,12 @@ class RealmStore:
                             if occupied:
                                 waiting_reason = self._waiting_for_resource(key)
                                 break
+                # Preflight may read snapshots or storage before authority is
+                # granted. Recheck the existing hard bounds after that work so
+                # a task cannot acquire a fresh attempt past its deadline.
+                failure = self._task_lifetime_failure(task, datetime.now(timezone.utc))
+                if failure is not None:
+                    return self._fail_task_in_transaction(task, failure, attempt_id=task["attempt_id"])
                 if waiting_reason:
                     self._set_waiting_reason(task_id, waiting_reason)
                     return self.get_task(task_id)

@@ -7740,7 +7740,7 @@ class RuntimeService:
                 "runtime_session_id",
             ) if key in value} | ({"verified_facts": value["verified_facts"]} if "verified_facts" in value else {})
 
-    @_durable_mutation
+    @_durable_mutation(reap_task_lifetimes=True)
     def claim_next(self, body, *, idempotency_key=None, identity=None):
         """Atomically select, claim, fence, and record a canonical claim.
 
@@ -7872,7 +7872,9 @@ class RuntimeService:
                 )
         attempt_id, lease_id = new_id(), new_id()
         value = self.store._claim_task(row["id"], executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
-        if value["task"]["status"] != "running":
+        if value["task"]["status"] == "failed":
+            result = None
+        elif value["task"]["status"] != "running":
             result = {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
         else:
             task = value["task"]
@@ -7901,7 +7903,7 @@ class RuntimeService:
             admitted_spec, generation_intent = public_task_spec(task.get("spec") or {})
             if task.get("generation_intent") is not None:
                 generation_intent = task["generation_intent"]
-            result = {"attempt_id": attempt_id, "task_id": row["id"], "run_id": value["run"]["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            result = {"attempt_id": attempt_id, "task_id": row["id"], "run_id": value["run"]["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "deadline_at": self.store._task_absolute_deadline(task).isoformat(), "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
             if task.get("execution_request") is not None:
                 result["execution_request"] = dict(task["execution_request"])
             if binding is not None:
