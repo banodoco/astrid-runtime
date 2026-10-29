@@ -12,8 +12,20 @@ from astrid_runtime.bootstrap import BootstrapConfig, BootstrapError, SourceProf
 from astrid_runtime.operator_upgrade import OperatorUpgradeError, upgrade_workspace
 from astrid_runtime.paths import RuntimePaths
 from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+from astrid_runtime.refusal import refusal_from
 from runtime_protocol.store import SCHEMA_VERSION, RealmStore
 from runtime_protocol.upgrade import inspect_canonical_schema
+
+
+def test_refusal_from_prefers_structured_message_and_preserves_details():
+    details = {"headline": "Operator action required", "safe": False}
+    exc = RuntimeError("fallback")
+    exc.details = details
+    assert refusal_from(exc) == ("Operator action required", details)
+
+
+def test_refusal_from_uses_exception_message_without_details():
+    assert refusal_from(RuntimeError("fallback")) == ("fallback", None)
 
 
 class _Boundary:
@@ -218,8 +230,10 @@ def test_operator_upgrade_refuses_running_task_before_signaling_owner(tmp_path):
     finally:
         connection.close()
     boundary = _Boundary(paths)
-    with pytest.raises(OperatorUpgradeError, match="work is active"):
+    with pytest.raises(OperatorUpgradeError, match=r"Astrid is busy \(1 tasks running\)\. Try again when they finish\.") as caught:
         upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
+    assert caught.value.details["safe"] is False
+    assert caught.value.details["blockers"][0]["task_id"] == "task"
     assert not any(call[0] == "stop" for call in boundary.calls)
 
 

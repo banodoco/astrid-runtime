@@ -53,6 +53,8 @@ def _parser():
     start.add_argument("--display-name", default="Workspace")
     start.add_argument("--realm-id")
     start.add_argument("--owner-lock")
+    start.add_argument("--runtime-checkout")
+    start.add_argument("--agent-checkout")
     start.add_argument("--bootstrap-token-file")
     start.add_argument("--admission-timeout", type=float, help="bounded startup integrity budget in seconds")
     start.add_argument("--worker-profile", help="absolute installed local Worker composition profile")
@@ -350,6 +352,12 @@ def _main(args):
         print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
         return 0
     try:
+        runtime_checkout = args.runtime_checkout
+        agent_checkout = args.agent_checkout
+        if agent_checkout is None and args.service_source_checkout:
+            agent_checkout = args.service_source_checkout
+        if runtime_checkout is None and agent_checkout is not None:
+            runtime_checkout = str(Path(__file__).resolve().parents[1])
         door = None
         if args.door_origin:
             if not args.door_credential_file:
@@ -390,6 +398,8 @@ def _main(args):
             door=door,
             services=services,
             log_directory=Path(args.log_file).parent if args.log_file else None,
+            runtime_checkout=runtime_checkout,
+            agent_checkout=agent_checkout,
         ).start()
     except KeyboardInterrupt:
         raise

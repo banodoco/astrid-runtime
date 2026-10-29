@@ -272,15 +272,51 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 and urlsplit(getattr(self, "path", "")).path in {"/v1/health", "/v1/realm"}
                 and getattr(self, "headers", {}).get("X-Astrid-Owner-Identity") == "1")
 
+    def _require_update_context(self):
+        raise AuthorizationError("updates require the trusted browser door")
+
+    def _update_route(self):
+        self.close_connection = True
+        self._require_update_context()
+        expected = {"/v1/update": "POST", "/v1/update/status": "GET"}
+        if self.path not in expected or self.command != expected[self.path]:
+            raise ProtocolError("exact update path and method required; no parameters")
+        if any(self._header_values(name) for name in ("Transfer-Encoding", "Content-Encoding", "Trailer")):
+            raise ProtocolError("update requests do not accept encoded or ambiguous framing")
+        lengths = self._header_values("Content-Length")
+        if (self.command == "POST" or lengths) and (len(lengths) != 1 or lengths[0] != "0"):
+            raise ProtocolError("update requests require zero body bytes")
+        from astrid_runtime.update import update_admission
+        admission = update_admission(self.server.daemon_runtime)
+        if self.command == "GET":
+            return self._send(200, admission.status())
+        return self._send(202, admission.request())
+
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
+        if method == "POST" and len(path) == 5 and path[:3] == ["v1", "control", "tasks"] and path[4] == "abandon":
+            identity = self._identity("admin")
+            if identity.get("actor") != "owner":
+                raise ForbiddenError("task abandon requires the Runtime owner actor")
+            return self._send(200, self.runtime.abandon_task(path[3], self._body(),
+                idempotency_key=self._idempotency_key(), identity=identity))
         if path == ["v1", "health"]:
             health = dict(self.runtime.health(identity_probe=True) if self._is_owner_identity_probe()
                           else self.runtime.health())
+            # RuntimeService is also exercised without an owning daemon in
+            # low-level protocol fixtures. Such a response has no startup
+            # identity; real owner listeners replace this with the snapshot.
+            health["identity"] = None
             daemon = getattr(self.server, "daemon_runtime", None)
             if daemon is not None:
-                health["runtime_instance_id"] = daemon.instance_id
+                # Startup identity belongs to one owner instance. Read only
+                # the defensive snapshot captured by RuntimeDaemon.start();
+                # health must never recapture install records or checkouts.
+                health["runtime_instance_id"] = getattr(
+                    daemon, "startup_identity_instance_id", None
+                )
+                health["identity"] = getattr(daemon, "startup_identity", None)
                 health["services"] = daemon.service_status()
             return self._send(200, health)
         if path == ["v1", "credentials"] and method == "POST":
@@ -294,7 +330,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             from .daemon import WORKER_ACTOR
             if actor == WORKER_ACTOR:
                 raise ConflictError("the shared Worker actor requires exact owner credential control")
-            scopes = ["handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write"]
+            from .door import PRODUCT_SCOPES
+            scopes = list(PRODUCT_SCOPES)
             self.server.credentials.provision_static(actor, token, scopes)  # type: ignore[attr-defined]
             return self._send(201, {"actor_id": actor, "scope": scope})
         if path == ["v1", "handshake"] and method == "POST":
@@ -309,11 +346,24 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, self.runtime.handshake({"authenticated_actor": identity["actor"], "authenticated_scopes": identity.get("scopes", []), "requested_scopes": []}))
         if path == ["v1", "realm"] and method == "GET":
             self._identity("projects:read")
-            return self._send(200, self.runtime.realm_resource(identity_probe=True)
-                              if self._is_owner_identity_probe() else self.runtime.realm_resource())
+            owner_probe = self._is_owner_identity_probe()
+            resource = dict(self.runtime.realm_resource(identity_probe=True)
+                            if owner_probe else self.runtime.realm_resource())
+            daemon = getattr(self.server, "daemon_runtime", None)
+            if owner_probe and daemon is not None:
+                resource["runtime_instance_id"] = getattr(daemon, "startup_identity_instance_id", None)
+            return self._send(200, resource)
         if path == ["v1", "doctor"] and method == "GET":
             self._identity("admin")
             return self._send(200, self.runtime.doctor())
+        if path == ["v1", "diagnostics"] and method == "GET":
+            self._identity("projects:read")
+            from astrid_runtime.diagnostics import diagnostics_report
+            from astrid_runtime.paths import RuntimePaths
+            paths = RuntimePaths.current(data_root=self.runtime.support_root.parent if self.runtime.support_root else None)
+            support = self.runtime.doctor()
+            report = diagnostics_report(paths, support)
+            return self._send(200, {"report": report})
         if path == ["v1", "realm", "tombstone"] and method == "POST":
             self._identity("admin")
             return self._send(200, self.runtime.tombstone(self._body()))
@@ -956,6 +1006,21 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             "/v1/control/local-worker/start", "/v1/control/local-worker/relinquish",
         }) or (method == "GET" and path == "/v1/control/local-worker/generation")
 
+    def _is_task_settlement_control(self):
+        path = [unquote(x) for x in urlsplit(getattr(self, "path", "")).path.split("/") if x]
+        return (getattr(self, "command", None) == "GET" and len(path) == 5
+                and path[:3] == ["v1", "control", "tasks"] and path[4] == "settlement")
+
+    def _task_settlement_control(self):
+        identity = self._identity("admin")
+        if identity.get("actor") != "owner":
+            raise ForbiddenError("task settlement requires the Runtime owner actor")
+        daemon = getattr(self.server, "daemon_runtime", None)
+        if daemon is None:
+            raise ConflictError("task settlement requires daemon ownership")
+        task_id = unquote(urlsplit(self.path).path.split("/")[4])
+        return self._send(200, daemon.task_settlement(task_id, identity=identity))
+
     def _is_remote_credential_control(self):
         path = [unquote(x) for x in urlsplit(getattr(self, "path", "")).path.split("/") if x]
         return getattr(self, "command", None) == "POST" and len(path) == 4 and path[:2] == ["v1", "tasks"] and path[3] == "remote-credential"
@@ -971,10 +1036,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, daemon.local_worker_generation(identity=identity))
         body = self._body()
         if urlsplit(self.path).path.endswith("/relinquish"):
-            if not isinstance(body, dict) or set(body) != {"executor_incarnation", "evidence_digest"}:
+            if (not isinstance(body, dict) or not {"executor_incarnation", "evidence_digest"} <= set(body)
+                    or set(body) - {"executor_incarnation", "evidence_digest", "expected_task_ids"}
+                    or ("expected_task_ids" in body and body["expected_task_ids"] is None)):
                 raise ProtocolError("exact local Worker generation fields are required")
             return self._send(200, daemon.relinquish_local_worker(
                 body["executor_incarnation"], body["evidence_digest"], identity=identity,
+                expected_task_ids=body.get("expected_task_ids"),
             ))
         if not isinstance(body, dict) or set(body) != {"profile_id", "expected_workspace_uuid"}:
             raise ProtocolError("profile_id and expected_workspace_uuid are the only accepted launch fields")
@@ -997,7 +1065,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._prefetched_body = None
             self._defer_response = True
             try:
-                if self._is_local_worker_control():
+                if urlsplit(getattr(self, "path", "")).path.startswith("/v1/update"):
+                    # Admission and network preparation never hold the shared SQLite writer.
+                    self._update_route()
+                elif self._is_task_settlement_control():
+                    self._task_settlement_control()
+                elif self._is_local_worker_control():
                     # Process preparation and OS observation are deliberately
                     # outside the SQLite mutex. Credential authentication and
                     # publication use CredentialStore's short internal lock.
@@ -1006,6 +1079,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     # Boundary identity probes use independent read-only
                     # snapshots while a lifecycle fence blocks the writer.
                     # Ordinary health/realm reads retain writer serialization.
+                    self._route()
+                elif getattr(self, "command", None) == "GET" and urlsplit(getattr(self, "path", "")).path == "/v1/diagnostics":
+                    # Support diagnostics performs independent owner-boundary
+                    # probes; it must not hold the serialized SQLite section.
                     self._route()
                 elif self._is_remote_credential_control() or self._is_binary_io():
                     # Both routes own short store sections. Transfer, hashing,

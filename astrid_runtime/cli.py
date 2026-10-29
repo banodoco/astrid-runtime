@@ -87,6 +87,12 @@ def parser() -> argparse.ArgumentParser:
     start_worker.add_argument("--profile", default="astrid", choices=["astrid"])
     start_worker.add_argument("--expected-workspace-uuid", required=True)
 
+    tasks = sub.add_parser("tasks", help="manage named Runtime tasks")
+    tasks_sub = tasks.add_subparsers(dest="tasks_command", required=True)
+    clear = tasks_sub.add_parser("clear", help="cancel and settle exact named task ids")
+    clear.add_argument("task_ids", nargs="+", help="exact task ids to clear")
+    _read_args(clear)
+
     workspace = sub.add_parser("workspace", help="explicitly inspect, create, or attach the sole workspace")
     workspace_sub = workspace.add_subparsers(dest="workspace_command", required=True)
     workspace_inspect = workspace_sub.add_parser("inspect", help="read-only canonical workspace inspection")
@@ -257,7 +263,7 @@ def _emit_ready(result: BootstrapResult, *, json_mode: bool) -> None:
         print(f"\nOpen {result.door_origin}")
 
 
-def _credential(paths: RuntimePaths) -> str:
+def _credential(paths: RuntimePaths, *, advise_start: bool = True) -> str:
     # Product traffic uses the Astrid-scoped credential in app support.  An
     # operator command needs the daemon-issued owner credential, which is
     # scoped to admin/worker lifecycle operations and remains inside the
@@ -271,6 +277,8 @@ def _credential(paths: RuntimePaths) -> str:
             raise BootstrapError(f"Runtime owner credential access refused: {exc}") from exc
         token = ""
     if not token:
+        if not advise_start:
+            raise BootstrapError("No Runtime owner credential is available; tasks clear requires an existing owner and will not start Runtime.")
         raise BootstrapError("No runtime owner credential is available; run astrid-runtime up --profile astrid.")
     return token
 
@@ -445,9 +453,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         paths = _paths(args)
     except (OSError, ValueError) as exc:
+        if args.command == "tasks" and args.tasks_command == "clear":
+            from .task_clear import _error_row, _result
+            outcomes = {task_id: _error_row(task_id, "failed", str(exc)) for task_id in args.task_ids}
+            _emit(_result(args.task_ids, outcomes), json_mode=args.json)
+            return 1
         _emit({"ok": False, "error": str(exc)}, json_mode=True)
         return 1
-    if args.command not in {"workspace", "doctor", "status"}:
+    if args.command not in {"workspace", "doctor", "status", "tasks"}:
         # Any other command may stop or signal the Runtime it manages, so it
         # follows the installed process-control setting from the start.
         try:
@@ -487,8 +500,22 @@ def main(argv: list[str] | None = None) -> int:
         # Doctor is read-only but must still use the concrete process boundary
         # to distinguish a live, matching owner from a stale/reused PID.
         result = doctor(paths, LocalRuntimeBoundary())
-        _emit(result, json_mode=args.json)
+        if args.json:
+            _emit(result, json_mode=True)
+        else:
+            from .diagnostics import diagnostics_report
+            print(diagnostics_report(paths, result))
         return 0 if result["healthy"] else 1
+    if args.command == "tasks" and args.tasks_command == "clear":
+        from .task_clear import clear_tasks
+
+        result = clear_tasks(
+            paths, args.task_ids,
+            credential_reader=lambda current: _credential(current, advise_start=False),
+            client_factory=_client,
+        )
+        _emit(result, json_mode=args.json)
+        return 0 if result["ok"] else 1
     if args.command == "run":
         config = _config(args, paths)
         try:
@@ -518,25 +545,30 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "connect":
             config = _config(args, paths)
             boundary = LocalRuntimeBoundary()
-            boundary.configure_source(config.resolve_source_profile(paths))
             result = connect(paths, boundary, config)
             _emit(result, json_mode=args.json)
             return 0
         if args.command in {"restart", "down"}:
             config = _config(args, paths)
             boundary = LocalRuntimeBoundary()
+            if args.command == "down":
+                # down validates and prepares the selected owner inside its
+                # fence, including the already-stopped case: C1 validates a
+                # retained completed-stop marker (or safely refuses) instead
+                # of requiring discovery here.
+                _emit(down(paths, boundary), json_mode=args.json)
+                return 0
             source = config.resolve_source_profile(paths)
             catalog = _read_catalog(paths)
             realm_id = str(catalog.get("selected_realm_id") or "")
             realm = next((item for item in catalog.get("realms", []) if str(item.get("realm_id")) == realm_id), None)
             discovery = _read_support_json(paths.discovery_path) or {}
-            if not realm or not discovery.get("pid"):
+            if not realm:
+                raise BootstrapError("No selected runtime owner to restart; run astrid-runtime up --profile astrid.")
+            if not discovery.get("pid"):
                 raise BootstrapError("No selected runtime owner to restart; run astrid-runtime up --profile astrid.")
             boundary.prepare_restart(source_profile=source, realm_id=realm_id, realm_root=Path(str(realm["data_root"])), support_root=paths.runtime_support, pid=int(discovery["pid"]))
-            if args.command == "restart":
-                _emit_ready(restart(paths, boundary, config), json_mode=args.json)
-            else:
-                _emit(down(paths, boundary), json_mode=args.json)
+            _emit_ready(restart(paths, boundary, config), json_mode=args.json)
             return 0
         if args.command == "status":
             _validate_support_paths(paths)
@@ -615,7 +647,10 @@ def main(argv: list[str] | None = None) -> int:
             _emit(value, json_mode=args.json)
             return 0
     except (BootstrapError, ValueError, OSError) as exc:
-        _emit({"ok": False, "error": str(exc)}, json_mode=True)
+        error = str(exc)
+        if isinstance(exc, BootstrapError) and exc.details is not None:
+            error = {"message": error, "details": exc.details}
+        _emit({"ok": False, "error": error}, json_mode=True)
         return 1
     except Exception as exc:
         # Generated clients expose typed ApiError; keep that import lazy so

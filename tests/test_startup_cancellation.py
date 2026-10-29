@@ -95,6 +95,11 @@ def test_readiness_cancels_while_request_is_still_pending():
 @pytest.mark.parametrize("stage", ["provision", "handshake"])
 @pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGINT])
 def test_run_cancels_pending_handoff_and_rolls_back(monkeypatch, tmp_path, capsys, stage, stop_signal):
+    # PROFILE uses synthetic checkout paths, so select the matching installed
+    # identity explicitly instead of asking source identity capture to inspect
+    # those paths. This keeps the test on the cancellation path.
+    monkeypatch.setenv("ASTRID_INSTALL_RELEASE", "0")
+    monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "")
     paths = RuntimePaths.sandbox(tmp_path)
     paths.ensure_support_dirs()
     root = paths.realms_dir / "realm"

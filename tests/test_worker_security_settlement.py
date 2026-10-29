@@ -314,3 +314,78 @@ def test_journal_recovery_pins_cas_prefix_before_unlinking(tmp_path: Path) -> No
             prefix.unlink()
         if real_prefix.exists():
             real_prefix.rename(prefix)
+
+
+def test_retained_external_worker_token_is_fenced_after_abandon_restart_and_new_claim(tmp_path):
+    from tests.test_tasks_clear import _external_cli_task
+    from tests.test_execution_binding_contract import CAPABILITY, _admit, _identity
+
+    root, support = tmp_path / "realm", tmp_path / "support"
+    daemon = _new_daemon(root, support_root=support).start()
+    try:
+        task_id, old = _external_cli_task(daemon)
+        placement = _identity(old["execution_binding"]["actual_target"])["execution_binding"]
+        token, _ = daemon.credentials.provision("executor-a", ["worker:execute", "tasks:read", "objects:write"],
+            metadata={"execution_binding": placement})
+        owner, worker = Api(daemon.endpoint, daemon.token), Api(daemon.endpoint, token)
+        lease = {key: old[key] for key in ("lease_id", "fence", "runtime_epoch")}
+        worker.request("POST", f"/v1/attempts/{old['attempt_id']}/heartbeat", lease,
+                       headers={"Idempotency-Key": "retained-heartbeat"})
+        owner.request("POST", f"/v1/tasks/{task_id}/cancel", {}, headers={"Idempotency-Key": "retained-cancel"})
+        observed = owner.request("GET", f"/v1/control/tasks/{task_id}/settlement")["task"]
+        abandon_body = {
+            "expected_task_version": observed["version"], "attempt_id": old["attempt_id"], **lease,
+            "execution_binding": observed["execution_binding"], "reason": "owner loses provider attempt",
+        }
+        abandoned = owner.request("POST", f"/v1/control/tasks/{task_id}/abandon", abandon_body,
+                                  headers={"Idempotency-Key": "retained-abandon"})
+
+        def reject_old_reports():
+            before = list(daemon.service.store.conn.iterdump())
+            for action, body, key in (
+                ("heartbeat", lease, "retained-heartbeat"),  # previously successful replay
+                ("heartbeat", lease, "retained-heartbeat-new-key"),
+                ("settle", {**lease, "outputs": [{"digest": _digest(b"late-output"), "size": 11,
+                    "data_base64": base64.b64encode(b"late-output").decode(), "name": "late"}]}, "retained-settle"),
+                ("fail", {**lease, "error": {"code": "late"}}, "retained-fail"),
+            ):
+                with pytest.raises(RuntimeError) as denied:
+                    worker.request("POST", f"/v1/attempts/{old['attempt_id']}/{action}", body,
+                                   headers={"Idempotency-Key": key})
+                assert denied.value.status in {401, 409}
+            assert list(daemon.service.store.conn.iterdump()) == before
+
+        reject_old_reports()
+        daemon.stop()
+        daemon = RuntimeDaemon(root, support_root=support).start()
+        worker = Api(daemon.endpoint, token)  # retain actual original credential bytes
+        owner = Api(daemon.endpoint, daemon.token)
+        assert daemon.credentials.load(token)["actor"] == "executor-a"
+        reject_old_reports()
+        owner.request("POST", f"/v1/tasks/{task_id}/retry", {}, headers={"Idempotency-Key": "retained-retry"})
+        epoch = daemon.service.health()["runtime_epoch"]
+        daemon.service.register_executor({"executor_id": "executor-a", "capabilities": [CAPABILITY],
+            "resource_keys": ["external-gpu"], "runtime_epoch": epoch}, idempotency_key="retained-refresh")
+        fresh = worker.request("POST", "/v1/tasks/claim", {"executor_id": "executor-a", "capability_ids": [CAPABILITY],
+            "runtime_epoch": epoch, "target": placement["actual"]}, headers={"Idempotency-Key": "retained-fresh-claim"})
+        assert fresh["attempt_id"] != old["attempt_id"] and fresh["fence"] > old["fence"]
+        reject_old_reports()
+        before_replay = list(daemon.service.store.conn.iterdump())
+        assert owner.request("POST", f"/v1/control/tasks/{task_id}/abandon", abandon_body,
+                             headers={"Idempotency-Key": "retained-abandon"}) == abandoned
+        assert list(daemon.service.store.conn.iterdump()) == before_replay
+        worker.request("POST", f"/v1/attempts/{fresh['attempt_id']}/settle", {
+            **{key: fresh[key] for key in ("lease_id", "fence", "runtime_epoch")}, "outputs": [],
+        }, headers={"Idempotency-Key": "retained-fresh-settle"})
+        assert daemon.service.store.get_task(task_id)["task"]["status"] == "completed"
+        independent = _admit(daemon.service, "retained-independent-task", placement["actual"])
+        independent_attempt = worker.request("POST", "/v1/tasks/claim", {
+            "executor_id": "executor-a", "capability_ids": [CAPABILITY], "runtime_epoch": epoch,
+            "target": placement["actual"]}, headers={"Idempotency-Key": "retained-independent-claim"})
+        assert independent_attempt["task_id"] == independent["task"]["id"] != task_id
+        worker.request("POST", f"/v1/attempts/{independent_attempt['attempt_id']}/settle", {
+            **{key: independent_attempt[key] for key in ("lease_id", "fence", "runtime_epoch")}, "outputs": [],
+        }, headers={"Idempotency-Key": "retained-independent-settle"})
+        assert daemon.service.store.get_task(independent_attempt["task_id"])["task"]["status"] == "completed"
+    finally:
+        daemon.stop()

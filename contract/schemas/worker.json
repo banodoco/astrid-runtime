@@ -110,6 +110,27 @@
         "runtime_session_id": { "type": "string", "minLength": 1 }
       }
     },
+    "TaskSettlement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["task_id", "state", "settled", "blockers", "task"],
+      "properties": {
+        "task_id": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "minLength": 1 },
+        "settled": { "type": "boolean" },
+        "blockers": { "type": "array", "items": { "type": "object" } },
+        "task": { "$ref": "task.json" },
+        "lost_disposition": {
+          "description": "Current durable owner-abandon decision; absent after retry or a later terminal event. Never inferred from worker result data.",
+          "type": "object", "additionalProperties": false,
+          "required": ["event_id", "attempt_id", "reason"],
+          "properties": {
+            "event_id": { "type": "string", "minLength": 1 },
+            "attempt_id": { "type": "string", "minLength": 1 },
+            "reason": { "type": "string", "minLength": 1, "maxLength": 4096 }
+          }
+        }
+      }
+    },
     "LocalWorkerGeneration": {
       "type": "object", "additionalProperties": false,
       "required": ["executor_incarnation", "evidence_digest", "profile_id", "workspace_uuid", "state"],
@@ -126,7 +147,8 @@
       "required": ["executor_incarnation", "evidence_digest"],
       "properties": {
         "executor_incarnation": { "type": "string", "minLength": 1 },
-        "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "expected_task_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
       }
     },
     "LocalWorkerRelinquishResult": {

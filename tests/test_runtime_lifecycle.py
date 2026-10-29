@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
+import sys
 import threading
+import time
 
 import pytest
 from http_helpers import Api
@@ -10,6 +14,7 @@ from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError, RealmAdmissionError
 from runtime_protocol.lifecycle import inspect_interruption_state, interruption_fence
+from runtime_protocol.services import ServiceConfiguration, ServiceSpec
 from runtime_protocol.store import RealmStore
 
 
@@ -63,7 +68,7 @@ def test_unsettled_attempt_blocks_even_when_expired_or_uncertain(
     report = inspect_interruption_state(root)
     assert report["safe"] is False
     assert report["unreconciled_attempts"][0]["lease_expired"] is expected_expired
-    with pytest.raises(ConflictError, match="active or unreconciled"):
+    with pytest.raises(ConflictError, match="Astrid is busy"):
         with interruption_fence(root):
             pass
 

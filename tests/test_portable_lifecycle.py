@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import contextlib
 from pathlib import Path
 import signal
 import socket
@@ -16,6 +17,8 @@ import urllib.request
 import pytest
 
 from runtime_protocol import platform
+from tests.door_helpers import HOSTED, create_realm, door_call
+from astrid_runtime import update
 
 
 HOSTED_ORIGIN = "https://hosted.test"
@@ -94,6 +97,130 @@ def test_workspace_setup_uses_installed_cli_and_explicit_realm_without_starting_
     assert argv[argv.index("--realm-id") + 1] == "portable-test"
     assert kwargs["env"] is env
     assert "run" not in argv and "up" not in argv
+
+
+@pytest.mark.integration
+def test_real_post_worker_finishes_after_runtime_daemon_process_is_killed(tmp_path: Path, monkeypatch):
+    """Real authenticated door POST and Agent run_job; OS-manager survival is not claimed."""
+    home = tmp_path / "home"
+    home.mkdir()
+    data_home = home / "share"
+    env = _environment(tmp_path)
+    env["XDG_DATA_HOME"] = str(data_home)
+    env["PYTHONPATH"] = f"{ROOT}:{ROOT.parent / 'astrid-agent'}"
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    realm = tmp_path / "realm"
+    create_realm(realm)
+    program = tmp_path / "program with spaces"
+    data = tmp_path / "data with spaces"
+    version = program / "versions" / "old"
+    agent_root = ROOT.parent / "astrid-agent"
+    ready, trigger, worker_result = (tmp_path / "daemon.json", tmp_path / "worker.start",
+                                     tmp_path / "worker.json")
+    worker_pid = tmp_path / "worker.pid"
+    worker_script = tmp_path / "update-worker.py"
+    worker_script.write_text(f"""\
+import json, pathlib, sys, time
+sys.path[:0] = [{str(agent_root)!r}, {str(ROOT)!r}]
+from astrid.installer import update_job as jobs
+trigger = pathlib.Path(sys.argv[3])
+deadline = time.monotonic() + 20
+while not trigger.exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+if not trigger.exists():
+    raise SystemExit("Runtime handoff trigger was not received")
+result = jobs.run_job(pathlib.Path(sys.argv[1]), sys.argv[2])
+pathlib.Path(sys.argv[4]).write_text(json.dumps(result))
+""", encoding="utf-8")
+    child = f"""\
+import contextlib, hashlib, json, os, pathlib, secrets, subprocess, sys, time
+from types import SimpleNamespace
+sys.path[:0] = [{str(ROOT)!r}, {str(agent_root)!r}]
+from astrid_runtime import update
+from astrid.installer.service import install_selection
+from runtime_protocol import platform
+from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.door import DoorConfig, PRODUCT_SCOPES
+home=pathlib.Path(os.environ['HOME']); program=pathlib.Path({str(program)!r}); data=pathlib.Path({str(data)!r})
+version=pathlib.Path({str(version)!r}); realm=pathlib.Path({str(realm)!r})
+version.mkdir(parents=True); (program/'logs').mkdir(); data.mkdir(parents=True)
+agent=version/'agent'; runtime=version/'runtime'; agent.mkdir(); runtime.mkdir()
+python=version/'python'; python.write_text('')
+profile=version/'profile.json'; profile.write_text(json.dumps({{'profile':'astrid','source_checkout':str(agent),'runtime_checkout':str(runtime)}}))
+old={{'root':str(version),'python':str(python),'profile':str(profile),'identity':{{'release':4,'managed_by':None}},'env':{{'ASTRID_INSTALL_RELEASE':'4','ASTRID_INSTALL_MANAGED_BY':''}}}}
+(version/'version.json').write_text(json.dumps(old)); (program/'current').write_text('old\\n')
+selection=install_selection(home, sys.platform); selection.parent.mkdir(parents=True,exist_ok=True)
+selected={{'owner':'haus.astrid.runtime','program_root':str(program),'data_root':str(data),'realm_root':str(realm),'realm_id':'test-realm'}}
+selection.write_text(json.dumps(selected)); marker=program/'install.json'; marker.write_text(json.dumps({{'owner':'haus.astrid.runtime','data_root':str(data)}}))
+snapshots={{path:path.read_bytes() for path in (selection,program/'current',version/'version.json',profile,marker)}}
+fake=SimpleNamespace(root=realm,instance_id='old-instance',startup_identity={{'release':4,'managed_by':None}},startup_identity_instance_id='old-instance',support_root=data/'runtime',service=SimpleNamespace(realm={{'id':'test-realm'}}),_identity_agent_checkout=agent,_identity_runtime_checkout=runtime)
+admission=update.UpdateAdmission(fake)
+admission._selection=lambda:(selection,snapshots,python,agent,runtime,4)
+admission._installer_idle=lambda _path: contextlib.nullcontext()
+update.assert_interruption_safe=lambda _root:None
+def helper(_python,_agent,_runtime,payload,**kwargs):
+    if payload.get('action')=='accept':
+        op=payload['operation_id']; job={{'format':'astrid-update-job/v1','operation_id':op,'state':'accepted','job_name':payload['job_name'],'program_root':str(program),'data_root':str(data),'log_path':payload['log_path'],'old_instance_id':payload['old_instance_id'],'old_identity':payload['old_identity'],'old_version':payload['old_version'],'target_release':payload['metadata']['release'],'metadata':payload['metadata'],'message':'Update accepted.'}}
+        marker_value=json.loads(marker.read_text()); marker_value['update_job']=job; marker.write_text(json.dumps(marker_value)); return job
+    directory=pathlib.Path(payload['directory']); directory.mkdir(exist_ok=True)
+    manifest=directory/'manifest'; bootstrap=directory/'bootstrap'; manifest.write_text('{{"release":5}}'); bootstrap.write_text('bootstrap')
+    platform.owner_only(manifest); platform.owner_only(bootstrap)
+    return {{'manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest(),'bootstrap_sha256':hashlib.sha256(bootstrap.read_bytes()).hexdigest(),'release':5}}
+admission._helper=helper
+trigger=pathlib.Path({str(trigger)!r}); result_path=pathlib.Path({str(worker_result)!r}); worker_pid=pathlib.Path({str(worker_pid)!r})
+def launch(job):
+    op=job['operation_id']
+    worker=subprocess.Popen([sys.executable,{str(worker_script)!r},str(program),op,{str(trigger)!r},{str(worker_result)!r}],cwd={str(ROOT)!r},env=os.environ.copy(),start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    worker_pid.write_text(str(worker.pid))
+    return {{'state':'launching','launch_status':'acknowledged'}}
+admission.launcher=launch
+door_credential=pathlib.Path({str(tmp_path/'door.json')!r})
+daemon=RuntimeDaemon(realm,support_root=data/'runtime',door=DoorConfig(origin={HOSTED!r},credential_file=door_credential,port=0)).start()
+daemon.update_admission=admission
+fake.instance_id=daemon.instance_id; fake.startup_identity_instance_id=daemon.instance_id
+discovery=data/'runtime'/'discovery.json'; discovery.parent.mkdir(parents=True,exist_ok=True); discovery.write_text(json.dumps({{'runtime_instance_id':daemon.instance_id,'endpoint':daemon.endpoint,'door_endpoint':daemon.endpoint}}))
+token,_=daemon.credentials.provision('astrid-door-product',list(PRODUCT_SCOPES))
+platform.private_directory(door_credential.parent); door_credential.write_text(json.dumps({{'version':1,'scope':'astrid','actor_id':'astrid-door-product','token':token}})); platform.owner_only(door_credential)
+pathlib.Path({str(ready)!r}).write_text(json.dumps({{'port':daemon.door_httpd.server_port}}))
+while True: time.sleep(1)
+"""
+    runtime_process = subprocess.Popen([sys.executable, "-c", child], cwd=ROOT, env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    worker_result_payload = None
+    try:
+        deadline = time.monotonic() + 20
+        while not ready.exists() and time.monotonic() < deadline:
+            if runtime_process.poll() is not None:
+                stdout, stderr = runtime_process.communicate()
+                raise AssertionError(f"RuntimeDaemon child failed: {stderr}{stdout}")
+            time.sleep(0.05)
+        port = json.loads(ready.read_text(encoding="utf-8"))["port"]
+        response = door_call(port, "/api/runtime/v1/update", "POST", body=b"")
+        assert response.status == 202, response.body
+        accepted_response = json.loads(response.body)
+        assert accepted_response["accepted"] is True
+        runtime_process.kill()
+        runtime_process.wait(timeout=10)
+        trigger.touch()
+        deadline = time.monotonic() + 20
+        while not worker_result.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        worker_result_payload = json.loads(worker_result.read_text(encoding="utf-8"))
+        assert worker_result_payload["state"] == "failed"
+        assert worker_result_payload["operation_id"] == accepted_response["operation_id"]
+        status = update.read_update_status(home, available=True)
+        assert status["state"] == "terminal"
+        assert status["outcome"] == "failed"
+        assert status["result"].startswith("Failed:")
+        assert status["operation_id"] == worker_result_payload["operation_id"]
+    finally:
+        trigger.touch(exist_ok=True)
+        if runtime_process.poll() is None:
+            runtime_process.kill()
+            runtime_process.wait(timeout=10)
+        if worker_pid.exists() and not worker_result.exists():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(worker_pid.read_text()), signal.SIGTERM)
 
 
 def _json_output(result: subprocess.CompletedProcess[str]) -> dict:

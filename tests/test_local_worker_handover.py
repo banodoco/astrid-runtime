@@ -436,23 +436,24 @@ def test_host_only_daemon_rejects_credential_binding_mismatch(tmp_path, binding_
         daemon.stop()
 
 
-def _owned_cancel_claim(daemon, *, key="owned-cancel", cancel=True):
+def _owned_cancel_claim(daemon, *, key="owned-cancel", cancel=True, resource_key="cpu"):
     """Actual store/claim/cancel transitions; only the OS stop is a fixture."""
     service = daemon.service
     metadata = daemon.credentials.actor_metadata(WORKER_ACTOR)
     placement = metadata["execution_binding"]
     worker = {"actor": WORKER_ACTOR, "scopes": list(WORKER_SCOPES),
               "execution_binding": placement}
+    capability_id = "handover." + resource_key
     capability = service.register_capability({
-        "capability_id": "handover.cpu", "definition_digest": "sha256:" + hashlib.sha256(b"handover.cpu").hexdigest(),
-        "required_resource_keys": ["cpu"],
+        "capability_id": capability_id, "definition_digest": "sha256:" + hashlib.sha256(capability_id.encode()).hexdigest(),
+        "required_resource_keys": [resource_key],
     })
-    service.register_executor({"executor_id": WORKER_ACTOR, "capabilities": ["handover.cpu"],
-        "max_concurrency": 4, "resource_keys": ["cpu"]}, idempotency_key=key + "-executor", identity=worker)
-    task = service.create_task({"capability_id": "handover.cpu", "capability_digest": capability["definition_digest"],
+    service.register_executor({"executor_id": WORKER_ACTOR, "capabilities": [capability_id],
+        "max_concurrency": 4, "resource_keys": [resource_key], "runtime_epoch": service.store._current_runtime_epoch()}, idempotency_key=key + "-executor", identity=worker)
+    task = service.create_task({"capability_id": capability_id, "capability_digest": capability["definition_digest"],
         "input_object_ids": [], "spec": {}, "idempotency_key": key,
         "execution_request": {"schema_version": 1, "target": {"kind": "default"}, "inputs": []}})["task"]
-    attempt = service.claim_next({"executor_id": WORKER_ACTOR, "capability_ids": ["handover.cpu"],
+    attempt = service.claim_next({"executor_id": WORKER_ACTOR, "capability_ids": [capability_id],
         "runtime_epoch": service.store._current_runtime_epoch(), "target": {"kind": "default"}},
         idempotency_key=key + "-claim", identity=worker)
     assert attempt["task_id"] == task["id"]
@@ -464,7 +465,9 @@ def _owned_cancel_claim(daemon, *, key="owned-cancel", cancel=True):
 
 def _assert_owned_cancel_finalized(daemon, task_id, attempt):
     store = daemon.service.store
-    assert store.get_task(task_id)["task"]["status"] == "cancelled"
+    value = store.get_task(task_id)
+    assert value["task"]["status"] == "cancelled"
+    assert value["run"]["status"] == "cancelled"
     assert store.conn.execute("SELECT settled FROM attempts WHERE id=?", (attempt["attempt_id"],)).fetchone()[0] == 1
     assert not store.conn.execute("SELECT 1 FROM reservations WHERE task_id=? AND released_at IS NULL", (task_id,)).fetchone()
     assert store.execution_binding(task_id)["status"] == "released"
@@ -640,4 +643,227 @@ def test_owned_cancel_captured_replay_rejects_drift_before_second_stop(tmp_path)
         assert daemon.credentials.actor_metadata(WORKER_ACTOR) is not None
     finally:
         preparer.fail_stop = False
+        daemon.stop()
+
+
+def _named_relinquish(daemon, launch, task_ids):
+    return Api(daemon.endpoint, daemon.token).request(
+        "POST", "/v1/control/local-worker/relinquish",
+        {"executor_incarnation": launch["executor_incarnation"],
+         "evidence_digest": launch["evidence_digest"], "expected_task_ids": task_ids})
+
+
+def _settlement(daemon, task_id, token=None):
+    return Api(daemon.endpoint, token or daemon.token).request(
+        "GET", f"/v1/control/tasks/{task_id}/settlement")
+
+
+def test_named_full_generation_settles_and_down_fence_is_safe(tmp_path):
+    from runtime_protocol.lifecycle import interruption_fence
+    daemon, preparer, _, workspace_uuid = _daemon(tmp_path, host_only=True)
+    try:
+        launch = _launch(daemon, workspace_uuid)
+        first, first_attempt = _owned_cancel_claim(daemon)
+        second, second_attempt = _owned_cancel_claim(daemon, key="second", resource_key="cpu2")
+        assert not _settlement(daemon, first)["settled"]
+        assert _named_relinquish(daemon, launch, [first, second])["state"] == "relinquished"
+        _assert_owned_cancel_finalized(daemon, first, first_attempt)
+        _assert_owned_cancel_finalized(daemon, second, second_attempt)
+        observation = _settlement(daemon, first)
+        assert {key: observation[key] for key in ("task_id", "state", "settled", "blockers")} == {"task_id": first, "state": "cancelled", "settled": True, "blockers": []}
+        assert observation["task"]["task_id"] == first
+        assert observation["task"]["state"] == "cancelled"
+        assert preparer.events.count("stop_owned") == 1
+        # Order is irrelevant; expanding even a completed checkpoint is denied.
+        assert _named_relinquish(daemon, launch, [second, first])["state"] == "relinquished"
+        with pytest.raises(RuntimeError) as denied:
+            _named_relinquish(daemon, launch, [first, second, "unrelated"])
+        assert denied.value.status == 409
+        with interruption_fence(daemon.root) as report:
+            assert report["safe"]
+        for task_id in (first, second):
+            assert daemon.service.store.conn.execute(
+                "SELECT count(*) FROM events WHERE task_id=? AND kind='task.cancelled'", (task_id,)).fetchone()[0] == 1
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("cancel_unlisted", [False, True])
+def test_named_subset_refuses_unlisted_work_before_fencing_or_stop(tmp_path, cancel_unlisted):
+    daemon, preparer, _, workspace_uuid = _daemon(tmp_path, host_only=True)
+    try:
+        launch = _launch(daemon, workspace_uuid)
+        named, _ = _owned_cancel_claim(daemon)
+        other, attempt = _owned_cancel_claim(daemon, key="other", resource_key="cpu2", cancel=cancel_unlisted)
+        before = daemon.service.store.get_task(other)
+        with pytest.raises(RuntimeError) as denied:
+            _named_relinquish(daemon, launch, [named])
+        assert denied.value.status == 409
+        assert denied.value.detail["details"]["required_task_ids"] == [other]
+        assert daemon.service.store.get_task(other) == before
+        assert daemon.service.store.conn.execute("SELECT settled FROM attempts WHERE id=?", (attempt["attempt_id"],)).fetchone()[0] == 0
+        assert preparer.events.count("stop_owned") == 0
+        assert daemon._local_relinquish_state() is None
+        assert WORKER_ACTOR not in daemon.credentials._disabled_actors
+    finally:
+        daemon.stop()
+
+
+def test_named_owner_rechecks_claim_raced_after_generation_observation(tmp_path):
+    daemon, preparer, _, workspace_uuid = _daemon(tmp_path, host_only=True)
+    try:
+        _launch(daemon, workspace_uuid)
+        named, _ = _owned_cancel_claim(daemon)
+        observed = Api(daemon.endpoint, daemon.token).request("GET", "/v1/control/local-worker/generation")
+        claimed = threading.Event()
+        def claim():
+            with daemon.service.store._mutex:
+                task_id, _ = _owned_cancel_claim(daemon, key="raced", resource_key="cpu2", cancel=False)
+            claimed.set()
+            return task_id
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(claim)
+            assert claimed.wait(5)
+            other = future.result(5)
+        with pytest.raises(RuntimeError) as denied:
+            _named_relinquish(daemon, observed, [named])
+        assert denied.value.status == 409
+        assert daemon.service.store.get_task(other)["task"]["status"] == "running"
+        assert preparer.events.count("stop_owned") == 0
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("ids", [None, [], ["same", "same"], [1], "task-id"])
+def test_named_relinquish_rejects_malformed_authority(tmp_path, ids):
+    daemon, preparer, _, workspace_uuid = _daemon(tmp_path, host_only=True)
+    try:
+        launch = _launch(daemon, workspace_uuid)
+        with pytest.raises(RuntimeError) as denied:
+            _named_relinquish(daemon, launch, ids)
+        assert denied.value.status == 400
+        assert preparer.events.count("stop_owned") == 0
+        assert daemon._local_relinquish_state() is None
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("actor,scopes", [("worker-control", list(WORKER_SCOPES)), ("browser-control", ["tasks:read", "tasks:write"]), ("other-admin", ["admin"])])
+def test_named_controls_require_owner_actor_and_admin_scope(tmp_path, actor, scopes):
+    daemon, preparer, _, workspace_uuid = _daemon(tmp_path, host_only=True)
+    try:
+        launch = _launch(daemon, workspace_uuid)
+        task_id, _ = _owned_cancel_claim(daemon)
+        token, _ = daemon.credentials.provision(actor, scopes)
+        api = Api(daemon.endpoint, token)
+        for method, path, body in (
+            ("GET", f"/v1/control/tasks/{task_id}/settlement", None),
+            ("GET", "/v1/control/local-worker/generation", None),
+            ("POST", "/v1/control/local-worker/relinquish", {"executor_incarnation": launch["executor_incarnation"], "evidence_digest": launch["evidence_digest"], "expected_task_ids": [task_id]}),
+        ):
+            with pytest.raises(RuntimeError) as denied:
+                api.request(method, path, body)
+            assert denied.value.status in {401, 403}
+        assert preparer.events.count("stop_owned") == 0
+        assert daemon._local_relinquish_state() is None
+    finally:
+        daemon.stop()
+
+
+def test_named_stopped_replay_binds_task_authority_and_deduplicates_terminal_events(tmp_path):
+    daemon, preparer, proxy, workspace_uuid = _daemon(tmp_path, host_only=True)
+    launch = _launch(daemon, workspace_uuid)
+    task_id, attempt = _owned_cancel_claim(daemon)
+    original_revoke = daemon.credentials.revoke
+    def fail_revoke(actor):
+        raise OSError("fixture failure after settlement before response")
+    daemon.credentials.revoke = fail_revoke
+    try:
+        with pytest.raises(RuntimeError):
+            _named_relinquish(daemon, launch, [task_id])
+        assert _settlement(daemon, task_id)["settled"]
+        assert daemon._local_relinquish_state()["state"] == "stopped"
+        assert preparer.events.count("stop_owned") == 1
+    finally:
+        daemon.credentials.revoke = original_revoke
+        daemon.stop()
+    replacement, _, _, _ = _daemon(tmp_path, preparer, proxy, host_only=True)
+    try:
+        for changed in ([task_id, "another-task"], ["another-task"]):
+            with pytest.raises(RuntimeError) as denied:
+                _named_relinquish(replacement, launch, changed)
+            assert denied.value.status == 409
+        assert _named_relinquish(replacement, launch, [task_id])["state"] == "relinquished"
+        _assert_owned_cancel_finalized(replacement, task_id, attempt)
+        assert preparer.events.count("stop_owned") == 1
+        assert replacement.service.store.conn.execute(
+            "SELECT count(*) FROM events WHERE task_id=? AND kind='task.cancelled'", (task_id,)).fetchone()[0] == 1
+    finally:
+        replacement.stop()
+
+
+def test_terminal_state_with_outstanding_attempt_is_not_settlement_proof(tmp_path):
+    daemon, _, _, workspace_uuid = _daemon(tmp_path, host_only=True)
+    try:
+        _launch(daemon, workspace_uuid)
+        task_id, _ = _owned_cancel_claim(daemon)
+        daemon.service.store.conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
+        report = _settlement(daemon, task_id)
+        assert report["state"] == "failed" and not report["settled"]
+        assert {row["blocker_kind"] for row in report["blockers"]} == {"unsettled_attempt", "unreleased_reservation", "claimed_or_stale_binding"}
+        with pytest.raises(RuntimeError) as missing:
+            _settlement(daemon, "unknown-exact-id")
+        assert missing.value.status == 404
+    finally:
+        daemon.stop()
+
+
+def test_named_unrelated_id_cannot_authorize_idle_worker_termination(tmp_path):
+    daemon, preparer, _, workspace_uuid = _daemon(tmp_path, host_only=True)
+    try:
+        launch = _launch(daemon, workspace_uuid)
+        with pytest.raises(RuntimeError) as denied:
+            _named_relinquish(daemon, launch, ["task-on-another-executor"])
+        assert denied.value.status == 409
+        assert "no named outstanding task" in str(denied.value)
+        assert preparer.events.count("stop_owned") == 0
+        assert daemon._local_relinquish_state() is None
+        assert WORKER_ACTOR not in daemon.credentials._disabled_actors
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("field,value", [("executor_incarnation", "wrong"), ("evidence_digest", "sha256:" + "f" * 64)])
+def test_named_wrong_generation_or_evidence_never_stops(tmp_path, field, value):
+    daemon, preparer, _, workspace_uuid = _daemon(tmp_path, host_only=True)
+    try:
+        launch = _launch(daemon, workspace_uuid)
+        task_id, _ = _owned_cancel_claim(daemon)
+        with pytest.raises(RuntimeError) as denied:
+            _named_relinquish(daemon, {**launch, field: value}, [task_id])
+        assert denied.value.status == 409
+        assert preparer.events.count("stop_owned") == 0
+        assert daemon._local_relinquish_state() is None
+        assert not _settlement(daemon, task_id)["settled"]
+    finally:
+        daemon.stop()
+
+
+def test_owner_settlement_observation_does_not_reap_expired_work(tmp_path):
+    daemon, _, _, workspace_uuid = _daemon(tmp_path, host_only=True)
+    try:
+        _launch(daemon, workspace_uuid)
+        named, attempt = _owned_cancel_claim(daemon, cancel=False)
+        store = daemon.service.store
+        with store._mutex:
+            store.conn.execute("UPDATE tasks SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (named,))
+            before = "\n".join(store.conn.iterdump())
+        report = _settlement(daemon, named)
+        assert report["task"]["state"] == "running"
+        assert report["task"]["attempt_id"] == attempt["attempt_id"]
+        assert report["task"]["lease_expires_at"] == "2000-01-01T00:00:00+00:00"
+        assert not report["settled"]
+        with store._mutex:
+            assert "\n".join(store.conn.iterdump()) == before
+    finally:
         daemon.stop()

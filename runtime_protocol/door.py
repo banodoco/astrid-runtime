@@ -33,7 +33,6 @@ from __future__ import annotations
 import errno
 import http.client
 import json
-import os as process_os
 from .dirfd import filesystem as os
 import re
 import selectors
@@ -54,7 +53,8 @@ from .server import RuntimeHTTPServer, RuntimeHandler
 DEFAULT_DOOR_PORT = 17340
 DEFAULT_HOSTED_ORIGIN = "https://astrid.haus"
 
-PRODUCT_SCOPES = ("handshake", "objects:read", "objects:write", "projects:read", "projects:write", "tasks:read", "tasks:write")
+LEGACY_PRODUCT_SCOPES = ("handshake", "objects:read", "objects:write", "projects:read", "projects:write", "tasks:read", "tasks:write")
+PRODUCT_SCOPES = tuple(sorted((*LEGACY_PRODUCT_SCOPES, "installer:update")))
 # The daemon owner and the shared Worker are never the product, whatever their scopes.
 NON_PRODUCT_ACTORS = frozenset({"owner", "astrid-pack-host"})
 
@@ -189,6 +189,9 @@ def _entry(methods: str, template: str) -> tuple[frozenset[str], tuple[str, ...]
 
 WORKSPACE_ROUTES = (
     _entry("GET", "/v1/health"),
+    _entry("GET", "/v1/diagnostics"),
+    _entry("POST", "/v1/update"),
+    _entry("GET", "/v1/update/status"),
     _entry("POST", "/v1/handshake"),
     _entry("GET", "/v1/realm"),
     _entry("GET,PUT", "/v1/app-state/user/:"),
@@ -327,6 +330,8 @@ def classify(path: str, method: str) -> DoorRoute | None:
         return None
     service, upstream = segments[1], segments[2:]
     upstream_path = "/" + "/".join(upstream)
+    if upstream[:2] == ["v1", "update"] and ("?" in path or path != f"/api/{service}{upstream_path}"):
+        return None
     with_query = upstream_path + (f"?{query}" if query else "")
     # Compose (/api/astrid/generation/compose) is the local app's own route and is never served here.
     if service == "astrid" and upstream[0] == "acp":
@@ -600,6 +605,17 @@ class DoorHandler(RuntimeHandler):
                 del self.headers[name]
         self._dispatch()
 
+    def _require_update_context(self):
+        # These values are set by admission before browser headers are removed.
+        # An ordinary RuntimeHandler has no way to manufacture this context.
+        if (self._door_route is None or self._door_token is None
+                or self._door_origin != self.server.door.origin):
+            raise AuthorizationError("trusted door context required")
+        identity = self._identity("installer:update")
+        if "installer:update" not in identity.get("scopes", []):
+            raise AuthorizationError("installer:update scope required; reconnect with astrid-runtime up")
+        return identity
+
     def _preflight(self):
         # The requested route, method and headers are all judged before the 204. An ACP route
         # passes with no chat registered, so the request itself reads `acp_unavailable`.
@@ -641,7 +657,7 @@ class DoorHandler(RuntimeHandler):
         except AuthorizationError:
             raise _Refusal(503, "runtime_unavailable") from None
         if (identity.get("actor") != actor or actor in NON_PRODUCT_ACTORS
-                or tuple(sorted(identity.get("scopes", []))) != PRODUCT_SCOPES):
+                or tuple(sorted(identity.get("scopes", []))) not in (PRODUCT_SCOPES, LEGACY_PRODUCT_SCOPES)):
             raise _Refusal(503, "runtime_identity_mismatch")
         return token
 
@@ -657,13 +673,14 @@ class DoorHandler(RuntimeHandler):
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):
         # The hosted App uses this door health response to show install-manager
         # guidance. Keep this browser-facing marker out of Runtime's canonical
-        # health contract so the Runtime schema digest remains stable.
+        # health contract; derive it from the published owner snapshot.
         if (
             status == 200
             and self.command == "GET"
             and self.path.split("?", 1)[0] == "/v1/health"
             and isinstance(payload, dict)
-            and process_os.environ.get("ASTRID_INSTALL_MANAGED_BY") == "pinokio"
+            and isinstance(payload.get("identity"), dict)
+            and payload["identity"].get("managed_by") == "pinokio"
         ):
             payload = {**payload, "install": {"managed_by": "pinokio"}}
         return super()._send(

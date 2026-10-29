@@ -19,25 +19,32 @@ def _fresh(root):
     RealmStore.initialize(root).close()
 
 
-def test_verified_candidate_replaces_owner_with_fresh_epoch_credentials_and_quarantine(tmp_path):
+def test_verified_candidate_replaces_owner_with_fresh_epoch_credentials_and_quarantine(tmp_path, monkeypatch):
     active_root = tmp_path / "active"
     support_root = tmp_path / "support"
     _fresh(active_root)
+    monkeypatch.setenv("ASTRID_INSTALL_RELEASE", "10")
+    monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "")
     daemon = RuntimeDaemon(active_root, support_root=support_root).start()
     old_service = daemon.service
     old_epoch = old_service.health()["runtime_epoch"]
     old_token = daemon.token
     old_instance_id = daemon.instance_id
+    assert daemon.startup_identity == {"release": 10, "managed_by": None}
+    assert daemon.startup_identity_instance_id == old_instance_id
     backup = tmp_path / "backup"
     candidate = tmp_path / "candidate"
     try:
         old_service.backup(backup)
         old_service.restore(backup, candidate)
+        monkeypatch.setenv("ASTRID_INSTALL_RELEASE", "11")
         result = daemon.activate_candidate(candidate, retain_superseded=True)
         assert result["state"] == "complete"
         assert result["retained"] is True
         assert result["runtime_epoch"] > old_epoch
         assert result["runtime_instance_id"] != old_instance_id
+        assert daemon.startup_identity == {"release": 11, "managed_by": None}
+        assert daemon.startup_identity_instance_id == result["runtime_instance_id"]
         assert daemon.token != old_token
         assert daemon.service is not old_service
         assert old_service.store.conn is None
@@ -117,6 +124,7 @@ def test_failed_replacement_rolls_back_and_leaves_recoverable_state(tmp_path, mo
         assert candidate.is_dir()
         assert daemon.service is not None
         assert daemon.service.health()["status"] == "ok"
+        assert daemon.startup_identity_instance_id == daemon.instance_id
         assert any(path.name.startswith(".active.superseded-") for path in tmp_path.iterdir()) is False
     finally:
         daemon.stop()
