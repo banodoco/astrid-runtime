@@ -7,6 +7,31 @@ match it and is never upgraded while being opened or inspected.
 
 CANONICAL_FORMAT_ID = "astrid-runtime-sqlite-v1"
 
+def generation_tag_expression(field: str) -> str:
+    """The guarded scalar expression shared by filters and the v32 index."""
+    if field not in {"kind", "model", "target"}:
+        raise ValueError("unsupported indexed generation tag")
+    return (
+        "CASE WHEN json_valid(metadata_json) THEN CASE WHEN "
+        f"json_type(metadata_json, '$.gen.{field}')='text' THEN "
+        f"json_extract(metadata_json, '$.gen.{field}') END END"
+    )
+
+
+GENERATION_TAG_INDEX_SQL = (
+    "CREATE INDEX idx_generations_gen ON generations(project_id, "
+    + ", ".join(generation_tag_expression(field) for field in ("model", "target", "kind"))
+    + ", created_at DESC, id ASC)"
+)
+
+
+def generation_tag_index_is_current(connection) -> bool:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_generations_gen'"
+    ).fetchone()
+    return row is not None and " ".join(row[0].split()).rstrip(";") == GENERATION_TAG_INDEX_SQL
+
+
 CANONICAL_SCHEMA_SQL = r"""
 CREATE TABLE runtime_schema (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -423,3 +448,5 @@ CREATE UNIQUE INDEX idx_timeline_render_publications_render_task
 CREATE INDEX idx_managed_output_task ON managed_output_associations(task_id, created_at);
 CREATE INDEX idx_managed_output_manifest ON managed_output_associations(manifest_digest, created_at);
 """
+
+CANONICAL_SCHEMA_SQL += GENERATION_TAG_INDEX_SQL + ";\n"

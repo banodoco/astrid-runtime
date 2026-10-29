@@ -627,8 +627,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if len(path) == 4 and path[3] == "generations":
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 if method == "GET":
-                    query = parse_qs(urlsplit(self.path).query)
-                    return self._send(200, self.runtime.list_generations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
+                    query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    filters = {name: query[name][0] for name in ("kind", "model", "target", "tag") if name in query}
+                    return self._send(200, self.runtime.list_generations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0], **filters))
                 if method == "POST": return self._send(201, self.runtime.create_generation(selector, self._body(), idempotency_key=self._idempotency_key()))
             if len(path) == 4 and path[3] == "objects":
                 # Project association is control-plane mutation.  A worker may

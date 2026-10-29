@@ -65,7 +65,7 @@ def _effect(project_id: str, *, policy: str = "reject", groups: list[dict] | Non
     }
 
 
-def _fixture(tmp_path, *, effect_factory=_effect, slug="publish"):
+def _fixture(tmp_path, *, effect_factory=_effect, slug="publish", generation_intent=None):
     root = tmp_path / slug
     RealmStore.initialize(root).close()
     service = RuntimeService(root)
@@ -84,6 +84,7 @@ def _fixture(tmp_path, *, effect_factory=_effect, slug="publish"):
             "capability_digest": digest,
             "project": project["id"],
             "settlement_effect": effect,
+            **({"generation_intent": generation_intent} if generation_intent is not None else {}),
             "idempotency_key": f"{slug}-task",
         }
     )
@@ -122,6 +123,55 @@ def _derived_variant(generation_id: str, ordinal: int, variant_key: str) -> str:
     return "variant-" + hashlib.sha256(
         canonical_json({"generation_id": generation_id, "ordinal": ordinal, "variant_key": variant_key}).encode()
     ).hexdigest()
+
+
+def test_generation_tags_preserve_opaque_intent_and_publication_metadata(tmp_path):
+    metadata = {
+        "prompt": "original prompt",
+        "gen": {
+            "kind": "video", "origin": "generated", "generator": "vibecomfy",
+            "model": "WAN/model.safetensors", "mode": "t2v", "backend": "comfy",
+            "target": "runpod", "machine": "fixture-machine",
+            "workflow_digest": _digest(b"workflow"), "task_id": "producer-task",
+            "run_id": "producer-run", "seed": 0, "cost_usd": 0.012,
+            "duration_ms": 1234, "tags": ["hero", "test"],
+            "future_field": {"nested": [True, None]},
+        },
+    }
+
+    def effect_factory(project_id):
+        effect = _effect(project_id, groups=[{
+            "group_key": "main",
+            "selectors": [{"selector": "video", "ordinal": 0,
+                           "variant_key": "original", "output_port": "video"}],
+        }])
+        effect["payload"]["metadata"] = metadata
+        return effect
+
+    intent = {"modality": "video", "metadata": metadata}
+    service, project, task, attempt, effect = _fixture(
+        tmp_path, effect_factory=effect_factory, generation_intent=intent,
+    )
+    try:
+        assert service.task(task["task"]["id"])["task"]["generation_intent"] == intent
+        assert attempt["generation_intent"] == intent
+        _settle(service, attempt, [
+            _output(b"video", output_port="video", group_key="main",
+                    variant_key="original", ordinal=0),
+        ], effect=effect)
+        generation_id = _derived_generation(task["task"]["id"], "main")
+        assert service.get_generation(generation_id)["metadata"] == metadata
+        assert service.list_generations(project["id"], model="WAN/model.safetensors",
+                                        target="runpod", tag="hero")["items"][0]["metadata"] == metadata
+    finally:
+        service.close()
+
+    reopened = RuntimeService(tmp_path / "publish")
+    try:
+        assert reopened.get_generation(generation_id)["metadata"] == metadata
+        assert reopened.task(task["task"]["id"])["task"]["generation_intent"] == intent
+    finally:
+        reopened.close()
 
 
 def test_publish_v1_matches_out_of_order_groups_and_derives_domain_identity(tmp_path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 from . import platform
 
 from .cas import ContentAddressedStore, StagedObject, DEFAULT_MAX_OBJECT_BYTES, file_identity
+from .canonical_schema import generation_tag_expression
 from .backup import create_backup, restore_backup, structured_export
 from .store import (
     GENERATION_INTENT_STORAGE_KEY,
@@ -4996,10 +4997,37 @@ class RuntimeService:
         result = self._generation_resource(self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone())
         return self._command_record("generation.create", generation_id, idempotency_key, request_hash, result, project_id=project["id"])
 
-    def list_generations(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
+    def list_generations(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT,
+                         kind=None, model=None, target=None, tag=None):
         project = self.store.get_project(project_id)
-        rows = self.store.conn.execute("SELECT * FROM generations WHERE project_id=? ORDER BY created_at DESC, id ASC", (project["id"],)).fetchall()
-        return _page_rows(rows, scope=f"generations:{project['id']}", cursor=cursor, limit=limit,
+        filters = {name: value for name, value in
+                   (("kind", kind), ("model", model), ("target", target), ("tag", tag))
+                   if value is not None}
+        predicates, parameters = ["project_id=?"], [project["id"]]
+        for name, value in filters.items():
+            if not isinstance(value, str) or not value:
+                raise InvalidRequestError(f"{name} must be a non-empty string")
+            if name == "tag":
+                # Historical optional fields may be absent or have the wrong
+                # shape. json_each must only receive a verified JSON array.
+                predicates.append(
+                    "EXISTS (SELECT 1 FROM json_each("
+                    "CASE WHEN json_valid(metadata_json) THEN "
+                    "CASE WHEN json_type(metadata_json, '$.gen.tags')='array' "
+                    "THEN json_extract(metadata_json, '$.gen.tags') ELSE '[]' END "
+                    "ELSE '[]' END) WHERE type='text' AND value=?)"
+                )
+            else:
+                predicates.append(f"{generation_tag_expression(name)}=?")
+            parameters.append(value)
+        rows = self.store.conn.execute(
+            "SELECT * FROM generations WHERE " + " AND ".join(predicates)
+            + " ORDER BY created_at DESC, id ASC", parameters,
+        ).fetchall()
+        scope = f"generations:{project['id']}"
+        if filters:
+            scope += ":" + hashlib.sha256(canonical_json(filters).encode()).hexdigest()
+        return _page_rows(rows, scope=scope, cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
                           resource_fn=self._generation_resource,
                           skip_after=lambda key, after: (
@@ -5538,6 +5566,7 @@ class RuntimeService:
             "payload": {
                 "generation_type": prepared["content_type"],
                 "metadata": {
+                    "gen": {"kind": prepared["content_type"], "origin": "imported"},
                     "provenance": provenance,
                     "params": {"content_type": prepared["content_type"], **details},
                 },

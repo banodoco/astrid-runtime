@@ -23,6 +23,7 @@ from .upgrade import (
     GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION,
     compact_idempotency_ledger,
     migrate_historical_managed_outputs,
+    migrate_generation_tags,
     migrate_canonical_v24_to_v25,
     migrate_canonical_to_current,
     compact_idempotency_ledger,
@@ -100,6 +101,13 @@ def _parser():
     reconcile.add_argument("--task-id")
     reconcile.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
     reconcile.add_argument("--confirm", required=True)
+    generation_tags = sub.add_parser("migrate-generation-tags", help="offline backfill explicit Runtime generation metadata")
+    generation_tags.add_argument("--root", required=True)
+    generation_tags.add_argument("--project-id")
+    generation_tags.add_argument("--dry-run", action="store_true")
+    generation_tags.add_argument("--skip-ledger", action="store_true", help="ledger data is always skipped")
+    generation_tags.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    generation_tags.add_argument("--confirm")
     repair = sub.add_parser("repair-media-types", help="repair generic published MIME values from managed filenames")
     repair.add_argument("--root", required=True)
     repair.add_argument("--project-id")
@@ -258,6 +266,17 @@ def _main(args):
                 task_id=args.task_id,
                 timeout_seconds=args.timeout,
                 confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "migrate-generation-tags":
+        try:
+            result = migrate_generation_tags(
+                args.root, project_id=args.project_id, dry_run=args.dry_run,
+                timeout_seconds=args.timeout, confirmation=args.confirm,
             )
         except RuntimeErrorBase as exc:
             print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
