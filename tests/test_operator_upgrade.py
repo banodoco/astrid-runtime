@@ -68,11 +68,11 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
     paths.ensure_support_dirs()
     realm_root = paths.realms_dir / "realm-1"
     RealmStore.initialize(realm_root, realm_id="realm-1").close()
-    if version < 30:
-        # A fresh realm is the current schema; v30 -> v29 drops timelines.name (the only v30 change).
+    if version < 31:
         with sqlite3.connect(realm_root / "realm.sqlite3") as connection:
-            connection.execute("ALTER TABLE timelines DROP COLUMN name")
             connection.execute("DROP TABLE user_app_state")
+            if version < 30:
+                connection.execute("ALTER TABLE timelines DROP COLUMN name")
     if version < 28:
         # v28 -> v27 restores inline specs and drops task_specs.
         connection = sqlite3.connect(realm_root / "realm.sqlite3")
@@ -100,6 +100,8 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
             connection.commit()
         finally:
             connection.close()
+    with sqlite3.connect(realm_root / "realm.sqlite3") as connection:
+        connection.execute("UPDATE runtime_schema SET version=? WHERE id=1", (version,))
     assert inspect_canonical_schema(realm_root, expected_realm_id="realm-1")["kind"] == f"v{version}"
     checkout = runtime_checkout or tmp_path
     profile = SourceProfile(profile="astrid", runtime_checkout=str(checkout), source_checkout=str(checkout))
@@ -330,3 +332,9 @@ def test_operator_upgrade_rejects_catalog_root_with_symlink_parent_before_journa
     assert after == before
     assert not (paths.runtime_support / "upgrade-journal.json").exists()
     assert not any(call[0] == "stop" for call in boundary.calls)
+
+
+@pytest.mark.parametrize("version", [27, 28, 29, 30, SCHEMA_VERSION])
+def test_operator_fixture_supports_each_late_canonical_entry_state(tmp_path, version):
+    _, _, root = _fixture(tmp_path, version=version)
+    assert inspect_canonical_schema(root, expected_realm_id="realm-1")["version"] == version

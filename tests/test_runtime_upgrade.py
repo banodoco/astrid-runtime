@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -329,12 +330,12 @@ def _canonical_fixture(root, version):
     return f"realm-v{version}"
 
 
-@pytest.mark.parametrize("source_version, expected_steps", [(24, 7), (25, 6), (26, 5), (29, 2), (30, 1)])
+@pytest.mark.parametrize("source_version, expected_steps", [(24, 7), (25, 6), (26, 5), (27, 4), (28, 3), (29, 2), (30, 1)])
 def test_complete_canonical_migration_chain_reaches_current_schema(tmp_path, source_version, expected_steps):
     root = tmp_path / f"realm-{source_version}"
     realm_id = _canonical_fixture(root, source_version)
     assert inspect_canonical_schema(root)["kind"] == f"v{source_version}"
-    with sqlite3.connect(root / "realm.sqlite3") as connection:
+    with closing(sqlite3.connect(root / "realm.sqlite3")) as connection:
         projects_before = connection.execute("SELECT * FROM projects ORDER BY id").fetchall()
         documents_before = connection.execute("SELECT * FROM project_documents ORDER BY id").fetchall()
     result = migrate_canonical_to_current(
@@ -347,7 +348,7 @@ def test_complete_canonical_migration_chain_reaches_current_schema(tmp_path, sou
     assert len(result["steps"]) == expected_steps
     assert inspect_canonical_schema(root, expected_realm_id=realm_id)["version"] == SCHEMA_VERSION
 
-    with sqlite3.connect(root / "realm.sqlite3") as connection:
+    with closing(sqlite3.connect(root / "realm.sqlite3")) as connection:
         assert connection.execute("SELECT * FROM projects ORDER BY id").fetchall() == projects_before
         assert connection.execute("SELECT * FROM project_documents ORDER BY id").fetchall() == documents_before
         assert connection.execute("SELECT COUNT(*) FROM user_preferences").fetchone()[0] == 0
@@ -824,3 +825,42 @@ os._exit(0)
     assert len(publications) == 1
     assert {path.name: path.read_bytes() for path in root.glob("realm.sqlite3*") if path.is_file()} == original
     assert not list(tmp_path.glob(".realm-upgrade-transaction-*"))
+
+
+def test_authentic_pre_updater_realm_survives_candidate_migration(tmp_path):
+    """The pre-updater producer is already v31; migration is a verified no-op."""
+    import zipfile
+
+    archive = Path(__file__).parent / "fixtures/pre_updater_realm/realm.zip"
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == "6ebcfba0f0c30954e37c2790893c2d19487d65fbf0993206e61af2925f9ee930"
+    root = tmp_path / "realm"
+    root.mkdir()
+    with zipfile.ZipFile(archive) as fixture:
+        names = set(fixture.namelist())
+        digest = hashlib.sha256(b"authentic fixture object\n").hexdigest()
+        cas_name = f"cas/sha256/{digest[:2]}/{digest[2:]}"
+        assert names == {"realm.sqlite3", cas_name}
+        for name in names:
+            destination = root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(fixture.read(name))
+    (root / "staging").mkdir()
+    db = root / "realm.sqlite3"
+    before = db.read_bytes()
+    with sqlite3.connect(db) as connection:
+        assert connection.execute("SELECT name FROM projects WHERE slug='film'").fetchone() == ("Fixture film",)
+        document = json.loads(connection.execute("SELECT content_json FROM project_documents WHERE id='timeline:main'").fetchone()[0])
+        assert document['config']['metadata']['note'] == 'keep timeline'
+        assert connection.execute("SELECT content FROM user_preferences WHERE actor_id='fixture-user'").fetchone() == ("Prefer local editing.",)
+        assert connection.execute("SELECT body_json FROM task_specs JOIN tasks ON tasks.spec_digest=task_specs.digest WHERE tasks.capability='fixture.render'").fetchone() == ('{"prompt":"keep task"}',)
+        assert connection.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone() == (25, "text/plain")
+    result = migrate_canonical_to_current(root, confirmation="MIGRATE CANONICAL realm-authentic-pre-updater", expected_realm_id="realm-authentic-pre-updater")
+    assert result['source_schema_version'] == result['target_schema_version'] == 31
+    assert result['changed'] is False
+    assert db.read_bytes() == before
+    assert (root / cas_name).read_bytes() == b"authentic fixture object\n"
+    store = RealmStore(root)
+    try:
+        assert store.integrity_report()['ok'] is True
+    finally:
+        store.close()
