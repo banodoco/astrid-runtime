@@ -981,6 +981,14 @@ def test_snapshot_same_task_retry_shares_parent_quota(runtime):
         service.store.conn.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (expired, child["task_id"]))
         service.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expired, child["attempt_id"]))
         service.store._reap_expired_leases()
+    assert service.claim_next({"executor_id": "reviewer", "capability_ids": [HUMAN_REVIEW],
+        "runtime_epoch": service.health()["runtime_epoch"]}, idempotency_key="no-blind-review-retry", identity=REVIEWER_IDENTITY) is None
+    assert service.store.conn.execute("SELECT settled FROM attempts WHERE id=?", (child["attempt_id"],)).fetchone()[0] == 0
+    # Retrying this child requires an exact owner cession, and must still
+    # account for the snapshot acknowledged by its previous attempt.
+    service.fail_attempt(child["attempt_id"], {**lease(child), "error": {"code": "lease_lost"}},
+        idempotency_key="cede-review", identity=REVIEWER_IDENTITY)
+    service.retry_task(child["task_id"], {}, idempotency_key="retry-review")
     retry = service.claim_next({"executor_id": "reviewer", "capability_ids": [HUMAN_REVIEW],
         "runtime_epoch": service.health()["runtime_epoch"]}, idempotency_key="claim-review-retry", identity=REVIEWER_IDENTITY)
     assert retry["task_id"] == child["task_id"] and retry["attempt_id"] != child["attempt_id"]

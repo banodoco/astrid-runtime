@@ -3393,10 +3393,10 @@ class RealmStore:
         return overdue
 
     def reap_overdue_leases(self):
-        """Apply the claim path's lease-expiry transition outside a claim.
+        """Apply the claim path's lifetime checks outside a claim.
 
-        Reads and the server's existing poll hook share the claim path's
-        reaper. It is a no-op unless a lease or absolute task bound is overdue.
+        Reads and the server's poll hook share the claim path's reaper.
+        Ordinary expiry revokes worker authority, but is not stop evidence.
         """
         with self._mutex:
             if self.conn.in_transaction or not self._overdue_lease_rows():
@@ -3405,10 +3405,12 @@ class RealmStore:
                 self._reap_expired_leases()
 
     def _reap_expired_leases(self):
-        """Reconcile expired attempts and enforce absolute task bounds.
+        """Contain expired authority and enforce absolute task bounds.
 
-        Called inside the caller's transaction. Lease expiry affects v2
-        attempts; absolute bounds also apply before any worker has claimed.
+        Called inside the caller's transaction. Ordinary expired executors
+        retain their task, attempt and reservation blockers until an explicit
+        settlement/reconciliation path closes them. Hard bounds still apply
+        before any worker has claimed and take precedence over lease expiry.
         """
         self._contain_orphaned_delegations()
         for row in self._overdue_lease_rows():
@@ -3448,21 +3450,9 @@ class RealmStore:
                     },
                 )
                 continue
-            self.conn.execute("UPDATE tasks SET status='queued', executor_id=NULL, lease_token=NULL, lease_expires_at=NULL, waiting_reason='waiting_for_worker', updated_at=? WHERE id=?", (timestamp, row["id"]))
-            reconciled_attempt_id = self._reconcile_runtime_attempt(
-                row["id"], row["attempt_id"]
-            )
-            self.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=? AND status='running'", (timestamp, row["run_id"]))
-            self._release_reservations(row["id"], row["lease_token"])
-            self.reset_execution_attempt(row["id"])
-            self._append_event(
-                row["run_id"], row["id"], "task.lease_expired",
-                {
-                    "waiting_reason": "waiting_for_worker",
-                    "attempt_id": reconciled_attempt_id,
-                    "recovery_disposition": "runtime_owned_attempt_reconciled",
-                },
-            )
+            # Expiry fences renewal/publication, but cannot prove the executor
+            # stopped. Preserve its exact custody and lifecycle blockers;
+            # fail/cancel and explicit maintenance own reconciliation.
 
     def register_capability(self, capability_id, definition_digest, *, required_resource_keys=None, status="ready", unavailable_reason=None, estimated_scratch_bytes=0, estimated_output_bytes=0):
         if not capability_id or not definition_digest:

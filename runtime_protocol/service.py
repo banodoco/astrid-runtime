@@ -7798,9 +7798,8 @@ class RuntimeService:
                         )):
                     raise AuthorizationError("remote activation is missing, revoked, or stale")
             return replay
-        # Reap before selecting work. Otherwise an expired running task is
-        # invisible to the queued-task query and reclaim waits for another
-        # claim attempt.
+        # Enforce hard bounds and contain expired authority before selecting
+        # work. Ordinary expiry alone does not make a running task claimable.
         self.store._reap_expired_leases()
         caps = set(capability_ids)
         rows = self.store.conn.execute(

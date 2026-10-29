@@ -682,7 +682,7 @@ def test_generated_task_lease_fields_decode_from_get_and_project_list() -> None:
     ]
 
 
-def test_distinct_tasks_reader_reads_expired_task_as_requeued_with_fence(tmp_path: Path) -> None:
+def test_distinct_tasks_reader_retains_expired_task_custody_with_fence(tmp_path: Path) -> None:
     realm = tmp_path / "realm"
     RealmStore.initialize(realm).close()
     daemon = RuntimeDaemon(
@@ -744,11 +744,19 @@ def test_distinct_tasks_reader_reads_expired_task_as_requeued_with_fence(tmp_pat
         assert reader_identity["actor"] != "executor-a"
 
         readback = WorkspaceClient(daemon.endpoint, reader_token).get_task(admitted["task_id"])
-        # A read applies the claim path's lease expiry: the dead
-        # attempt's task is requeued, keeping its fence, with no live deadline.
-        assert readback.state == "queued"
+        # Expiry ends publication authority but does not prove executor stop.
+        # A distinct reader preserves the exact running attempt and deadline.
+        assert readback.state == "running"
         assert readback.lease_fence == claimed.fence
-        assert readback.lease_expires_at is None
+        assert readback.lease_expires_at == expired
+        task = daemon.service.store.conn.execute(
+            "SELECT status, attempt_id, executor_id, lease_fence, lease_expires_at FROM tasks WHERE id=?",
+            (admitted["task_id"],),
+        ).fetchone()
+        assert tuple(task) == ("running", claimed.attempt_id, "executor-a", claimed.fence, expired)
+        assert daemon.service.store.conn.execute(
+            "SELECT settled FROM attempts WHERE id=?", (claimed.attempt_id,),
+        ).fetchone()[0] == 0
     finally:
         daemon.stop()
 

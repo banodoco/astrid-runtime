@@ -96,6 +96,10 @@ def test_expired_owner_failure_cannot_mutate_successor(service):
     task_id = _admit(service)
     old = _claim(service)
     _expire_lease(service, task_id, old)
+    assert _claim(service, "before-cession") is None
+    service.fail_attempt(old["attempt_id"], {**_binding(old), "error": {"code": "lease_lost"}}, idempotency_key="cede-old")
+    _assert_failed(service, task_id, "lease_lost", attempt=old)
+    service.retry_task(task_id, {}, idempotency_key="retry-after-cession")
     successor = _claim(service, "successor")
     with pytest.raises(LeaseError):
         service.fail_attempt(old["attempt_id"], {**_binding(old), "error": {"code": "lease_lost"}}, idempotency_key="old-fail")
@@ -150,6 +154,14 @@ def test_attempt_cap_terminalizes_expiry_and_prevents_fourth_claim(service):
         assert attempt["task_id"] == task_id
         _expire_lease(service, task_id, attempt)
         service.task(task_id)
+        if number < MAX_TASK_ATTEMPTS - 1:
+            # Below the hard cap, expiry retains custody. Only an explicit
+            # owner cession and retry can make the next attempt claimable.
+            assert service.store.get_task(task_id)["task"]["status"] == "running"
+            assert _claim(service, f"before-cession-{number}") is None
+            service.fail_attempt(attempt["attempt_id"], {**_binding(attempt), "error": {"code": "lease_lost"}}, idempotency_key=f"cede-{number}")
+            _assert_failed(service, task_id, "lease_lost", attempt=attempt)
+            service.retry_task(task_id, {}, idempotency_key=f"retry-{number}")
     _assert_failed(service, task_id, "attempt_limit_exceeded", attempt=attempt)
     assert _claim(service, "beyond-cap") is None
     assert service.store.conn.execute("SELECT COUNT(*) FROM attempts WHERE task_id=?", (task_id,)).fetchone()[0] == MAX_TASK_ATTEMPTS
