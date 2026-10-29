@@ -25,6 +25,18 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
     request_queue_size = 64
     accepting_authenticated_requests = True
 
+    def service_actions(self):
+        # serve_forever already polls every 0.5s, including when no clients or
+        # workers are connected. Reuse the same fenced reaper as reads/claims.
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None and self.accepting_authenticated_requests:
+            try:
+                runtime.reap_task_lifetimes()
+            except RuntimeErrorBase:
+                # Admission loss already revokes daemon readiness. Keep the
+                # listener alive so its existing failure response remains usable.
+                pass
+
     def server_bind(self):
         if sys.platform == "win32":
             self.allow_reuse_address = False

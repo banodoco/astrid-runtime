@@ -454,12 +454,18 @@ def _verified_mutation(function):
     return wrapped
 
 
-def _durable_mutation(function):
+def _durable_mutation(function=None, *, reap_task_lifetimes=False):
     """Keep a project mutation and its idempotency receipt atomic."""
+    if function is None:
+        return lambda target: _durable_mutation(target, reap_task_lifetimes=reap_task_lifetimes)
     @wraps(function)
     def wrapped(self, *args, **kwargs):
         with self.store._mutex:
             self._assert_mutation_admitted()
+            if reap_task_lifetimes:
+                # A rejected late settlement must not roll back its independent
+                # Runtime-owned terminal deadline transition.
+                self.store.reap_overdue_leases()
             try:
                 with self.store._transaction():
                     result = function(self, *args, **kwargs)
@@ -468,6 +474,8 @@ def _durable_mutation(function):
                 # renamed.  Reconcile after SQLite has rolled back so a
                 # failed commit cannot leave an unreferenced object behind.
                 self._recover_cas_publication_journals()
+                if reap_task_lifetimes:
+                    self.store.reap_overdue_leases()
                 raise
             self._recover_cas_publication_journals()
             return result
@@ -6789,6 +6797,11 @@ class RuntimeService:
         self.store.reap_overdue_leases()
         return self.store.get_task(task_id)
 
+    @_verified_mutation
+    def reap_task_lifetimes(self):
+        """Run the existing claim/read reaper from the server's poll hook."""
+        self.store.reap_overdue_leases()
+
     def managed_outputs(self, task_id):
         """Read Runtime-owned immutable output associations and lifecycle state."""
         return self.store.list_managed_outputs(task_id)
@@ -7904,7 +7917,7 @@ class RuntimeService:
                 result["storage_estimate"] = dict(admitted_spec["storage_estimate"])
         return self._command_record("task.claim", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
-    @_durable_mutation
+    @_durable_mutation(reap_task_lifetimes=True)
     def settle_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None, _verified_objects=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = dict(_wire_object(
@@ -9271,6 +9284,8 @@ class RuntimeService:
             replay = self._command_replay("attempt.heartbeat", attempt_id, idempotency_key, request_hash, project_id=project_id or "unscoped")
             if replay is not None:
                 return replay
+            self.store.reap_overdue_leases()
+            row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._validate_attempt_lease(row, body, current)
             recorded = None
             def record(value):
@@ -9310,10 +9325,16 @@ class RuntimeService:
             replay = self._command_replay("attempt.fail", attempt_id, idempotency_key, request_hash, project_id=project_id or "unscoped")
             if replay is not None:
                 return replay
-            self._validate_attempt_lease(row, body, current)
+            self._validate_attempt_lease(row, body, current, allow_expired=True)
             if "reason" in body:
                 raise ValidationError("reason is not supported; use error")
             failure = body.get("error") or {"code": "executor_failed"}
+            if isinstance(failure, Mapping):
+                failure = dict(failure)
+                if not isinstance(failure.get("code"), str) or not failure["code"].strip():
+                    failure["code"] = "executor_failed"
+            else:
+                failure = {"code": "executor_failed", "message": str(failure)}
             recorded = None
             def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
                 nonlocal recorded
