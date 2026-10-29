@@ -4,6 +4,7 @@ import json
 import re
 import socket
 import sys
+import threading
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,17 +26,55 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
     request_queue_size = 64
     accepting_authenticated_requests = True
 
+    def __init__(self, *args, **kwargs):
+        self._maintenance_lock = threading.Lock()
+        self._maintenance_thread = None
+        self._maintenance_error = None
+        super().__init__(*args, **kwargs)
+
     def service_actions(self):
         # serve_forever already polls every 0.5s, including when no clients or
         # workers are connected. Reuse the same fenced reaper as reads/claims.
+        # SQLite may wait on an external writer or the shared store mutex;
+        # neither wait may occupy the accept loop. Admit only one reaper.
         runtime = getattr(self, "runtime", None)
-        if runtime is not None and self.accepting_authenticated_requests:
-            try:
-                runtime.reap_task_lifetimes()
-            except RuntimeErrorBase:
-                # Admission loss already revokes daemon readiness. Keep the
-                # listener alive so its existing failure response remains usable.
-                pass
+        if (runtime is None or not self.accepting_authenticated_requests
+                or not self._maintenance_lock.acquire(blocking=False)):
+            return
+        try:
+            error, self._maintenance_error = self._maintenance_error, None
+            if error is not None:
+                raise error
+            self._maintenance_thread = threading.Thread(
+                target=self._reap_task_lifetimes, args=(runtime,),
+                name="astrid-runtime-lifetime-reaper", daemon=True,
+            )
+            self._maintenance_thread.start()
+        except BaseException:
+            self._maintenance_thread = None
+            self._maintenance_lock.release()
+            raise
+
+    def _reap_task_lifetimes(self, runtime):
+        try:
+            runtime.reap_task_lifetimes()
+        except RuntimeErrorBase:
+            # Admission loss already revokes daemon readiness. Keep the
+            # listener alive so its existing failure response remains usable.
+            pass
+        except BaseException as exc:
+            # Preserve unexpected failures on the serving thread's next poll.
+            self._maintenance_error = exc
+        finally:
+            self._maintenance_lock.release()
+
+    def server_close(self):
+        self.accepting_authenticated_requests = False
+        super().server_close()
+        # RuntimeDaemon closes its store after the listener. Drain the one
+        # admitted reaper before that connection can be closed or replaced.
+        if self._maintenance_thread is not None:
+            self._maintenance_thread.join()
 
     def server_bind(self):
         if sys.platform == "win32":
