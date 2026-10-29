@@ -981,6 +981,45 @@ def test_list_documents_generated_client_kind_filter_is_encoded() -> None:
     assert WorkspaceClient("http://runtime", transport=transport).list_documents("p /", cursor="next/page", limit=5, kind="astrid.note /?") == ([], None)
 
 
+@pytest.mark.parametrize("name", ["kind", "model", "target", "tag"])
+def test_list_project_objects_generated_client_forwards_each_filter(name):
+    def transport(method, path, headers, body):
+        assert method == "GET"
+        assert path == f"/v1/projects/p/objects?limit=50&{name}=value"
+        return 200, {}, b'{"items": [], "next_cursor": "next"}'
+
+    assert getattr(WorkspaceClient("http://runtime", transport=transport), "list_project_objects")("p", **{name: "value"}) == ([], "next")
+
+
+def test_list_project_objects_generated_client_forwards_combined_filters_and_encodes_values():
+    from urllib.parse import parse_qs, urlsplit
+
+    filters = {
+        "kind": "astrid.video /?",
+        "model": "vendor/model&variant=fast",
+        "target": "runpod+gpu=1",
+        "tag": "scene #1",
+    }
+
+    def transport(method, path, headers, body):
+        parsed = urlsplit(path)
+        assert method == "GET"
+        assert parsed.path == "/v1/projects/p%20%2F/objects"
+        assert parse_qs(parsed.query, keep_blank_values=True) == {"limit": ["50"], **{key: [value] for key, value in filters.items()}}
+        return 200, {}, b'{"items": [], "next_cursor": null}'
+
+    assert WorkspaceClient("http://runtime", transport=transport).list_project_objects("p /", **filters) == ([], None)
+
+
+def test_list_project_objects_generated_client_without_filters_preserves_request_and_response():
+    def transport(method, path, headers, body):
+        assert method == "GET"
+        assert path == "/v1/projects/p%20%2F/objects?limit=50"
+        return 200, {}, b'{"items": [], "next_cursor": "existing-cursor"}'
+
+    assert WorkspaceClient("http://runtime", transport=transport).list_project_objects("p /") == ([], "existing-cursor")
+
+
 def test_stream_project_object_upload_sets_length_digest_and_does_not_buffer_or_close(monkeypatch) -> None:
     import astrid_runtime_client.generated as generated
 

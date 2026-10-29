@@ -1201,8 +1201,11 @@ class WorkspaceClient:
     def get_project_media_import(self, project_id: str, import_operation_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/media-imports/{_path_part(import_operation_id)}")[2])
 
-    def list_project_objects(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[ManagedObject], str | None]:
+    def list_project_objects(self, project_id: str, *, cursor: str | None = None, limit: int = 50, kind: str | None = None, model: str | None = None, target: str | None = None, tag: str | None = None) -> tuple[list[ManagedObject], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        for name, value in (("kind", kind), ("model", model), ("target", target), ("tag", tag)):
+            if value is not None:
+                query += f"&{name}={_path_part(value)}"
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/objects" + query)[2])
         items, next_cursor = self._page(value)
         return [ManagedObject.from_json(item) for item in items], next_cursor
