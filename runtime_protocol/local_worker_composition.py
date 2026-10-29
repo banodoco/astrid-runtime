@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import ipaddress
 from pathlib import Path
 import platform
@@ -1153,6 +1153,24 @@ class LocalWorkerComposition:
     def bind_runtime(self, *, endpoint: str, runtime_instance_id: str, credential_file: Path) -> None:
         self.preparer.bind_runtime(endpoint=endpoint, runtime_instance_id=runtime_instance_id, credential_file=credential_file)
 
+    def _retain(self):
+        """Snapshot owner selection without retaining its mutable lifecycle actors."""
+        if (not isinstance(self.profiles, dict) or len(self.profiles) != 1
+                or not isinstance(self.preparer, CrossProcessWorkerPreparer)
+                or not isinstance(self.inspector, OSProcessInspector)
+                or not isinstance(self.preparer.config, dict)):
+            raise ValidationError("invalid owner-selected local worker composition")
+        for key, profile in self.profiles.items():
+            if (not isinstance(profile, LocalWorkerProfile) or key != profile.profile_id
+                    or profile != self.preparer.profile or profile != self.inspector.profile):
+                raise ValidationError("local worker composition selection differs")
+            if _secure_profile(profile):
+                _selected_profile_payload(profile)
+        return _RetainedLocalWorkerComposition(
+            _selection_bytes({key: asdict(profile) for key, profile in self.profiles.items()}),
+            _selection_bytes(self.preparer.config),
+        )
+
 
 def _path(value: Any, label: str, *, directory: bool | None = None) -> Path:
     if not isinstance(value, str) or not value.strip():
@@ -1341,6 +1359,78 @@ def _installed_host_release(profile, config):
         "import_binding": {"schema_version": 1, "mode": "trusted-local-isolated-source/v1",
             "launcher": {"path": str(launcher), "sha256": hashlib.sha256(launcher.read_bytes()).hexdigest()},
             "python_runtime_inventory_digest": entries[1]["inventory_digest"], "import_roots": entries}}
+
+
+def _selection_bytes(value):
+    def encode(item):
+        if isinstance(item, Path):
+            return str(item)
+        raise TypeError("local worker selection must contain JSON values or paths")
+    try:
+        return json.dumps(value, default=encode, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("invalid owner-selected local worker selection") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedLocalWorkerComposition:
+    """Private read-only selection; grants no launch, admission, or recipe result."""
+    _profiles_json: bytes
+    _config_json: bytes
+    _installed_release_loader: Any = field(init=False, repr=False, compare=False)
+    _verified_source_loader: Any = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        from .verified_host_launch import _SourceLoader
+        try:
+            if type(self._profiles_json) is not bytes or type(self._config_json) is not bytes:
+                raise ValueError("selection is not immutable bytes")
+            profiles = self.profiles
+            if len(profiles) != 1 or not isinstance(self.config, dict):
+                raise ValueError("selection is missing")
+            _path(self.config.get("source_checkout"), "source_checkout")
+            for key, profile in profiles.items():
+                if key != profile.profile_id:
+                    raise ValueError("profile differs")
+                if _secure_profile(profile):
+                    _selected_profile_payload(profile)
+        except (TypeError, ValueError, KeyError, AttributeError, ValidationError) as exc:
+            raise ValidationError("invalid retained local worker composition") from exc
+        # Fixed implementation references, never callbacks selected by a request.
+        object.__setattr__(self, "_installed_release_loader", _installed_host_release)
+        object.__setattr__(self, "_verified_source_loader", _SourceLoader)
+
+    @property
+    def profiles(self):
+        paths = {"realm_root", "support_root", "worker_executable", "host_executable",
+                 "engine_executable", "engine_listener_executable", "host_os_executable"}
+        return {key: LocalWorkerProfile(**{
+            name: Path(value) if name in paths and value is not None else value
+            for name, value in profile.items()
+        }) for key, profile in json.loads(self._profiles_json).items()}
+
+    @property
+    def config(self):
+        return json.loads(self._config_json)
+
+    def _installed_release(self, profile_id):
+        profiles = self.profiles
+        if profile_id not in profiles:
+            raise ValidationError("local worker profile is not owner-selected")
+        return json.loads(_selection_bytes(self._installed_release_loader(profiles[profile_id], self.config)))
+
+
+def _retain_local_worker_composition(value, *, required=False):
+    if value is None and not required:
+        return None
+    if type(value) is _RetainedLocalWorkerComposition:
+        return value
+    if not isinstance(value, LocalWorkerComposition):
+        raise ValidationError("owner-selected local worker composition is required")
+    retained = value._retain()
+    if type(retained) is not _RetainedLocalWorkerComposition:
+        raise ValidationError("invalid retained local worker composition")
+    return retained
 
 
 def _load_host_only_composition(raw, *, workspace_uuid, realm_root, support_root, runtime_instance_id):

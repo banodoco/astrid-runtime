@@ -414,6 +414,8 @@ def _main(args):
             local_worker_profiles=composition.profiles if composition else None,
             local_worker_preparer=composition.preparer if composition else None,
             local_worker_inspector=composition.inspector if composition else None,
+            _local_worker_composition=composition,
+            _local_worker_composition_required=bool(getattr(args, "worker_profile", None)),
             door=door,
             services=services,
             log_directory=Path(args.log_file).parent if args.log_file else None,

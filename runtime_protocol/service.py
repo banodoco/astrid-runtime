@@ -511,7 +511,10 @@ def _durable_mutation(function=None, *, reap_task_lifetimes=False):
 class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
-    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None, _admission_fd=None):
+    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None, _admission_fd=None, _local_worker_composition=None, _local_worker_composition_required=False):
+        from .local_worker_composition import _retain_local_worker_composition
+        self._local_worker_composition = _retain_local_worker_composition(
+            _local_worker_composition, required=_local_worker_composition_required)
         configured_max = os.environ.get("RUNTIME_MAX_OBJECT_BYTES", str(OBJECT_MAX_BYTES))
         if not re.fullmatch(r"[0-9]{1,20}", configured_max):
             raise ValidationError("RUNTIME_MAX_OBJECT_BYTES must be a positive decimal integer")
