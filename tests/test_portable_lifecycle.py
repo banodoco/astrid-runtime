@@ -137,6 +137,7 @@ import contextlib, hashlib, json, os, pathlib, secrets, subprocess, sys, time
 from types import SimpleNamespace
 sys.path[:0] = [{str(ROOT)!r}, {str(agent_root)!r}]
 from astrid_runtime import update
+from astrid.installer.service import install_selection
 from runtime_protocol import platform
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.door import DoorConfig, PRODUCT_SCOPES
@@ -148,7 +149,7 @@ python=version/'python'; python.write_text('')
 profile=version/'profile.json'; profile.write_text(json.dumps({{'profile':'astrid','source_checkout':str(agent),'runtime_checkout':str(runtime)}}))
 old={{'root':str(version),'python':str(python),'profile':str(profile),'identity':{{'release':4,'managed_by':None}},'env':{{'ASTRID_INSTALL_RELEASE':'4','ASTRID_INSTALL_MANAGED_BY':''}}}}
 (version/'version.json').write_text(json.dumps(old)); (program/'current').write_text('old\\n')
-selection=data_home=pathlib.Path(os.environ['XDG_DATA_HOME']); selection=selection/'astrid-install.json'; selection.parent.mkdir(parents=True,exist_ok=True)
+selection=install_selection(home, sys.platform); selection.parent.mkdir(parents=True,exist_ok=True)
 selected={{'owner':'haus.astrid.runtime','program_root':str(program),'data_root':str(data),'realm_root':str(realm),'realm_id':'test-realm'}}
 selection.write_text(json.dumps(selected)); marker=program/'install.json'; marker.write_text(json.dumps({{'owner':'haus.astrid.runtime','data_root':str(data)}}))
 snapshots={{path:path.read_bytes() for path in (selection,program/'current',version/'version.json',profile,marker)}}
