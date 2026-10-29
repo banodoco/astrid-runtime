@@ -5,6 +5,20 @@ import { ApiError, CONTRACT_VERSION, WorkspaceClient } from "@astrid/runtime-cli
 
 const json = (value) => new TextEncoder().encode(JSON.stringify(value));
 
+test("generated TypeScript task query preserves default URL and forwards scoped generation query", async () => {
+  const paths = [];
+  const transport = async (method, path) => {
+    assert.equal(method, "GET");
+    paths.push(path);
+    return { status: 200, headers: {}, body: json({ items: [], next_cursor: null }) };
+  };
+  const client = new WorkspaceClient("http://runtime", undefined, transport);
+  assert.deepEqual(await client.listProjectTasks("p /"), { items: [], next_cursor: null });
+  await client.listProjectTasks("p /", "signed/cursor", 1, "root_generation", "admitted_desc");
+  assert.deepEqual(paths, ["/v1/projects/p%20%2F/tasks?limit=50",
+    "/v1/projects/p%20%2F/tasks?limit=1&cursor=signed%2Fcursor&kind=root_generation&order=admitted_desc"]);
+});
+
 test("generated TypeScript client performs scoped handshake and idempotent project admission", async () => {
   const release = JSON.parse(readFileSync(new URL("../../../generators/release.json", import.meta.url), "utf8"));
   assert.equal(CONTRACT_VERSION, release.contract_version);

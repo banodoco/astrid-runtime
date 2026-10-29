@@ -2373,13 +2373,130 @@ class RuntimeService:
         timeline = self.store.conn.execute("SELECT project_id FROM timelines WHERE id=?", (row["timeline_id"],)).fetchone()
         return {"reference_id": row["id"], "timeline_id": row["timeline_id"], "project_id": timeline["project_id"], "object_id": row["object_id"], **({"role": row["role"]} if row["role"] else {}), "version": int(state["version"] if state else 1), "archived": bool(state and state["archived_at"])}
 
-    def list_project_tasks(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
+    def _root_generation_cursor(self, scope, *, key=None, cursor=None):
+        """Purpose/project/query-scoped cursor using the existing session signer."""
+        if key is not None:
+            encoded = _page_cursor(scope, key, numeric=True)
+            signature = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
+            return encoded + "." + signature
+        if cursor in (None, ""):
+            return None
+        if not isinstance(cursor, str) or cursor.count(".") != 1:
+            raise InvalidRequestError("cursor is invalid")
+        encoded, signature = cursor.split(".")
+        expected = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise InvalidRequestError("cursor is invalid or expired")
+        _, decoded = _page_args(encoded, PAGE_DEFAULT_LIMIT)
+        if decoded["s"] != scope:
+            raise InvalidRequestError("cursor does not belong to this collection")
+        key = decoded["k"]
+        if (len(key) != 2 or type(key[0]) is not int or key[0] < 1
+                or not isinstance(key[1], str) or not key[1]):
+            raise InvalidRequestError("cursor is invalid")
+        return tuple(key)
+
+    def _root_generation_task_page(self, project_id, *, cursor, limit):
+        limit, _ = _page_args(None, limit)
+        scope = f"tasks:{project_id}:root_generation:admitted_desc"
+        after = self._root_generation_cursor(scope, cursor=cursor)
+        rows = self.store.conn.execute(
+            "SELECT t.id, t.spec_digest, t.expected_effect_json, s.body_json, "
+            "e.id AS admission_sequence, e.payload_json, "
+            "(SELECT c.payload_json FROM events c WHERE c.task_id=t.id "
+            "AND c.kind='task.parent_contained' ORDER BY c.id DESC LIMIT 1) AS containment_json FROM tasks t "
+            "JOIN runs r ON r.id=t.run_id LEFT JOIN task_specs s ON s.digest=t.spec_digest "
+            "LEFT JOIN events e ON e.id=(SELECT MIN(a.id) FROM events a "
+            "WHERE a.task_id=t.id AND a.kind='task.admitted') "
+            "WHERE r.project_id=? ORDER BY e.id DESC, t.id DESC", (project_id,),
+        ).fetchall()
+
+        def classification(row):
+            try:
+                contained = json.loads(row["containment_json"]) if row["containment_json"] else None
+            except (TypeError, ValueError):
+                contained = None
+            if (isinstance(contained, dict) and isinstance(contained.get("parent_task_id"), str)
+                    and contained["parent_task_id"] and contained["parent_task_id"] != row["id"]):
+                # Runtime emits this on the child under its delegated parent
+                # authority. It can prove non-root after legacy spec retirement;
+                # its absence cannot prove root.
+                return False
+            try:
+                payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+            except (TypeError, ValueError):
+                payload = {}
+            facts = payload.get("classification") if isinstance(payload, dict) else None
+            if isinstance(facts, dict) and type(facts.get("version")) is int and facts["version"] == 1:
+                if facts.get("is_root") is False or facts.get("is_generation") is False:
+                    return False
+                if facts.get("is_root") is True and facts.get("is_generation") is True:
+                    return True
+            if row["body_json"] is None:
+                return None
+            try:
+                retained = self.store._task_admission_facts(
+                    json.loads(row["body_json"]),
+                    json.loads(row["expected_effect_json"]) if row["expected_effect_json"] else None,
+                    project_id,
+                )
+            except (TypeError, ValueError):
+                return None
+            if retained.get("is_root") is False or retained.get("is_generation") is False:
+                return False
+            if retained.get("is_root") is True and retained.get("is_generation") is True:
+                return True
+            return None
+
+        def barrier(row, reason):
+            raise ConflictError(
+                "latest root generation cannot be proven from retained admission evidence",
+                details={"reason": "root_generation_selection_barrier", "project_id": project_id,
+                         "task_id": row["id"], "admission_sequence": row["admission_sequence"],
+                         "missing": reason},
+            )
+
+        # An unanchored possible root cannot safely be placed before or after
+        # any known root. Never substitute a mutable task timestamp.
+        for row in rows:
+            if row["admission_sequence"] is None and classification(row) is not False:
+                barrier(row, "original_admission_sequence")
+        selected = []
+        has_more = False
+        for row in rows:
+            if row["admission_sequence"] is None:
+                continue
+            key = (int(row["admission_sequence"]), str(row["id"]))
+            if after is not None and key >= after:
+                continue
+            known_root = classification(row)
+            if known_root is None:
+                if not selected:
+                    barrier(row, "validated_root_generation_classification")
+                # Return the proven newer prefix. The next page reaches this
+                # barrier; it must never silently skip to older known roots.
+                has_more = True
+                break
+            if known_root:
+                if len(selected) == limit:
+                    has_more = True
+                    break
+                selected.append((key, row["id"]))
+        return {"items": [task_id for _, task_id in selected],
+                "next_cursor": self._root_generation_cursor(scope, key=selected[-1][0]) if has_more else None}
+
+    def list_project_tasks(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT, kind=None, order=None):
+        if (kind, order) not in ((None, None), ("root_generation", "admitted_desc")):
+            raise InvalidRequestError("task kind/order must be root_generation/admitted_desc together")
         self.store.reap_overdue_leases()
         project = self.store.get_project(project_id)
-        rows = self.store.conn.execute("SELECT id, created_at FROM tasks WHERE run_id IN (SELECT id FROM runs WHERE project_id=?) ORDER BY created_at, id", (project["id"],)).fetchall()
-        page = _page_rows(rows, scope=f"tasks:{project['id']}", cursor=cursor, limit=limit,
-                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
-                          resource_fn=lambda row: row["id"])
+        if kind is not None:
+            page = self._root_generation_task_page(project["id"], cursor=cursor, limit=limit)
+        else:
+            rows = self.store.conn.execute("SELECT id, created_at FROM tasks WHERE run_id IN (SELECT id FROM runs WHERE project_id=?) ORDER BY created_at, id", (project["id"],)).fetchall()
+            page = _page_rows(rows, scope=f"tasks:{project['id']}", cursor=cursor, limit=limit,
+                              key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                              resource_fn=lambda row: row["id"])
         tasks, progress = self.store._task_page(tuple(page["items"]))
         page["items"] = [self._task_resource(tasks[task_id], progress=progress.get(task_id), related_loaded=True)
                          for task_id in page["items"]]

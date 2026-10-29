@@ -1271,8 +1271,10 @@ class WorkspaceClient:
         _, _, body = self._request("GET", f"/v1/tasks/{_path_part(task_id)}")
         return Task.from_json(self._json(body))
 
-    def list_project_tasks(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Task], str | None]:
+    def list_project_tasks(self, project_id: str, *, cursor: str | None = None, limit: int = 50, kind: Literal["root_generation"] | None = None, order: Literal["admitted_desc"] | None = None) -> tuple[list[Task], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        if kind is not None: query += f"&kind={_path_part(kind)}"
+        if order is not None: query += f"&order={_path_part(order)}"
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/tasks" + query)[2])
         items, next_cursor = self._page(value)
         return [Task.from_json(item) for item in items], next_cursor

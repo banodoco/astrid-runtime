@@ -236,8 +236,31 @@ paths:
   /v1/projects/{project_id}/tasks:
     get:
       operationId: listProjectTasks
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
-      responses: { '200': { description: Project tasks, content: { application/json: { schema: { $ref: '#/components/schemas/TaskPage' } } } } }
+      description: |
+        Default listing remains creation-time ascending. Supply kind=root_generation
+        and order=admitted_desc together to query validated root generation creation/
+        publication declarations by original task.admitted event sequence descending,
+        then task ID descending. Includes failed/cancelled and active tasks; no repeat
+        eligibility or frozen-recipe claim is made, including for media imports.
+        Classification uses minimal validated immutable admission facts, or retained
+        authoritative admission envelopes for legacy tasks. Caller metadata, opaque
+        generation intent and capability names are not classification authorities.
+        An unknown possible root before the first provable match returns 409 with
+        details.reason=root_generation_selection_barrier, task_id,
+        admission_sequence (null if unavailable), project_id and missing. A proven
+        newer prefix may be returned with a cursor that reaches an older barrier on
+        the next page; unknown admissions are never skipped to older known roots.
+        Filtered cursors are signed, bound to project/query/order, and expire on
+        Runtime session restart. Start without a cursor for the latest admission.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { name: kind, in: query, schema: { type: string, enum: [root_generation] } }
+        - { name: order, in: query, schema: { type: string, enum: [admitted_desc] } }
+      responses:
+        '200': { description: Project tasks, content: { application/json: { schema: { $ref: '#/components/schemas/TaskPage' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
   /v1/tasks/{task_id}/managed-outputs:
     get:
       operationId: listManagedOutputs

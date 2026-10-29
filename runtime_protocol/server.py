@@ -653,7 +653,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if len(path) == 4 and path[3] in ("tasks", "runs") and method == "GET":
                 self._identity("tasks:read")
                 query = parse_qs(urlsplit(self.path).query)
-                value = self.runtime.list_project_tasks(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]) if path[3] == "tasks" else self.runtime.list_project_runs(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0])
+                filters = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                task_query = {key: filters[key][0] for key in ("kind", "order") if key in filters}
+                value = self.runtime.list_project_tasks(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0], **task_query) if path[3] == "tasks" else self.runtime.list_project_runs(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0])
                 return self._send(200, value)
             if len(path) == 4 and path[3] in ("shots", "references") and method == "GET":
                 self._identity("projects:read")

@@ -114,6 +114,8 @@ def render_python_client(manifest_path: Path = MANIFEST) -> str:
 def render_typescript_client() -> str:
     """Render the source-frame thumbnail operations into the typed TS client."""
     source = _regular(TYPESCRIPT_CLIENT_OUTPUT, "TypeScript client").decode("utf-8")
+    task_query_method = '  async listProjectTasks(projectId: string, cursor?: string, limit = 50, kind?: "root_generation", order?: "admitted_desc"): Promise<Page<Task>> { return this.page((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/tasks?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}${kind !== undefined ? `&kind=${encodeURIComponent(kind)}` : ""}${order !== undefined ? `&order=${encodeURIComponent(order)}` : ""}`)).body) }'
+    source = '\n'.join(task_query_method if line.startswith('  async listProjectTasks(') else line for line in source.split('\n'))
     abandon_types = ('export interface TaskAbandonRequest { expected_task_version: number; attempt_id: string; lease_id: string; fence: number; runtime_epoch: number; execution_binding: NonNullable<Task["execution_binding"]>; reason: string }\n'
         'export interface TaskAbandonResult { task_id: string; run_id: string; attempt_id: string; disposition: "lost"; reason: string; remote_stop_confirmed: false; billing_stop_confirmed: false; task: Task }')
     if 'export interface TaskAbandonRequest ' not in source:
