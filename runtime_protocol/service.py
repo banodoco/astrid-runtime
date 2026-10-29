@@ -388,6 +388,31 @@ def _probe_media_bytes(data):
     return {"stream_types": tuple(stream_types), "durations": durations, "format_duration": format_duration}
 
 
+def _generation_filters(*, kind=None, model=None, target=None, tag=None):
+    """Share exact metadata.gen matching between generation and object pages."""
+    filters = {name: value for name, value in
+               (("kind", kind), ("model", model), ("target", target), ("tag", tag))
+               if value is not None}
+    predicates, parameters = [], []
+    for name, value in filters.items():
+        if not isinstance(value, str) or not value:
+            raise InvalidRequestError(f"{name} must be a non-empty string")
+        if name == "tag":
+            # Historical optional fields may be absent or have the wrong
+            # shape. json_each must only receive a verified JSON array.
+            predicates.append(
+                "EXISTS (SELECT 1 FROM json_each("
+                "CASE WHEN json_valid(metadata_json) THEN "
+                "CASE WHEN json_type(metadata_json, '$.gen.tags')='array' "
+                "THEN json_extract(metadata_json, '$.gen.tags') ELSE '[]' END "
+                "ELSE '[]' END) WHERE type='text' AND value=?)"
+            )
+        else:
+            predicates.append(f"{generation_tag_expression(name)}=?")
+        parameters.append(value)
+    return filters, predicates, parameters
+
+
 def _page_args(cursor, limit):
     """Validate the public page arguments and decode an opaque keyset cursor."""
     if isinstance(limit, bool):
@@ -5000,26 +5025,11 @@ class RuntimeService:
     def list_generations(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT,
                          kind=None, model=None, target=None, tag=None):
         project = self.store.get_project(project_id)
-        filters = {name: value for name, value in
-                   (("kind", kind), ("model", model), ("target", target), ("tag", tag))
-                   if value is not None}
-        predicates, parameters = ["project_id=?"], [project["id"]]
-        for name, value in filters.items():
-            if not isinstance(value, str) or not value:
-                raise InvalidRequestError(f"{name} must be a non-empty string")
-            if name == "tag":
-                # Historical optional fields may be absent or have the wrong
-                # shape. json_each must only receive a verified JSON array.
-                predicates.append(
-                    "EXISTS (SELECT 1 FROM json_each("
-                    "CASE WHEN json_valid(metadata_json) THEN "
-                    "CASE WHEN json_type(metadata_json, '$.gen.tags')='array' "
-                    "THEN json_extract(metadata_json, '$.gen.tags') ELSE '[]' END "
-                    "ELSE '[]' END) WHERE type='text' AND value=?)"
-                )
-            else:
-                predicates.append(f"{generation_tag_expression(name)}=?")
-            parameters.append(value)
+        filters, predicates, parameters = _generation_filters(
+            kind=kind, model=model, target=target, tag=tag,
+        )
+        predicates.insert(0, "project_id=?")
+        parameters.insert(0, project["id"])
         rows = self.store.conn.execute(
             "SELECT * FROM generations WHERE " + " AND ".join(predicates)
             + " ORDER BY created_at DESC, id ASC", parameters,
@@ -5917,9 +5927,31 @@ class RuntimeService:
     def objects(self, project):
         return self.store.list_project_objects(project)
 
-    def list_project_objects(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
-        rows = self.store.list_project_objects(project)
-        return _page_rows(rows, scope=f"objects:{self.store.get_project(project)['id']}", cursor=cursor, limit=limit,
+    def list_project_objects(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT,
+                             kind=None, model=None, target=None, tag=None):
+        project_id = self.store.get_project(project)["id"]
+        filters, predicates, parameters = _generation_filters(
+            kind=kind, model=model, target=target, tag=tag,
+        )
+        scope = f"objects:{project_id}"
+        if filters:
+            # All predicates belong to ONE generation in the object's project.
+            # Existence checks avoid multiplying objects by variants/generations.
+            # MIN retains one deterministic relation if a promoted ref also exists.
+            rows = [dict(row) for row in self.store.conn.execute(
+                "SELECT o.*, MIN(po.relation) AS relation FROM objects o "
+                "JOIN project_objects po ON po.digest=o.digest WHERE po.project_id=? "
+                "AND EXISTS (SELECT 1 FROM generations WHERE project_id=po.project_id AND "
+                + " AND ".join(predicates)
+                + " AND EXISTS (SELECT 1 FROM generation_variants "
+                "WHERE generation_id=generations.id AND object_id=o.digest)) "
+                "GROUP BY o.digest ORDER BY o.created_at, o.digest",
+                [project_id, *parameters],
+            ).fetchall()]
+            scope += ":" + hashlib.sha256(canonical_json(filters).encode()).hexdigest()
+        else:
+            rows = self.store.list_project_objects(project)
+        return _page_rows(rows, scope=scope, cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["created_at"]), str(row["digest"])),
                           resource_fn=lambda row: self._object_resource(row) | {"relation": row["relation"]})
 

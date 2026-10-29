@@ -161,7 +161,39 @@ paths:
   /v1/projects/{project_id}/objects:
     get:
       operationId: listProjectObjects
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      description: >-
+        Lists project objects ordered by object created_at ascending, then digest ascending.
+        Optional filters select an object when one generation in this project references it
+        through a variant's object_id and satisfies every supplied metadata.gen filter.
+        All variant types qualify; thumbnail references and variant metadata do not.
+        Multiple matching variants or generations return the object once. Multiple project
+        reference relations collapse to the lexicographically first relation.
+        Cursor continuation requires the same complete filter set and project; page size
+        may change. Existing unfiltered cursors remain valid without filters.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+        - name: kind
+          in: query
+          required: false
+          description: Exact case-sensitive string equality on the matching generation's metadata.gen.kind; absent or malformed values do not match.
+          schema: { type: string, minLength: 1 }
+        - name: model
+          in: query
+          required: false
+          description: Exact case-sensitive string equality on the matching generation's metadata.gen.model; absent or malformed values do not match.
+          schema: { type: string, minLength: 1 }
+        - name: target
+          in: query
+          required: false
+          description: Exact case-sensitive string equality on the matching generation's metadata.gen.target; absent or malformed values do not match.
+          schema: { type: string, minLength: 1 }
+        - name: tag
+          in: query
+          required: false
+          description: Exact case-sensitive membership among string elements of the matching generation's metadata.gen.tags array; absent or malformed arrays do not match.
+          schema: { type: string, minLength: 1 }
       responses: { '200': { description: Project-scoped managed objects, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedObjectPage' } } } } }
     post:
       operationId: ingestProjectObject

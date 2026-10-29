@@ -26,7 +26,7 @@
     "conformance/second-client-core-v1.yaml": "sha256:3a0a5aff4e66435212ba567850a0a27c5555601a33ecbd3ed7e21737948662e3",
     "contract/component-manifest.json": "sha256:7b74a8df08c86bbd8168d11272f13abd3e76becc2bcb4cbed799f11dc2f85f34",
     "contract/manifest.json": "sha256:e8b17c5d354f070e81977364e761613b057c29289a367e3f9c4f4202f1fee7ba",
-    "contract/openapi/workspace-v1.yaml": "sha256:b8fcc1323e1145fcc5697b3a79e985f0d44e5a93af573a0a5eb4a4f06047610e",
+    "contract/openapi/workspace-v1.yaml": "sha256:b81de7d9c43b96cfa2b126241dc60e1aea2da9f83ceac4b095a3b8b1d91938e7",
     "contract/schemas/app-state.json": "sha256:bba8272c9dbf3039d329af8d05d5e23c94d4f59884b332c7f12ab1bb07ace043",
     "contract/schemas/backup.json": "sha256:71ec2f4bc9ad63ac05e8149cf0d1a4f96fa8d5aa4b85bf12a61938fbafb2151e",
     "contract/schemas/common.json": "sha256:65e0196e36a0565f3a2f69e489e4c1fa6114df039eb25666c60591f266e06f19",
@@ -77,5 +77,5 @@
     "packages/typescript/tsconfig.json": "sha256:48bc718286b70c7ff5af00d1adfea37ad7c7f8820d3050117dc9d6aea239181b"
   },
   "producer": "astrid-runtime",
-  "version": "sha256:360800da9f4cd08cacf15afbb3b49386df295501473de7c024e1a2636559c083"
+  "version": "sha256:587f17a27ae06388aa53918a076c05b688ab22068db08fb89f96c83538564f79"
 }

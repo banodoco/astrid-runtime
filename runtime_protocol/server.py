@@ -637,8 +637,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 # to a project without the user-scoped project authority.
                 self._identity("objects:read" if method == "GET" else "projects:write")
                 if method == "GET":
+                    filter_query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    filters = {name: filter_query[name][0] for name in ("kind", "model", "target", "tag") if name in filter_query}
+                    # Keep legacy blank cursor/limit handling; blank filters are invalid.
                     query = parse_qs(urlsplit(self.path).query)
-                    return self._send(200, self.runtime.list_project_objects(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
+                    return self._send(200, self.runtime.list_project_objects(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0], **filters))
                 if method == "POST":
                     key = self._idempotency_key()
                     with self.runtime.stage_object(self._binary_chunks(), expected_digest=self.headers.get("X-Expected-Digest")) as data:
