@@ -66,16 +66,16 @@
     "contract/schemas/worker.json": "sha256:471fb9ad32cd8c5fed2bba40ae12cf81f5264a45220d4680ddb2ee4854bcb0ad",
     "generators/release.json": "sha256:fd214a039820284ae2a1fe39a110ec6ca4c0d3c423038a5ea6bd91ce34abc21e",
     "packages/python/astrid_runtime_client/__init__.py": "sha256:fdcb09cadc13d218a4182272589e14ce02c889638305cae4593ca6f3d5e38842",
-    "packages/python/astrid_runtime_client/contract_metadata.py": "sha256:29aed272e741e526d080b11f3a785c2adc95f2a4bdde4b188345f05fc0f1affc",
-    "packages/python/astrid_runtime_client/generated.py": "sha256:1f2b168abf3a27f70136b9049738a1ae5f39b9c06f11539a12567a8740ef00c1",
+    "packages/python/astrid_runtime_client/contract_metadata.py": "sha256:3821c663962fe22656699d85c5d5dcc9899f378c49e49a7b7356070d613b9cac",
+    "packages/python/astrid_runtime_client/generated.py": "sha256:e39d9adfe7d99afe409346b15956b8777aff00fa3d4b2780842afd4cec508d38",
     "packages/python/pyproject.toml": "sha256:722d5917c9536172d4071005fd7249a13fd6d68b012d957022c2d2eb6daee183",
     "packages/typescript/package-lock.json": "sha256:c1f4d4a16fe8a2b2fa50828b3436f90fe70a66c95d61ef7539167b28a356e8be",
     "packages/typescript/package.json": "sha256:f20637c612b6957c299e2c024032ec9a2b33c769e092ea60ba40ca749b999b32",
-    "packages/typescript/src/contract-metadata.ts": "sha256:40d28512cc075627ef99eb76cae81f09d3884d444eeab01a290230a00d7ab1cb",
+    "packages/typescript/src/contract-metadata.ts": "sha256:582c686284c338f92e6e61ca1797033748e4c8dbafeea297394c430bc88c7fb8",
     "packages/typescript/src/generated.ts": "sha256:e2c9cd98692f264574c7ff8aa17a94c1c3eb569dba6039e42b6f79cc0a9ad640",
     "packages/typescript/src/index.ts": "sha256:6b6dff85e4199007c8890802e0c228171285114fa2f862999c6741c632c5d1a5",
     "packages/typescript/tsconfig.json": "sha256:48bc718286b70c7ff5af00d1adfea37ad7c7f8820d3050117dc9d6aea239181b"
   },
   "producer": "astrid-runtime",
-  "version": "sha256:587f17a27ae06388aa53918a076c05b688ab22068db08fb89f96c83538564f79"
+  "version": "sha256:8ba5a8b451ab1d585bb8e329b5cea1e4cf4afb4e9471a335502756b14ac90410"
 }
