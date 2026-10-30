@@ -38,7 +38,7 @@ import os, socket, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from astrid_runtime.custody_broker import AuthenticatedCleanupActor, RoleCustodyAuthority
-from runtime_protocol.local_execution_supervisor import _frame_receive, _frame_send
+from runtime_protocol.local_worker_composition import _frame_receive, _frame_send
 channel = socket.socket(fileno=int(sys.argv[2]))
 observer = socket.socket(fileno=int(sys.argv[3]))
 request = _frame_receive(channel)
