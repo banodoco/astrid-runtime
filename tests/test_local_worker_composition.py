@@ -729,6 +729,149 @@ def test_host_only_abort_missing_ack_retains_handle_and_does_not_signal(tmp_path
     assert preparer._active is handle and not handle.closed and preparer.cleanup_uncertain
 
 
+@pytest.fixture
+def retained_host_cleanup(tmp_path, monkeypatch):
+    """Real original-child wait; synthetic host identity and ACK transport."""
+    from runtime_protocol.local_execution_supervisor import RetainedProcess
+    from test_local_worker import host_only_profile_case
+
+    profile = host_only_profile_case()
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    child = subprocess.Popen([sys.executable, "-I", "-c",
+        "import sys; sys.stdin.buffer.read(1); raise SystemExit(23)"], stdin=subprocess.PIPE)
+    retained = RetainedProcess(child)
+    monkeypatch.setattr(retained, "verify", lambda: {"pid": child.pid, "birth_id": "original"})
+    control, peer = socket.socketpair()
+    activation, activation_peer = socket.socketpair()
+    events, requests = [], []
+
+    def signal(signum, *, expected_pid):
+        assert expected_pid == child.pid and signum == runtime_platform.TERM
+        assert events[-1] == "ack"
+        events.append("signal")
+        child.stdin.close()
+
+    handle = _PreparedWorker(child, "original", control, {}, tmp_path / "config.json",
+        retained=retained, host_only=True, activation=activation, owner_epoch="epoch",
+        custody_scope=str(tmp_path),
+        preparation={"version": "runtime.local-execution-preparation/v1", "operation_id": "op",
+            "channel_id": "channel", "owner_epoch": "epoch"},
+        broker=SimpleNamespace(signal=signal))
+    preparer._active = handle
+    monkeypatch.setattr(preparer, "_host_only_report", lambda _: {
+        "profile_binding_digest": _digest("1"), "custody_capabilities": {"host": {"pid": child.pid}}})
+
+    def send(channel, request):
+        events.append("request")
+        requests.append(request)
+
+    def receive(channel):
+        events.append("ack")
+        return {**{key: value for key, value in requests[-1].items() if key != "command"},
+            "status": "cleaned", "cleanup": {"host_children": "absent"}}
+
+    monkeypatch.setattr("runtime_protocol.local_worker_composition._frame_send", send)
+    monkeypatch.setattr("runtime_protocol.local_worker_composition._frame_receive", receive)
+    original_wait = retained.wait
+
+    def wait(timeout):
+        events.append("reap")
+        return original_wait(timeout)
+
+    monkeypatch.setattr(retained, "wait", wait)
+    try:
+        yield SimpleNamespace(preparer=preparer, handle=handle, child=child, retained=retained,
+            events=events, receive=receive, original_wait=original_wait)
+    finally:
+        child.stdin.close()
+        for channel in (control, peer, activation, activation_peer):
+            channel.close()
+        if retained.exit_code is None:
+            child.wait(timeout=5.0)
+
+
+def _terminal_cleanup_launcher(preparer):
+    from runtime_protocol.local_worker import LocalWorkerLauncher
+    launcher = LocalWorkerLauncher.__new__(LocalWorkerLauncher)
+    launcher.preparer = preparer
+    launcher._watch_thread = None
+    return launcher
+
+
+def test_host_only_ack_then_real_original_child_reap_closes_and_clears(retained_host_cleanup):
+    case = retained_host_cleanup
+    _terminal_cleanup_launcher(case.preparer).finish_shutdown([case.handle])
+    assert case.events == ["request", "ack", "signal", "reap"]
+    assert case.retained.exit_code == case.child.returncode == 23
+    assert case.handle.closed and case.preparer.current_handle() is None
+    assert not case.handle.cleanup_abandoned
+    assert case.handle.control.fileno() == case.handle.activation.fileno() == -1
+
+
+@pytest.mark.parametrize("ack", ["missing", "wrong-epoch", "children-unresolved"])
+def test_terminal_shutdown_child_exit_without_valid_ack_releases_channels_but_keeps_custody(
+    retained_host_cleanup, monkeypatch, ack,
+):
+    case = retained_host_cleanup
+
+    def receive(channel):
+        # A positively reaped original child is still insufficient without the
+        # authenticated, exactly bound ACK covering all owned descendants.
+        case.child.stdin.close()
+        assert case.original_wait(5.0) == 23
+        if ack == "missing":
+            raise OSError("host cleanup ACK missing")
+        response = case.receive(channel)
+        if ack == "wrong-epoch":
+            response["owner_epoch"] = "other"
+        else:
+            response["cleanup"]["host_children"] = "unresolved"
+        return response
+
+    monkeypatch.setattr("runtime_protocol.local_worker_composition._frame_receive", receive)
+    with pytest.raises(ConflictError, match="cleanup is uncertain"):
+        _terminal_cleanup_launcher(case.preparer).finish_shutdown([case.handle])
+    assert "signal" not in case.events
+    assert case.retained.exit_code == case.child.returncode == 23
+    assert case.preparer.current_handle() is case.handle and not case.handle.closed
+    assert case.handle.cleanup_abandoned and case.preparer.cleanup_uncertain
+    assert case.handle.control.fileno() == case.handle.activation.fileno() == -1
+
+
+def test_terminal_shutdown_timeout_prevents_late_cleanup_from_clearing_custody(
+    retained_host_cleanup, monkeypatch,
+):
+    import threading
+    case = retained_host_cleanup
+    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+    abort = case.preparer.abort
+
+    def wait(timeout):
+        entered.set()
+        assert release.wait(5.0)
+        return case.original_wait(timeout)
+
+    def delayed_abort(handle):
+        try:
+            abort(handle)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(case.retained, "wait", wait)
+    monkeypatch.setattr(case.preparer, "abort", delayed_abort)
+    try:
+        with pytest.raises(ConflictError, match="bounded deadline"):
+            _terminal_cleanup_launcher(case.preparer).finish_shutdown([case.handle])
+        assert entered.is_set()
+        assert case.handle.control.fileno() == case.handle.activation.fileno() == -1
+    finally:
+        release.set()
+        assert completed.wait(5.0)
+    assert case.retained.exit_code == 23
+    assert case.preparer.current_handle() is case.handle and not case.handle.closed
+    assert case.handle.cleanup_abandoned and case.preparer.cleanup_uncertain
+
+
 def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_without_engine(tmp_path,monkeypatch):
     """Offline transport contract only; fake handles grant no native custody proof."""
     import threading

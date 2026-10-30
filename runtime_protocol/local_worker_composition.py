@@ -106,7 +106,9 @@ class _PreparedWorker:
     closed: bool = False
     rpc_lock: threading.Lock = field(default_factory=threading.Lock)
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock)
+    cleanup_resolution_lock: threading.Lock = field(default_factory=threading.Lock)
     cleanup_started: bool = False
+    cleanup_abandoned: bool = False
     relay: bool = False
     retained: Any = None
     broker: Any = None
@@ -455,8 +457,11 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             if handle.retained.poll() is None:
                 handle.broker.signal(runtime_platform.TERM, expected_pid=handle.worker.pid)
             handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
-            handle.control.close(); handle.activation.close(); handle.closed = True
-            if self._active is handle: self._active = None
+            with handle.cleanup_resolution_lock:
+                if handle.cleanup_abandoned:
+                    raise ConflictError("host-only cleanup exceeded terminal shutdown custody")
+                handle.control.close(); handle.activation.close(); handle.closed = True
+                if self._active is handle: self._active = None
 
     def _prepare_relay(self, profile, *, operation_id, channel_id):
         from .local_execution_supervisor import host_prepare_request, RetainedProcess
@@ -544,10 +549,35 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             except BaseException:
                 handle.broker.signal(runtime_platform.KILL, expected_pid=handle.worker.pid)
                 handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
-        handle.control.close()
-        handle.closed = True
-        if self._active is handle:
-            self._active = None
+        with handle.cleanup_resolution_lock:
+            if handle.cleanup_abandoned:
+                raise ConflictError("relay cleanup exceeded terminal shutdown custody")
+            handle.control.close()
+            handle.closed = True
+            if self._active is handle:
+                self._active = None
+
+    def release_failed_cleanup_channels(self, handle):
+        """Release terminal shutdown transport, retaining unresolved custody.
+
+        Ordinary abort failures keep their descriptors for an authenticated
+        retry. Once Runtime shutdown has exhausted that attempt, descriptors
+        cannot remain live resources or allow late cleanup to claim success.
+        """
+        if not isinstance(handle, _PreparedWorker) or not (handle.host_only or handle.relay):
+            return
+        with handle.cleanup_resolution_lock:
+            if handle.closed:
+                return
+            handle.cleanup_abandoned = True
+            self.cleanup_uncertain = "retained child cleanup remains unresolved after shutdown"
+            for channel in (handle.control, handle.activation):
+                if channel is not None:
+                    try:
+                        channel.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    channel.close()
 
     def report(self, handle: _PreparedWorker) -> Mapping[str, Any]:
         if handle.host_only:
