@@ -244,6 +244,7 @@ def test_windows_role_broker_rejects_rogue_then_seals_real_child(native_peer, mo
         chain_head="chain", authority_journal=None, _persist=events.append,
         _ready=threading.Event(), socket_path=SimpleNamespace(unlink=lambda **kwargs: None),
         socket_root=SimpleNamespace(rmdir=lambda: None), _release_authority_scope=lambda: None,
+        _retain_post_exec_connection=False, _post_exec_connection=None,
     )
     custody.RoleBoundCustodyBroker._serve(broker)
     assert broker.error is None and broker.state == "sealed"
