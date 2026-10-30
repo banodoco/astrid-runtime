@@ -1,6 +1,7 @@
 """Private owner selection transport; no producer, worker, or engine execution."""
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import FrozenInstanceError
 import json
 
@@ -37,10 +38,18 @@ class _StartupCaptured(Exception):
 
 
 @pytest.mark.parametrize("entrypoint", ["cli", "foreground"])
-def test_startup_paths_retain_owner_selection_before_lifecycle(tmp_path, monkeypatch, capsys, composition, entrypoint):
+@pytest.mark.parametrize("selection_kind", ["host_only", "legacy_worker"])
+def test_startup_paths_retain_owner_selection_before_lifecycle(tmp_path, monkeypatch, capsys, composition, entrypoint, selection_kind):
+    if selection_kind == "legacy_worker":
+        from test_local_worker_composition import _profile_document
+        document, _source, support, _packs = _profile_document(tmp_path)
+        path = tmp_path / "worker-profile.json"
+        path.write_text(json.dumps(document))
+        composition = module.load_local_worker_composition(path, workspace_uuid="realm",
+            realm_root=tmp_path / "realm", support_root=support, runtime_instance_id="pending-startup")
     root, support = tmp_path / "realm", tmp_path / "support"
     RealmStore.initialize(root, realm_id="realm").close()
-    selected = composition.profiles.copy()
+    selected = deepcopy(composition.profiles)
     expected_config = json.loads(json.dumps(composition.preparer.config))
     loaded, owners, services = [], [], []
 
@@ -53,6 +62,11 @@ def test_startup_paths_retain_owner_selection_before_lifecycle(tmp_path, monkeyp
         owners.append(value)
         # The owner constructor must retain selection before callers can edit
         # the original object, including while startup has not opened its store.
+        for profile in composition.profiles.values():
+            if profile.host_launch is not None:
+                profile.host_launch["environment"]["CALLER"] = "changed-before-service"
+        if "environment" in composition.preparer.config:
+            composition.preparer.config["environment"]["OWNER"] = "changed-before-service"
         composition.profiles.clear()
         composition.preparer.config["source_checkout"] = "/caller-mutation"
         return value
@@ -96,6 +110,16 @@ def test_startup_paths_retain_owner_selection_before_lifecycle(tmp_path, monkeyp
         retained = service._local_worker_composition
         assert retained is owner._local_worker_composition
         assert retained.profiles == selected and retained.config == expected_config
+        assert owner.local_worker_preparer is composition.preparer
+        assert owner.local_worker_inspector is composition.inspector
+        reader_profiles, reader_config = retained.profiles, retained.config
+        for profile in reader_profiles.values():
+            if profile.host_launch is not None:
+                profile.host_launch["environment"]["READER"] = "changed"
+        reader_profiles.clear()
+        reader_config["source_checkout"] = "/reader-mutation"
+        assert owner._local_worker_composition.profiles == selected
+        assert owner._local_worker_composition.config == expected_config
         assert retained._installed_release_loader is _forbid
         assert retained._verified_source_loader is _forbid
         assert owner.local_worker_launcher is None and owner.credentials is None
@@ -105,6 +129,34 @@ def test_startup_paths_retain_owner_selection_before_lifecycle(tmp_path, monkeyp
     finally:
         for service in services:
             service.close()
+
+
+def test_live_runtime_binding_keeps_actors_and_retained_selection_independent(tmp_path, monkeypatch, composition):
+    monkeypatch.setattr(module, "_installed_host_release", _forbid)
+    monkeypatch.setattr(verified_host_launch, "_SourceLoader", _forbid)
+    monkeypatch.setattr(CrossProcessWorkerPreparer, "prepare", _forbid)
+    expected_profiles = deepcopy(composition.profiles)
+    expected_config = deepcopy(composition.preparer.config)
+    owner = RuntimeDaemon(tmp_path / "realm", local_worker_profiles=composition.profiles,
+        local_worker_preparer=composition.preparer, local_worker_inspector=composition.inspector,
+        _local_worker_composition=composition, _local_worker_composition_required=True)
+    retained = owner._local_worker_composition
+    credential_file = tmp_path / "selected-token-path"
+
+    composition.bind_runtime(endpoint="http://127.0.0.1:43210/",
+        runtime_instance_id="bound-instance", credential_file=credential_file)
+
+    assert owner.local_worker_preparer is composition.preparer
+    assert owner.local_worker_inspector is composition.inspector
+    assert composition.preparer.profile is composition.inspector.profile
+    assert composition.preparer.config == {**expected_config,
+        "runtime_endpoint": "http://127.0.0.1:43210", "runtime_instance_id": "bound-instance",
+        "credential_file": str(credential_file)}
+    assert retained.profiles == expected_profiles and retained.config == expected_config
+    assert not hasattr(retained, "preparer") and not hasattr(retained, "inspector")
+    assert owner.service is None and owner.local_worker_launcher is None
+    assert owner.credentials is None and not credential_file.exists()
+    assert not (tmp_path / "realm").exists()
 
 
 @pytest.mark.parametrize("entrypoint", ["cli", "foreground"])

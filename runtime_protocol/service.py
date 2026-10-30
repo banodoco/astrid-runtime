@@ -514,6 +514,8 @@ class RuntimeService:
 
     def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None, _admission_fd=None, _local_worker_composition=None, _local_worker_composition_required=False):
         from .local_worker_composition import _retain_local_worker_composition
+        # Retain owner declarations before opening the realm; this neither
+        # invokes a producer nor changes ordinary task admission below.
         self._local_worker_composition = _retain_local_worker_composition(
             _local_worker_composition, required=_local_worker_composition_required)
         configured_max = os.environ.get("RUNTIME_MAX_OBJECT_BYTES", str(OBJECT_MAX_BYTES))

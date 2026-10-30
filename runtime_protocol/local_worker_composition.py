@@ -1184,7 +1184,11 @@ class LocalWorkerComposition:
         self.preparer.bind_runtime(endpoint=endpoint, runtime_instance_id=runtime_instance_id, credential_file=credential_file)
 
     def _retain(self):
-        """Snapshot owner selection without retaining its mutable lifecycle actors."""
+        """Snapshot owner selection before live actors bind startup credentials.
+
+        Retention copies declarations only; launch verification and mutable
+        preparer/inspector ownership remain on their existing lifecycle path.
+        """
         if (not isinstance(self.profiles, dict) or len(self.profiles) != 1
                 or not isinstance(self.preparer, CrossProcessWorkerPreparer)
                 or not isinstance(self.inspector, OSProcessInspector)
@@ -1451,6 +1455,10 @@ class _RetainedLocalWorkerComposition:
 
 
 def _retain_local_worker_composition(value, *, required=False):
+    """Keep one private immutable selection across daemon/service construction.
+
+    ``required`` records configured presence, never a verification assertion.
+    """
     if value is None and not required:
         return None
     if type(value) is _RetainedLocalWorkerComposition:
