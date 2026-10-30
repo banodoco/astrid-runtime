@@ -395,6 +395,156 @@ def test_reference_verification_is_read_only_and_requires_exact_designated_actor
         authority.verify_reference(ref, expected_actor=actors[102].verify(), owner_epoch="runtime-A", identity_provider=identities.get, token_provider=tokens.get)
 
 
+def test_reference_diagnostics_success_is_repeatable_read_only_and_silent(graph, monkeypatch, capsys, caplog):
+    authority, actors, identities, tokens = graph
+    ref = authority.reference()
+    reference_before = {**ref, "target": dict(ref["target"])}
+    pins = {pid: dict(actor._pinned) for pid, actor in actors.items()}
+    before = authority.path.read_bytes()
+    calls = []
+    monkeypatch.setattr(authority, "_write", lambda _: pytest.fail("verification rewrote designation"))
+    for _ in range(2):
+        assert authority.verify_reference(ref, expected_actor=pins[101], owner_epoch="runtime-A",
+            identity_provider=lambda pid: calls.append(("identity", pid)) or identities[pid],
+            token_provider=lambda pid: calls.append(("token", pid)) or tokens[pid]) == reference_before
+    assert calls == [("identity", 101), ("token", 101), ("identity", 103), ("token", 103)] * 2
+    assert authority.path.read_bytes() == before
+    assert ref == reference_before
+    assert {pid: actor._pinned for pid, actor in actors.items()} == pins
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err and not caplog.text
+
+
+@pytest.mark.parametrize("role,pid", [("actor", 101), ("target", 103)])
+@pytest.mark.parametrize("edge,stage,availability,fields", [
+    ("pid", "compare", "available", "pid"),
+    ("uid", "compare", "available", "uid"),
+    ("birth_id", "compare", "available", "birth_id"),
+    ("sha256", "compare", "available", "audit_token_sha256"),
+    ("pidversion", "compare", "available", "audit_token_pidversion"),
+    ("multiple", "compare", "available", "pid,uid,birth_id,audit_token_sha256,audit_token_pidversion"),
+    ("absent", "identity", "absent", "none"),
+    ("identity-custody", "identity", "unavailable", "none"),
+    ("identity-oserror", "identity", "unavailable", "none"),
+    ("token-custody", "token", "available", "none"),
+    ("token-oserror", "token", "available", "none"),
+    ("invalid-identity", "incarnation", "available", "none"),
+    ("invalid-token", "incarnation", "available", "none"),
+    ("unknown-key-only", "compare", "available", "none"),
+])
+def test_reference_diagnostics_reject_without_disclosure_write_or_rebinding(
+        graph, monkeypatch, role, pid, edge, stage, availability, fields, capsys, caplog):
+    authority, actors, identities, tokens = graph
+    ref = authority.reference()
+    pins = {actor_pid: dict(actor._pinned) for actor_pid, actor in actors.items()}
+    selected_actor = dict(pins[101])
+    before = authority.path.read_bytes()
+    private = "synthetic-private-credential" + "x" * 4096
+    observed = {
+        "identity": {actor_pid: {**identity, "private-field-label": private} for actor_pid, identity in identities.items()},
+        "token": {actor_pid: {**token, "private-token-label": private, "words": [987654321] * 8}
+                  for actor_pid, token in tokens.items()},
+    }
+    for field in ("pid", "uid"):
+        if edge in {field, "multiple"}:
+            observed["identity"][pid][field] += 1
+            observed["token"][pid][field] += 1
+    if edge in {"birth_id", "multiple"}:
+        observed["identity"][pid]["birth_id"] = "private-birth" + private
+    if edge in {"sha256", "multiple"}:
+        observed["token"][pid]["sha256"] = "private-token-digest" + private
+    if edge in {"pidversion", "multiple"}:
+        observed["token"][pid]["pidversion"] += 1
+    if edge == "absent":
+        observed["identity"][pid] = None
+    elif edge.endswith(("-custody", "-oserror")):
+        kind, error_kind = edge.split("-")
+        error_type = custody.CustodyError if error_kind == "custody" else OSError
+        observed[kind][pid] = error_type(private + " private-token-digest 987654321")
+    elif edge == "invalid-identity":
+        observed["identity"][pid]["birth_id"] = ""
+    elif edge == "invalid-token":
+        observed["token"][pid]["uid"] += 1
+    elif edge == "unknown-key-only":
+        # Only full mapping equality catches an extra expected key; its label
+        # must not become a diagnostic field, even though no known field differs.
+        record = authority._read()
+        record[role]["private-field-label"] = private
+        monkeypatch.setattr(authority, "_read", lambda: record)
+        ref = authority._reference(record)
+        selected_actor = dict(record["actor"])
+    reference_before = {**ref, "target": dict(ref["target"])}
+    actor_before = dict(selected_actor)
+    calls = []
+
+    def observe(kind, observed_pid):
+        calls.append((kind, observed_pid))
+        value = observed[kind][observed_pid]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(authority, "_write", lambda _: pytest.fail("verification rewrote designation"))
+    with pytest.raises(custody.CustodyError) as error:
+        authority.verify_reference(ref, expected_actor=selected_actor, owner_epoch="runtime-A",
+            identity_provider=lambda observed_pid: observe("identity", observed_pid),
+            token_provider=lambda observed_pid: observe("token", observed_pid))
+    prefix = "custody designation has unavailable or changed kernel identity"
+    if availability == "unavailable" or stage == "token":
+        prefix = f"custody designation {stage} observation is unavailable"
+    elif stage == "incarnation":
+        prefix = "custody incarnation lacks authenticated identity"
+    metadata = f"[role={role}; stage=verify_reference.{stage}; identity={availability}; mismatched_fields={fields}]"
+    assert str(error.value) == prefix + " " + metadata
+    assert len(metadata) < 200 and len(str(error.value)) < 300
+    if availability == "unavailable" or stage in {"token", "incarnation"}:
+        assert error.value.__suppress_context__
+    expected_calls = [] if role == "actor" else [("identity", 101), ("token", 101)]
+    expected_calls.append(("identity", pid))
+    if stage != "identity":
+        expected_calls.append(("token", pid))
+    assert calls == expected_calls  # Absence never asks for a token; failure stops all later observations.
+    captured = capsys.readouterr()
+    rendered = "".join(traceback.format_exception(error.value)) + captured.out + captured.err + caplog.text
+    for secret in ("private-birth", "private-token-digest", "987654321", "synthetic-private-credential",
+                   "private-field-label", "private-token-label", "birth-101", "birth-103", "sha256:token-101", "sha256:token-103"):
+        assert secret not in rendered
+    assert not captured.out and not captured.err and not caplog.text
+    assert authority.path.read_bytes() == before
+    assert ref == reference_before and selected_actor == actor_before
+    assert {actor_pid: actor._pinned for actor_pid, actor in actors.items()} == pins
+
+
+@pytest.mark.parametrize("edge", ["state", "actor", "reference", "epoch"])
+def test_reference_diagnostics_owner_reference_and_epoch_precede_observation(graph, monkeypatch, edge):
+    authority, actors, identities, tokens = graph
+    ref = authority.reference()
+    pins = {pid: dict(actor._pinned) for pid, actor in actors.items()}
+    selected_actor, epoch = pins[101], "runtime-A"
+    before = authority.path.read_bytes()
+    if edge == "state":
+        record = authority._read()
+        record["state"] = "pending"
+        monkeypatch.setattr(authority, "_read", lambda: record)
+    elif edge == "actor":
+        selected_actor = pins[102]
+    elif edge == "reference":
+        ref["generation"] += 1
+    else:
+        epoch = "runtime-B"
+    reference_before = {**ref, "target": dict(ref["target"])}
+    calls = []
+    monkeypatch.setattr(authority, "_write", lambda _: pytest.fail("verification rewrote designation"))
+    with pytest.raises(custody.CustodyError) as error:
+        authority.verify_reference(ref, expected_actor=selected_actor, owner_epoch=epoch,
+            identity_provider=lambda pid: calls.append(("identity", pid)) or identities[pid],
+            token_provider=lambda pid: calls.append(("token", pid)) or tokens[pid])
+    assert str(error.value) == "custody designation differs from selected owner/reference"
+    assert not calls
+    assert authority.path.read_bytes() == before and ref == reference_before
+    assert {pid: actor._pinned for pid, actor in actors.items()} == pins
+
+
 @pytest.fixture
 def runtime_owner(tmp_path, graph):
     _, actors, identities, tokens = graph
