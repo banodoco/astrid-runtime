@@ -839,6 +839,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             resource = self.runtime._task_resource(value)
             project_id = value["run"].get("project_id") or "unscoped"
             return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("task.create", project_id, key, project_id=project_id)})
+        if len(path) == 4 and path[:2] == ["v1", "tasks"] and path[3] == "claim-delegated-child" and method == "POST":
+            identity = self._identity("worker:execute")
+            return self._send(200, self.runtime.claim_delegated_child(
+                path[2], self._body(), idempotency_key=self._idempotency_key(), identity=identity,
+            ))
         if path == ["v1", "tasks", "claim"] and method == "POST":
             identity = self._identity("worker:execute")
             key = self.headers.get("Idempotency-Key")

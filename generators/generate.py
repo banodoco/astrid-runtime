@@ -137,6 +137,9 @@ def render_typescript_client() -> str:
         'JSON.stringify({ executor_incarnation: executorIncarnation, evidence_digest: evidenceDigest })',
         'JSON.stringify({ executor_incarnation: executorIncarnation, evidence_digest: evidenceDigest, ...(expectedTaskIds === undefined ? {} : { expected_task_ids: expectedTaskIds }) })',
     )
+    exact_claim_method = '  async claimDelegatedChild(taskId: string, body: { executor_id: string; capability_ids: string[]; runtime_epoch: number; target: ExecutionTarget; authority: string }, idempotencyKey: string): Promise<AttemptFence> { return this.json<AttemptFence>((await this.request("POST", `/v1/tasks/${encodeURIComponent(taskId)}/claim-delegated-child`, new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [200])).body) }'
+    if "  async claimDelegatedChild(" not in source:
+        source = source.replace("  async claimTask(", exact_claim_method + "\n  async claimTask(", 1)
     child_authority_types = (
         'export interface ChildAuthorityChild { child_id: string; capability_id: string; capability_digest: string }\n'
         'export interface DerivedInputDescriptor { name: string; output_port: string; filename: string; object_id: string; size: number; media_type: string }\n'

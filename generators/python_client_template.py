@@ -1322,6 +1322,11 @@ class WorkspaceClient:
         value = self._json(body)
         return ClaimWaiting.from_json(value) if isinstance(value, Mapping) and "waiting_reason" in value else AttemptFence.from_json(value)
 
+    def claim_delegated_child(self, task_id: str, *, executor_id: str, capability_ids: list[str], idempotency_key: str, runtime_epoch: int, target: Mapping[str, Any], authority: str) -> AttemptFence:
+        payload = {"executor_id": executor_id, "capability_ids": capability_ids, "runtime_epoch": runtime_epoch, "target": dict(target), "authority": authority}
+        _, _, body = self._request("POST", f"/v1/tasks/{_path_part(task_id)}/claim-delegated-child", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200,))
+        return AttemptFence.from_json(self._json(body))
+
     def heartbeat_attempt(self, attempt_id: str, *, lease_id: str, fence: int, idempotency_key: str, runtime_epoch: int, progress: Mapping[str, Any] | None = None) -> MutationResult:
         payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "runtime_epoch": runtime_epoch}
         if progress is not None: payload["progress"] = dict(progress)

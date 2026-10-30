@@ -2699,7 +2699,7 @@ class RuntimeService:
         if idempotency_key is None:
             return False, None
         validate_idempotency_key(idempotency_key)
-        if kind in {"task.claim", "executor.register"}:
+        if kind in {"task.claim", "task.claim_delegated_child", "executor.register"}:
             query = (
                 "SELECT NULL AS txn_id, command_kind, idempotency_key, request_hash, result_json, "
                 "NULL AS first_project_seq, NULL AS last_project_seq, NULL AS event_ids_json, created_at "
@@ -2719,7 +2719,7 @@ class RuntimeService:
         result = self._publication_replay_result(prior) if kind == "parent_composition.publish" else command_result(
             prior["result_json"], kind=kind, connection=self.store.conn,
             created_at=None if kind in {"object.ingest", "media.import"} else prior["created_at"],
-            window_seconds=SESSION_IDEMPOTENCY_WINDOW_SECONDS if kind in {"task.claim", "executor.register"} else IDEMPOTENCY_RESULT_WINDOW_SECONDS,
+            window_seconds=SESSION_IDEMPOTENCY_WINDOW_SECONDS if kind in {"task.claim", "task.claim_delegated_child", "executor.register"} else IDEMPOTENCY_RESULT_WINDOW_SECONDS,
         )
         if project_id is not None and with_receipt:
             result = {"data": result, "receipt": self._receipt_payload(prior, project_id=project_id)}
@@ -2735,7 +2735,7 @@ class RuntimeService:
     def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, with_receipt=True, created_at=None):
         if idempotency_key is not None:
             validate_idempotency_key(idempotency_key)
-            if kind in {"task.claim", "executor.register"}:
+            if kind in {"task.claim", "task.claim_delegated_child", "executor.register"}:
                 self.store.conn.execute(
                     "INSERT INTO session_command_replay(command_kind,aggregate_id,idempotency_key,request_hash,result_json,created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
@@ -6912,10 +6912,8 @@ class RuntimeService:
         if actual != source["raw_publication"]:
             raise ConflictError("actual raw publication changed after final admission")
 
-    @_durable_mutation
-    def admit_delegated_child(self, body, *, idempotency_key, identity):
-        body = _wire_object(body, required=("authority", "task"), allowed=("authority", "task"))
-        payload = self._decode_child_authority(body["authority"])
+    def _live_child_authority(self, authority, *, identity):
+        payload = self._decode_child_authority(authority)
         if payload.get("identity_digest") != self._child_identity_digest(identity):
             raise AuthorizationError("child authority is bound to another worker identity")
         lease = {"lease_id": payload.get("parent_lease_id"), "fence": payload.get("parent_fence"), "runtime_epoch": payload.get("runtime_epoch")}
@@ -6942,6 +6940,12 @@ class RuntimeService:
                 or payload.get("effective_target") != effective_target
                 or payload.get("placement_version") != placement_version):
             raise AuthorizationError("child authority no longer matches parent attempt")
+        return payload, row, parent, project, policy, recovery, placement_version, effective_target
+
+    @_durable_mutation
+    def admit_delegated_child(self, body, *, idempotency_key, identity):
+        body = _wire_object(body, required=("authority", "task"), allowed=("authority", "task"))
+        payload, row, parent, project, policy, recovery, placement_version, effective_target = self._live_child_authority(body["authority"], identity=identity)
         task = _wire_object(body["task"], required=("capability_id", "capability_digest"), allowed=("capability_id", "capability_digest", "input_object_ids", "input_refs", "stage", "schema_version", "spec", "execution_request", "generation_intent", "required_facts", "storage_estimate"))
         if {"capability_id": task["capability_id"], "capability_digest": task["capability_digest"]} not in policy["capabilities"]:
             raise AuthorizationError("child capability is outside parent policy")
@@ -8415,6 +8419,174 @@ class RuntimeService:
             if "storage_estimate" in admitted_spec:
                 result["storage_estimate"] = dict(admitted_spec["storage_estimate"])
         return self._command_record("task.claim", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
+
+    @_durable_mutation
+    def claim_delegated_child(self, task_id, body, *, idempotency_key, identity):
+        """Claim only the named admitted child under its still-live parent.
+
+        Authority, immutable lineage, verified machine placement, exact target,
+        shared store preflight, attempt fence and command receipt share one
+        transaction. A rejected claim rolls back and never searches the queue.
+        Replays authenticate the parent again and require the same live child
+        attempt; a historical command receipt is never fresh lease authority.
+        """
+        fields = ("executor_id", "capability_ids", "runtime_epoch", "target", "authority")
+        body = _wire_object(body, required=fields, allowed=fields)
+        executor_id = _wire_string(body, "executor_id")
+        _wire_string(body, "authority")
+        _wire_integer(body, "runtime_epoch", positive=True)
+        idempotency_key = require_idempotency_key(idempotency_key)
+        caps = body["capability_ids"]
+        if (not isinstance(caps, list) or not caps
+                or any(not isinstance(cap, str) or not cap for cap in caps)
+                or len(set(caps)) != len(caps)):
+            raise ValidationError("capability_ids must contain unique non-empty strings")
+        target = _normalize_execution_target(body["target"])
+        # Unlike ordinary administrative claim, delegated authority belongs to
+        # the authenticated executor itself. Admin scope cannot impersonate it.
+        if not isinstance(identity, dict) or identity.get("actor") != executor_id:
+            raise AuthorizationError("delegated claim requires the parent executor actor")
+        self._assert_local_claim_admission(executor_id, identity=identity)
+        placement = self._trusted_execution_placement(identity)
+        if placement is None or placement["actual"]["kind"] != "machine":
+            raise AuthorizationError("delegated claim requires verified machine placement")
+        epoch = self.store._validate_runtime_epoch(body["runtime_epoch"], identity="executor", identity_id=executor_id, required=True)
+        payload, parent_attempt, parent, project, policy, _, placement_version, effective_target = self._live_child_authority(body["authority"], identity=identity)
+        if executor_id != parent_attempt["executor_id"]:
+            raise AuthorizationError("delegated claim must use the verified parent executor")
+        if (not parent_attempt["lease_expires_at"]
+                or parent["lease_expires_at"] != parent_attempt["lease_expires_at"]):
+            raise LeaseError("parent attempt lease deadline is missing or inconsistent")
+        parent_binding = self.store.execution_binding(parent["id"])
+        if self.store._execution_request_from_row(parent) is not None and parent_binding is None:
+            raise LeaseError("parent execution binding is missing")
+        if parent_binding is not None and (
+                parent_binding["status"] != "claimed"
+                or parent_binding.get("actual_target") != placement["actual"]
+                or parent_binding.get("verification") != placement["verification"]
+                or parent_binding.get("executor_incarnation") != placement["executor_incarnation"]
+                or any(parent_binding.get(field) != parent_attempt[source] for field, source in (
+                    ("attempt_id", "id"), ("lease_id", "lease_id"), ("fence", "fence"),
+                    ("executor_id", "executor_id"), ("runtime_epoch", "runtime_epoch")))):
+            raise LeaseError("parent execution binding fence is stale")
+        child = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+        if child is None:
+            raise NotFoundError("delegated child not found")
+        lineage = self.store._spec(child).get("delegated_parent")
+        expected_lineage = {
+            "parent_task_id": parent["id"], "parent_attempt_id": parent_attempt["id"],
+            "parent_lease_id": parent_attempt["lease_id"], "parent_fence": int(parent_attempt["fence"]),
+            "runtime_epoch": epoch, "executor_id": executor_id, "project_id": project,
+            "parent_placement": placement, "parent_effective_target": effective_target,
+            "parent_placement_version": placement_version, "policy_digest": payload["policy_digest"],
+        }
+        child_run = self.store.conn.execute("SELECT * FROM runs WHERE id=?", (child["run_id"],)).fetchone()
+        if lineage != expected_lineage or child_run["project_id"] != project:
+            raise AuthorizationError("delegated child lineage or project does not match parent authority")
+        if (child["capability"] not in caps
+                or {"capability_id": child["capability"], "capability_digest": child["capability_digest"]} not in policy["capabilities"]):
+            raise AuthorizationError("delegated child capability is outside claim or parent policy")
+        exact_child = payload.get("child")
+        if exact_child is not None and (exact_child["child_id"] != child_run["idempotency_key"]
+                or exact_child["capability_id"] != child["capability"]
+                or exact_child["capability_digest"] != child["capability_digest"]):
+            raise AuthorizationError("child authority is bound to another exact child")
+        selected = self.store.effective_execution_target(str(task_id))
+        # Untargeted scalar children retain their ordinary path; explicit
+        # default is the only selector for their exact delegated claim.
+        if target not in policy["targets"] or target != (selected if selected is not None else {"kind": "default"}):
+            raise AuthorizationError("delegated child target does not match explicit selector")
+        binding = self.store.execution_binding(str(task_id))
+        if (not execution_placement_matches(target, placement)
+                or (selected is not None and binding is None)
+                or (binding is not None and binding["resolved_target"] != target)
+                or not self._placement_recovery_qualification_matches(str(task_id), placement)
+                or not self._placement_recovery_qualification_matches(parent["id"], placement)):
+            raise AuthorizationError("delegated child execution placement does not match")
+        if self._task_drain(str(task_id)) is not None or self._task_drain(parent["id"]) is not None:
+            raise ConflictError("remote drain blocks fresh delegated claims")
+        if (self._task_requires_remote_activation(str(task_id))
+                or isinstance(identity.get("qualified_activation"), dict)) and not self._remote_activation_matches(str(task_id), identity, placement, require_fresh=True):
+            raise AuthorizationError("delegated child activation is missing, revoked, or stale")
+        failure = self.store._task_lifetime_failure(child, datetime.now(timezone.utc))
+        if failure is not None or child["waiting_reason"] in {"provider_state_unknown", "runtime_recovery"}:
+            raise ConflictError("delegated child requires recovery or exhausted its lifetime", details=failure or {"waiting_reason": child["waiting_reason"]})
+        accounting = self.store.delegated_child_accounting(parent["id"], parent_attempt["id"])
+        if (accounting["lifetime"] > policy["limits"]["max_children"]
+                or accounting["active"] > policy["limits"]["max_active_children"]):
+            raise ConflictError("delegated child exceeds parent child capacity")
+        request_hash = sha256_bytes(canonical_json({
+            "task_id": str(task_id), "body": body, "target": target,
+            "trusted_execution_placement": placement,
+        }).encode())
+        replayed, replay = self._command_replay_state("task.claim_delegated_child", "claim", idempotency_key, request_hash, with_receipt=False)
+        if replayed:
+            # Reuse the store's readiness/resource predicates, but count the
+            # replayed attempt's own occupied slot and reservation as its own.
+            executor = self.store.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+            child_spec = self.store._spec(child)
+            active = self.store.conn.execute("SELECT COUNT(*) FROM tasks WHERE executor_id=? AND status='running'", (executor_id,)).fetchone()[0]
+            if (not self.store._executor_can_run(executor, child["capability"], child["capability_digest"], include_storage=False, required_facts=child_spec.get("required_facts"))
+                    or active > executor["max_concurrency"]
+                    or not self.store.storage_preflight(child["capability"], storage_estimate=child_spec.get("storage_estimate"))["ok"]):
+                raise ConflictError("delegated child replay preflight rejected claim")
+            for key in self.store._required_resource_keys(child["capability"]):
+                reservations = self.store.conn.execute("SELECT * FROM reservations WHERE executor_id=? AND resource_key=? AND released_at IS NULL", (executor_id, key)).fetchall()
+                if (key not in json.loads(executor["resource_keys_json"]) or len(reservations) != 1
+                        or any(reservations[0][field] != replay[source] for field, source in (
+                            ("task_id", "task_id"), ("lease_token", "lease_id"), ("fence", "fence"), ("runtime_epoch", "runtime_epoch"), ("lease_expires_at", "lease_expires_at")))):
+                    raise ConflictError("delegated child replay resource reservation changed")
+            attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (replay["attempt_id"],)).fetchone()
+            self._assert_attempt_identity(attempt, identity)
+            self._validate_attempt_lease(attempt, replay, epoch)
+            if (attempt["lease_expires_at"] != replay["lease_expires_at"]
+                    or child["status"] != "running" or child["attempt_id"] != replay["attempt_id"]
+                    or child["lease_token"] != replay["lease_id"] or child["lease_fence"] != replay["fence"]
+                    or child["executor_id"] != executor_id or child["runtime_epoch"] != epoch
+                    or child["lease_expires_at"] != replay["lease_expires_at"]
+                    or binding != replay.get("execution_binding")):
+                raise LeaseError("delegated child claim is no longer the same live attempt")
+            return replay
+        if child["status"] != "queued":
+            raise ConflictError("delegated child is not queued")
+        if binding is not None and binding["status"] != "prepared":
+            raise ConflictError("delegated child binding requires recovery")
+        if self.store.conn.execute("SELECT 1 FROM attempts WHERE task_id=? AND settled=0 LIMIT 1", (str(task_id),)).fetchone():
+            raise ConflictError("delegated child has an unresolved prior attempt")
+        attempt_id, lease_id = new_id(), new_id()
+        value = self.store._claim_task(str(task_id), executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
+        task = value["task"]
+        if task["status"] != "running":
+            raise ConflictError("delegated child preflight rejected claim", details={"waiting_reason": task.get("waiting_reason")})
+        executor = self.store.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+        if not self.store._executor_can_run(executor, child["capability"], child["capability_digest"], include_storage=False, required_facts=self.store._spec(child).get("required_facts")):
+            raise ConflictError("delegated child executor qualification changed")
+        # Shared preflight can reap expired leases; recheck parent before any
+        # attempt or receipt is committed, including a deadline crossing here.
+        self._live_child_authority(body["authority"], identity=identity)
+        fence, expires = int(task["lease_fence"]), task["lease_expires_at"]
+        self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", (attempt_id, str(task_id), lease_id, fence, executor_id, expires, epoch))
+        self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, str(task_id)))
+        binding = self.store.bind_execution_attempt(str(task_id), attempt_id=attempt_id, lease_id=lease_id, fence=fence, executor_id=executor_id, runtime_epoch=epoch, placement=placement)
+        if binding is not None:
+            self.store._append_event(value["run"]["id"], str(task_id), "task.execution_bound", {
+                "attempt_id": attempt_id, "lease_id": lease_id, "fence": fence,
+                "runtime_epoch": epoch, "execution_binding": binding,
+            })
+        admitted_spec, generation_intent = public_task_spec(task.get("spec") or {})
+        generation_intent = task.get("generation_intent") or generation_intent
+        result = {"attempt_id": attempt_id, "task_id": str(task_id), "run_id": value["run"]["id"], "project_id": project, "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+        for field in ("execution_request", "expected_effect"):
+            if task.get(field) is not None:
+                result[field] = dict(task[field])
+        for field in ("required_facts", "storage_estimate"):
+            if field in admitted_spec:
+                result[field] = dict(admitted_spec[field])
+        if binding is not None:
+            result["execution_binding"] = binding
+        if generation_intent is not None:
+            result["generation_intent"] = generation_intent
+        return self._command_record("task.claim_delegated_child", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
     @_durable_mutation(reap_task_lifetimes=True)
     def settle_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None, _verified_objects=None):
