@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      agent_sha:
+        description: Full immutable Agent commit SHA (empty uses fixture pin)
+        required: false
+        type: string
 
 jobs:
   integration:
@@ -16,15 +21,32 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      # This pin records the Astrid revision against which Runtime's integration lane is verified.
-      - name: Read verified Astrid revision
+      # The override is an immutable test input; never modify the fixture pin.
+      - name: Select Agent revision
         id: astrid-pin
-        run: echo "sha=$(cat tests/astrid-agent.pin)" >> "$GITHUB_OUTPUT"
+        env:
+          AGENT_OVERRIDE: ${{ inputs.agent_sha }}
+        shell: bash
+        run: |
+          sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
+          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Agent revision must be a full 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: banodoco/astrid-agent
           ref: ${{ steps.astrid-pin.outputs.sha }}
           path: astrid-agent
+      - name: Record effective checkouts
+        shell: bash
+        run: |
+          runtime_sha=$(git rev-parse HEAD)
+          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
+          echo "Runtime: $runtime_sha"
+          echo "Agent: $agent_sha"
+          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Install system media tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: python -m pip install -e '.[test]'
