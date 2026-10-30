@@ -25,6 +25,8 @@ from astrid_runtime import update
 HOSTED_ORIGIN = "https://hosted.test"
 ROOT = Path(__file__).resolve().parents[1]
 _CHILD_OUTPUT_LIMIT = 4096
+_PHASE_EVENT_LIMIT = 16
+_PRE_TIMEOUT_STACK_DELAY_SECONDS = 15
 
 
 def _redacted_tail(value: str | bytes | None) -> str:
@@ -33,21 +35,45 @@ def _redacted_tail(value: str | bytes | None) -> str:
         value = value.decode(errors="replace")
     value = value or ""
     tail = value[-_CHILD_OUTPUT_LIMIT:]
-    return re.sub(
+    tail = re.sub(
         r'(?i)(["\']?(?:token|authorization|credential|secret|password)["\']?\s*[:=]\s*)'
         r'(?:["\'][^"\']*["\']|\S+)',
         r"\1<redacted>",
         tail,
     )
+    tail = re.sub(r"(?i)\b(bearer\s+)[-A-Za-z0-9._~+/]{8,}", r"\1<redacted>", tail)
+    return re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,})\b",
+        "<redacted>",
+        tail,
+    )
+
+
+def _bounded_file_tail(path: Path | None) -> str:
+    """Read only a redacted tail, so timeout evidence never expands with child output."""
+    if path is None:
+        return ""
+    try:
+        with path.open("rb") as source:
+            source.seek(0, os.SEEK_END)
+            source.seek(max(0, source.tell() - _CHILD_OUTPUT_LIMIT))
+            return _redacted_tail(source.read())
+    except OSError as exc:
+        return f"<unavailable: {type(exc).__name__}>"
 
 
 def _readiness_failure(
     process: subprocess.Popen[str], *, started_monotonic: float, started_unix: float, polls: int,
+    phase_path: Path | None = None, stack_path: Path | None = None,
+    spawn_started_monotonic: float | None = None, spawn_started_unix: float | None = None,
+    spawned_monotonic: float | None = None, spawned_unix: float | None = None,
 ) -> str:
     """Return bounded child state after an early exit or readiness timeout."""
     observed_monotonic = time.monotonic()
     observed_unix = time.time()
     exit_before_capture = process.poll()
+    phase_events = _bounded_file_tail(phase_path)
+    pre_timeout_stack = _bounded_file_tail(stack_path)
     if exit_before_capture is None:
         process.kill()
     try:
@@ -69,8 +95,14 @@ def _readiness_failure(
         "child_exit_before_capture": exit_before_capture,
         "child_output_drain": drain,
         "child_pid": process.pid,
+        "child_spawn_started_monotonic": spawn_started_monotonic,
+        "child_spawn_started_unix": spawn_started_unix,
+        "child_spawned_monotonic": spawned_monotonic,
+        "child_spawned_unix": spawned_unix,
         "child_stderr_tail": _redacted_tail(stderr),
         "child_stdout_tail": _redacted_tail(stdout),
+        "pre_timeout_python_stack_tail": pre_timeout_stack,
+        "readiness_phase_events_tail": phase_events,
         "readiness_elapsed_seconds": round(observed_monotonic - started_monotonic, 3),
         "readiness_observed_monotonic": observed_monotonic,
         "readiness_observed_unix": observed_unix,
@@ -83,6 +115,13 @@ def _readiness_failure(
 
 def test_readiness_failure_reports_live_child_state(tmp_path: Path):
     started = tmp_path / "child-started"
+    phase_path = tmp_path / "phases.json"
+    phase_path.write_text(
+        json.dumps([{"sequence": 1, "phase": "child_entry", "monotonic_ns": 1, "time_utc": "x"}]),
+        encoding="utf-8",
+    )
+    stack_path = tmp_path / "stack.txt"
+    stack_path.write_text("Bearer value-for-stack\nghp_0123456789abcdefghijklmnop\n", encoding="utf-8")
     process = subprocess.Popen(
         [
             sys.executable,
@@ -104,11 +143,42 @@ def test_readiness_failure_reports_live_child_state(tmp_path: Path):
         started_monotonic=time.monotonic(),
         started_unix=time.time(),
         polls=400,
+        phase_path=phase_path,
+        stack_path=stack_path,
+        spawn_started_monotonic=0.5,
+        spawn_started_unix=1.5,
+        spawned_monotonic=1.0,
+        spawned_unix=2.0,
     )
     assert '"child_exit_before_capture": null' in diagnostics
     assert '"child_exit_after_capture":' in diagnostics
     assert '"child_stdout_tail": "token=<redacted>\\n"' in diagnostics
+    assert '"child_spawned_monotonic": 1.0' in diagnostics
+    assert "child_entry" in diagnostics
+    assert "Bearer <redacted>" in diagnostics
+    assert "ghp_0123456789abcdefghijklmnop" not in diagnostics
     assert "not-for-output" not in diagnostics
+
+
+def test_pre_timeout_python_stack_snapshot_is_bounded(tmp_path: Path):
+    stack_path = tmp_path / "stack.txt"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import faulthandler, pathlib, sys, time; "
+            "output=pathlib.Path(sys.argv[1]).open('w', encoding='utf-8'); "
+            "faulthandler.dump_traceback_later(0.01, file=output); time.sleep(0.1); output.close()",
+            str(stack_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    assert result.returncode == 0, result.stderr
+    snapshot = _bounded_file_tail(stack_path)
+    assert snapshot
+    assert len(snapshot) <= _CHILD_OUTPUT_LIMIT
 
 
 def _python(environment: Path) -> Path:
@@ -203,6 +273,8 @@ def test_real_post_worker_finishes_after_runtime_daemon_process_is_killed(tmp_pa
     agent_root = ROOT.parent / "astrid-agent"
     ready, trigger, worker_result = (tmp_path / "daemon.json", tmp_path / "worker.start",
                                      tmp_path / "worker.json")
+    phase_path = tmp_path / "readiness-phases.json"
+    stack_path = tmp_path / "readiness-stack.txt"
     worker_pid = tmp_path / "worker.pid"
     worker_script = tmp_path / "update-worker.py"
     worker_script.write_text(f"""\
@@ -219,14 +291,27 @@ result = jobs.run_job(pathlib.Path(sys.argv[1]), sys.argv[2])
 pathlib.Path(sys.argv[4]).write_text(json.dumps(result))
 """, encoding="utf-8")
     child = f"""\
-import contextlib, hashlib, json, os, pathlib, secrets, subprocess, sys, time
+import contextlib, faulthandler, hashlib, json, os, pathlib, secrets, subprocess, sys, time
 from types import SimpleNamespace
+phase_path=pathlib.Path({str(phase_path)!r}); stack_path=pathlib.Path({str(stack_path)!r})
+phases=[]
+def phase(name):
+    timestamp_ns=time.time_ns(); seconds,nanos=divmod(timestamp_ns,1_000_000_000)
+    phases.append({{'sequence':len(phases)+1,'phase':name,'monotonic_ns':time.monotonic_ns(),'time_utc':time.strftime('%Y-%m-%dT%H:%M:%S',time.gmtime(seconds))+f'.{{nanos:09d}}Z'}})
+    pending=phase_path.with_name(phase_path.name+'.tmp')
+    pending.write_text(json.dumps(phases[-{_PHASE_EVENT_LIMIT}:]),encoding='utf-8')
+    os.replace(pending,phase_path)
+phase('child_entry')
+stack_output=stack_path.open('w',encoding='utf-8')
+faulthandler.dump_traceback_later({_PRE_TIMEOUT_STACK_DELAY_SECONDS},repeat=False,file=stack_output)
+phase('runtime_import_begin')
 sys.path[:0] = [{str(ROOT)!r}, {str(agent_root)!r}]
 from astrid_runtime import update
 from astrid.installer.service import install_selection
 from runtime_protocol import platform
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.door import DoorConfig, PRODUCT_SCOPES
+phase('runtime_import_complete')
 home=pathlib.Path(os.environ['HOME']); program=pathlib.Path({str(program)!r}); data=pathlib.Path({str(data)!r})
 version=pathlib.Path({str(version)!r}); realm=pathlib.Path({str(realm)!r})
 version.mkdir(parents=True); (program/'logs').mkdir(); data.mkdir(parents=True)
@@ -261,17 +346,36 @@ def launch(job):
     return {{'state':'launching','launch_status':'acknowledged'}}
 admission.launcher=launch
 door_credential=pathlib.Path({str(tmp_path/'door.json')!r})
-daemon=RuntimeDaemon(realm,support_root=data/'runtime',door=DoorConfig(origin={HOSTED!r},credential_file=door_credential,port=0)).start()
+phase('runtime_daemon_construction_begin')
+daemon=RuntimeDaemon(realm,support_root=data/'runtime',door=DoorConfig(origin={HOSTED!r},credential_file=door_credential,port=0))
+phase('runtime_daemon_constructed')
+phase('runtime_daemon_start_begin')
+daemon=daemon.start()
+phase('runtime_daemon_started')
 daemon.update_admission=admission
 fake.instance_id=daemon.instance_id; fake.startup_identity_instance_id=daemon.instance_id
-discovery=data/'runtime'/'discovery.json'; discovery.parent.mkdir(parents=True,exist_ok=True); discovery.write_text(json.dumps({{'runtime_instance_id':daemon.instance_id,'endpoint':daemon.endpoint,'door_endpoint':daemon.endpoint}}))
+discovery=data/'runtime'/'discovery.json'
+phase('product_discovery_read_begin')
+published=json.loads(discovery.read_text()); assert published['runtime_instance_id']==daemon.instance_id
+phase('product_discovery_published')
+phase('fixture_discovery_rewrite_begin')
+discovery.parent.mkdir(parents=True,exist_ok=True); discovery.write_text(json.dumps({{'runtime_instance_id':daemon.instance_id,'endpoint':daemon.endpoint,'door_endpoint':daemon.endpoint}}))
+phase('fixture_discovery_rewritten')
+phase('door_credential_setup_begin')
 token,_=daemon.credentials.provision('astrid-door-product',list(PRODUCT_SCOPES))
 platform.private_directory(door_credential.parent); door_credential.write_text(json.dumps({{'version':1,'scope':'astrid','actor_id':'astrid-door-product','token':token}})); platform.owner_only(door_credential)
+phase('door_credential_setup_complete')
+phase('fixture_marker_write_begin')
 pathlib.Path({str(ready)!r}).write_text(json.dumps({{'port':daemon.door_httpd.server_port}}))
+phase('fixture_marker_written')
 while True: time.sleep(1)
 """
+    spawn_started_monotonic = time.monotonic()
+    spawn_started_unix = time.time()
     runtime_process = subprocess.Popen([sys.executable, "-c", child], cwd=ROOT, env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    spawned_monotonic = time.monotonic()
+    spawned_unix = time.time()
     worker_result_payload = None
     try:
         readiness_started_monotonic = time.monotonic()
@@ -284,12 +388,20 @@ while True: time.sleep(1)
                 raise AssertionError(_readiness_failure(
                     runtime_process, started_monotonic=readiness_started_monotonic,
                     started_unix=readiness_started_unix, polls=readiness_polls,
+                    phase_path=phase_path, stack_path=stack_path,
+                    spawn_started_monotonic=spawn_started_monotonic,
+                    spawn_started_unix=spawn_started_unix,
+                    spawned_monotonic=spawned_monotonic, spawned_unix=spawned_unix,
                 ))
             time.sleep(0.05)
         if not ready.exists():
             raise AssertionError(_readiness_failure(
                 runtime_process, started_monotonic=readiness_started_monotonic,
                 started_unix=readiness_started_unix, polls=readiness_polls,
+                phase_path=phase_path, stack_path=stack_path,
+                spawn_started_monotonic=spawn_started_monotonic,
+                spawn_started_unix=spawn_started_unix,
+                spawned_monotonic=spawned_monotonic, spawned_unix=spawned_unix,
             ))
         port = json.loads(ready.read_text(encoding="utf-8"))["port"]
         response = door_call(port, "/api/runtime/v1/update", "POST", body=b"")
