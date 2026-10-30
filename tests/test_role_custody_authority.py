@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import signal
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -252,6 +253,104 @@ def test_runtime_owner_two_handoff_cycles_fence_historical_claim(runtime_owner):
                     signum=signal.SIGTERM, identity_provider=g[2].get, signal_provider=lambda *_: pytest.fail("stale signal"))
     with pytest.raises(custody.CustodyError, match="conflicts"):
         claim_runtime(g, actor=101)
+
+
+def _ready_token_broker(monkeypatch, *, connection):
+    identity = {"pid": 103, "birth_id": "birth-103", "uid": 501}
+    token = {"pid": 103, "uid": 501, "pidversion": 104,
+             "sha256": "sha256:token-103", "words": [103] * 8}
+    persisted = []
+    bound = []
+    observations = []
+    monkeypatch.setattr(custody, "audit_token_details",
+                        lambda words: {key: token[key] for key in ("pid", "pidversion", "uid", "sha256")})
+    broker = object.__new__(custody.RoleBoundCustodyBroker)
+    broker.state = "sealed"
+    broker.registration = {"identity": dict(identity), "audit_token_sha256": "old-sha",
+                           "audit_token_pidversion": 103}
+    broker.identity_provider = lambda pid: (observations.append(pid) or dict(identity)) if pid == 103 else None
+    broker.role_authority = SimpleNamespace(bind_target=lambda **kwargs: bound.append(kwargs))
+    broker.cleanup_actor = object()
+    broker.custody_generation = 1
+    broker._post_exec_connection = connection
+    broker._persist = persisted.append
+    return broker, identity, token, persisted, bound, observations
+
+
+def test_ready_binding_uses_authenticated_peer_token_only_for_task_name_denial(monkeypatch):
+    class Channel:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    channel = Channel()
+    broker, identity, token, persisted, bound, observations = _ready_token_broker(
+        monkeypatch, connection=channel,
+    )
+    monkeypatch.setattr(custody, "_peer_token", lambda received: token)
+
+    def denied(_pid):
+        raise custody._TaskNameUnavailable("final-ready Runtime task-name port is unavailable")
+
+    broker.bind_ready_token(expected_pid=103, expected_identity=identity, token_provider=denied)
+
+    assert observations == [103, 103]
+    assert broker.registration["audit_token_words"] == token["words"]
+    assert broker.registration["audit_token_sha256"] == token["sha256"]
+    assert bound[0]["token"] == token
+    assert persisted == ["readiness_token_bound"]
+    assert channel.closed and broker._post_exec_connection is None
+
+
+def test_ready_binding_rejection_closes_retained_channel(monkeypatch):
+    class Channel:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    channel = Channel()
+    broker, identity, _, persisted, bound, _ = _ready_token_broker(
+        monkeypatch, connection=channel,
+    )
+
+    with pytest.raises(custody.CustodyError, match="differs from provisional custody"):
+        broker.bind_ready_token(
+            expected_pid=103,
+            expected_identity={**identity, "birth_id": "wrong-birth"},
+        )
+
+    assert not bound and not persisted
+    assert channel.closed and broker._post_exec_connection is None
+
+
+@pytest.mark.parametrize("failure", ["absent", "identity-mismatch"])
+def test_ready_binding_peer_token_failure_remains_fatal(monkeypatch, failure):
+    class Channel:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    channel = Channel()
+    broker, identity, token, persisted, bound, _ = _ready_token_broker(
+        monkeypatch, connection=channel,
+    )
+    if failure == "absent":
+        def absent(_received):
+            raise custody.CustodyError("peer token is unavailable")
+        monkeypatch.setattr(custody, "_peer_token", absent)
+    else:
+        monkeypatch.setattr(custody, "_peer_token", lambda _received: {**token, "pid": 104})
+
+    def denied(_pid):
+        raise custody._TaskNameUnavailable("final-ready Runtime task-name port is unavailable")
+
+    with pytest.raises(custody.CustodyError, match="peer token is unavailable|audit token is invalid"):
+        broker.bind_ready_token(expected_pid=103, expected_identity=identity, token_provider=denied)
+    assert not bound and not persisted
+    assert channel.closed and broker._post_exec_connection is None
 
 
 @pytest.mark.parametrize("actor,generation", [(102, 1), (101, 2)])
