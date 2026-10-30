@@ -155,7 +155,7 @@ selection.write_text(json.dumps(selected)); marker=program/'install.json'; marke
 snapshots={{path:path.read_bytes() for path in (selection,program/'current',version/'version.json',profile,marker)}}
 fake=SimpleNamespace(root=realm,instance_id='old-instance',startup_identity={{'release':4,'managed_by':None}},startup_identity_instance_id='old-instance',support_root=data/'runtime',service=SimpleNamespace(realm={{'id':'test-realm'}}),_identity_agent_checkout=agent,_identity_runtime_checkout=runtime)
 admission=update.UpdateAdmission(fake)
-admission._selection=lambda:(selection,snapshots,python,agent,runtime,4)
+admission._selection=lambda **_kwargs:(selection,snapshots,python,agent,runtime,4)
 admission._installer_idle=lambda _path: contextlib.nullcontext()
 update.assert_interruption_safe=lambda _root:None
 def helper(_python,_agent,_runtime,payload,**kwargs):
