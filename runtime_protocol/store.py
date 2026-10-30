@@ -3506,6 +3506,14 @@ class RealmStore:
                     },
                 )
                 continue
+            if self.delegated_children(row["id"], row["attempt_id"]):
+                # Accepted lineage belongs to this exact parent attempt.
+                # Containment fences/settles children, but does not prove the
+                # parent executor stopped. Retain its custody until the owner
+                # reconciles through the existing failure/cancellation path.
+                # A policy alone, or children from a prior attempt, does not
+                # prevent ordinary worker lease recovery below.
+                continue
             self.conn.execute("UPDATE tasks SET status='queued', executor_id=NULL, lease_token=NULL, lease_expires_at=NULL, waiting_reason='waiting_for_worker', updated_at=? WHERE id=?", (timestamp, row["id"]))
             reconciled_attempt_id = self._reconcile_runtime_attempt(
                 row["id"], row["attempt_id"]
