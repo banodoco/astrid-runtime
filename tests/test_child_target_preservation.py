@@ -95,14 +95,14 @@ def test_explicit_target_survives_child_admission_and_projection(runtime, target
     assert claimed["execution_binding"]["actual_target"] == EXPLICIT
 
 
-@pytest.mark.parametrize("target", [DEFAULT, TARGET], ids=["default-inherits", "inherited-selector"])
-def test_inherited_target_retains_canonical_staged_inputs(runtime, target):
+@pytest.mark.parametrize("target", [DEFAULT, TARGET], ids=["explicit-default", "inherited-selector"])
+def test_selected_target_retains_canonical_staged_inputs(runtime, target):
     service, _ = runtime
     _, receipt, task, descriptor = child_case(runtime, target=target)
     resource = admit_resource(service, receipt, task)
-    assert resource["execution_request"] == {"schema_version": 1, "target": TARGET, "inputs": [descriptor]}
-    assert resource["execution_binding"]["resolved_target"] == TARGET
-    assert claim_child(service, TARGET)["task_id"] == resource["task_id"]
+    assert resource["execution_request"] == {"schema_version": 1, "target": target, "inputs": [descriptor]}
+    assert resource["execution_binding"]["resolved_target"] == target
+    assert claim_child(service, target)["task_id"] == resource["task_id"]
 
 
 def test_local_default_retains_request_inputs_and_guarded_claim_path(runtime):
@@ -111,7 +111,8 @@ def test_local_default_retains_request_inputs_and_guarded_claim_path(runtime):
     resource = admit_resource(service, receipt, task)
     assert resource["execution_request"] == {"schema_version": 1, "target": DEFAULT, "inputs": [descriptor]}
     assert resource["execution_binding"]["resolved_target"] == DEFAULT
-    # A request still requires a matching selector and credential-verified placement.
+    # A generic executor still requires an explicit selector; the no-selector
+    # exception is reserved for the configured credential-verified local worker.
     assert claim_child(service, None, key="no-selector") is None
     assert claim_child(service, DEFAULT)["task_id"] == resource["task_id"]
 

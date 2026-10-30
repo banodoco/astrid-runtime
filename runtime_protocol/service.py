@@ -6648,10 +6648,10 @@ class RuntimeService:
             request["inputs"] = canonical_inputs
         if request is not None:
             request = dict(request)
-            # Default requests inherit placement. Recovery also projects the
-            # parent's original selector to its authorized replacement; other
-            # policy-approved explicit child selectors must survive admission.
-            if target["kind"] == "default" or (
+            # A supplied default is an explicit choice; the Agent bridge
+            # resolves inheritance before admission. Retain recovery projection
+            # of the parent's original non-default selector.
+            if target["kind"] != "default" and (
                 recovery is not None and target == recovery["original_target"]
             ):
                 target = effective_target or target
@@ -7822,9 +7822,21 @@ class RuntimeService:
             targeted_request = self.store._execution_request_from_row(item)
             targeted = targeted_request is not None
             if targeted:
-                if binding is None or requested_target is None:
+                if binding is None:
                     continue
-                if canonical_json(binding["resolved_target"]) != canonical_json(requested_target):
+                if requested_target is None:
+                    # Ordinary local managed inputs retain a default request.
+                    # Only the credential-verified local machine may consume
+                    # that exact default binding without a selector.
+                    if (targeted_request["target"] != {"kind": "default"}
+                            or binding["resolved_target"] != targeted_request["target"]
+                            or executor_id != self._local_claim_actor
+                            or identity is None or identity.get("actor") != executor_id
+                            or identity.get("qualified_activation") is not None
+                            or trusted_placement is None
+                            or trusted_placement["actual"]["kind"] != "machine"):
+                        continue
+                elif canonical_json(binding["resolved_target"]) != canonical_json(requested_target):
                     continue
                 selected_binding = binding
             row = item
