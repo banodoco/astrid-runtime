@@ -115,6 +115,9 @@ jobs:
   portability-lifecycle:
     env:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
+    defaults:
+      run:
+        working-directory: astrid-runtime
     strategy:
       fail-fast: false
       matrix:
@@ -122,6 +125,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: astrid-runtime
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
