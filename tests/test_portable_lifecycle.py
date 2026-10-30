@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-import contextlib
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -23,6 +24,91 @@ from astrid_runtime import update
 
 HOSTED_ORIGIN = "https://hosted.test"
 ROOT = Path(__file__).resolve().parents[1]
+_CHILD_OUTPUT_LIMIT = 4096
+
+
+def _redacted_tail(value: str | bytes | None) -> str:
+    """Keep readiness-failure output small without exposing credential values."""
+    if isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    value = value or ""
+    tail = value[-_CHILD_OUTPUT_LIMIT:]
+    return re.sub(
+        r'(?i)(["\']?(?:token|authorization|credential|secret|password)["\']?\s*[:=]\s*)'
+        r'(?:["\'][^"\']*["\']|\S+)',
+        r"\1<redacted>",
+        tail,
+    )
+
+
+def _readiness_failure(
+    process: subprocess.Popen[str], *, started_monotonic: float, started_unix: float, polls: int,
+) -> str:
+    """Return bounded child state after an early exit or readiness timeout."""
+    observed_monotonic = time.monotonic()
+    observed_unix = time.time()
+    exit_before_capture = process.poll()
+    if exit_before_capture is None:
+        process.kill()
+    try:
+        stdout, stderr = process.communicate(timeout=5)
+        drain = "completed"
+    except subprocess.TimeoutExpired as first_timeout:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+            drain = "completed after forced child kill"
+        except subprocess.TimeoutExpired as second_timeout:
+            stdout, stderr = second_timeout.output or first_timeout.output, (
+                second_timeout.stderr or first_timeout.stderr
+            )
+            drain = "timed out after bounded 5s + 5s drain"
+    details = {
+        "child_exit_after_capture": process.returncode,
+        "child_exit_before_capture": exit_before_capture,
+        "child_output_drain": drain,
+        "child_pid": process.pid,
+        "child_stderr_tail": _redacted_tail(stderr),
+        "child_stdout_tail": _redacted_tail(stdout),
+        "readiness_elapsed_seconds": round(observed_monotonic - started_monotonic, 3),
+        "readiness_observed_monotonic": observed_monotonic,
+        "readiness_observed_unix": observed_unix,
+        "readiness_polls": polls,
+        "readiness_started_monotonic": started_monotonic,
+        "readiness_started_unix": started_unix,
+    }
+    return f"RuntimeDaemon child did not publish readiness: {json.dumps(details, sort_keys=True)}"
+
+
+def test_readiness_failure_reports_live_child_state(tmp_path: Path):
+    started = tmp_path / "child-started"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, sys, time; print('token=not-for-output', flush=True); "
+            "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(60)",
+            str(started),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 5
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+    diagnostics = _readiness_failure(
+        process,
+        started_monotonic=time.monotonic(),
+        started_unix=time.time(),
+        polls=400,
+    )
+    assert '"child_exit_before_capture": null' in diagnostics
+    assert '"child_exit_after_capture":' in diagnostics
+    assert '"child_stdout_tail": "token=<redacted>\\n"' in diagnostics
+    assert "not-for-output" not in diagnostics
 
 
 def _python(environment: Path) -> Path:
@@ -188,12 +274,23 @@ while True: time.sleep(1)
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     worker_result_payload = None
     try:
+        readiness_started_monotonic = time.monotonic()
+        readiness_started_unix = time.time()
         deadline = time.monotonic() + 20
+        readiness_polls = 0
         while not ready.exists() and time.monotonic() < deadline:
+            readiness_polls += 1
             if runtime_process.poll() is not None:
-                stdout, stderr = runtime_process.communicate()
-                raise AssertionError(f"RuntimeDaemon child failed: {stderr}{stdout}")
+                raise AssertionError(_readiness_failure(
+                    runtime_process, started_monotonic=readiness_started_monotonic,
+                    started_unix=readiness_started_unix, polls=readiness_polls,
+                ))
             time.sleep(0.05)
+        if not ready.exists():
+            raise AssertionError(_readiness_failure(
+                runtime_process, started_monotonic=readiness_started_monotonic,
+                started_unix=readiness_started_unix, polls=readiness_polls,
+            ))
         port = json.loads(ready.read_text(encoding="utf-8"))["port"]
         response = door_call(port, "/api/runtime/v1/update", "POST", body=b"")
         assert response.status == 202, response.body
