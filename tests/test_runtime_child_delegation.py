@@ -1924,3 +1924,29 @@ def test_named_compose_rejects_unusable_selected_raw_association(runtime, corrup
     with pytest.raises((AuthorizationError, ConflictError)):
         admit_stage(service, p, policy, "compose", associations)
     assert len(service.store.delegated_children(p["task_id"], p["attempt_id"])) == 1
+
+
+@pytest.mark.parametrize("corruption", ["selector", "wrong_attempt", "stale", "omission", "substitution"])
+def test_named_compose_revalidates_selected_raw_at_settlement(runtime, corruption):
+    service, _ = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="raw")
+    admitted = admit_stage(service, p, policy, "compose", associations)
+    attempt = claim(service, CHILD, "compose-revalidate-claim")
+    body = stage_settlement(service, attempt, b"candidate", "candidate_video")
+    raw = associations[("raw", "raw_video")]
+    if corruption == "selector":
+        service.store.conn.execute("UPDATE managed_output_associations SET variant_key='substituted' WHERE association_id=?", (raw["association_id"],))
+    elif corruption == "wrong_attempt":
+        service.store.conn.execute("UPDATE managed_output_associations SET attempt_id=? WHERE association_id=?", (p["attempt_id"], raw["association_id"]))
+    elif corruption == "stale":
+        service.store.conn.execute("UPDATE managed_output_lifecycle SET state='reclaimed' WHERE association_id=?", (raw["association_id"],))
+    else:
+        spec = load_task_spec(service, admitted["task"]["id"])
+        if corruption == "omission":
+            spec["delegated_inputs"] = []
+        else:
+            spec["delegated_inputs"][0]["association_id"] = "substituted-association"
+        store_task_spec(service, admitted["task"]["id"], spec)
+    with pytest.raises((AuthorizationError, ConflictError)):
+        service.settle_attempt(attempt["attempt_id"], body, idempotency_key="compose-revalidate", identity=IDENTITY)
+    assert not service.managed_outputs(attempt["task_id"])
