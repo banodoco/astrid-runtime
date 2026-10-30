@@ -6369,12 +6369,13 @@ class RuntimeService:
                     or not (order.index(raw["stage"]) <= order.index(candidate) < order.index(verify) < order.index(final["stage"]))
                     or final["stage"] != order[-1] or raw["effect"] == final["effect"]):
                 raise ValidationError("named publications must order raw, candidate, verification, and distinct final effects")
-            def consumes(stage, producer, port):
-                return sum(ref.get("producer_stage") == producer and ref.get("output_port") == port for ref in stages[stage]["inputs"]) == 1
+            def consumes(stage, producer, port, *, allow_auxiliary=False):
+                count = sum(ref.get("producer_stage") == producer and ref.get("output_port") == port for ref in stages[stage]["inputs"])
+                return count >= 1 if allow_auxiliary else count == 1
             if candidate == raw["stage"]:
                 if final["candidate_output_port"] != raw["output_port"]:
                     raise ValidationError("raw candidate must use the declared raw output port")
-            elif not consumes(candidate, raw["stage"], raw["output_port"]):
+            elif not consumes(candidate, raw["stage"], raw["output_port"], allow_auxiliary=True):
                 raise ValidationError("candidate stage must consume the actual raw publication")
             if (not consumes(verify, candidate, final["candidate_output_port"])
                     or len(stages[final["stage"]]["inputs"]) != 2
@@ -6712,6 +6713,41 @@ class RuntimeService:
             raise ValidationError("resolved delegated inputs must have unique object IDs")
         return object_ids, resolved
 
+    @staticmethod
+    def _named_publication_output(effect, outputs):
+        """Resolve the admitted GEN selector, including legacy output defaults."""
+        group = effect["payload"]["groups"][0]
+        selector = group["selectors"][0]
+        key = (selector["output_port"], group["group_key"], selector["variant_key"], selector["ordinal"])
+        if not isinstance(outputs, list):
+            raise ValidationError("named publication requires an outputs list")
+        matches = []
+        for output in outputs:
+            if not isinstance(output, dict) or output.get("role") == "thumbnail":
+                continue
+            ordinal = output.get("ordinal", 0)
+            if type(ordinal) is not int or ordinal < 0:
+                continue
+            alias = output.get("selector")
+            alias = alias if isinstance(alias, dict) else {}
+            actual = (output.get("output_port", output.get("name", "output")),
+                      output.get("group_key", alias.get("group_key", "default")),
+                      output.get("variant_key", alias.get("variant_key", str(ordinal))), ordinal)
+            if actual == key:
+                matches.append(output)
+        if len(matches) != 1:
+            raise ConflictError("named publication selector must resolve exactly one output")
+        return matches[0]
+
+    def _named_publication_association(self, task, publication):
+        outputs = [output for output in self.store.list_managed_outputs(task["id"])
+                   if output["attempt_id"] == task["attempt_id"]]
+        output = self._named_publication_output(publication["effect"], outputs)
+        if (output["role"] == "recoverable_snapshot" or output["durability"] != "durable"
+                or output["lifecycle"]["state"] not in {"available", "promoted"}):
+            raise ConflictError("named publication selected association is no longer available")
+        return output
+
     def _assert_delegated_publication_source(self, source, project):
         association = self.store.get_managed_output(source["association_id"])
         producer = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (source["producer_task_id"],)).fetchone()
@@ -6790,6 +6826,10 @@ class RuntimeService:
             if spec.get("delegated_parent") != lineage or spec.get("delegated_stage") != source[key]["producer_stage"]:
                 raise ConflictError("named publication source escaped its parent lineage")
             producers[key] = spec
+        raw_task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (source["raw"]["producer_task_id"],)).fetchone()
+        selected_raw = self._named_publication_association(raw_task, {"effect": source["raw_effect"]})
+        if selected_raw["association_id"] != source["raw"]["association_id"]:
+            raise ConflictError("raw publication selector no longer resolves its frozen association")
         def consumes(spec, selected):
             return any(all(ref.get(key) == selected[key] for key in ("producer_task_id", "producer_attempt_id", "association_id", "output_port", "object_id"))
                        for ref in spec.get("delegated_inputs", []))
@@ -6907,6 +6947,17 @@ class RuntimeService:
                 publication_effect = final["effect"]
             publications = policy.get("publications")
             if publications is not None:
+                raw = publications["raw"]
+                final = publications["final"]
+                raw_consumer = (final["candidate_stage"] if final["candidate_stage"] != raw["stage"]
+                                else final["verify_stage"])
+                if stage_name == raw_consumer:
+                    raw_task = siblings[raw["stage"]]
+                    selected_raw = self._named_publication_association(raw_task, raw)
+                    consumed = [ref for ref in resolved_inputs if ref.get("producer_stage") == raw["stage"]
+                                and ref.get("output_port") == raw["output_port"]]
+                    if sum(ref.get("association_id") == selected_raw["association_id"] for ref in consumed) != 1:
+                        raise AuthorizationError("candidate lineage must consume the selected raw publication")
                 for publication_name, publication in publications.items():
                     if stage_name == publication["stage"]:
                         publication_effect = publication["effect"]
@@ -6916,10 +6967,7 @@ class RuntimeService:
                             verification = next(ref for ref in resolved_inputs if ref.get("producer_stage") == publication["verify_stage"] and ref.get("output_port") == publication["verify_output_port"])
                             raw = publications["raw"]
                             raw_task = siblings[raw["stage"]]
-                            raw_outputs = [output for output in self.store.list_managed_outputs(raw_task["id"]) if output["attempt_id"] == raw_task["attempt_id"] and output["output_port"] == raw["output_port"] and output["role"] != "recoverable_snapshot"]
-                            if len(raw_outputs) != 1:
-                                raise ConflictError("raw publication must have one actual managed association")
-                            raw_association = raw_outputs[0]
+                            raw_association = self._named_publication_association(raw_task, raw)
                             raw_source = {"producer_stage": raw["stage"], "producer_task_id": raw_task["id"], "producer_attempt_id": raw_task["attempt_id"], "association_id": raw_association["association_id"], "output_port": raw["output_port"], "object_id": raw_association["object_id"]}
                             if candidate["producer_task_id"] != raw_task["id"]:
                                 candidate_task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (candidate["producer_task_id"],)).fetchone()
@@ -8368,14 +8416,15 @@ class RuntimeService:
             if verified_source is not None and "publication_name" in verified_source:
                 name = verified_source["publication_name"]
                 outputs = body.get("outputs") or []
-                selected = [output for output in outputs if isinstance(output, dict) and output.get("output_port") == verified_source["output_port"]]
-                if (len(selected) != 1 or selected[0].get("kind", "object") != "object"
-                        or selected[0].get("durability", "durable") != "durable"):
+                selected = self._named_publication_output(declared, outputs)
+                if (selected.get("kind", "object") != "object"
+                        or selected.get("durability", "durable") != "durable"
+                        or selected.get("role") == "recoverable_snapshot"):
                     raise AuthorizationError("named publication must use its one declared durable output")
                 publication_binding = {"name": name, **{key: lineage[key] for key in ("parent_task_id", "parent_attempt_id", "parent_fence", "runtime_epoch")}}
                 if name == "final":
                     self._validate_named_publication_lineage(verified_source, project_id, lineage)
-                    if selected[0].get("digest") != verified_source["candidate"]["object_id"]:
+                    if selected.get("digest") != verified_source["candidate"]["object_id"]:
                         raise AuthorizationError("final publication must use the declared candidate bytes")
                     publication_binding.update({key: verified_source[key] for key in ("candidate", "verification", "raw", "raw_publication")})
             parent_publication = None
@@ -8402,11 +8451,11 @@ class RuntimeService:
                         raise ValidationError("complete requires editorial approval and verified cleanup evidence")
                 children = self.store.delegated_children(task["id"], attempt_id)
                 final_children = [child for child in children if self.store._spec(child).get("delegated_stage") == publications["final"]["stage"]]
-                final_outputs = [association for child in final_children for association in self.store.list_managed_outputs(child["id"])
-                                 if association["attempt_id"] == child["attempt_id"] and association["output_port"] == publications["final"]["output_port"]]
-                if len(final_outputs) != 1 or not isinstance(final_outputs[0]["provenance"].get("delegated_publication"), dict):
+                if len(final_children) != 1:
                     raise ConflictError("parent requires its actual settled final publication")
-                final_output = final_outputs[0]
+                final_output = self._named_publication_association(final_children[0], publications["final"])
+                if not isinstance(final_output["provenance"].get("delegated_publication"), dict):
+                    raise ConflictError("parent requires its actual settled final publication")
                 final_spec = self.store._spec(final_children[0])
                 final_source = final_spec.get("verified_publication_source")
                 final_lineage = final_spec.get("delegated_parent")
@@ -8422,10 +8471,10 @@ class RuntimeService:
                 if (final_output["object_id"] != final_source["candidate"]["object_id"]
                         or any(final_output["provenance"]["delegated_publication"].get(key) != final_source[key] for key in ("candidate", "verification", "raw", "raw_publication"))):
                     raise ConflictError("parent final publication binding no longer matches its frozen sources")
-                if not any(isinstance(output, dict) and output.get("digest") == final_output["object_id"]
-                           and output.get("output_port") == final_output["output_port"]
-                           and output.get("kind", "object") == "object" and output.get("durability", "durable") == "durable"
-                           for output in body.get("outputs", [])):
+                parent_selected = self._named_publication_output(final_effect, body.get("outputs", []))
+                if (parent_selected.get("digest") != final_output["object_id"]
+                        or parent_selected.get("kind", "object") != "object"
+                        or parent_selected.get("durability", "durable") != "durable"):
                     raise AuthorizationError("parent must retain the actual final publication output")
                 parent_publication = final_output
             if _verified_objects is not None and (row["executor_id"] != MEDIA_IMPORT_EXECUTOR or task["capability"] != MEDIA_IMPORT_CAPABILITY):
@@ -8440,15 +8489,13 @@ class RuntimeService:
                 verified_objects=_verified_objects,
             )
             if publication_binding is not None:
-                for output in staged["outputs"]:
-                    if output.get("output_port") == verified_source["output_port"]:
-                        output["provenance"] = {**(output.get("provenance") or {}), "delegated_publication": publication_binding}
+                selected_staged = self._named_publication_output(declared, staged["outputs"])
+                selected_staged["provenance"] = {**(selected_staged.get("provenance") or {}), "delegated_publication": publication_binding}
             if parent_publication is not None:
-                for output in staged["outputs"]:
-                    if output.get("digest") == parent_publication["object_id"] and output.get("output_port") == parent_publication["output_port"]:
-                        binding = dict(parent_publication["provenance"]["delegated_publication"])
-                        binding.update({"source_association_id": parent_publication["association_id"], "source_task_id": parent_publication["task_id"], "source_attempt_id": parent_publication["attempt_id"]})
-                        output["provenance"] = {**(output.get("provenance") or {}), "delegated_publication": binding}
+                output = self._named_publication_output(final_effect, staged["outputs"])
+                binding = dict(parent_publication["provenance"]["delegated_publication"])
+                binding.update({"source_association_id": parent_publication["association_id"], "source_task_id": parent_publication["task_id"], "source_attempt_id": parent_publication["attempt_id"]})
+                output["provenance"] = {**(output.get("provenance") or {}), "delegated_publication": binding}
             try:
                 # Persist one flat result object. Outputs are the only
                 # reserved field and are added atomically with user fields.
