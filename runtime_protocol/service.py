@@ -6648,7 +6648,14 @@ class RuntimeService:
             request["inputs"] = canonical_inputs
         if request is not None:
             request = dict(request)
-            request["target"] = effective_target or {"kind": "default"}
+            # Default requests inherit placement. Recovery also projects the
+            # parent's original selector to its authorized replacement; other
+            # policy-approved explicit child selectors must survive admission.
+            if target["kind"] == "default" or (
+                recovery is not None and target == recovery["original_target"]
+            ):
+                target = effective_target or target
+            request["target"] = target
         elif effective_target is not None:
             request = {"schema_version": 1, "target": effective_target}
         if derived_refs:
