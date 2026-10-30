@@ -8451,6 +8451,9 @@ class RuntimeService:
         if placement is None or placement["actual"]["kind"] != "machine":
             raise AuthorizationError("delegated claim requires verified machine placement")
         epoch = self.store._validate_runtime_epoch(body["runtime_epoch"], identity="executor", identity_id=executor_id, required=True)
+        registered = self.store.conn.execute("SELECT runtime_epoch FROM executors WHERE id=?", (executor_id,)).fetchone()
+        if registered is None or int(registered["runtime_epoch"]) != epoch:
+            raise LeaseError("delegated claim executor registration belongs to another runtime epoch")
         payload, parent_attempt, parent, project, policy, _, placement_version, effective_target = self._live_child_authority(body["authority"], identity=identity)
         if executor_id != parent_attempt["executor_id"]:
             raise AuthorizationError("delegated claim must use the verified parent executor")

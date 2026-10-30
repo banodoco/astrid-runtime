@@ -152,7 +152,7 @@ def test_rejects_every_foreign_stored_lineage_component(runtime, field):
     "missing-placement", "machine", "incarnation", "unverified", "non-machine", "target",
     "epoch", "fence", "lease", "expired-parent", "missing-parent-deadline", "parent-deadline-mismatch",
     "revoked", "cancelled-parent", "changed-policy", "parent-binding-missing", "parent-binding-fence",
-    "parent-binding-machine", "authority-signature",
+    "parent-binding-machine", "authority-signature", "executor-registration-epoch",
 ])
 def test_authority_executor_machine_target_and_parent_rejections_are_atomic(runtime, mutation):
     service, _ = runtime
@@ -168,6 +168,7 @@ def test_authority_executor_machine_target_and_parent_rejections_are_atomic(runt
         identity["actor"] = "foreign"
         if mutation == "admin-actor": identity["scopes"].append("admin")
     elif mutation == "executor": body["executor_id"] = "foreign"
+    elif mutation == "executor-registration-epoch": service.store.conn.execute("UPDATE executors SET runtime_epoch=runtime_epoch+1 WHERE id='worker'")
     elif mutation == "missing-placement": identity.pop("execution_binding")
     elif mutation == "machine": identity["execution_binding"]["actual"] = {"kind": "machine", "id": "foreign"}
     elif mutation == "incarnation": identity["execution_binding"]["executor_incarnation"] = "foreign"
@@ -178,7 +179,7 @@ def test_authority_executor_machine_target_and_parent_rejections_are_atomic(runt
     elif mutation == "fence": service.store.conn.execute("UPDATE attempts SET fence=fence+1 WHERE id=?", (p["attempt_id"],))
     elif mutation == "lease": service.store.conn.execute("UPDATE attempts SET lease_id='foreign' WHERE id=?", (p["attempt_id"],))
     elif mutation == "expired-parent": service.store.conn.execute("UPDATE attempts SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (p["attempt_id"],))
-    elif mutation == "missing-parent-deadline": service.store.conn.execute("UPDATE attempts SET lease_expires_at=NULL WHERE id=?", (p["attempt_id"],))
+    elif mutation == "missing-parent-deadline": service.store.conn.execute("UPDATE attempts SET lease_expires_at='' WHERE id=?", (p["attempt_id"],))
     elif mutation == "parent-deadline-mismatch": service.store.conn.execute("UPDATE tasks SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (p["task_id"],))
     elif mutation == "cancelled-parent": service.store.conn.execute("UPDATE tasks SET status='cancelled' WHERE id=?", (p["task_id"],))
     elif mutation in {"revoked", "changed-policy"}:
@@ -267,7 +268,7 @@ def test_recovery_lifetime_retry_and_parent_capacity_fail_closed(runtime, mutati
     _no_claim_receipt(service)
 
 
-@pytest.mark.parametrize("mutation", ["parent-revoked", "parent-expired", "child-expired", "child-settled", "child-cancelled", "child-fence", "child-binding", "heartbeat", "missing-attempt-deadline", "mismatched-attempt-deadline", "reservation-deadline", "readiness", "capability", "capacity"])
+@pytest.mark.parametrize("mutation", ["parent-revoked", "parent-expired", "child-expired", "child-settled", "child-cancelled", "child-fence", "child-binding", "heartbeat", "missing-attempt-deadline", "mismatched-attempt-deadline", "reservation-deadline", "readiness", "capability", "capacity", "executor-registration-epoch"])
 def test_replay_rechecks_live_parent_and_same_live_child(runtime, mutation):
     service, _ = runtime
     p, child, body, others = _case(runtime)
@@ -284,12 +285,13 @@ def test_replay_rechecks_live_parent_and_same_live_child(runtime, mutation):
     elif mutation == "child-cancelled": service.store.conn.execute("UPDATE tasks SET status='cancel_requested' WHERE id=?", (child,))
     elif mutation == "child-fence": service.store.conn.execute("UPDATE tasks SET lease_fence=lease_fence+1 WHERE id=?", (child,))
     elif mutation == "child-binding": service.store.conn.execute("UPDATE execution_bindings SET fence=fence+1 WHERE task_id=?", (child,))
-    elif mutation == "missing-attempt-deadline": service.store.conn.execute("UPDATE attempts SET lease_expires_at=NULL WHERE id=?", (result["attempt_id"],))
+    elif mutation == "missing-attempt-deadline": service.store.conn.execute("UPDATE attempts SET lease_expires_at='' WHERE id=?", (result["attempt_id"],))
     elif mutation == "mismatched-attempt-deadline": service.store.conn.execute("UPDATE attempts SET lease_expires_at='2099-01-01T00:00:00+00:00' WHERE id=?", (result["attempt_id"],))
     elif mutation == "reservation-deadline": service.store.conn.execute("UPDATE reservations SET lease_expires_at='2099-01-01T00:00:00+00:00' WHERE task_id=?", (child,))
     elif mutation == "heartbeat":
         service.store.conn.execute("UPDATE tasks SET lease_expires_at='2099-01-01T00:00:00+00:00' WHERE id=?", (child,))
         service.store.conn.execute("UPDATE attempts SET lease_expires_at='2099-01-01T00:00:00+00:00' WHERE id=?", (result["attempt_id"],))
+    elif mutation == "executor-registration-epoch": service.store.conn.execute("UPDATE executors SET runtime_epoch=runtime_epoch+1 WHERE id='worker'")
     elif mutation == "readiness": service.store.conn.execute("UPDATE executors SET readiness='not_ready' WHERE id='worker'")
     elif mutation == "capability": service.store.conn.execute("UPDATE capabilities SET status='unavailable' WHERE id=?", (CHILD,))
     elif mutation == "capacity": service.store.conn.execute("UPDATE executors SET max_concurrency=1 WHERE id='worker'")
