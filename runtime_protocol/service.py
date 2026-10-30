@@ -8542,7 +8542,8 @@ class RuntimeService:
             attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (replay["attempt_id"],)).fetchone()
             self._assert_attempt_identity(attempt, identity)
             self._validate_attempt_lease(attempt, replay, epoch)
-            if (attempt["lease_expires_at"] != replay["lease_expires_at"]
+            if (attempt["task_id"] != str(task_id) or attempt["executor_id"] != executor_id
+                    or attempt["lease_expires_at"] != replay["lease_expires_at"]
                     or child["status"] != "running" or child["attempt_id"] != replay["attempt_id"]
                     or child["lease_token"] != replay["lease_id"] or child["lease_fence"] != replay["fence"]
                     or child["executor_id"] != executor_id or child["runtime_epoch"] != epoch

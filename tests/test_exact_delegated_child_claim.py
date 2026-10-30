@@ -268,7 +268,7 @@ def test_recovery_lifetime_retry_and_parent_capacity_fail_closed(runtime, mutati
     _no_claim_receipt(service)
 
 
-@pytest.mark.parametrize("mutation", ["parent-revoked", "parent-expired", "child-expired", "child-settled", "child-cancelled", "child-fence", "child-binding", "heartbeat", "missing-attempt-deadline", "mismatched-attempt-deadline", "reservation-deadline", "readiness", "capability", "capacity", "executor-registration-epoch"])
+@pytest.mark.parametrize("mutation", ["parent-revoked", "parent-expired", "child-expired", "child-settled", "child-cancelled", "child-fence", "child-binding", "heartbeat", "missing-attempt-deadline", "mismatched-attempt-deadline", "reservation-deadline", "readiness", "capability", "capacity", "executor-registration-epoch", "attempt-task", "attempt-executor"])
 def test_replay_rechecks_live_parent_and_same_live_child(runtime, mutation):
     service, _ = runtime
     p, child, body, others = _case(runtime)
@@ -280,6 +280,8 @@ def test_replay_rechecks_live_parent_and_same_live_child(runtime, mutation):
         spec = load_task_spec(service, p["task_id"]); spec["delegation_closed_attempt_id"] = p["attempt_id"]
         store_task_spec(service, p["task_id"], spec)
     elif mutation == "parent-expired": service.store.conn.execute("UPDATE attempts SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (p["attempt_id"],))
+    elif mutation == "attempt-task": service.store.conn.execute("UPDATE attempts SET task_id=? WHERE id=?", (p["task_id"], result["attempt_id"]))
+    elif mutation == "attempt-executor": service.store.conn.execute("UPDATE attempts SET executor_id='foreign' WHERE id=?", (result["attempt_id"],))
     elif mutation == "child-expired": service.store.conn.execute("UPDATE attempts SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (result["attempt_id"],))
     elif mutation == "child-settled": service.store.conn.execute("UPDATE attempts SET settled=1 WHERE id=?", (result["attempt_id"],))
     elif mutation == "child-cancelled": service.store.conn.execute("UPDATE tasks SET status='cancel_requested' WHERE id=?", (child,))
@@ -297,7 +299,8 @@ def test_replay_rechecks_live_parent_and_same_live_child(runtime, mutation):
     elif mutation == "capacity": service.store.conn.execute("UPDATE executors SET max_concurrency=1 WHERE id='worker'")
     with pytest.raises(REJECTED):
         _claim(service, child, body)
-    assert service.store.conn.execute("SELECT COUNT(*) FROM attempts WHERE task_id=?", (child,)).fetchone()[0] == 1
+    assert service.store.conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 2
+    assert service.store.conn.execute("SELECT COUNT(*) FROM attempts WHERE id=?", (result["attempt_id"],)).fetchone()[0] == 1
     _unclaimed(service, *others)
 
 
