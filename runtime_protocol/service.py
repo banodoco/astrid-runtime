@@ -7117,8 +7117,14 @@ class RuntimeService:
             request["inputs"] = canonical_inputs
         if request is not None:
             request = dict(request)
-            request["target"] = (stage["target"] if stages is not None and "execution_request" in stage
-                                 else effective_target or {"kind": "default"})
+            # Supplied default is explicit; absent requests inherit below.
+            # An admitted frozen stage keeps its exact request, while ordinary
+            # children retain authorized parent-selector recovery projection.
+            if (not (stages is not None and "execution_request" in stage)
+                    and target["kind"] != "default" and recovery is not None
+                    and target == recovery["original_target"]):
+                target = effective_target or target
+            request["target"] = target
         elif effective_target is not None:
             request = {"schema_version": 1, "target": effective_target}
         if derived_refs:
@@ -8286,14 +8292,32 @@ class RuntimeService:
             if isinstance(activation, dict) and not self._activation_scope_matches(item["id"], activation, trusted_placement):
                 # An exact prepared generation cannot block, mutate, or claim
                 # an earlier queued sibling merely sharing capability/target.
-                continue
+                try:
+                    prepared_actor = self.prepared_child_executor(activation.get("task_id"))
+                except (AuthorizationError, ConflictError, LeaseError, ValidationError, NotFoundError):
+                    continue
+                if prepared_actor is not None:
+                    continue
+                # Ordinary remote generations retain the existing waiting
+                # response; remote activation authorization still runs below.
             binding = self.store.execution_binding(item["id"])
             targeted_request = self.store._execution_request_from_row(item)
             targeted = targeted_request is not None
             if targeted:
-                if binding is None or requested_target is None:
+                if binding is None:
                     continue
-                if canonical_json(binding["resolved_target"]) != canonical_json(requested_target):
+                if requested_target is None:
+                    # Only the configured credential-verified local machine
+                    # may consume an exact default request without a selector.
+                    if (targeted_request["target"] != {"kind": "default"}
+                            or binding["resolved_target"] != targeted_request["target"]
+                            or executor_id != self._local_claim_actor
+                            or identity is None or identity.get("actor") != executor_id
+                            or identity.get("qualified_activation") is not None
+                            or trusted_placement is None
+                            or trusted_placement["actual"]["kind"] != "machine"):
+                        continue
+                elif canonical_json(binding["resolved_target"]) != canonical_json(requested_target):
                     continue
                 selected_binding = binding
             row = item

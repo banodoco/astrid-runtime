@@ -100,11 +100,11 @@ def authority(service, attempt, *, refs=None, key="child", cap=CHILD):
     return service.issue_child_authority(attempt["attempt_id"], body, identity=IDENTITY)
 
 
-def admit(service, receipt, *, refs=None, key="child", cap=CHILD, params=None):
+def admit(service, receipt, *, refs=None, key="child", cap=CHILD, params=None, target=None):
     task = {"capability_id": cap, "capability_digest": digest(cap), "input_object_ids": [], "spec": {"params": params or {"query": "fixture://video"}}}
     if refs is not None:
         task["input_object_ids"] = [ref["object_id"] for ref in refs]
-        task["execution_request"] = {"schema_version": 1, "target": {"kind": "default"}, "inputs": [{"name": ref["name"], "object_id": ref["object_id"], "filename": ref["filename"], "digest": ref["object_id"]} for ref in refs]}
+        task["execution_request"] = {"schema_version": 1, "target": target if target is not None else {"kind": "default"}, "inputs": [{"name": ref["name"], "object_id": ref["object_id"], "filename": ref["filename"], "digest": ref["object_id"]} for ref in refs]}
     return service.admit_delegated_child({"authority": receipt["authority"], "task": task}, idempotency_key=key, identity=IDENTITY)
 
 
@@ -501,7 +501,9 @@ def test_four_by_four_runtime_fanout_has_33_overlapping_required_children(runtim
         cap = CHILD if index < 17 else OTHER
         key = "fanout-" + str(index)
         ref = refs[index if index < 17 else index - 16]
-        accepted.append(admit(service, authority(service, attempt, refs=[ref], key=key, cap=cap), refs=[ref], key=key, cap=cap))
+        # The integrated Agent bridge resolves inheritance before Runtime sees
+        # the file request; an explicit default now remains a real choice.
+        accepted.append(admit(service, authority(service, attempt, refs=[ref], key=key, cap=cap), refs=[ref], key=key, cap=cap, target=TARGET))
     attempts = [claim(service, CHILD if index < 17 else OTHER, "claim-fanout-" + str(index)) for index in range(33)]
     assert service.store.delegated_child_accounting(attempt["task_id"], attempt["attempt_id"])["active"] == 33
     assert all(value["task"]["execution_request"]["target"] == TARGET for value in accepted)
