@@ -1,8 +1,12 @@
 """CPU-only ownership protocol proof; no kernel signaling qualification."""
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 import signal
+import socket
 import threading
+import traceback
+from types import SimpleNamespace
 
 import pytest
 
@@ -208,8 +212,177 @@ def test_retained_binding_serializes_waiter_and_refuses_changed_capture(graph):
         assert wait_guard.locked(), "waiter must be excluded throughout kernel binding"
         identities[103] = {**identities[103], "birth_id": "replacement"}
         return tokens[pid]
-    with pytest.raises(custody.CustodyError, match="changed"):
+    with pytest.raises(custody.CustodyError, match="changed") as error:
         custody.AuthenticatedCleanupActor.retained_child(child, reap_guard=threading.RLock(), identity_provider=identities.get, token_provider=token)
+    assert str(error.value).endswith("[stage=retained_child.after; identity=available; mismatched_fields=birth_id]")
+
+
+@pytest.mark.parametrize("edge,diagnostic", [
+    ("before-absent", "stage=retained_child.before; identity=absent; mismatched_fields=none"),
+    ("wrong-parent", "stage=retained_child.before; identity=available; mismatched_fields=parent_pid"),
+    ("after-absent", "stage=retained_child.after; identity=absent; mismatched_fields=none"),
+])
+def test_retained_binding_diagnostics_preserve_refusal(graph, edge, diagnostic):
+    identity = {**graph[2][103], "parent_pid": os.getpid()}
+    child = SimpleNamespace(pid=103, returncode=None, _waitpid_lock=threading.Lock())
+    if edge == "before-absent":
+        observations = iter([None])
+    elif edge == "wrong-parent":
+        observations = iter([{**identity, "parent_pid": os.getpid() + 1}])
+    else:
+        observations = iter([identity, identity, None])
+    with pytest.raises(custody.CustodyError) as error:
+        custody.AuthenticatedCleanupActor.retained_child(child, reap_guard=threading.RLock(),
+            identity_provider=lambda pid: next(observations), token_provider=graph[3].get)
+    assert str(error.value).endswith("[" + diagnostic + "]")
+    assert child.returncode is None
+
+
+@pytest.fixture
+def retained_diagnostics(tmp_path, monkeypatch):
+    """Production retained/report/abort path with only synthetic OS inputs."""
+    from runtime_protocol.local_execution_supervisor import RetainedProcess
+    from runtime_protocol import local_worker_composition as composition
+    from test_local_worker import host_only_profile_case
+
+    identity = {"pid": 103, "uid": 501, "birth_id": "private-birth", "parent_pid": os.getpid()}
+    token = {"pid": 103, "uid": 501, "pidversion": 17, "sha256": "private-token-digest",
+             "words": [987654321] * 8, "credential": "synthetic-private-credential"}
+    observations = {"identity": dict(identity), "token": dict(token)}
+
+    def observe(kind):
+        value = observations[kind]
+        if isinstance(value, Exception):
+            raise value
+        return dict(value) if value is not None else None
+
+    monkeypatch.setattr(custody, "default_process_identity", lambda pid: observe("identity"))
+    monkeypatch.setattr(custody, "current_process_audit_token", lambda pid: observe("token"))
+    child = SimpleNamespace(pid=103, returncode=None, _waitpid_lock=threading.Lock(), poll=lambda: None)
+    retained = RetainedProcess(child)
+    actor = retained.bind_actor()
+    pinned = retained.verify()
+    preparer = composition.CrossProcessWorkerPreparer(profile=host_only_profile_case(), config={}, environment={})
+    control, peer = socket.socketpair()
+    activation, activation_peer = socket.socketpair()
+    events = []
+    handle = composition._PreparedWorker(child, identity["birth_id"], control, {}, tmp_path / "config.json",
+        retained=retained, host_only=True, activation=activation, owner_epoch="epoch", custody_scope=str(tmp_path),
+        preparation={"version": "runtime.local-execution-preparation/v1", "operation_id": "op",
+                     "channel_id": "ch", "owner_epoch": "epoch"},
+        broker=SimpleNamespace(signal=lambda *a, **k: events.append("signal"),
+                               role_authority=SimpleNamespace(reference=lambda: {"unit": "reference"})),
+        launch_verifier=SimpleNamespace(verify_child=lambda *a, **k: None), verified_launch=object())
+    preparer._active = handle
+    retained.wait = lambda timeout: events.append("reap")
+    requests = []
+    monkeypatch.setattr(composition, "_frame_send", lambda channel, request: (requests.append(request), events.append("request")))
+
+    def acknowledge(channel):
+        events.append("ack")
+        return {**{k: v for k, v in requests[-1].items() if k != "command"},
+                "status": "cleaned", "cleanup": {"host_children": "absent"}}
+
+    monkeypatch.setattr(composition, "_frame_receive", acknowledge)
+    try:
+        yield SimpleNamespace(identity=identity, token=token, observations=observations, actor=actor,
+            pinned=pinned, retained=retained, preparer=preparer, handle=handle, events=events, composition=composition)
+    finally:
+        for channel in (control, peer, activation, activation_peer):
+            channel.close()
+
+
+def test_retained_diagnostics_healthy_identity_keeps_ack_before_signal_and_reap(retained_diagnostics, capsys, caplog):
+    case = retained_diagnostics
+    for _ in range(2):
+        assert case.retained.verify() == case.pinned
+        assert case.preparer._host_only_report(case.handle)["processes"]["host"]["pid"] == 103
+    case.preparer.abort(case.handle)
+    assert case.events == ["request", "ack", "signal", "reap"]
+    assert case.handle.closed and case.preparer._active is None
+    assert case.handle.control.fileno() == case.handle.activation.fileno() == -1
+    assert case.actor._pinned == case.pinned
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err and not caplog.text
+
+
+@pytest.mark.parametrize("edge,diagnostic", [
+    ("pid", "stage=verify.compare; identity=available; mismatched_fields=pid"),
+    ("uid", "stage=verify.compare; identity=available; mismatched_fields=uid"),
+    ("birth_id", "stage=verify.compare; identity=available; mismatched_fields=birth_id"),
+    ("sha256", "stage=verify.compare; identity=available; mismatched_fields=audit_token_sha256"),
+    ("pidversion", "stage=verify.compare; identity=available; mismatched_fields=audit_token_pidversion"),
+    ("multiple", "stage=verify.compare; identity=available; mismatched_fields=birth_id,audit_token_sha256,audit_token_pidversion"),
+    ("absent", "stage=verify.identity; identity=absent; mismatched_fields=none"),
+    ("identity-unavailable", "stage=verify.identity; identity=unavailable; mismatched_fields=none"),
+    ("token-unavailable", "stage=verify.token; identity=unobserved; mismatched_fields=none"),
+    ("token-custody-unavailable", "stage=verify.token; identity=unobserved; mismatched_fields=none"),
+    ("invalid-identity", "stage=verify.incarnation; identity=available; mismatched_fields=none"),
+    ("invalid-token", "stage=verify.incarnation; identity=available; mismatched_fields=none"),
+])
+def test_retained_diagnostics_reject_without_disclosing_or_rebinding(retained_diagnostics, edge, diagnostic, capsys, caplog):
+    case = retained_diagnostics
+    observed = case.observations
+    if edge in {"pid", "uid"}:
+        observed["identity"][edge] += 1
+        observed["token"][edge] += 1
+    elif edge in {"birth_id", "multiple"}:
+        observed["identity"]["birth_id"] = "changed-private-birth"
+    if edge in {"sha256", "multiple"}:
+        observed["token"]["sha256"] = "changed-private-token-digest"
+    if edge in {"pidversion", "multiple"}:
+        observed["token"]["pidversion"] += 1
+    if edge == "absent":
+        observed["identity"] = None
+    elif edge.endswith("unavailable"):
+        kind = edge.split("-")[0]
+        error_type = custody.CustodyError if "custody" in edge else OSError
+        observed[kind] = error_type("synthetic-private-credential 987654321 private-token-digest")
+    elif edge == "invalid-identity":
+        observed["identity"]["birth_id"] = ""
+    elif edge == "invalid-token":
+        observed["token"]["uid"] += 1
+    # Unknown DTO keys and credential-like data must never become field labels.
+    if isinstance(observed["identity"], dict):
+        observed["identity"]["private-field-label"] = "synthetic-private-credential"
+    for action in (lambda: case.preparer._host_only_report(case.handle), lambda: case.preparer.abort(case.handle)):
+        with pytest.raises(custody.CustodyError) as error:
+            action()
+        message = str(error.value)
+        assert message.endswith("[" + diagnostic + "]")
+        rendered = "".join(traceback.format_exception(error.value)) + caplog.text + str(capsys.readouterr())
+        for secret in ("private-birth", "private-token-digest", "987654321", "synthetic-private-credential", "private-field-label"):
+            assert secret not in rendered
+        assert len(message) < 300
+    assert case.retained.actor is case.actor and case.actor._pinned == case.pinned
+    assert case.retained.exit_code is None and case.handle.worker.returncode is None
+    assert not case.events  # No request/ACK, signal, or reap after rejection.
+    assert case.preparer._active is case.handle and not case.handle.closed
+    assert case.handle.control.fileno() >= 0 and case.handle.activation.fileno() >= 0
+
+
+@pytest.mark.parametrize("ack", ["missing", "wrong-epoch", "children-unresolved"])
+def test_retained_diagnostics_invalid_ack_keeps_handle_and_never_signals(retained_diagnostics, monkeypatch, ack):
+    case = retained_diagnostics
+    original_receive = case.composition._frame_receive
+
+    def receive(channel):
+        if ack == "missing":
+            raise OSError("synthetic missing ACK")
+        response = original_receive(channel)
+        if ack == "wrong-epoch":
+            response["owner_epoch"] = "other"
+        else:
+            response["cleanup"]["host_children"] = "unresolved"
+        return response
+
+    monkeypatch.setattr(case.composition, "_frame_receive", receive)
+    with pytest.raises((OSError, case.composition.ConflictError)):
+        case.preparer.abort(case.handle)
+    assert "signal" not in case.events and "reap" not in case.events
+    assert case.preparer._active is case.handle and not case.handle.closed
+    assert case.handle.control.fileno() >= 0 and case.handle.activation.fileno() >= 0
+    assert case.actor._pinned == case.pinned
 
 
 def test_reference_verification_is_read_only_and_requires_exact_designated_actor(graph):
