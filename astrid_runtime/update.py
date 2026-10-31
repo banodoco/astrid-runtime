@@ -381,6 +381,44 @@ def _read_bounded_object(path):
         return None
 
 
+def _terminal_success_verified(root, selected, job, transaction, state):
+    """Corroborate the selected version and live owner without changing either."""
+    try:
+        name = _bytes(root / "current").decode("utf-8").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+            return False
+        folder = root / "versions" / name
+        version = _json(folder / "version.json", {})
+        expected = transaction.get("candidate" if state == "updated" else "old")
+        if (not isinstance(expected, dict) or version != expected
+                or version.get("root") != str(folder)):
+            return False
+        identity = normalize_startup_identity(version.get("identity"))
+        if state == "updated":
+            if identity != {"release": job.get("target_release"), "managed_by": None}:
+                return False
+        elif version != job.get("old_version") or identity != normalize_startup_identity(job.get("old_identity")):
+            return False
+        if "identity" in selected and normalize_startup_identity(selected["identity"]) != identity:
+            return False
+        data = _path(selected.get("data_root"))
+        discovery = _json(data / "runtime" / "discovery.json", {})
+        instance = discovery.get("runtime_instance_id")
+        endpoint = discovery.get("endpoint") or discovery.get("door_endpoint")
+        old_instance = job.get("old_instance_id")
+        if (not isinstance(old_instance, str) or not old_instance
+                or not isinstance(instance, str) or not instance or instance == old_instance
+                or not isinstance(endpoint, str) or not endpoint):
+            return False
+        from .identity import validate_live_owner_identity
+        from .runtime_boundary import LocalRuntimeBoundary
+        health = LocalRuntimeBoundary().owner_startup_identity(endpoint=endpoint, instance_id=instance)
+        return (isinstance(health, dict) and health.get("status") == "ok"
+                and validate_live_owner_identity(health, instance_id=instance) == identity)
+    except (OSError, ValueError, TypeError, KeyError, UnicodeDecodeError):
+        return False
+
+
 def read_update_status(home=None, *, available=False, reason=None):
     """Read the authoritative accepted job and C2 journal without recovery."""
     def none():
@@ -456,16 +494,19 @@ def read_update_status(home=None, *, available=False, reason=None):
         # report the unresolved handoff without inferring success or rollback.
         state = "active" if _installer_lock_held(home) else "recovery-needed"
     elif state in {"updated", "rolled_back", "failed"}:
-        # A terminal F1 result is evidence only when its C2 journal binds both
-        # the job operation and the transaction recorded on the job.
         transaction_id = job.get("transaction_id")
-        if (transaction.get("format") != "astrid-install-update/v1"
-                or step not in terminal_steps
-                or not isinstance(journal_job, dict)
-                or journal_job.get("operation_id") != operation_id
-                or not isinstance(transaction_id, str) or not transaction_id
-                or transaction_id != transaction.get("operation_id")):
-            state = "recovery-needed"
+        bound = (state != "failed" or "transaction_id" in job
+                 or (isinstance(journal_job, dict) and journal_job.get("operation_id") == operation_id))
+        if bound:
+            linked = (transaction.get("format") == "astrid-install-update/v1"
+                      and step in terminal_steps and isinstance(journal_job, dict)
+                      and journal_job.get("operation_id") == operation_id
+                      and isinstance(transaction_id, str) and bool(re.fullmatch(r"[0-9a-f]{32}", transaction_id))
+                      and transaction_id == transaction.get("operation_id"))
+            expected_step = {"updated": "complete", "rolled_back": "rolled_back"}.get(state)
+            if (not linked or (expected_step is not None
+                    and (step != expected_step or not _terminal_success_verified(root, selected, job, transaction, state)))):
+                state = "recovery-needed"
     outcome = state if state in {"updated", "rolled_back", "failed"} else None
     api_state = "active" if state in {"accepted", "launching", "active"} else "terminal" if outcome else state
     result = "Recovery needed." if state == "recovery-needed" else job.get("result") or job.get("message") or (outcome or api_state)
