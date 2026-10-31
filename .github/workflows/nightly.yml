@@ -13,6 +13,7 @@ on:
 jobs:
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     steps:
