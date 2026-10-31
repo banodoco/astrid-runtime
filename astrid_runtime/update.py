@@ -107,7 +107,7 @@ class UpdateAdmission:
             available = False
             candidate = refusal.details.get("reason")
             reason = candidate if candidate in _STATUS_REASONS else None
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             available = False
         if available and _installer_lock_held(home):
             available, reason = False, "busy"
@@ -116,16 +116,22 @@ class UpdateAdmission:
     def _status_availability(self, python, agent, runtime):
         """Read the optional Agent capability response without invoking admission.
 
-        A missing response leaves an otherwise valid installation available;
-        it must not make GET start, accept, or reconcile an update.
+        A failed or malformed response is unavailable. It must not make GET
+        start, accept, or reconcile an update.
         """
         try:
-            return self._helper(python, agent, runtime, {"action": "availability"})
+            availability = self._helper(python, agent, runtime, {"action": "availability"})
         except UpdateRefusal as refusal:
             reason = refusal.details.get("reason")
             if reason in _STATUS_REASONS:
                 return {"available": False, "reason": reason}
-            return None
+            return {"available": False}
+        if not isinstance(availability, dict) or type(availability.get("available")) is not bool:
+            return {"available": False}
+        if availability["available"]:
+            return {"available": True}
+        reason = availability.get("reason")
+        return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}
 
     def _helper(self, python, agent, runtime, payload):
         script = ("import sys; sys.path[:0]=sys.argv[1:3]; "

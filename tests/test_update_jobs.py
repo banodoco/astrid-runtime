@@ -87,6 +87,32 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
             assert response.json() == {"available": True, "state": "none"}
         assert calls == [] and marker.read_bytes() == before
 
+        # A failed read-only availability probe still returns a status response
+        # without accepting, launching, reconciling, or changing durable state.
+        journal = _write(root / "update-transaction.json", {"step": "complete"})
+        status_sources = {path: path.read_bytes() for path in (selected, marker, journal)}
+        failing_queries = len(availability_queries)
+        original_helper = daemon.update_admission._helper
+
+        def failed_probe(selected_python, selected_agent, selected_runtime, payload):
+            assert (selected_python, selected_agent, selected_runtime) == (python, agent, runtime)
+            assert payload == {"action": "availability"}
+            availability_queries.append(payload)
+            raise subprocess.TimeoutExpired([str(python)], 300)
+
+        monkeypatch.setattr(daemon.update_admission, "_helper", failed_probe)
+        with monkeypatch.context() as probe_platform:
+            probe_platform.setattr(update.sys, "platform", "linux")
+            for _ in range(2):
+                response = world.call("/api/runtime/v1/update/status")
+                assert response.status == 200
+                assert response.json() == {"available": False, "state": "none"}
+        assert availability_queries[failing_queries:] == [{"action": "availability"}] * 2
+        assert calls == []
+        assert {path: path.read_bytes() for path in status_sources} == status_sources
+        monkeypatch.setattr(daemon.update_admission, "_helper", original_helper)
+        journal.unlink()
+
         # GET only observes the durable records. It must not admit, launch,
         # reconcile, or mutate either an unacknowledged job or its journal.
         unacknowledged = {**record, "update_job": {
@@ -224,6 +250,53 @@ def test_status_preserves_allowlisted_service_manager_refusal(tmp_path, monkeypa
     admission._helper = helper
     assert admission.status() == {
         "available": False, "reason": "unsupported-service-manager", "state": "none"}
+
+
+@pytest.mark.parametrize("failure", ["timeout", "invocation", "subprocess", "nonzero", "malformed"])
+def test_status_projects_availability_probe_failures_as_unavailable_without_side_effects(tmp_path, monkeypatch, failure):
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    home.mkdir()
+    monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
+    monkeypatch.setattr(update.sys, "platform", "linux")
+    selected = _write(update._install_record_path(home), {
+        "owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data),
+    })
+    marker = _write(root / "install.json", {
+        "owner": "haus.astrid.runtime", "data_root": str(data),
+    })
+    journal = _write(root / "update-transaction.json", {"step": "complete"})
+    status_sources = {path: path.read_bytes() for path in (selected, marker, journal)}
+    admission = update.UpdateAdmission(SimpleNamespace())
+    admission._selection = lambda **_kwargs: (selected, {}, Path("/python"), Path("/agent"), Path("/runtime"), 1)
+    admission.launcher = lambda _job: pytest.fail("GET must not launch an update")
+    calls = []
+
+    if failure == "malformed":
+        def helper(_python, _agent, _runtime, payload):
+            calls.append(payload)
+            assert payload == {"action": "availability"}
+            return {"available": "yes"}
+
+        admission._helper = helper
+    else:
+        def run(command, *args, **kwargs):
+            payload = json.loads(kwargs["input"])
+            calls.append(payload)
+            assert payload == {"action": "availability"}
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(command, 300)
+            if failure == "invocation":
+                raise OSError("selected helper is unavailable")
+            if failure == "subprocess":
+                raise subprocess.SubprocessError("selected helper failed")
+            return subprocess.CompletedProcess(
+                command, 1, json.dumps({"reason": "inputs-unavailable", "message": "probe failed"}), "")
+
+        monkeypatch.setattr(update.subprocess, "run", run)
+
+    assert admission.status() == {"available": False, "state": "none"}
+    assert calls == [{"action": "availability"}]
+    assert {path: path.read_bytes() for path in status_sources} == status_sources
 
 
 def test_status_projects_busy_while_an_update_request_owns_admission(tmp_path, monkeypatch):
