@@ -334,6 +334,29 @@ def test_status_preserves_allowlisted_service_manager_refusal(tmp_path, monkeypa
         "available": False, "reason": "unsupported-service-manager", "state": "none"}
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(lambda: subprocess.TimeoutExpired(["python"], 300), id="timeout"),
+        pytest.param(lambda: OSError("selected helper is unavailable"), id="invocation"),
+        pytest.param(lambda: subprocess.SubprocessError("selected helper failed"), id="subprocess"),
+    ],
+)
+def test_status_availability_contains_probe_invocation_failures(failure):
+    admission = update.UpdateAdmission(SimpleNamespace())
+    calls = []
+
+    def helper(_python, _agent, _runtime, payload):
+        calls.append(payload)
+        raise failure()
+
+    admission._helper = helper
+    assert admission._status_availability(Path("/python"), Path("/agent"), Path("/runtime")) == {
+        "available": False,
+    }
+    assert calls == [{"action": "availability"}]
+
+
 @pytest.mark.parametrize("failure", ["timeout", "invocation", "subprocess", "nonzero", "malformed", "nonboolean"])
 def test_status_projects_availability_probe_failures_as_unavailable_without_side_effects(tmp_path, monkeypatch, failure):
     home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"

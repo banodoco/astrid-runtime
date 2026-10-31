@@ -120,6 +120,8 @@ class UpdateAdmission:
         except UpdateRefusal as refusal:
             reason = refusal.details.get("reason")
             return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}
+        except (OSError, subprocess.SubprocessError):
+            return {"available": False}
         if not isinstance(availability, dict) or type(availability.get("available")) is not bool:
             return {"available": False}
         if availability["available"]:
