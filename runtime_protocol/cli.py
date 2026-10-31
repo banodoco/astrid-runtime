@@ -104,8 +104,13 @@ def _parser():
     generation_tags = sub.add_parser("migrate-generation-tags", help="offline backfill explicit Runtime generation metadata")
     generation_tags.add_argument("--root", required=True)
     generation_tags.add_argument("--project-id")
-    generation_tags.add_argument("--dry-run", action="store_true")
+    tag_action = generation_tags.add_mutually_exclusive_group()
+    tag_action.add_argument("--dry-run", dest="dry_run", action="store_true", default=True, help="report candidates without changes (default)")
+    tag_action.add_argument("--apply", dest="dry_run", action="store_false", help="apply after stopped-owner confirmation")
     generation_tags.add_argument("--skip-ledger", action="store_true", help="ledger data is always skipped")
+    generation_tags.add_argument("--manifest-root", action="append", default=[], help="explicit absolute JSON file/directory; repeatable")
+    generation_tags.add_argument("--receipt-root", action="append", default=[], help="explicit absolute JSON receipt file/directory; repeatable")
+    generation_tags.add_argument("--template-model-map", help="absolute JSON file mapping template ids to model names")
     generation_tags.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
     generation_tags.add_argument("--confirm")
     repair = sub.add_parser("repair-media-types", help="repair generic published MIME values from managed filenames")
@@ -276,6 +281,8 @@ def _main(args):
         try:
             result = migrate_generation_tags(
                 args.root, project_id=args.project_id, dry_run=args.dry_run,
+                manifest_roots=args.manifest_root, receipt_roots=args.receipt_root,
+                template_model_map=args.template_model_map,
                 timeout_seconds=args.timeout, confirmation=args.confirm,
             )
         except RuntimeErrorBase as exc:

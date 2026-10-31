@@ -825,7 +825,15 @@ paths:
   /v1/projects/{project_id}/generations:
     get:
       operationId: listGenerations
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      description: All supplied filters match the same generation's metadata.gen. String comparisons and tag membership are exact and case-sensitive; absent or malformed optional values do not match. Cursor continuation requires the same project and complete filter set.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { name: kind, in: query, required: false, schema: { type: string, minLength: 1 } }
+        - { name: model, in: query, required: false, schema: { type: string, minLength: 1 } }
+        - { name: target, in: query, required: false, schema: { type: string, minLength: 1 } }
+        - { name: tag, in: query, required: false, schema: { type: string, minLength: 1 } }
       responses: { '200': { description: Project generations, content: { application/json: { schema: { $ref: '#/components/schemas/GenerationPage' } } } } }
     post:
       operationId: createGeneration

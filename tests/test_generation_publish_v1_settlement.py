@@ -125,11 +125,12 @@ def _derived_variant(generation_id: str, ordinal: int, variant_key: str) -> str:
     ).hexdigest()
 
 
-def test_generation_tags_preserve_opaque_intent_and_publication_metadata(tmp_path):
+@pytest.mark.parametrize("origin", ["generated", "imported"])
+def test_generation_tags_preserve_opaque_intent_and_publication_metadata(tmp_path, origin):
     metadata = {
         "prompt": "original prompt",
         "gen": {
-            "kind": "video", "origin": "generated", "generator": "vibecomfy",
+            "kind": "video", "origin": origin, "generator": "vibecomfy",
             "model": "WAN/model.safetensors", "mode": "t2v", "backend": "comfy",
             "target": "runpod", "machine": "fixture-machine",
             "workflow_digest": _digest(b"workflow"), "task_id": "producer-task",
@@ -138,6 +139,8 @@ def test_generation_tags_preserve_opaque_intent_and_publication_metadata(tmp_pat
             "future_field": {"nested": [True, None]},
         },
     }
+    if origin == "imported":
+        metadata["provenance"] = {"origin": "imported", "source": "fixture-import"}
 
     def effect_factory(project_id):
         effect = _effect(project_id, groups=[{

@@ -1955,26 +1955,140 @@ def _generation_tag_object(value, *, reason: str) -> dict:
     return parsed
 
 
-def _generation_tag_evidence(connection, generation, *, version: int) -> dict:
+_GENERATION_TAG_FIELDS = frozenset({
+    "kind", "origin", "generator", "model", "mode", "backend", "target", "machine",
+    "workflow_digest", "task_id", "run_id", "seed", "cost_usd", "duration_ms", "tags",
+})
+
+
+def _generation_tag_inputs(roots, *, deadline):
+    """Read only JSON below operator-selected roots; never follow links."""
+    records, skipped = [], []
+    for supplied in roots:
+        root = Path(supplied)
+        if not root.is_absolute() or root.is_symlink() or not root.exists():
+            raise ValidationError("generation evidence roots must be existing absolute non-symlink paths")
+        paths = []
+        if root.is_file():
+            paths.append(root)
+        elif root.is_dir():
+            for directory, directories, files in os.walk(root, followlinks=False):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("generation tag migration timed out")
+                directories[:] = sorted(name for name in directories if not (Path(directory) / name).is_symlink())
+                paths.extend(Path(directory) / name for name in sorted(files) if name.endswith(".json"))
+        else:
+            raise ValidationError("generation evidence root must be a JSON file or directory")
+        for path in sorted(paths):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("generation tag migration timed out")
+            try:
+                if path.is_symlink() or not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+                    raise ValueError("unsafe_or_oversized_evidence_file")
+                value = json.loads(path.read_text(encoding="utf-8"))
+                values = value.get("generations", [value]) if isinstance(value, dict) else value
+                if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
+                    raise ValueError("malformed_evidence_file")
+                for index, item in enumerate(values):
+                    locator = item.get("locator")
+                    identity = locator if isinstance(locator, dict) else item
+                    if not any(isinstance(identity.get(key), str) and identity[key]
+                               for key in ("generation_id", "task_id", "kernel_task_id")):
+                        skipped.append({"source": str(path), "row": index, "reason": "missing_generation_or_task_identity"})
+                        continue
+                    records.append((str(path), index, item))
+            except (OSError, UnicodeError, ValueError) as exc:
+                reason = str(exc) if isinstance(exc, ValueError) and not isinstance(exc, json.JSONDecodeError) else "malformed_evidence_file"
+                skipped.append({"source": str(path), "reason": reason})
+    return records, skipped
+
+
+def _generation_tag_template_models(path):
+    if path is None:
+        return {}
+    path = Path(path)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+        raise ValidationError("template model map must be an explicit absolute regular JSON file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ValidationError("template model map must contain a JSON object") from exc
+    if not isinstance(value, dict) or not all(isinstance(key, str) and key and isinstance(item, str) and item
+                                              for key, item in value.items()):
+        raise ValidationError("template model map must map non-empty template ids to model strings")
+    return value
+
+
+def _generation_tag_evidence(connection, generation, *, version: int,
+                             external=(), template_models=None, realm_id=None) -> dict:
     metadata = _generation_tag_object(generation["metadata_json"], reason="malformed_metadata")
     current = metadata.get("gen", {})
     if not isinstance(current, dict):
         raise ValueError("malformed_gen")
     evidence = dict(current)
+    template_models = template_models or {}
+    imported = isinstance(metadata.get("provenance"), dict) and metadata["provenance"].get("origin") == "imported"
+    if imported:
+        evidence.setdefault("origin", "imported")
+
+    def merge(tags):
+        for key, item in tags.items():
+            if key not in _GENERATION_TAG_FIELDS or key in current or (key == "origin" and imported):
+                continue
+            if key == "tags":
+                valid = isinstance(item, list) and all(isinstance(tag, str) and tag for tag in item)
+            elif key in {"seed", "duration_ms"}:
+                valid = isinstance(item, int) and not isinstance(item, bool) and (key == "seed" or item >= 0)
+            elif key == "cost_usd":
+                valid = isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(item) and item >= 0
+            else:
+                valid = isinstance(item, str) and bool(item)
+            if not valid:
+                raise ValueError("malformed_generation_field:" + key)
+            if key in evidence and evidence[key] != item:
+                raise ValueError("conflicting_evidence")
+            evidence[key] = item
+
+    def merge_legacy(value):
+        """Use named historical fields, never filenames or model-name guesses."""
+        value = _generation_tag_object(value, reason="malformed_source_metadata")
+        tags = {key: value[key] for key in _GENERATION_TAG_FIELDS if key in value and value[key] is not None and key != "kind"}
+        for source, target in (("modality", "kind"), ("content_type", "kind"),
+                               ("mode_used", "mode"), ("execution", "backend")):
+            if source in value and value[source] is not None:
+                if target == "kind" and value[source] not in ("image", "video", "audio"):
+                    continue
+                tags.setdefault(target, value[source])
+        if isinstance(value.get("kind"), str) and value["kind"] in {"image", "video", "audio"}:
+            tags.setdefault("kind", value["kind"])
+        template = value.get("template_id", value.get("template"))
+        if isinstance(template, str) and template in template_models:
+            tags.setdefault("model", template_models[template])
+        merge(tags)
+        h3 = value.get("h3_av")
+        if h3 is not None:
+            h3 = _generation_tag_object(h3, reason="malformed_h3_av")
+            merge({"generator": "h3_av.transform"})
+            merge_legacy({key: item for key, item in h3.items() if key != "h3_av"})
+            graph = h3.get("graph")
+            if isinstance(graph, dict):
+                profile = graph.get("profile")
+                if isinstance(profile, str) and profile in template_models:
+                    merge({"model": template_models[profile]})
+                workflow = graph.get("workflow")
+                if isinstance(workflow, dict) and isinstance(workflow.get("sha256"), str):
+                    merge({"workflow_digest": "sha256:" + workflow["sha256"].removeprefix("sha256:")})
 
     def merge_metadata(value):
         value = _generation_tag_object(value, reason="malformed_source_metadata")
         tags = value.get("gen", {})
         if not isinstance(tags, dict):
             raise ValueError("malformed_source_gen")
-        for key, item in tags.items():
-            # Existing generation metadata remains authoritative. Conflicting
-            # historical sources for a missing field require operator judgment.
-            if key in current:
-                continue
-            if key in evidence and evidence[key] != item:
-                raise ValueError("conflicting_evidence")
-            evidence[key] = item
+        merge(tags)
+        merge_legacy(value)
+        params = value.get("params")
+        if isinstance(params, dict):
+            merge_legacy(params)
 
     def merge_spec(value):
         spec = _generation_tag_object(value, reason="malformed_source_spec")
@@ -1983,6 +2097,13 @@ def _generation_tag_evidence(connection, generation, *, version: int) -> dict:
             if not isinstance(intent, dict):
                 raise ValueError("malformed_generation_intent")
             merge_metadata(intent.get("metadata", {}))
+            if isinstance(intent.get("modality"), str) and intent["modality"] in {"image", "video", "audio"}:
+                merge({"kind": intent["modality"]})
+        inputs = spec.get("inputs")
+        if isinstance(inputs, dict):
+            merge_legacy(inputs)
+            if isinstance(inputs.get("generation_intent"), dict):
+                merge_spec({"generation_intent": inputs["generation_intent"]})
 
     def stored_spec(row):
         if version < SPEC_DEDUP_TARGET_SCHEMA_VERSION:
@@ -1996,6 +2117,9 @@ def _generation_tag_evidence(connection, generation, *, version: int) -> dict:
             raise ValueError("missing_source_spec")
         return spec[0]
 
+    merge_metadata(metadata)
+    if generation["type"] in {"image", "video", "audio"}:
+        merge({"kind": generation["type"]})
     task = None
     if generation["source_task_id"]:
         task = connection.execute("SELECT * FROM tasks WHERE id=?", (generation["source_task_id"],)).fetchone()
@@ -2014,6 +2138,36 @@ def _generation_tag_evidence(connection, generation, *, version: int) -> dict:
             spec = stored_spec(row)
             if spec is not None:
                 merge_spec(spec)
+        if version >= EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
+            binding = connection.execute("SELECT target_kind, target_id FROM execution_bindings WHERE task_id=?", (task["id"],)).fetchone()
+            if binding:
+                merge({"target": binding["target_kind"]})
+                if binding["target_kind"] == "machine" and binding["target_id"]:
+                    merge({"machine": binding["target_id"]})
+    for source, index, value in external:
+        identity = value.get("locator") if isinstance(value.get("locator"), dict) else value
+        generation_id = identity.get("generation_id")
+        task_id = identity.get("task_id", identity.get("kernel_task_id"))
+        if generation_id != generation["id"] and (not task_id or task_id != generation["source_task_id"]):
+            continue
+        if ((generation_id is not None and generation_id != generation["id"])
+                or (task_id is not None and task_id != generation["source_task_id"])
+                or (identity.get("run_id") is not None and task is not None and identity["run_id"] != task["run_id"])
+                or (value.get("project_id") is not None and value["project_id"] != generation["project_id"])
+                or (value.get("realm_id") is not None and value["realm_id"] != realm_id)):
+            raise ValueError("external_source_identity_mismatch")
+        merge_metadata(value)
+        admission = value.get("admission")
+        if isinstance(admission, dict):
+            if admission.get("project_id") not in {None, generation["project_id"]}:
+                raise ValueError("external_source_identity_mismatch")
+            merge_spec(admission)
+            merge_spec(admission.get("spec", {}))
+            effect = admission.get("settlement_effect", admission.get("expected_effect"))
+            if isinstance(effect, dict) and isinstance(effect.get("payload"), dict):
+                merge_metadata(effect["payload"].get("metadata", {}))
+        if "metadata" in value:
+            merge_metadata(value["metadata"])
     provenance = metadata.get("provenance")
     if isinstance(provenance, dict) and provenance.get("origin") == "imported":
         evidence.setdefault("origin", "imported")
@@ -2036,21 +2190,34 @@ def migrate_generation_tags(
     root: str | Path,
     *,
     project_id: str | None = None,
-    dry_run: bool = False,
+    dry_run: bool = True,
+    manifest_roots=(),
+    receipt_roots=(),
+    template_model_map: str | Path | None = None,
     timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
     confirmation: str | None = None,
 ) -> dict:
     """Backfill explicit Runtime generation evidence while the owner is stopped.
 
-    The command never reads command receipts, idempotency records, external
-    manifests, or CAS content. Dry-run uses a read-only SQLite connection and
-    works on supported old canonical schemas without upgrading them.
+    Runtime SQL and explicitly supplied JSON evidence are the only inputs.
+    The idempotency ledger and CAS contents are never read or changed. Dry-run
+    is the default and works on old canonical schemas without upgrading them.
     """
     root = _safe_realm_root(root)
     if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
         raise ValidationError("timeout_seconds must be positive")
     started = time.monotonic()
     deadline = started + float(timeout_seconds)
+    template_models = _generation_tag_template_models(template_model_map)
+    external, source_skipped = _generation_tag_inputs((*manifest_roots, *receipt_roots), deadline=deadline)
+    external_by_generation, external_by_task = {}, {}
+    for record in external:
+        identity = record[2].get("locator") if isinstance(record[2].get("locator"), dict) else record[2]
+        if isinstance(identity.get("generation_id"), str):
+            external_by_generation.setdefault(identity["generation_id"], []).append(record)
+        task_id = identity.get("task_id", identity.get("kernel_task_id"))
+        if isinstance(task_id, str):
+            external_by_task.setdefault(task_id, []).append(record)
     identity = inspect_canonical_schema(root)
     realm_id = str(identity["realm_id"])
     version = int(identity["version"])
@@ -2079,7 +2246,9 @@ def migrate_generation_tags(
                     if time.monotonic() >= deadline:
                         raise TimeoutError("generation tag migration timed out")
                     try:
-                        metadata = _generation_tag_evidence(connection, generation, version=version)
+                        selected = external_by_generation.get(generation["id"], []) + external_by_task.get(generation["source_task_id"], [])
+                        kwargs = {"external": selected, "template_models": template_models, "realm_id": realm_id} if selected or template_models else {}
+                        metadata = _generation_tag_evidence(connection, generation, version=version, **kwargs)
                     except ValueError as exc:
                         skipped.append({"generation_id": generation["id"], "reason": str(exc)})
                         continue
@@ -2088,7 +2257,8 @@ def migrate_generation_tags(
                         skipped.append({"generation_id": generation["id"], "reason": "already_current"})
                         continue
                     candidates.append({"generation_id": generation["id"],
-                                       "fields": sorted(set(metadata["gen"]) - set(before.get("gen", {})))})
+                                       "fields": sorted(set(metadata["gen"]) - set(before.get("gen", {}))),
+                                       "gen": metadata["gen"]})
                     if not dry_run:
                         connection.execute(
                             "UPDATE generations SET metadata_json=?, version=version+1, updated_at=? WHERE id=?",
@@ -2103,6 +2273,7 @@ def migrate_generation_tags(
                     "candidate_count": len(candidates), "candidates": candidates,
                     "migrated": 0 if dry_run else len(candidates),
                     "skipped_count": len(skipped), "skipped": skipped,
+                    "source_skipped": source_skipped, "source_skipped_count": len(source_skipped),
                     "elapsed_seconds": time.monotonic() - started}
         except sqlite3.OperationalError as exc:
             connection.rollback()

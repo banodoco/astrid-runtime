@@ -27,6 +27,26 @@ def _patch_opener(monkeypatch, open_response):
     )
 
 
+@pytest.mark.parametrize("filters", [{}, {"kind": "video", "model": "X /&?", "target": "runpod", "tag": "hero +"}, {"tag": ""}])
+def test_generation_list_filters_encode_through_generated_transport(filters):
+    from urllib.parse import parse_qs, urlsplit
+
+    calls = []
+
+    def transport(method, path, headers, body):
+        calls.append((method, path))
+        return 200, {}, b'{"items":[],"next_cursor":"page-two"}'
+
+    client = WorkspaceClient("http://runtime", transport=transport)
+    assert client.list_generations("project /&?", cursor="page +", limit=7, **filters) == ([], "page-two")
+    method, path = calls.pop()
+    assert method == "GET"
+    assert urlsplit(path).path == "/v1/projects/project%20%2F%26%3F/generations"
+    assert parse_qs(urlsplit(path).query, keep_blank_values=True) == {
+        "cursor": ["page +"], "limit": ["7"], **{name: [value] for name, value in filters.items()},
+    }
+
+
 def test_generated_abandon_client_roundtrips_exact_identity_receipt_and_wire_schema(tmp_path):
     from jsonschema import Draft202012Validator
     from referencing import Registry, Resource

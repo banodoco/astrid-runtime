@@ -137,9 +137,9 @@ def test_apply_preserves_metadata_and_existing_gen_values_is_idempotent_and_skip
         return connection
 
     monkeypatch.setattr(sqlite3, "connect", deny_ledger_connect)
-    result = migrate_generation_tags(root, confirmation=CONFIRMATION)
+    result = migrate_generation_tags(root, dry_run=False, confirmation=CONFIRMATION)
     assert result["migrated"] == 1 and result["skip_ledger"] is True
-    repeated = migrate_generation_tags(root, confirmation=CONFIRMATION)
+    repeated = migrate_generation_tags(root, dry_run=False, confirmation=CONFIRMATION)
     assert repeated["migrated"] == 0
     assert repeated["skipped"] == [{"generation_id": "evidence", "reason": "already_current"}]
     with original_connect(database) as connection:
@@ -169,7 +169,7 @@ def test_apply_requires_exact_confirmation_before_mutation(tmp_path):
     database = _realm(root)
     before = database.read_bytes()
     with pytest.raises(ValidationError, match="confirmation exactly"):
-        migrate_generation_tags(root, confirmation="MIGRATE GENERATION TAGS wrong-realm")
+        migrate_generation_tags(root, dry_run=False, confirmation="MIGRATE GENERATION TAGS wrong-realm")
     assert database.read_bytes() == before
 
 
@@ -195,7 +195,7 @@ def test_backfill_uses_effect_evidence_and_honors_project_scope(tmp_path):
         )
         _generation(connection, "other", {"provenance": {"origin": "imported"}})
         connection.execute("UPDATE generations SET project_id='other-project' WHERE id='other'")
-    result = migrate_generation_tags(root, project_id="project-tags", confirmation=CONFIRMATION)
+    result = migrate_generation_tags(root, project_id="project-tags", dry_run=False, confirmation=CONFIRMATION)
     assert result["migrated"] == 1 and result["skipped_count"] == 0
     with sqlite3.connect(database) as connection:
         metadata = {identity: json.loads(body) for identity, body in connection.execute("SELECT id, metadata_json FROM generations")}
@@ -210,7 +210,7 @@ def test_backfill_reports_conflicting_evidence_without_guessing(tmp_path):
         _generation(connection, "conflict", {}, task_id="task-a", intent={"model": "intent"}, effect={
             "effect_type": "generation.create_with_variant", "payload": {"metadata": {"gen": {"model": "effect"}}},
         })
-    result = migrate_generation_tags(root, confirmation=CONFIRMATION)
+    result = migrate_generation_tags(root, dry_run=False, confirmation=CONFIRMATION)
     assert result["migrated"] == 0
     assert result["skipped"] == [{"generation_id": "conflict", "reason": "conflicting_evidence"}]
 
@@ -225,7 +225,7 @@ def test_backfill_rejects_source_project_mismatch(tmp_path):
             (STAMP, STAMP),
         )
         connection.execute("UPDATE runs SET project_id='other-project' WHERE id='run-task-a'")
-    result = migrate_generation_tags(root, confirmation=CONFIRMATION)
+    result = migrate_generation_tags(root, dry_run=False, confirmation=CONFIRMATION)
     assert result["migrated"] == 0
     assert result["skipped"] == [{"generation_id": "mismatch", "reason": "source_project_mismatch"}]
 
@@ -236,7 +236,7 @@ def test_imported_kind_uses_only_explicit_runtime_content_type(tmp_path):
     with sqlite3.connect(database) as connection:
         _generation(connection, "imported", {"provenance": {"origin": "imported"}, "params": {"content_type": "image"}})
         _generation(connection, "other", {"provenance": {"origin": "imported"}, "params": {"content_type": "unknown"}})
-    assert migrate_generation_tags(root, confirmation=CONFIRMATION)["migrated"] == 2
+    assert migrate_generation_tags(root, dry_run=False, confirmation=CONFIRMATION)["migrated"] == 2
     with sqlite3.connect(database) as connection:
         values = {identity: json.loads(body)["gen"] for identity, body in connection.execute("SELECT id, metadata_json FROM generations")}
     assert values["imported"] == {"kind": "image", "origin": "imported"}
@@ -262,6 +262,6 @@ def test_backfill_timeout_rolls_back_earlier_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(upgrade.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(upgrade, "_generation_tag_evidence", evidence_and_advance)
     with pytest.raises(TimeoutError, match="timed out"):
-        migrate_generation_tags(root, confirmation=CONFIRMATION, timeout_seconds=1)
+        migrate_generation_tags(root, dry_run=False, confirmation=CONFIRMATION, timeout_seconds=1)
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT * FROM generations ORDER BY id").fetchall() == before
