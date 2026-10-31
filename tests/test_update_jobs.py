@@ -343,6 +343,43 @@ def test_lost_launcher_ack_keeps_durable_job_and_inputs_without_retry(tmp_path, 
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("agent_reason", [
+    "busy", "conflicting-operation", "mismatched-payload", "corrupt-journal",
+    "unsupported-recovery",
+])
+def test_agent_structured_refusal_round_trip_is_bounded_and_fail_closed(tmp_path, monkeypatch, agent_reason):
+    admission, _, _ = _admission_fixture(tmp_path, monkeypatch, None)
+    production = update.UpdateAdmission(admission.daemon)
+    document = {
+        "format": "astrid-update-refusal/v1", "accepted": False,
+        "reason": agent_reason, "message": "bounded refusal",
+    }
+
+    monkeypatch.setattr(
+        update.subprocess, "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, stdout=json.dumps(document), stderr="free-form stderr must be ignored"),
+    )
+    with pytest.raises(update.UpdateRefusal) as error:
+        production._helper(Path("/python"), Path("/agent"), Path("/runtime"), {"action": "accept"})
+
+    assert error.value.details["agent_reason"] == agent_reason
+    assert error.value.details["reason"] in {"busy", "selection-or-inputs-invalid"}
+    assert "bounded refusal" in str(error.value)
+
+
+def test_helper_free_form_or_malformed_refusal_never_counts_as_acceptance(tmp_path, monkeypatch):
+    admission, _, _ = _admission_fixture(tmp_path, monkeypatch, None)
+    production = update.UpdateAdmission(admission.daemon)
+    monkeypatch.setattr(
+        update.subprocess, "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, stdout="busy", stderr=""),
+    )
+    with pytest.raises(update.UpdateRefusal) as error:
+        production._helper(Path("/python"), Path("/agent"), Path("/runtime"), {"action": "accept"})
+    assert error.value.details["reason"] == "update-record-failed"
+
+
 def test_lost_ack_retry_reconciles_existing_operation_without_new_acceptance_or_launch(tmp_path, monkeypatch):
     launches = []
 
@@ -363,7 +400,8 @@ def test_lost_ack_retry_reconciles_existing_operation_without_new_acceptance_or_
                 return real_helper(python, agent, runtime, payload, **kwargs)
             reconciliations.append(payload)
             assert payload["operation_id"] == new_acceptances[0]
-            return {"operation_id": new_acceptances[0], "state": "active", "message": "Update active."}
+            return {"format": "astrid-update-job/v1", "operation_id": new_acceptances[0],
+                    "state": "active", "message": "Update active."}
         return real_helper(python, agent, runtime, payload, **kwargs)
 
     admission._helper = helper
@@ -474,7 +512,7 @@ def test_existing_operation_returns_terminal_result_without_second_start(tmp_pat
     def helper(python, agent, runtime, payload, **kwargs):
         nonlocal first_accept
         if payload.get("action") == "accept" and not first_accept:
-            return {"operation_id": accepted["operation_id"], "state": "updated",
+            return {"format": "astrid-update-job/v1", "operation_id": accepted["operation_id"], "state": "updated",
                     "result": "Updated to release 5."}
         if payload.get("action") == "accept":
             first_accept = False
@@ -521,7 +559,8 @@ def test_explicit_update_returns_reconciled_terminal_result_without_second_launc
         if payload.get("action") == "accept":
             # The selected Agent reconciled an existing operation under its
             # installer lock. This is recovery-only, not a new acceptance.
-            return {"operation_id": "b" * 32, "state": "updated", "result": "updated"}
+            return {"format": "astrid-update-job/v1", "operation_id": "b" * 32,
+                    "state": "updated", "result": "updated"}
         return real_helper(python, agent, runtime, payload, **kwargs)
 
     admission._helper = helper
@@ -546,7 +585,7 @@ def test_mismatched_reconciler_operation_refuses_without_launch_or_record_mutati
 
     def helper(python, agent, runtime, payload, **kwargs):
         if payload.get("action") == "accept":
-            return {"operation_id": "c" * 32, "state": "active"}
+            return {"format": "astrid-update-job/v1", "operation_id": "c" * 32, "state": "active"}
         return real_helper(python, agent, runtime, payload, **kwargs)
 
     admission._helper = helper

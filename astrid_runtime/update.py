@@ -29,11 +29,21 @@ MANIFEST_URL = "https://astrid.haus/install-manifest.json"
 BOOTSTRAP_URL = "https://astrid.haus/install"
 WINDOWS_BOOTSTRAP_URL = "https://astrid.haus/install.ps1"
 MAX_METADATA_BYTES = 1024 * 1024
+AGENT_JOB_FORMAT = "astrid-update-job/v1"
+AGENT_REFUSAL_FORMAT = "astrid-update-refusal/v1"
+AGENT_REFUSAL_REASONS = frozenset({
+    "busy", "conflicting-operation", "mismatched-payload", "corrupt-journal",
+    "unsupported-recovery",
+})
+MAX_HELPER_MESSAGE = 240
 
 
 class UpdateRefusal(ConflictError):
-    def __init__(self, reason, message):
-        super().__init__(message, details={"reason": reason})
+    def __init__(self, reason, message, *, agent_reason=None):
+        details = {"reason": reason}
+        if agent_reason is not None:
+            details["agent_reason"] = agent_reason
+        super().__init__(message, details=details)
 
 
 def _recoverable_operation(snapshots, root):
@@ -66,8 +76,7 @@ def _recoverable_operation(snapshots, root):
     transaction_id = job.get("transaction_id") if isinstance(job, dict) else None
     journal_operation = journal.get("operation_id") if isinstance(journal, dict) else None
     state = job.get("state") if isinstance(job, dict) else None
-    unresolved = (state in {"accepted", "recovery-needed"}
-                  or (state == "launching" and job.get("launch_status") != "acknowledged")
+    unresolved = (state in {"accepted", "launching", "active", "recovery-needed"}
                   or pending
                   or (state == "active" and isinstance(journal, dict)
                       and journal.get("step") in {"complete", "rolled_back"}))
@@ -247,18 +256,47 @@ class UpdateAdmission:
             value = json.loads(result.stdout)
         except (TypeError, json.JSONDecodeError):
             raise UpdateRefusal(failure_reason, failure_message) from None
+
+        def refusal_from_agent(document):
+            if payload.get("action") != "accept":
+                return None
+            if (not isinstance(document, dict)
+                    or document.get("format") != AGENT_REFUSAL_FORMAT
+                    or document.get("accepted") is not False
+                    or document.get("reason") not in AGENT_REFUSAL_REASONS
+                    or not isinstance(document.get("message"), str)
+                    or not document["message"].strip()
+                    or len(document["message"]) > MAX_HELPER_MESSAGE):
+                return None
+            agent_reason = document["reason"]
+            # Keep Runtime's established bounded public vocabulary while
+            # retaining the Agent category as diagnostic detail. A refusal is
+            # never an invitation to prepare or retry another operation.
+            runtime_reason = {
+                "busy": "busy",
+                "conflicting-operation": "busy",
+                "mismatched-payload": "selection-or-inputs-invalid",
+                "corrupt-journal": "busy",
+                "unsupported-recovery": "busy",
+            }[agent_reason]
+            return UpdateRefusal(runtime_reason, document["message"], agent_reason=agent_reason)
+
         if result.returncode:
-            # The installer helper may return a bounded refusal document when
-            # it held the real installer lock long enough to reconcile an
-            # older operation. Preserve that refusal instead of translating it
-            # into a fresh-admission failure or retrying the side effect.
-            helper_reason = value.get("reason") if isinstance(value, dict) else None
-            helper_message = value.get("message") if isinstance(value, dict) else None
-            if helper_reason == "busy":
-                raise UpdateRefusal("busy", helper_message or failure_message)
+            refusal = refusal_from_agent(value)
+            if refusal is not None:
+                raise refusal
             raise UpdateRefusal(failure_reason, failure_message)
         if not isinstance(value, dict):
             raise UpdateRefusal(failure_reason, failure_message)
+        refusal = refusal_from_agent(value)
+        if refusal is not None:
+            raise refusal
+        if (payload.get("action") == "accept"
+                and (value.get("format") != AGENT_JOB_FORMAT
+                     or not isinstance(value.get("operation_id"), str)
+                     or not re.fullmatch(r"[0-9a-f]{32}", value["operation_id"])
+                     or value.get("state") not in _JOB_STATES)):
+            raise UpdateRefusal("update-record-failed", "The update acceptance result is incomplete; no job was launched.")
         return value
 
     def _selection(self, *, allow_pending=False):
@@ -289,7 +327,12 @@ class UpdateAdmission:
                 raise ValueError("installer owner, management or data root mismatch")
         journal = root / "update-transaction.json"
         if journal.exists() or journal.is_symlink():
-            transaction = _json(journal, snapshots)
+            try:
+                transaction = _json(journal, snapshots)
+            except (OSError, UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+                if allow_pending:
+                    raise UpdateRefusal("busy", "The existing update journal is corrupt; no job was launched.") from None
+                raise
             if not allow_pending and transaction.get("step") not in {"complete", "rolled_back"}:
                 raise UpdateRefusal("recovery-needed", "The installer must recover its pending update first. Run the install line.")
         pointer = _bytes(root / "current")
