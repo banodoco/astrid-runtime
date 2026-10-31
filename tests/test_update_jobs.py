@@ -119,15 +119,15 @@ def test_status_reads_authoritative_job_and_c2_journal_without_recovery(tmp_path
     log.write_text("log")
     update.platform.owner_only(log)
     assert update.read_update_status(home) == {
-        "available": False, "state": "active", "operation_id": "11111111111111111111111111111111",
-        "result": "Update accepted.", "target_release": 9,
+        "available": False, "state": "recovery-needed", "operation_id": "11111111111111111111111111111111",
+        "result": "Recovery needed.", "target_release": 9,
         "log_path": str(root / "logs/update.log"),
     }
     fresh = subprocess.run(
         [sys.executable, "-c", "import json,sys; from astrid_runtime.update import read_update_status; print(json.dumps(read_update_status(sys.argv[1])))", str(home)],
         cwd=Path(__file__).parents[1], text=True, capture_output=True, check=True,
     )
-    assert json.loads(fresh.stdout)["state"] == "active"
+    assert json.loads(fresh.stdout)["state"] == "recovery-needed"
 
     # A fresh status reader observes a pending C2 transaction but never calls
     # recovery or modifies either record.
@@ -269,9 +269,10 @@ def _admission_fixture(tmp_path, monkeypatch, launcher):
     )
     admission = update.UpdateAdmission(daemon)
     snapshots = {selected: json.dumps(selected_value).encode(), root / "current": b"old\n",
+                 root / "install.json": b"{}",
                  version_path: json.dumps(version).encode()}
     python, agent, runtime = root / "versions/old/python", root / "agent", root / "runtime"
-    admission._selection = lambda: (selected, snapshots, python, agent, runtime, 4)
+    admission._selection = lambda **_kwargs: (selected, snapshots, python, agent, runtime, 4)
 
     @contextmanager
     def idle(_selection):
@@ -290,6 +291,7 @@ def _admission_fixture(tmp_path, monkeypatch, launcher):
                 "message": "Update accepted.",
             }}
             _write(root / "install.json", record)
+            snapshots[root / "install.json"] = (root / "install.json").read_bytes()
             return record["update_job"]
         directory = Path(payload["directory"])
         directory.mkdir(exist_ok=True)
@@ -324,9 +326,131 @@ def test_lost_launcher_ack_keeps_durable_job_and_inputs_without_retry(tmp_path, 
     assert accepted["metadata"]["release"] == 5
     assert prepared[0].exists()  # The accepted worker owns these selected bytes.
     status = update.read_update_status(Path.home(), available=True)
-    assert status["state"] == "active"
+    assert status["state"] == "recovery-needed"
     assert status["operation_id"] == accepted["operation_id"]
     assert len(calls) == 1
+
+
+def test_lost_ack_retry_reconciles_existing_operation_without_new_acceptance_or_launch(tmp_path, monkeypatch):
+    launches = []
+
+    def launcher(job):
+        launches.append(job)
+        if len(launches) == 1:
+            raise OSError("launcher response lost")
+
+    admission, accepted, prepared = _admission_fixture(tmp_path, monkeypatch, launcher)
+    real_helper = admission._helper
+    new_acceptances = []
+    reconciliations = []
+
+    def helper(python, agent, runtime, payload, **kwargs):
+        if payload.get("action") == "accept":
+            if not new_acceptances:
+                new_acceptances.append(payload["operation_id"])
+                return real_helper(python, agent, runtime, payload, **kwargs)
+            reconciliations.append(payload)
+            assert payload["operation_id"] == new_acceptances[0]
+            return {"operation_id": new_acceptances[0], "state": "active", "message": "Update active."}
+        return real_helper(python, agent, runtime, payload, **kwargs)
+
+    admission._helper = helper
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
+    assert error.value.details["reason"] == "launch-acknowledgement-unknown"
+    operation_id = new_acceptances[0]
+
+    result = admission.request()
+
+    assert result == {"accepted": True, "state": "accepted", "operation_id": operation_id,
+                      "message": "Update already accepted."}
+    assert len(new_acceptances) == 1
+    assert len(reconciliations) == 1
+    assert len(launches) == 1
+    assert accepted["operation_id"] == operation_id
+    assert prepared and prepared[0].exists()
+
+
+def test_explicit_update_returns_reconciled_terminal_result_without_second_launch(tmp_path, monkeypatch):
+    launches = []
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: launches.append(job))
+    selection_calls = []
+    real_selection = admission._selection
+
+    def selection(**kwargs):
+        selection_calls.append(kwargs)
+        return real_selection(**kwargs)
+
+    admission._selection = selection
+    real_helper = admission._helper
+    helper_actions = []
+
+    def helper(python, agent, runtime, payload, **kwargs):
+        helper_actions.append(payload.get("action"))
+        if payload.get("action") == "accept":
+            # The selected Agent reconciled an existing operation under its
+            # installer lock. This is recovery-only, not a new acceptance.
+            return {"operation_id": "b" * 32, "state": "updated", "result": "updated"}
+        return real_helper(python, agent, runtime, payload, **kwargs)
+
+    admission._helper = helper
+    result = admission.request()
+
+    assert selection_calls == [{"allow_pending": True}]
+    assert helper_actions == [None, "accept"]
+    assert launches == []
+    assert result == {
+        "accepted": False, "state": "updated", "operation_id": "b" * 32,
+        "message": "updated",
+    }
+    assert prepared and not prepared[0].exists()
+
+
+def test_mismatched_reconciler_operation_refuses_without_launch_or_record_mutation(tmp_path, monkeypatch):
+    launches = []
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: launches.append(job))
+    marker = tmp_path / "program with spaces" / "install.json"
+    before = marker.read_bytes()
+    real_helper = admission._helper
+
+    def helper(python, agent, runtime, payload, **kwargs):
+        if payload.get("action") == "accept":
+            return {"operation_id": "c" * 32, "state": "active"}
+        return real_helper(python, agent, runtime, payload, **kwargs)
+
+    admission._helper = helper
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
+
+    assert error.value.details["reason"] == "busy"
+    assert launches == []
+    assert marker.read_bytes() == before
+    assert prepared and not prepared[0].exists()
+
+
+def test_corrupt_or_mismatched_recovery_evidence_refuses_before_preparation(tmp_path, monkeypatch):
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("must not launch"))
+    selection_path, snapshots, python, agent, runtime, installed = admission._selection()
+    root = tmp_path / "program with spaces"
+    marker = root / "install.json"
+    before = marker.read_bytes()
+
+    snapshots[root / "update-transaction.json"] = b"{"
+    with pytest.raises(update.UpdateRefusal) as corrupt:
+        admission.request()
+    assert corrupt.value.details["reason"] == "busy"
+    assert prepared == [] and marker.read_bytes() == before
+
+    snapshots[root / "update-transaction.json"] = json.dumps({
+        "operation_id": "b" * 32, "step": "stopping",
+    }).encode()
+    snapshots[root / "install.json"] = json.dumps({
+        "update_job": {"operation_id": "a" * 32, "state": "accepted"},
+    }).encode()
+    with pytest.raises(update.UpdateRefusal) as mismatch:
+        admission.request()
+    assert mismatch.value.details["reason"] == "busy"
+    assert prepared == [] and marker.read_bytes() == before
 
 
 def test_record_write_failure_cleans_prepared_inputs_and_never_launches(tmp_path, monkeypatch):
@@ -354,7 +478,7 @@ def test_explicit_autostart_off_refuses_before_preparation_or_launch(tmp_path, m
     selected = json.loads(snapshots[selection_path])
     selected["preferences"] = {"autostart": choice}
     snapshots[selection_path] = json.dumps(selected).encode()
-    admission._selection = lambda: (selection_path, snapshots, python, agent, runtime, installed)
+    admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)
     with pytest.raises(update.UpdateRefusal) as error:
         admission.request()
     assert error.value.details["reason"] == "autostart-off-unsupported"
@@ -368,7 +492,7 @@ def test_production_launcher_uses_selected_python_helper_once(tmp_path, monkeypa
     selected["preferences"] = {"autostart": "on"}
     snapshots[selection_path] = json.dumps(selected).encode()
     selection_path.write_bytes(snapshots[selection_path])
-    admission._selection = lambda: (selection_path, snapshots, python, agent, runtime, installed)
+    admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)
     calls = []
     real_helper = admission._helper
 

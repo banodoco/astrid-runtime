@@ -35,6 +35,47 @@ class UpdateRefusal(ConflictError):
         super().__init__(message, details={"reason": reason})
 
 
+def _recoverable_operation(snapshots, root):
+    """Return the selected unresolved job, or refuse ambiguous evidence.
+
+    This is a selection-snapshot check only. The helper repeats the binding and
+    liveness checks while holding the installer lock before it can reconcile or
+    continue the operation.
+    """
+    marker_raw = snapshots.get(root / "install.json")
+    try:
+        marker = json.loads(marker_raw) if marker_raw is not None else {}
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise UpdateRefusal("busy", "The existing update record is corrupt; no job was launched.") from None
+    job = marker.get("update_job") if isinstance(marker, dict) else None
+    journal_raw = snapshots.get(root / "update-transaction.json")
+    try:
+        journal = json.loads(journal_raw) if journal_raw is not None else None
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise UpdateRefusal("busy", "The existing update journal is corrupt; no job was launched.") from None
+    if journal is not None and not isinstance(journal, dict):
+        raise UpdateRefusal("busy", "The existing update journal is invalid; no job was launched.")
+    pending = isinstance(journal, dict) and journal.get("step") not in {None, "complete", "rolled_back"}
+    job_id = job.get("operation_id") if isinstance(job, dict) else None
+    valid_job_id = isinstance(job_id, str) and re.fullmatch(r"[0-9a-f]{32}", job_id)
+    journal_job = journal.get("update_job") if isinstance(journal, dict) else None
+    journal_id = journal.get("operation_id") if isinstance(journal, dict) else None
+    if isinstance(journal_job, dict) and "operation_id" in journal_job:
+        journal_id = journal_job.get("operation_id")
+    state = job.get("state") if isinstance(job, dict) else None
+    unresolved = (state in {"accepted", "recovery-needed"}
+                  or (state == "launching" and job.get("launch_status") != "acknowledged")
+                  or pending
+                  or (state == "active" and isinstance(journal, dict)
+                      and journal.get("step") in {"complete", "rolled_back"}))
+    if unresolved and (not valid_job_id
+                       or (journal_id is not None and journal_id != job_id)):
+        raise UpdateRefusal("busy", "The unresolved update identities do not match; no job was launched.")
+    if not isinstance(job, dict) or not valid_job_id:
+        return None
+    return job if unresolved else None
+
+
 def _path(value):
     if not isinstance(value, str) or not value or not Path(value).is_absolute():
         raise ValueError("absolute managed path required")
@@ -107,17 +148,25 @@ class UpdateAdmission:
         failure_reason = "update-record-failed" if payload.get("action") == "accept" else "inputs-unavailable"
         failure_message = ("The update request could not be saved safely." if failure_reason == "update-record-failed"
                            else "Update inputs are unavailable or invalid.")
-        if result.returncode:
-            raise UpdateRefusal(failure_reason, failure_message)
         try:
             value = json.loads(result.stdout)
         except (TypeError, json.JSONDecodeError):
             raise UpdateRefusal(failure_reason, failure_message) from None
+        if result.returncode:
+            # The installer helper may return a bounded refusal document when
+            # it held the real installer lock long enough to reconcile an
+            # older operation. Preserve that refusal instead of translating it
+            # into a fresh-admission failure or retrying the side effect.
+            helper_reason = value.get("reason") if isinstance(value, dict) else None
+            helper_message = value.get("message") if isinstance(value, dict) else None
+            if helper_reason == "busy":
+                raise UpdateRefusal("busy", helper_message or failure_message)
+            raise UpdateRefusal(failure_reason, failure_message)
         if not isinstance(value, dict):
             raise UpdateRefusal(failure_reason, failure_message)
         return value
 
-    def _selection(self):
+    def _selection(self, *, allow_pending=False):
         daemon = self.daemon
         identity = normalize_startup_identity(daemon.startup_identity)
         if identity["managed_by"] == "source":
@@ -146,7 +195,7 @@ class UpdateAdmission:
         journal = root / "update-transaction.json"
         if journal.exists() or journal.is_symlink():
             transaction = _json(journal, snapshots)
-            if transaction.get("step") not in {"complete", "rolled_back"}:
+            if not allow_pending and transaction.get("step") not in {"complete", "rolled_back"}:
                 raise UpdateRefusal("recovery-needed", "The installer must recover its pending update first. Run the install line.")
         pointer = _bytes(root / "current")
         snapshots[root / "current"] = pointer
@@ -207,65 +256,84 @@ class UpdateAdmission:
         if not self._lock.acquire(blocking=False):
             raise UpdateRefusal("update-busy", "An update request is already being prepared.")
         try:
-            selection_path, snapshots, python, agent, runtime, installed = self._selection()
+            # POST is the only route allowed to reach the installer's locked
+            # reconciler. GET/status remains read-only and never recovers.
+            selection_path, snapshots, python, agent, runtime, installed = self._selection(allow_pending=True)
             selected_record = json.loads(snapshots[selection_path])
             _assert_autostart_supported(selected_record)
             root = Path(selected_record["program_root"])
             data = Path(selected_record["data_root"])
             old_version_name = snapshots[root / "current"].decode("utf-8").strip()
             old_version = json.loads(snapshots[root / "versions" / old_version_name / "version.json"])
-            temporary_base = Path(tempfile.gettempdir()).resolve(strict=True)
-            temporary = Path(tempfile.mkdtemp(prefix="astrid-update-", dir=temporary_base))
-            platform.private_directory(temporary)
+            existing = _recoverable_operation(snapshots, root)
+            temporary = None
             accepted = False
             operation_id = None
             try:
+                if existing is None:
+                    temporary_base = Path(tempfile.gettempdir()).resolve(strict=True)
+                    temporary = Path(tempfile.mkdtemp(prefix="astrid-update-", dir=temporary_base))
+                    platform.private_directory(temporary)
                 with self._installer_idle(selection_path):
                     # C1 owns the blocker report and the final destructive fence.
                     # This is only its read-only preflight; no stop authority here.
                     assert_interruption_safe(self.daemon.root)
-                    request = {"directory": str(temporary), "installed_release": installed,
-                               "manifest_url": MANIFEST_URL,
-                               "bootstrap_url": WINDOWS_BOOTSTRAP_URL if sys.platform == "win32" else BOOTSTRAP_URL}
-                    metadata = self._helper(python, agent, runtime, request)
-                    # Validate selected bytes again in the parent at the point
-                    # of consumption; helper metadata is not upstream verification.
-                    from hashlib import sha256
-                    for input_name in ("manifest", "bootstrap"):
-                        path = temporary / input_name
-                        if not platform.is_owner_only(path):
-                            raise ValueError("selected input is no longer private")
-                        raw = _bytes(path, limit=2 * MAX_METADATA_BYTES)
-                        if sha256(raw).hexdigest() != metadata[input_name + "_sha256"]:
-                            raise ValueError("selected input changed")
-                    target = metadata["release"]
-                    if type(target) is not int or target <= installed:
-                        raise ValueError("target release must be an integer newer than installed")
-                    for path, raw in snapshots.items():
-                        if _bytes(path) != raw:
-                            raise ValueError("selected installation changed during preparation")
-                    from uuid import uuid4
-                    operation_id = uuid4().hex
-                    job_name = "astrid-update-" + operation_id
-                    log_path = root / "logs" / (job_name + ".log")
-                    durable = {
-                        "action": "accept", "root": str(root), "data_root": str(data),
-                        "selection_path": str(selection_path), "old_instance_id": self.daemon.instance_id,
-                        "old_identity": self.daemon.startup_identity, "old_version": old_version,
-                        "metadata": {
-                            "manifest_path": str(temporary / "manifest"),
-                            "bootstrap_path": str(temporary / "bootstrap"),
-                            "manifest_sha256": metadata["manifest_sha256"],
-                            "bootstrap_sha256": metadata["bootstrap_sha256"],
-                            "release": target,
-                        },
-                        "job_name": job_name, "operation_id": operation_id, "log_path": str(log_path),
-                    }
+                    if existing is not None:
+                        # A recovery POST carries the durable operation's own
+                        # identity. It must not prepare inputs or mint a new
+                        # UUID before the locked helper reconciles it.
+                        operation_id = existing["operation_id"]
+                        durable = {"action": "accept", "root": str(root),
+                                   "data_root": str(data), "operation_id": operation_id,
+                                   "selection_path": str(selection_path),
+                                   "old_instance_id": self.daemon.instance_id,
+                                   "old_identity": self.daemon.startup_identity,
+                                   "old_version": old_version}
+                        for key in ("metadata", "job_name", "log_path"):
+                            if key in existing:
+                                durable[key] = existing[key]
+                    else:
+                        request = {"directory": str(temporary), "installed_release": installed,
+                                   "manifest_url": MANIFEST_URL,
+                                   "bootstrap_url": WINDOWS_BOOTSTRAP_URL if sys.platform == "win32" else BOOTSTRAP_URL}
+                        metadata = self._helper(python, agent, runtime, request)
+                        # Validate selected bytes again in the parent at the point
+                        # of consumption; helper metadata is not upstream verification.
+                        from hashlib import sha256
+                        for input_name in ("manifest", "bootstrap"):
+                            path = temporary / input_name
+                            if not platform.is_owner_only(path):
+                                raise ValueError("selected input is no longer private")
+                            raw = _bytes(path, limit=2 * MAX_METADATA_BYTES)
+                            if sha256(raw).hexdigest() != metadata[input_name + "_sha256"]:
+                                raise ValueError("selected input changed")
+                        target = metadata["release"]
+                        if type(target) is not int or target <= installed:
+                            raise ValueError("target release must be an integer newer than installed")
+                        for path, raw in snapshots.items():
+                            if _bytes(path) != raw:
+                                raise ValueError("selected installation changed during preparation")
+                        from uuid import uuid4
+                        operation_id = uuid4().hex
+                        job_name = "astrid-update-" + operation_id
+                        log_path = root / "logs" / (job_name + ".log")
+                        durable = {
+                            "action": "accept", "root": str(root), "data_root": str(data),
+                            "selection_path": str(selection_path), "old_instance_id": self.daemon.instance_id,
+                            "old_identity": self.daemon.startup_identity, "old_version": old_version,
+                            "metadata": {
+                                "manifest_path": str(temporary / "manifest"),
+                                "bootstrap_path": str(temporary / "bootstrap"),
+                                "manifest_sha256": metadata["manifest_sha256"],
+                                "bootstrap_sha256": metadata["bootstrap_sha256"],
+                                "release": target,
+                            },
+                            "job_name": job_name, "operation_id": operation_id, "log_path": str(log_path),
+                        }
                 # The helper owns the K2 lock/write. Release the F1a read-only
                 # probe lock first so accept can reacquire the real installer lock.
                 try:
                     job = self._helper(python, agent, runtime, durable)
-                    accepted = True
                 except Exception:
                     current = _read_bounded_object(root / "install.json") or {}
                     current_job = current.get("update_job")
@@ -273,6 +341,32 @@ class UpdateAdmission:
                         accepted = True
                         raise UpdateRefusal("accept-acknowledgement-unknown", "The update request was saved; check update status before taking another action.") from None
                     raise
+                if not isinstance(job, dict):
+                    raise UpdateRefusal("busy", "The update acceptance result is incomplete; no job was launched.")
+                returned_operation = job.get("operation_id")
+                returned_state = job.get("state")
+                if returned_operation != operation_id:
+                    # A locked helper reconciliation returns the existing
+                    # operation's terminal result. It is recovery-only: do not
+                    # launch it and do not report a second logical acceptance.
+                    if (existing is None
+                            and returned_state in {"updated", "rolled_back", "failed"}
+                            and isinstance(returned_operation, str)
+                            and re.fullmatch(r"[0-9a-f]{32}", returned_operation)):
+                        return {"accepted": False, "state": returned_state,
+                                "operation_id": returned_operation,
+                                "message": job.get("message") or job.get("result")}
+                    raise UpdateRefusal("busy", "The unresolved update was not safely reconciled; no job was launched.")
+                if returned_state not in {"accepted", "launching", "active"}:
+                    raise UpdateRefusal("busy", "The update is not accepted for launch.")
+                # From this point the prepared inputs belong to the durable
+                # job; recovery-only terminal results returned above do not.
+                accepted = True
+                if existing is not None and returned_state in {"launching", "active"}:
+                    # The helper positively found the existing native attempt;
+                    # repeating launch would replay an uncertain side effect.
+                    return {"accepted": True, "state": "accepted",
+                            "operation_id": operation_id, "message": "Update already accepted."}
                 # Launcher acknowledgement can be lost after OS acceptance.
                 # Keep the durable job active and never retry it here.
                 try:
@@ -299,7 +393,7 @@ class UpdateAdmission:
             finally:
                 # Inputs belong to the durable job after acceptance; cleanup
                 # remains with the worker/job lifecycle owner.
-                if not accepted:
+                if not accepted and temporary is not None:
                     shutil.rmtree(temporary, ignore_errors=True)
         except ConflictError:
             raise
@@ -389,6 +483,12 @@ def read_update_status(home=None, *, available=False):
         matched = (job.get("transaction_id") is not None
                    and job.get("transaction_id") == transaction.get("operation_id"))
     if journal_corrupt:
+        state = "recovery-needed"
+    elif (state == "accepted"
+          or (state == "launching" and job.get("launch_status") != "acknowledged")):
+        # Durable acceptance/registration is not proof that the native job was
+        # acknowledged. Keep it unresolved until an explicit POST reaches the
+        # installer's locked reconciler.
         state = "recovery-needed"
     elif step and step not in terminal_steps:
         state = "active" if matched and _installer_lock_held(home) else "recovery-needed"
