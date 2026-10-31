@@ -27,6 +27,26 @@ def _patch_opener(monkeypatch, open_response):
     )
 
 
+@pytest.mark.parametrize("filters", [{}, {"kind": "video", "model": "X /&?", "target": "runpod", "tag": "hero +"}, {"tag": ""}])
+def test_generation_list_filters_encode_through_generated_transport(filters):
+    from urllib.parse import parse_qs, urlsplit
+
+    calls = []
+
+    def transport(method, path, headers, body):
+        calls.append((method, path))
+        return 200, {}, b'{"items":[],"next_cursor":"page-two"}'
+
+    client = WorkspaceClient("http://runtime", transport=transport)
+    assert client.list_generations("project /&?", cursor="page +", limit=7, **filters) == ([], "page-two")
+    method, path = calls.pop()
+    assert method == "GET"
+    assert urlsplit(path).path == "/v1/projects/project%20%2F%26%3F/generations"
+    assert parse_qs(urlsplit(path).query, keep_blank_values=True) == {
+        "cursor": ["page +"], "limit": ["7"], **{name: [value] for name, value in filters.items()},
+    }
+
+
 def test_generated_abandon_client_roundtrips_exact_identity_receipt_and_wire_schema(tmp_path):
     from jsonschema import Draft202012Validator
     from referencing import Registry, Resource
@@ -682,7 +702,7 @@ def test_generated_task_lease_fields_decode_from_get_and_project_list() -> None:
     ]
 
 
-def test_distinct_tasks_reader_reads_expired_task_as_requeued_with_fence(tmp_path: Path) -> None:
+def test_distinct_tasks_reader_retains_expired_task_custody_with_fence(tmp_path: Path) -> None:
     realm = tmp_path / "realm"
     RealmStore.initialize(realm).close()
     daemon = RuntimeDaemon(
@@ -744,11 +764,19 @@ def test_distinct_tasks_reader_reads_expired_task_as_requeued_with_fence(tmp_pat
         assert reader_identity["actor"] != "executor-a"
 
         readback = WorkspaceClient(daemon.endpoint, reader_token).get_task(admitted["task_id"])
-        # A read applies the claim path's lease expiry: the dead
-        # attempt's task is requeued, keeping its fence, with no live deadline.
-        assert readback.state == "queued"
+        # Expiry ends publication authority but does not prove executor stop.
+        # A distinct reader preserves the exact running attempt and deadline.
+        assert readback.state == "running"
         assert readback.lease_fence == claimed.fence
-        assert readback.lease_expires_at is None
+        assert readback.lease_expires_at == expired
+        task = daemon.service.store.conn.execute(
+            "SELECT status, attempt_id, executor_id, lease_fence, lease_expires_at FROM tasks WHERE id=?",
+            (admitted["task_id"],),
+        ).fetchone()
+        assert tuple(task) == ("running", claimed.attempt_id, "executor-a", claimed.fence, expired)
+        assert daemon.service.store.conn.execute(
+            "SELECT settled FROM attempts WHERE id=?", (claimed.attempt_id,),
+        ).fetchone()[0] == 0
     finally:
         daemon.stop()
 
@@ -979,6 +1007,45 @@ def test_list_documents_generated_client_kind_filter_is_encoded() -> None:
         assert path == "/v1/projects/p%20%2F/documents?limit=5&cursor=next%2Fpage&kind=astrid.note%20%2F%3F"
         return 200, {}, b'{"items": [], "next_cursor": null}'
     assert WorkspaceClient("http://runtime", transport=transport).list_documents("p /", cursor="next/page", limit=5, kind="astrid.note /?") == ([], None)
+
+
+@pytest.mark.parametrize("name", ["kind", "model", "target", "tag"])
+def test_list_project_objects_generated_client_forwards_each_filter(name):
+    def transport(method, path, headers, body):
+        assert method == "GET"
+        assert path == f"/v1/projects/p/objects?limit=50&{name}=value"
+        return 200, {}, b'{"items": [], "next_cursor": "next"}'
+
+    assert getattr(WorkspaceClient("http://runtime", transport=transport), "list_project_objects")("p", **{name: "value"}) == ([], "next")
+
+
+def test_list_project_objects_generated_client_forwards_combined_filters_and_encodes_values():
+    from urllib.parse import parse_qs, urlsplit
+
+    filters = {
+        "kind": "astrid.video /?",
+        "model": "vendor/model&variant=fast",
+        "target": "runpod+gpu=1",
+        "tag": "scene #1",
+    }
+
+    def transport(method, path, headers, body):
+        parsed = urlsplit(path)
+        assert method == "GET"
+        assert parsed.path == "/v1/projects/p%20%2F/objects"
+        assert parse_qs(parsed.query, keep_blank_values=True) == {"limit": ["50"], **{key: [value] for key, value in filters.items()}}
+        return 200, {}, b'{"items": [], "next_cursor": null}'
+
+    assert WorkspaceClient("http://runtime", transport=transport).list_project_objects("p /", **filters) == ([], None)
+
+
+def test_list_project_objects_generated_client_without_filters_preserves_request_and_response():
+    def transport(method, path, headers, body):
+        assert method == "GET"
+        assert path == "/v1/projects/p%20%2F/objects?limit=50"
+        return 200, {}, b'{"items": [], "next_cursor": "existing-cursor"}'
+
+    assert WorkspaceClient("http://runtime", transport=transport).list_project_objects("p /") == ([], "existing-cursor")
 
 
 def test_stream_project_object_upload_sets_length_digest_and_does_not_buffer_or_close(monkeypatch) -> None:

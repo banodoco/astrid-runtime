@@ -80,3 +80,64 @@ def test_host_only_rejects_undeclared_roles_or_mode(change):
         realm_root=profile.realm_root, support_root=profile.support_root)
     with pytest.raises(ValidationError):
         LocalWorkerLauncher._profile(launcher, profile.profile_id, profile.workspace_uuid)
+
+
+def _started_local_worker(tmp_path, monkeypatch):
+    from runtime_protocol.auth import CredentialStore
+    from test_local_worker_placement import FakePreparer, _launcher, _observation, _profile
+
+    profile = _profile(tmp_path, "reuse-realm")
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer = FakePreparer(store, observed)
+    inspector = SimpleNamespace(observe=lambda _handle: observed)
+    launcher = _launcher(store, profile, preparer, inspector, 77)
+    monkeypatch.setattr(launcher, "_start_watcher", lambda: None)
+    result = launcher.start(profile.profile_id, profile.workspace_uuid)
+    assert result["state"] == "active"
+    assert preparer.events == ["prepare", "report", "activate"]
+    return profile, store, observed, preparer, launcher, result
+
+
+def test_live_start_reuses_custody_without_preparing_or_reconnecting(tmp_path, monkeypatch):
+    from runtime_protocol.daemon import WORKER_ACTOR
+
+    profile, store, _observed, preparer, launcher, first = _started_local_worker(tmp_path, monkeypatch)
+    handle = preparer.handle
+    metadata = store.actor_metadata(WORKER_ACTOR)
+
+    def unexpected_disable(_actor):
+        pytest.fail("a live repeated start must preserve active actor authority")
+
+    monkeypatch.setattr(store, "disable_actor", unexpected_disable)
+    for _ in range(2):
+        reused = launcher.start(profile.profile_id, profile.workspace_uuid)
+        assert reused["state"] == "reconnected"
+        assert reused["executor_incarnation"] == first["executor_incarnation"]
+        assert reused["evidence_digest"] == first["evidence_digest"]
+        assert preparer.handle is handle and launcher._active_handle is handle
+        assert preparer.events == ["prepare", "report", "activate"]
+        assert store.actor_metadata(WORKER_ACTOR) == metadata
+
+
+def test_durable_start_reconnects_survivor_without_preparing_new_generation(tmp_path, monkeypatch):
+    from runtime_protocol.daemon import WORKER_ACTOR
+    from test_local_worker_placement import FakePreparer, _launcher
+
+    profile, store, observed, _preparer, _launcher_before_restart, first = _started_local_worker(tmp_path, monkeypatch)
+    metadata = store.actor_metadata(WORKER_ACTOR)
+    reparented = replace(observed, worker=replace(observed.worker, parent_pid=1))
+    preparer = FakePreparer(store, reparented)
+    inspector = SimpleNamespace(observe=lambda _handle: reparented)
+    launcher = _launcher(store, profile, preparer, inspector, 88)
+    monkeypatch.setattr(launcher, "_start_watcher", lambda: None)
+    assert launcher._active_handle is None
+
+    reconnected = launcher.start(profile.profile_id, profile.workspace_uuid)
+
+    assert reconnected["state"] == "reconnected"
+    assert reconnected["executor_incarnation"] == first["executor_incarnation"]
+    assert reconnected["evidence_digest"] == first["evidence_digest"]
+    assert preparer.events == ["reconnect"]
+    assert launcher._active_handle is preparer.handle
+    assert store.actor_metadata(WORKER_ACTOR) == metadata

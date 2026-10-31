@@ -20,7 +20,7 @@ from .catalog import LiveDiscovery, RealmCatalog, process_birth_identity
 from .backup import restore_backup, verify_backup, verify_restore_candidate
 from .dirfd import capture_parent, close_pinned, validate_parent
 from .door import CHAT_FILE_NAME, open_door
-from .errors import ConflictError, NotFoundError, ProtocolError
+from .errors import ConflictError, NotFoundError, ProtocolError, RuntimeErrorBase
 from .server import RuntimeHTTPServer, RuntimeHandler
 from .service import RuntimeService
 from .startup_identity import capture_startup_identity
@@ -55,7 +55,11 @@ def _authority_path(value, label):
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, services=None, log_directory=None, runtime_checkout=None, agent_checkout=None):
+    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, services=None, log_directory=None, runtime_checkout=None, agent_checkout=None, _local_worker_composition=None, _local_worker_composition_required=False):
+        from .local_worker_composition import _retain_local_worker_composition
+        self._local_worker_composition = _retain_local_worker_composition(
+            _local_worker_composition, required=_local_worker_composition_required)
+        self._local_worker_composition_required = _local_worker_composition_required
         if ":" in host:
             raise ValueError("runtime daemon requires IPv4 loopback; IPv6 is not supported yet")
         if host not in ("127.0.0.1", "localhost"):
@@ -157,6 +161,13 @@ class RuntimeDaemon:
         self._local_worker_deferred = False
         owner_scopes = ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register", "credentials:provision"]
         self.token, self.credential_path = self.credentials.provision("owner", owner_scopes, rotate=rotate)
+        # Prepared children have distinct generations, never the local parent's
+        # shared actor. A new owner leaves their bytes for exact reconciliation
+        # but fences every prior session before opening authenticated HTTP.
+        for row in self.service.store.conn.execute("SELECT id, spec_digest FROM tasks"):
+            if isinstance(self.service.store._spec(row).get("delegated_parent"), dict):
+                actor = "astrid-prepared-" + hashlib.sha256(str(row["id"]).encode()).hexdigest()[:32]
+                self.credentials.disable_actor(actor)
         if self.local_worker_profiles:
             if self._remote_worker_custody_unresolved() or self._local_relinquish_pending():
                 # Keep the owner and exact remote cleanup route available. Do
@@ -267,7 +278,7 @@ class RuntimeDaemon:
         self.process_signalling = platform.process_control_probe()
         process_control.announce(self.process_signalling)
         epoch_floor = self._read_epoch_floor()
-        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor, admission_timeout=self.admission_timeout, _admission_fd=self._replacement_admission_fd)
+        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor, admission_timeout=self.admission_timeout, _admission_fd=self._replacement_admission_fd, _local_worker_composition=self._local_worker_composition, _local_worker_composition_required=self._local_worker_composition_required)
         cancellation.check()
         self.service.set_readiness_callback(self._revoke_readiness)
         self.service.set_local_claim_generation_verifier(self._verify_local_claim_generation, actor=WORKER_ACTOR)
@@ -352,7 +363,15 @@ class RuntimeDaemon:
                 return True
             key = (str(row["task_id"]), activation_id)
             if row["kind"] == "task.remote_activation_qualified":
-                active.add(key)
+                try:
+                    prepared_actor = self.service.prepared_child_executor(row["task_id"])
+                except RuntimeErrorBase:
+                    return True
+                if prepared_actor is None or payload.get("credential_actor") != prepared_actor:
+                    # Only an exact canonical prepared child is separate from
+                    # the shared local actor. Legacy or unknown custody keeps
+                    # the historical conservative refusal.
+                    active.add(key)
             else:
                 active.discard(key)
         return bool(active)
@@ -920,7 +939,7 @@ class RuntimeDaemon:
         Called only inside the Runtime owner mutex after exact revocation.
         A foreign or changed byte is unresolved, never an orphan we may erase.
         """
-        actor = WORKER_ACTOR
+        actor = self.service.prepared_child_executor(task_id) or WORKER_ACTOR
         paths = self.credentials._paths(actor)
         existing = [path for path in paths if path.exists() or path.is_symlink()]
         if not existing:
@@ -962,9 +981,10 @@ class RuntimeDaemon:
                 self.service._assert_mutation_admitted()
                 if self.service._require_placement_recovery_owner(identity) != "owner":
                     raise ConflictError("remote credential control requires the Runtime owner")
-                if self.local_worker_launcher is not None and not self.local_worker_launcher.is_idle():
+                actor = self.service.prepared_child_executor(task_id) or WORKER_ACTOR
+                if actor == WORKER_ACTOR and self.local_worker_launcher is not None and not self.local_worker_launcher.is_idle():
                     raise ConflictError("the local Worker owns the shared executor actor")
-                if isinstance(body, dict) and body.get("action") in {"provision", "enable"} and self._local_relinquish_pending():
+                if actor == WORKER_ACTOR and isinstance(body, dict) and body.get("action") in {"provision", "enable"} and self._local_relinquish_pending():
                     raise ConflictError("local Worker relinquish is unresolved")
                 return self._remote_credential_control(task_id, body, identity=identity)
 
@@ -974,7 +994,7 @@ class RuntimeDaemon:
             isinstance(qualification, dict) and isinstance(placement, dict)
             and qualification.get("task_id") == task_id
             and qualification.get("run_id") == binding.admission_identity.run_id
-            and qualification.get("credential_actor") == WORKER_ACTOR
+            and qualification.get("credential_actor") == (self.service.prepared_child_executor(task_id) or WORKER_ACTOR)
             and qualification.get("binding_digest") == binding.digest()
             and qualification.get("effective_target") == binding.placement.effective_target
             and qualification.get("runtime_session_id") == self.service.runtime_session_id
@@ -999,7 +1019,7 @@ class RuntimeDaemon:
             raise ProtocolError("remote credential action is invalid")
         task = self.service._task_resource(self.service.store.get_task(task_id))
         binding = deployment_binding_from_task(task)
-        actor = WORKER_ACTOR
+        actor = self.service.prepared_child_executor(task_id) or WORKER_ACTOR
         if body["action"] == "revoke-uncommitted":
             if set(body) != {"action", "qualification", "placement"}:
                 raise ProtocolError("uncommitted remote cleanup requires exact qualification and placement")
@@ -1114,6 +1134,13 @@ class RuntimeDaemon:
             if latest is not None and latest != qualification:
                 raise ConflictError("remote activation generation changed before revocation")
             if latest == qualification:
+                if actor != WORKER_ACTOR:
+                    binding_row = self.service.store.execution_binding(task_id)
+                    if (task["state"] not in {"succeeded", "failed", "cancelled"}
+                            or self.service.store.conn.execute("SELECT 1 FROM attempts WHERE task_id=? AND settled=0", (task_id,)).fetchone()
+                            or self.service.store.conn.execute("SELECT 1 FROM reservations WHERE task_id=? AND released_at IS NULL", (task_id,)).fetchone()
+                            or (binding_row is not None and binding_row["status"] == "claimed")):
+                        raise ConflictError("prepared child still owns outstanding work")
                 self.service.revoke_remote_activation(
                     task_id, body["activation_id"], identity=identity, qualification=qualification,
                 )

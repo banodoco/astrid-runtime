@@ -125,8 +125,8 @@ def test_a5_crash_reclaim_fences_old_attempt_and_publishes_new_output(tmp_path):
         recovered.close()
 
 
-def test_a5_expired_attempt_is_reclaimed_and_stale_fence_is_rejected(tmp_path):
-    """Lease expiry fences a worker before a replacement claim can settle."""
+def test_a5_expired_attempt_requires_owner_cede_before_successor_and_stale_fence_is_rejected(tmp_path):
+    """Expiry retains custody; an exact owner failure permits explicit retry."""
     RealmStore.initialize(tmp_path / "realm").close()
     service = _service(tmp_path / "realm")
     try:
@@ -138,14 +138,47 @@ def test_a5_expired_attempt_is_reclaimed_and_stale_fence_is_rejected(tmp_path):
             "UPDATE tasks SET lease_expires_at=? WHERE id=?",
             (expired, task["task"]["id"]),
         )
+        service.store.conn.execute(
+            "UPDATE attempts SET lease_expires_at=? WHERE id=?",
+            (expired, old_attempt["attempt_id"]),
+        )
+        assert _claim(service, "a5-stale-no-reclaim") is None
+        retained = service.task(task["task"]["id"])["task"]
+        assert retained["status"] == "running"
+        assert retained["attempt_id"] == old_attempt["attempt_id"]
+        assert service.store.conn.execute(
+            "SELECT settled FROM attempts WHERE id=?", (old_attempt["attempt_id"],)
+        ).fetchone()[0] == 0
+        service.fail_attempt(
+            old_attempt["attempt_id"],
+            {**{key: old_attempt[key] for key in ("lease_id", "fence", "runtime_epoch")},
+             "error": {"code": "lease_lost"}},
+            idempotency_key="a5-stale-owner-cede",
+        )
+        service.retry_task(task["task"]["id"], {}, idempotency_key="a5-stale-explicit-retry")
         new_attempt = _claim(service, "a5-stale-claim-2")
         assert new_attempt["attempt_id"] != old_attempt["attempt_id"]
         assert new_attempt["fence"] > old_attempt["fence"]
+        payload = b"a5-expired-owner-successor-output"
+        output = {
+            "name": "successor.bin", "digest": _digest(payload),
+            "media_type": "application/octet-stream", "size": len(payload),
+            "data_base64": base64.b64encode(payload).decode("ascii"),
+        }
         with pytest.raises(LeaseError):
-            _settle(service, old_attempt, "a5-stale-old-settle", [])
-        _settle(service, new_attempt, "a5-stale-new-settle", [])
+            _settle(service, old_attempt, "a5-stale-old-settle", [output])
+        digest = _digest(payload).removeprefix("sha256:")
+        assert not service.cas.path_for(digest).exists()
+        assert service.store.conn.execute("SELECT COUNT(*) FROM objects WHERE digest=?", (digest,)).fetchone()[0] == 0
+        assert service.task(task["task"]["id"])["task"]["attempt_id"] == new_attempt["attempt_id"]
+        result = _settle(service, new_attempt, "a5-stale-new-settle", [output])
+        assert result["data"]["state"] == "succeeded"
+        assert service.cas.read(digest) == payload
+        assert service.store.conn.execute("SELECT COUNT(*) FROM objects WHERE digest=?", (digest,)).fetchone()[0] == 1
         event_kinds = [event["kind"] for event in service.events(task["run"]["id"])]
-        assert "task.lease_expired" in event_kinds
+        assert "task.lease_expired" not in event_kinds
+        assert "task.failed" in event_kinds
+        assert "task.retried" in event_kinds
         assert event_kinds[-1] == "task.completed"
     finally:
         service.close()

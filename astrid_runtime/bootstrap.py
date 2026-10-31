@@ -325,8 +325,8 @@ class BootstrapResult:
 
 
 def _default_legacy_roots(paths: RuntimePaths) -> tuple[Path, ...]:
-    # These are collision signals only; no directory is scanned and no legacy
-    # state is read.  Callers can provide the exact historical root explicitly.
+    # These are collision signals only; no legacy state is read.
+    # ~/.astrid also holds supported credentials and compute profiles.
     return (
         paths.home / ".astrid",
         paths.home / "Astrid" / "projects",
@@ -339,7 +339,15 @@ def _legacy_collision(paths: RuntimePaths, configured: tuple[Path, ...]) -> Path
         root = Path(root).expanduser()
         # lexists is intentional: a dangling legacy symlink is still a
         # collision and must not be bypassed by a stale/empty catalog.
-        if os.path.lexists(str(root)) and (root.is_dir() or root.is_file() or root.is_symlink()):
+        if root == paths.home / ".astrid" and root not in configured and root.is_dir() and not root.is_symlink():
+            # Inspect names only, never open legacy databases or credential files.
+            markers = (
+                "astrid.sqlite3", "workspace.sqlite3", "realm.sqlite3",
+                "projects", "runtime", "realms",
+            )
+            if any(os.path.lexists(str(root / marker)) for marker in markers):
+                return root
+        elif os.path.lexists(str(root)):
             return root
     return None
 
@@ -627,6 +635,38 @@ def _pid_alive(boundary: RuntimeBoundary | None, pid: Any) -> bool:
         if exc.errno == errno.ESRCH:
             return False
         raise BootstrapError("Runtime liveness observation remains uncertain.") from exc
+
+
+def _owner_may_be_alive(boundary: RuntimeBoundary, record: Mapping[str, Any]) -> bool:
+    """Only proven absence or a different birth permits stale-record cleanup."""
+    pid = record.get("pid")
+    if not _pid_alive(boundary, pid):
+        return False
+    observe = getattr(boundary, "process_birth_identity", None)
+    expected = record.get("process_birth_id")
+    if not callable(observe) or not expected:
+        return True
+    actual = observe(int(pid))
+    return actual is None or runtime_platform.process_birth_matches(str(expected), actual) is not False
+
+
+def _reclaim_stale_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> bool:
+    """Reclaim only stale advertisements under the launcher mutex; never signal.
+
+    Check both records before removing either: a missing/stale discovery must
+    not hide a live owner in instance.lock. Recheck snapshots so replacement
+    advertisements cannot be removed by an older cleanup attempt.
+    """
+    records = [(path, _read_support_json(path))
+               for path in (paths.discovery_path, paths.instance_lock_path)]
+    present = [(path, record) for path, record in records if record is not None]
+    if not present or any(_owner_may_be_alive(boundary, record) for _, record in present):
+        return False
+    if any(_read_support_json(path) != record for path, record in records):
+        raise BootstrapError("Runtime owner changed during stale-owner cleanup.")
+    for path, _ in present:
+        remove_file(path)
+    return True
 
 
 def _canonical_realm_root(value: str | Path, *, allow_missing: bool = False) -> Path:
@@ -963,13 +1003,16 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     new_realm = False
     diagnostics: list[str] = []
 
+    marker = _read_support_json(paths.instance_lock_path)
+    if marker is None or marker.get("state") is None:
+        _reclaim_stale_owner_locked(paths, boundary)
     discovery = _read_support_json(paths.discovery_path)
     if discovery is not None and discovery.get("active_realm"):
         _compatible(discovery, config, source)
         pid = discovery.get("pid")
         endpoint = str(discovery.get("endpoint", ""))
         instance_id = str(discovery.get("runtime_instance_id", ""))
-        if _pid_alive(boundary, pid):
+        if _owner_may_be_alive(boundary, discovery):
             if not endpoint or not instance_id:
                 raise DuplicateOwnerError(
                     "A runtime owner is active but its discovery record is incomplete; "
@@ -1029,6 +1072,9 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                 discovery.get("door_origin"), discovery.get("door_endpoint"),
                 discovery.get("runtime_instance_id"),
             )
+        marker = _read_support_json(paths.instance_lock_path)
+        if marker is not None and _owner_may_be_alive(boundary, marker):
+            raise DuplicateOwnerError("A live runtime owner lock protects the stale discovery.")
         # A dead advertisement is ephemeral support state.  Remove it before
         # starting so a crash cannot be mistaken for a live owner.
         remove_file(paths.discovery_path)
@@ -1038,7 +1084,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     # Never start a second owner while the durable instance lock still points
     # at a live process.
     marker = _read_support_json(paths.instance_lock_path)
-    if marker and _pid_alive(boundary, marker.get("pid")):
+    if marker and _owner_may_be_alive(boundary, marker):
         raise DuplicateOwnerError(
             "A different runtime owner is active for the selected realm; "
             "stop it before retrying astrid-runtime up --profile astrid."
@@ -2248,6 +2294,7 @@ def _interrupt_owner_locked(
     owner = None
     stale_owner_identity = None
     retained_completed_stop = None
+    reused_owner = False
     if discovery is None and marker is not None and marker.get("state") == "completed_stop":
         if pinokio_binding is None:
             _durable_remove(paths.instance_lock_path)
@@ -2310,14 +2357,29 @@ def _interrupt_owner_locked(
     elif discovery is None and marker is None and pinokio_binding is not None:
         raise _pinokio_stop_refusal("Runtime Pinokio interruption refused: no owner or completed-stop evidence.")
     if discovery is not None:
-        owner = _validate_published_stop_owner(
-            paths, boundary, realm, realm_root, discovery, marker,
+        # A proven different birth identifies a reused PID. Keep both matching
+        # publications until the lifecycle fence and manager callback succeed.
+        stale_pid, stale_birth, stale_instance, _endpoint = _recorded_owner_identity(
+            discovery, realm_id=str(realm["realm_id"]), realm_root=realm_root,
         )
-        if owner is None:
-            stale_pid, stale_birth, _instance, _endpoint = _recorded_owner_identity(
-                discovery, realm_id=str(realm["realm_id"]), realm_root=realm_root,
+        observe_birth = getattr(boundary, "process_birth_identity", None)
+        alive = _pid_alive(boundary, stale_pid)
+        actual_birth = observe_birth(stale_pid) if callable(observe_birth) and alive else None
+        if (_read_support_json(paths.discovery_path) != discovery
+                or _read_support_json(paths.instance_lock_path) != marker):
+            raise BootstrapError("Runtime owner changed during stale-owner cleanup.")
+        reused_owner = (marker is not None and marker.get("state") is None
+                        and _owner_record_matches(marker, pid=stale_pid, instance_id=stale_instance,
+                                                  process_birth_id=stale_birth,
+                                                  realm_id=str(realm["realm_id"]), realm_root=realm_root)
+                        and actual_birth is not None
+                        and runtime_platform.process_birth_matches(stale_birth, actual_birth) is False)
+        if not reused_owner:
+            owner = _validate_published_stop_owner(
+                paths, boundary, realm, realm_root, discovery, marker, observed_alive=alive,
             )
-            stale_owner_identity = (stale_pid, stale_birth)
+            if owner is None:
+                stale_owner_identity = (stale_pid, stale_birth)
     elif (marker is not None and retained_completed_stop is None
           and stale_owner_identity is None):
         raise BootstrapError("Runtime interruption refused: owner lock identity is incomplete.")
@@ -2341,6 +2403,14 @@ def _interrupt_owner_locked(
         raise TypeError("stop_foreground must be a zero-argument callback")
 
     def validate_stop_context() -> None:
+        if reused_owner:
+            if (_read_support_json(paths.discovery_path) != discovery
+                    or _read_support_json(paths.instance_lock_path) != marker):
+                raise BootstrapError("Runtime owner changed during stale-owner cleanup.")
+            observed = boundary.process_birth_identity(stale_pid)
+            if (not _pid_alive(boundary, stale_pid) or observed is None
+                    or runtime_platform.process_birth_matches(stale_birth, observed) is not False):
+                raise BootstrapError("Runtime reused process identity changed during stale-owner cleanup.")
         if pinokio_binding is None:
             return
         try:
@@ -2372,7 +2442,7 @@ def _interrupt_owner_locked(
         stale_owner_identity=stale_owner_identity,
         completed_stop_binding=pinokio_binding if owner is not None else None,
         retained_completed_stop=retained_completed_stop,
-        validate_stop=validate_stop_context if pinokio_binding is not None else None,
+        validate_stop=validate_stop_context if pinokio_binding is not None or reused_owner else None,
     )
     return {"status": "stopped", "realm_id": str(realm["realm_id"]),
             "idle": result["interruption"]}
@@ -2531,6 +2601,7 @@ def _validate_stop_endpoint(
 def _validate_published_stop_owner(
     paths: RuntimePaths, boundary: RuntimeBoundary | None, realm: Mapping[str, Any],
     realm_root: Path, discovery: Mapping[str, Any], marker: Mapping[str, Any] | None,
+    *, observed_alive: bool | None = None,
 ) -> tuple[int, str, str, str] | None:
     realm_id = str(realm.get("realm_id") or "")
     if marker is not None and marker.get("state") == "stopping":
@@ -2546,7 +2617,7 @@ def _validate_published_stop_owner(
         realm_id=realm_id, realm_root=realm_root,
     )):
         raise BootstrapError("Runtime interruption refused: owner lock changed or does not match discovery.")
-    alive = _pid_alive(boundary, pid)
+    alive = _pid_alive(boundary, pid) if observed_alive is None else observed_alive
     if not alive:
         try:
             if boundary is None:
@@ -2619,21 +2690,39 @@ def _doctor_observation(paths: RuntimePaths, boundary: RuntimeBoundary | None = 
     # Probed live in this process, evaluated for the configured mode.
     report["process_signalling"] = runtime_platform.process_control_probe(mode=report.get("process_control"))
     if discovery is not None:
-        report["pid_alive"] = bool(_pid_alive(boundary, discovery.get("pid")))
-        if not report["pid_alive"]:
-            report["healthy"] = False
-            report["issues"].append("stale_discovery")
-        elif boundary:
+        # Process visibility is diagnostic only: clients can be in another PID
+        # namespace. Lifecycle operations retain their stricter process fences.
+        try:
+            report["pid_alive"] = bool(_pid_alive(boundary, discovery.get("pid")))
+        except (BootstrapError, OSError):
+            report["pid_alive"] = None
+        if report["pid_alive"] is not True:
+            report["notes"] = ["pid_not_visible"]
+        if boundary:
             try:
-                owner_ok = bool(boundary.validate_owner(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", "")), owner_lock=paths.instance_lock_path, process_birth_id=str(discovery.get("process_birth_id") or "")))
+                metadata = boundary.endpoint_metadata(
+                    endpoint=_validate_loopback_endpoint(str(discovery.get("endpoint", ""))),
+                    credential_file=paths.runtime_support / "credentials" / "owner.token",
+                )
             except Exception:
-                owner_ok = False
-            if not owner_ok:
+                metadata = {}
+            if not metadata:
+                report["healthy"] = False
+                report["issues"].append(
+                    "stale_discovery" if report["pid_alive"] is False else "runtime_unhealthy"
+                )
+            elif (not discovery.get("runtime_instance_id") or not report.get("realm_id")
+                    or metadata.get("runtime_instance_id") != discovery["runtime_instance_id"]
+                    or metadata.get("realm_id") != discovery.get("active_realm")
+                    or metadata.get("realm_id") != report["realm_id"]):
                 report["healthy"] = False
                 report["issues"].append("discovery_identity")
-            elif not boundary.health(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", ""))):
+            elif metadata.get("status") != "ok":
                 report["healthy"] = False
                 report["issues"].append("runtime_unhealthy")
+        elif report["pid_alive"] is not True:
+            report["healthy"] = False
+            report["issues"].append("stale_discovery")
     return report, dict(discovery) if discovery is not None else None
 
 

@@ -47,22 +47,36 @@ def test_consumed_reboot_authorization_resumes_after_restart(tmp_path):
         second.close()
 
 
-def test_expired_settlement_has_zero_cas_or_object_mutation(tmp_path):
+def test_expired_settlement_has_zero_cas_or_object_mutation(tmp_path, monkeypatch):
     service, attempt, epoch = _setup(tmp_path)
     digest = hashlib.sha256(b"expired-output").hexdigest()
     expired = "2000-01-01T00:00:00+00:00"
     service.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expired, attempt["attempt_id"]))
     service.store.conn.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (expired, attempt["task_id"]))
+    before = list(service.store.conn.iterdump())
+    cas_writes = []
+
+    def unexpected_write(*args, **kwargs):
+        cas_writes.append((args, kwargs))
+        pytest.fail("expired settlement reached a CAS write")
+
+    for operation in ("stage", "publish", "put"):
+        monkeypatch.setattr(service.cas, operation, unexpected_write)
     try:
-        with pytest.raises(LeaseError, match="expired"):
+        # Ordinary expiry rejects publication without reconciling custody.
+        # Hard-deadline terminalization is a separate G28 contract.
+        with pytest.raises(LeaseError, match="^attempt lease has expired$"):
             service.settle_attempt(
                 attempt["attempt_id"],
                 {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": epoch, "outputs": [{"digest": "sha256:" + digest, "data_base64": "ZXhwaXJlZC1vdXRwdXQ"}]},
                 idempotency_key="b63-expired-settle",
             )
         assert not service.cas.path_for(digest).exists()
+        assert cas_writes == []
         assert service.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone() is None
         assert service.store.conn.execute("SELECT status FROM tasks WHERE id=?", (attempt["task_id"],)).fetchone()[0] == "running"
+        assert service.store.conn.execute("SELECT settled FROM attempts WHERE id=?", (attempt["attempt_id"],)).fetchone()[0] == 0
+        assert list(service.store.conn.iterdump()) == before
     finally:
         service.close()
 

@@ -469,9 +469,14 @@ def test_unrelated_ordinary_task_remains_a_lifecycle_blocker(tmp_path, monkeypat
     try:
         named = _task(daemon, "clear-this", capability="clear.named")
         unrelated = _task(daemon, "keep-this-running", capability="clear.unrelated")
+        daemon.service.register_capability({
+            "capability_id": "clear.unrelated",
+            "definition_digest": "sha256:" + hashlib.sha256(b"clear.unrelated").hexdigest(),
+            "required_resource_keys": ["gpu"],
+        })
         daemon.service.register_executor({
             "executor_id": "ordinary-worker", "capabilities": ["clear.unrelated"],
-            "max_concurrency": 1,
+            "max_concurrency": 1, "resource_keys": ["gpu"],
         })
         claim = daemon.service.claim_next({
             "executor_id": "ordinary-worker", "capability_ids": ["clear.unrelated"],
@@ -486,15 +491,29 @@ def test_unrelated_ordinary_task_remains_a_lifecycle_blocker(tmp_path, monkeypat
             "UPDATE tasks SET lease_expires_at='2000-01-01T00:00:00Z' WHERE id=?",
             (unrelated["id"],),
         )
+        # Exercise the periodic path deterministically before clearing another
+        # task; expiry is not evidence that this executor stopped.
+        daemon.service.reap_task_lifetimes()
         assert cli.main(["tasks", "clear", named["id"], "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["outcomes"][0]["outcome"] == "settled"
         blockers = _interruption_report(daemon.service.store.conn)["blockers"]
-        assert any(row["task_id"] == unrelated["id"] for row in blockers)
+        unrelated_blockers = [row for row in blockers if row["task_id"] == unrelated["id"]]
+        assert {row["blocker_kind"] for row in unrelated_blockers} == {
+            "running_task", "unsettled_attempt", "unreleased_reservation",
+        }
+        assert next(row for row in unrelated_blockers if row["blocker_kind"] == "unsettled_attempt")["lease_expired"] is True
         assert daemon.service.store.get_task(unrelated["id"])["task"]["status"] == "running"
         assert daemon.service.store.conn.execute(
             "SELECT settled FROM attempts WHERE id=?", (claim["attempt_id"],)
         ).fetchone()[0] == 0
+        reservation = daemon.service.store.conn.execute(
+            "SELECT * FROM reservations WHERE task_id=? AND resource_key='gpu'", (unrelated["id"],)
+        ).fetchone()
+        assert reservation["released_at"] is None
+        assert reservation["lease_token"] == claim["lease_id"]
+        assert reservation["executor_id"] == "ordinary-worker"
+        assert reservation["fence"] == claim["fence"]
     finally:
         daemon.stop()
 

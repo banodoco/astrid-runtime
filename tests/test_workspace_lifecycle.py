@@ -138,9 +138,15 @@ def _configured_live_owner(tmp_path):
                  "pid": 12345, "process_birth_id": "birth-a", "endpoint": "http://127.0.0.1:12345"}
     paths.discovery_path.write_text(json.dumps(discovery))
     boundary.is_pid_alive = lambda pid: pid == discovery["pid"]
-    boundary.validate_owner = lambda **kw: (kw["pid"], kw["instance_id"], kw["process_birth_id"], kw["owner_lock"]) == (
-        discovery["pid"], discovery["runtime_instance_id"], discovery["process_birth_id"], paths.instance_lock_path)
-    boundary.health = lambda **kw: kw["instance_id"] == discovery["runtime_instance_id"]
+    # Doctor verifies authenticated endpoint metadata. Keep that response
+    # independent of subsequent discovery-file mutations.
+    metadata = {"status": "ok", "runtime_instance_id": discovery["runtime_instance_id"],
+                "realm_id": discovery["active_realm"]}
+    def endpoint_metadata(*, endpoint, credential_file):
+        assert endpoint == discovery["endpoint"]
+        assert credential_file == paths.runtime_support / "credentials" / "owner.token"
+        return dict(metadata)
+    boundary.endpoint_metadata = endpoint_metadata
     boundary.calls.clear()
     return paths, root, boundary, discovery
 
@@ -169,12 +175,19 @@ def test_configured_inspection_reuses_same_verified_discovery_snapshot(tmp_path,
 def test_replaced_discovery_is_not_returned_as_the_verified_instance(tmp_path):
     paths, root, boundary, verified = _configured_live_owner(tmp_path)
     replacement = {**verified, "runtime_instance_id": "unverified-new-instance", "pid": 23456, "process_birth_id": "new-birth"}
-    def health(**kw):
-        assert kw["instance_id"] == verified["runtime_instance_id"]
+    endpoint_metadata = boundary.endpoint_metadata
+    probes = []
+    def replace_during_probe(**kw):
+        metadata = endpoint_metadata(**kw)
+        probes.append(metadata)
         paths.discovery_path.write_text(json.dumps(replacement))
-        return True
-    boundary.health = health
+        return metadata
+    boundary.endpoint_metadata = replace_during_probe
     result = inspect_workspace(paths, boundary)
+    assert len(probes) == 1
+    assert probes[0]["runtime_instance_id"] == verified["runtime_instance_id"]
+    assert json.loads(paths.discovery_path.read_text()) == replacement
+    assert result["inspection"]["source"] == "live_owner"
     assert result["inspection"]["runtime_instance_id"] == verified["runtime_instance_id"]
     assert result["inspection"]["runtime_instance_id"] != replacement["runtime_instance_id"]
     assert boundary.calls == []
@@ -186,10 +199,13 @@ def test_unverified_or_mismatched_live_owner_falls_back_to_full_inspection(tmp_p
     if failure == "dead":
         boundary.is_pid_alive = lambda _pid: False
     elif failure == "changed_instance":
-        # Actual native/lock/instance validation refuses a replaced owner.
-        boundary.validate_owner = lambda **_kw: False
+        endpoint_metadata = boundary.endpoint_metadata
+        boundary.endpoint_metadata = lambda **kw: {
+            **endpoint_metadata(**kw), "runtime_instance_id": "another-instance"}
     elif failure == "unhealthy":
-        boundary.health = lambda **_kw: False
+        endpoint_metadata = boundary.endpoint_metadata
+        boundary.endpoint_metadata = lambda **kw: {
+            **endpoint_metadata(**kw), "status": "degraded"}
     else:
         discovery["active_realm" if failure == "other_realm" else "realm_root"] = "other" if failure == "other_realm" else str(tmp_path / "other")
         paths.discovery_path.write_text(json.dumps(discovery))

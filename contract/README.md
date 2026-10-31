@@ -72,3 +72,47 @@ the authoritative local filename. If a requested export filename already
 exists or is too long for the host's temporary-name byte budget, Runtime keeps
 the same root and chooses a deterministic association-scoped direct filename
 rather than overwriting it or failing on the private staging sibling.
+
+
+## Project object generation filters
+
+`GET /v1/projects/{project_id}/objects` accepts optional `kind`, `model`, `target`
+and `tag` query strings. The service equivalent is
+`RuntimeService.list_project_objects(project, *, cursor=None, limit=50,
+kind=None, model=None, target=None, tag=None)`. For example,
+`?model=X&target=runpod` selects the RunPod object from managed/RunPod/fal
+objects whose associated generations carry those values.
+
+An object qualifies if it is already associated with the selected project and
+**one generation in that same project** both references it through
+`generation_variants.object_id` and satisfies **all** supplied filters. Different
+generations cannot contribute different parts of the conjunction. Any variant
+type and generation status qualifies; a generation without an object variant
+selects no objects. Thumbnail references, media relations, output associations,
+variant metadata, generation `type` and object MIME type do not supply matches.
+
+Matching reuses the generation-list contract: `kind`, `model` and `target` are
+exact, case-sensitive string comparisons against `generations.metadata.gen`;
+`tag` is exact, case-sensitive membership among string elements of its `tags`
+array. Missing or wrongly typed queried fields and malformed generation metadata
+JSON do not match. Unrelated optional fields do not affect a match. Filters are
+combined with AND, with no aliases, substring matching or wildcard expansion.
+An omitted/`None` service filter is absent; an empty or non-string filter is an
+`InvalidRequestError` (HTTP 400), including an explicitly blank query parameter.
+
+Filtering returns existing `ManagedObject` resources with `relation` in the
+unchanged `{items, next_cursor}` page envelope. Matching variants or generations
+never duplicate an object. If several project reference relations exist for a
+filtered object, its row uses the lexicographically first relation (`managed`
+before `promoted`). Object order remains `objects.created_at ASC, digest ASC`,
+independent of generation/variant order. Filtering and deduplication happen
+before object pagination; limits remain 1–200, default 50. The unfiltered path
+and its existing relation rows are unchanged.
+
+Cursors belong to the object collection, canonical project ID and complete
+non-absent filter set. Adding, removing or changing any filter, changing project,
+or using a generation/variant cursor raises HTTP 400. Query argument order and
+page size may change. Existing unfiltered object cursors remain compatible when
+no filters are supplied. Cursors retain the existing live keyset behavior;
+they do not freeze associations or metadata between requests. Clients forward
+all filters unchanged on every page and consume object rows directly.

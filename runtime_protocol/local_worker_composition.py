@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import ipaddress
 from pathlib import Path
 import platform
@@ -106,7 +106,9 @@ class _PreparedWorker:
     closed: bool = False
     rpc_lock: threading.Lock = field(default_factory=threading.Lock)
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock)
+    cleanup_resolution_lock: threading.Lock = field(default_factory=threading.Lock)
     cleanup_started: bool = False
+    cleanup_abandoned: bool = False
     relay: bool = False
     retained: Any = None
     broker: Any = None
@@ -455,8 +457,11 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             if handle.retained.poll() is None:
                 handle.broker.signal(runtime_platform.TERM, expected_pid=handle.worker.pid)
             handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
-            handle.control.close(); handle.activation.close(); handle.closed = True
-            if self._active is handle: self._active = None
+            with handle.cleanup_resolution_lock:
+                if handle.cleanup_abandoned:
+                    raise ConflictError("host-only cleanup exceeded terminal shutdown custody")
+                handle.control.close(); handle.activation.close(); handle.closed = True
+                if self._active is handle: self._active = None
 
     def _prepare_relay(self, profile, *, operation_id, channel_id):
         from .local_execution_supervisor import host_prepare_request, RetainedProcess
@@ -544,10 +549,35 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             except BaseException:
                 handle.broker.signal(runtime_platform.KILL, expected_pid=handle.worker.pid)
                 handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
-        handle.control.close()
-        handle.closed = True
-        if self._active is handle:
-            self._active = None
+        with handle.cleanup_resolution_lock:
+            if handle.cleanup_abandoned:
+                raise ConflictError("relay cleanup exceeded terminal shutdown custody")
+            handle.control.close()
+            handle.closed = True
+            if self._active is handle:
+                self._active = None
+
+    def release_failed_cleanup_channels(self, handle):
+        """Release terminal shutdown transport, retaining unresolved custody.
+
+        Ordinary abort failures keep their descriptors for an authenticated
+        retry. Once Runtime shutdown has exhausted that attempt, descriptors
+        cannot remain live resources or allow late cleanup to claim success.
+        """
+        if not isinstance(handle, _PreparedWorker) or not (handle.host_only or handle.relay):
+            return
+        with handle.cleanup_resolution_lock:
+            if handle.closed:
+                return
+            handle.cleanup_abandoned = True
+            self.cleanup_uncertain = "retained child cleanup remains unresolved after shutdown"
+            for channel in (handle.control, handle.activation):
+                if channel is not None:
+                    try:
+                        channel.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    channel.close()
 
     def report(self, handle: _PreparedWorker) -> Mapping[str, Any]:
         if handle.host_only:
@@ -1153,6 +1183,28 @@ class LocalWorkerComposition:
     def bind_runtime(self, *, endpoint: str, runtime_instance_id: str, credential_file: Path) -> None:
         self.preparer.bind_runtime(endpoint=endpoint, runtime_instance_id=runtime_instance_id, credential_file=credential_file)
 
+    def _retain(self):
+        """Snapshot owner selection before live actors bind startup credentials.
+
+        Retention copies declarations only; launch verification and mutable
+        preparer/inspector ownership remain on their existing lifecycle path.
+        """
+        if (not isinstance(self.profiles, dict) or len(self.profiles) != 1
+                or not isinstance(self.preparer, CrossProcessWorkerPreparer)
+                or not isinstance(self.inspector, OSProcessInspector)
+                or not isinstance(self.preparer.config, dict)):
+            raise ValidationError("invalid owner-selected local worker composition")
+        for key, profile in self.profiles.items():
+            if (not isinstance(profile, LocalWorkerProfile) or key != profile.profile_id
+                    or profile != self.preparer.profile or profile != self.inspector.profile):
+                raise ValidationError("local worker composition selection differs")
+            if _secure_profile(profile):
+                _selected_profile_payload(profile)
+        return _RetainedLocalWorkerComposition(
+            _selection_bytes({key: asdict(profile) for key, profile in self.profiles.items()}),
+            _selection_bytes(self.preparer.config),
+        )
+
 
 def _path(value: Any, label: str, *, directory: bool | None = None) -> Path:
     if not isinstance(value, str) or not value.strip():
@@ -1341,6 +1393,82 @@ def _installed_host_release(profile, config):
         "import_binding": {"schema_version": 1, "mode": "trusted-local-isolated-source/v1",
             "launcher": {"path": str(launcher), "sha256": hashlib.sha256(launcher.read_bytes()).hexdigest()},
             "python_runtime_inventory_digest": entries[1]["inventory_digest"], "import_roots": entries}}
+
+
+def _selection_bytes(value):
+    def encode(item):
+        if isinstance(item, Path):
+            return str(item)
+        raise TypeError("local worker selection must contain JSON values or paths")
+    try:
+        return json.dumps(value, default=encode, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("invalid owner-selected local worker selection") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedLocalWorkerComposition:
+    """Private read-only selection; grants no launch, admission, or recipe result."""
+    _profiles_json: bytes
+    _config_json: bytes
+    _installed_release_loader: Any = field(init=False, repr=False, compare=False)
+    _verified_source_loader: Any = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        from .verified_host_launch import _SourceLoader
+        try:
+            if type(self._profiles_json) is not bytes or type(self._config_json) is not bytes:
+                raise ValueError("selection is not immutable bytes")
+            profiles = self.profiles
+            if len(profiles) != 1 or not isinstance(self.config, dict):
+                raise ValueError("selection is missing")
+            _path(self.config.get("source_checkout"), "source_checkout")
+            for key, profile in profiles.items():
+                if key != profile.profile_id:
+                    raise ValueError("profile differs")
+                if _secure_profile(profile):
+                    _selected_profile_payload(profile)
+        except (TypeError, ValueError, KeyError, AttributeError, ValidationError) as exc:
+            raise ValidationError("invalid retained local worker composition") from exc
+        # Fixed implementation references, never callbacks selected by a request.
+        object.__setattr__(self, "_installed_release_loader", _installed_host_release)
+        object.__setattr__(self, "_verified_source_loader", _SourceLoader)
+
+    @property
+    def profiles(self):
+        paths = {"realm_root", "support_root", "worker_executable", "host_executable",
+                 "engine_executable", "engine_listener_executable", "host_os_executable"}
+        return {key: LocalWorkerProfile(**{
+            name: Path(value) if name in paths and value is not None else value
+            for name, value in profile.items()
+        }) for key, profile in json.loads(self._profiles_json).items()}
+
+    @property
+    def config(self):
+        return json.loads(self._config_json)
+
+    def _installed_release(self, profile_id):
+        profiles = self.profiles
+        if profile_id not in profiles:
+            raise ValidationError("local worker profile is not owner-selected")
+        return json.loads(_selection_bytes(self._installed_release_loader(profiles[profile_id], self.config)))
+
+
+def _retain_local_worker_composition(value, *, required=False):
+    """Keep one private immutable selection across daemon/service construction.
+
+    ``required`` records configured presence, never a verification assertion.
+    """
+    if value is None and not required:
+        return None
+    if type(value) is _RetainedLocalWorkerComposition:
+        return value
+    if not isinstance(value, LocalWorkerComposition):
+        raise ValidationError("owner-selected local worker composition is required")
+    retained = value._retain()
+    if type(retained) is not _RetainedLocalWorkerComposition:
+        raise ValidationError("invalid retained local worker composition")
+    return retained
 
 
 def _load_host_only_composition(raw, *, workspace_uuid, realm_root, support_root, runtime_instance_id):

@@ -1585,7 +1585,7 @@ class LocalWorkerLauncher:
             completed = threading.Event()
             failure: list[BaseException] = []
 
-            def cleanup() -> None:
+            def cleanup(handle=handle, failure=failure, completed=completed) -> None:
                 try:
                     self.preparer.abort(handle)
                 except BaseException as exc:
@@ -1604,9 +1604,17 @@ class LocalWorkerLauncher:
                 )),
             )
             thread.join(timeout)
-            if not completed.is_set():
+            timed_out = not completed.is_set()
+            if timed_out:
                 failures.append(ConflictError("local Worker cleanup exceeded its bounded deadline"))
             failures.extend(failure)
+            if failure or timed_out:
+                release_channels = getattr(self.preparer, "release_failed_cleanup_channels", None)
+                if callable(release_channels):
+                    try:
+                        release_channels(handle)
+                    except BaseException as exc:
+                        failures.append(exc)
         uncertain = getattr(self.preparer, "cleanup_uncertain", None)
         if failures or uncertain:
             # Preserve a bounded, credential-free operational reason.  The

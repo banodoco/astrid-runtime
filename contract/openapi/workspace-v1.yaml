@@ -161,7 +161,39 @@ paths:
   /v1/projects/{project_id}/objects:
     get:
       operationId: listProjectObjects
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      description: >-
+        Lists project objects ordered by object created_at ascending, then digest ascending.
+        Optional filters select an object when one generation in this project references it
+        through a variant's object_id and satisfies every supplied metadata.gen filter.
+        All variant types qualify; thumbnail references and variant metadata do not.
+        Multiple matching variants or generations return the object once. Multiple project
+        reference relations collapse to the lexicographically first relation.
+        Cursor continuation requires the same complete filter set and project; page size
+        may change. Existing unfiltered cursors remain valid without filters.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+        - name: kind
+          in: query
+          required: false
+          description: Exact case-sensitive string equality on the matching generation's metadata.gen.kind; absent or malformed values do not match.
+          schema: { type: string, minLength: 1 }
+        - name: model
+          in: query
+          required: false
+          description: Exact case-sensitive string equality on the matching generation's metadata.gen.model; absent or malformed values do not match.
+          schema: { type: string, minLength: 1 }
+        - name: target
+          in: query
+          required: false
+          description: Exact case-sensitive string equality on the matching generation's metadata.gen.target; absent or malformed values do not match.
+          schema: { type: string, minLength: 1 }
+        - name: tag
+          in: query
+          required: false
+          description: Exact case-sensitive membership among string elements of the matching generation's metadata.gen.tags array; absent or malformed arrays do not match.
+          schema: { type: string, minLength: 1 }
       responses: { '200': { description: Project-scoped managed objects, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedObjectPage' } } } } }
     post:
       operationId: ingestProjectObject
@@ -204,8 +236,31 @@ paths:
   /v1/projects/{project_id}/tasks:
     get:
       operationId: listProjectTasks
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
-      responses: { '200': { description: Project tasks, content: { application/json: { schema: { $ref: '#/components/schemas/TaskPage' } } } } }
+      description: |
+        Default listing remains creation-time ascending. Supply kind=root_generation
+        and order=admitted_desc together to query validated root generation creation/
+        publication declarations by original task.admitted event sequence descending,
+        then task ID descending. Includes failed/cancelled and active tasks; no repeat
+        eligibility or frozen-recipe claim is made, including for media imports.
+        Classification uses minimal validated immutable admission facts, or retained
+        authoritative admission envelopes for legacy tasks. Caller metadata, opaque
+        generation intent and capability names are not classification authorities.
+        An unknown possible root before the first provable match returns 409 with
+        details.reason=root_generation_selection_barrier, task_id,
+        admission_sequence (null if unavailable), project_id and missing. A proven
+        newer prefix may be returned with a cursor that reaches an older barrier on
+        the next page; unknown admissions are never skipped to older known roots.
+        Filtered cursors are signed, bound to project/query/order, and expire on
+        Runtime session restart. Start without a cursor for the latest admission.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { name: kind, in: query, schema: { type: string, enum: [root_generation] } }
+        - { name: order, in: query, schema: { type: string, enum: [admitted_desc] } }
+      responses:
+        '200': { description: Project tasks, content: { application/json: { schema: { $ref: '#/components/schemas/TaskPage' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
   /v1/tasks/{task_id}/managed-outputs:
     get:
       operationId: listManagedOutputs
@@ -635,6 +690,13 @@ paths:
       parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimTask' } } } }
       responses: { '200': { description: Fenced attempt or a typed waiting result, content: { application/json: { schema: { oneOf: [ { $ref: './schemas/worker.json#/definitions/AttemptFence' }, { $ref: './schemas/worker.json#/definitions/ClaimWaiting' } ] } } } }, '204': { description: No task available } }
+  /v1/tasks/{task_id}/claim-delegated-child:
+    post:
+      operationId: claimDelegatedChild
+      description: Atomically claim only this admitted child under live parent authority and verified parent machine placement. Rejections never select other queued work; replay rechecks both live parent and child attempt.
+      parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimDelegatedChild' } } } }
+      responses: { '200': { description: Exact fenced child attempt, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/AttemptFence' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/delegated-tasks:
     post:
       operationId: admitDelegatedTask
@@ -763,7 +825,15 @@ paths:
   /v1/projects/{project_id}/generations:
     get:
       operationId: listGenerations
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      description: All supplied filters match the same generation's metadata.gen. String comparisons and tag membership are exact and case-sensitive; absent or malformed optional values do not match. Cursor continuation requires the same project and complete filter set.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { name: kind, in: query, required: false, schema: { type: string, minLength: 1 } }
+        - { name: model, in: query, required: false, schema: { type: string, minLength: 1 } }
+        - { name: target, in: query, required: false, schema: { type: string, minLength: 1 } }
+        - { name: tag, in: query, required: false, schema: { type: string, minLength: 1 } }
       responses: { '200': { description: Project generations, content: { application/json: { schema: { $ref: '#/components/schemas/GenerationPage' } } } } }
     post:
       operationId: createGeneration
@@ -1305,6 +1375,16 @@ components:
       additionalProperties: false
       required: [executor_id, capability_ids, runtime_epoch]
       properties: { executor_id: { type: string, minLength: 1 }, capability_ids: { type: array, items: { type: string }, uniqueItems: true }, runtime_epoch: { type: integer, minimum: 1 } }
+    ClaimDelegatedChild:
+      type: object
+      additionalProperties: false
+      required: [executor_id, capability_ids, runtime_epoch, target, authority]
+      properties:
+        executor_id: { type: string, minLength: 1 }
+        capability_ids: { type: array, minItems: 1, items: { type: string, minLength: 1 }, uniqueItems: true }
+        runtime_epoch: { type: integer, minimum: 1 }
+        target: { $ref: './schemas/task.json#/definitions/ExecutionTarget' }
+        authority: { type: string, minLength: 1 }
     Heartbeat:
       type: object
       additionalProperties: false

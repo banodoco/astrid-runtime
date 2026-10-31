@@ -6,6 +6,8 @@ import {
 
 const version: string = CONTRACT_VERSION;
 const client = new WorkspaceClient("http://runtime.invalid");
+const roots = client.listProjectTasks("p", undefined, 1, "root_generation", "admitted_desc");
+void roots;
 const health: Promise<Health> = client.health();
 const sourceIdentity: NonNullable<Health["identity"]> = {
   release: 0, managed_by: "source", runtime_head: "a".repeat(40), agent_head: "b".repeat(40),
