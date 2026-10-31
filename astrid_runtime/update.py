@@ -7,6 +7,7 @@ or writes installer records or the C2 journal itself.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -62,6 +63,8 @@ def _recoverable_operation(snapshots, root):
     journal_id = journal.get("operation_id") if isinstance(journal, dict) else None
     if isinstance(journal_job, dict) and "operation_id" in journal_job:
         journal_id = journal_job.get("operation_id")
+    transaction_id = job.get("transaction_id") if isinstance(job, dict) else None
+    journal_operation = journal.get("operation_id") if isinstance(journal, dict) else None
     state = job.get("state") if isinstance(job, dict) else None
     unresolved = (state in {"accepted", "recovery-needed"}
                   or (state == "launching" and job.get("launch_status") != "acknowledged")
@@ -69,11 +72,88 @@ def _recoverable_operation(snapshots, root):
                   or (state == "active" and isinstance(journal, dict)
                       and journal.get("step") in {"complete", "rolled_back"}))
     if unresolved and (not valid_job_id
-                       or (journal_id is not None and journal_id != job_id)):
+                       or (journal_id is not None and journal_id != job_id)
+                       or (transaction_id is not None and journal_operation is not None
+                           and transaction_id != journal_operation)):
         raise UpdateRefusal("busy", "The unresolved update identities do not match; no job was launched.")
     if not isinstance(job, dict) or not valid_job_id:
         return None
     return job if unresolved else None
+
+
+def _recovery_request(existing, *, root, data, selection_path, old_version,
+                      installed, daemon):
+    """Rebuild the exact accepted request without minting or changing identity."""
+    if not isinstance(existing, dict):
+        raise UpdateRefusal("busy", "The existing update record is invalid; no job was launched.")
+    operation_id = existing.get("operation_id")
+    if not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+        raise UpdateRefusal("busy", "The existing update operation is invalid; no job was launched.")
+    if existing.get("program_root") is not None and existing.get("program_root") != str(root):
+        raise UpdateRefusal("busy", "The existing update installation does not match; no job was launched.")
+    if existing.get("data_root") is not None and existing.get("data_root") != str(data):
+        raise UpdateRefusal("busy", "The existing update data root does not match; no job was launched.")
+    if existing.get("old_instance_id") != daemon.instance_id:
+        raise UpdateRefusal("busy", "The existing update live identity does not match; no job was launched.")
+    if (not isinstance(existing.get("old_identity"), dict)
+            or existing.get("old_identity") != daemon.startup_identity):
+        raise UpdateRefusal("busy", "The existing update live identity does not match; no job was launched.")
+    if (not isinstance(existing.get("old_version"), dict)
+            or existing.get("old_version") != old_version):
+        raise UpdateRefusal("busy", "The existing update version does not match; no job was launched.")
+
+    metadata = existing.get("metadata")
+    if not isinstance(metadata, dict):
+        raise UpdateRefusal("busy", "The existing update metadata is incomplete; no job was launched.")
+    required = ("manifest_path", "bootstrap_path", "manifest_sha256",
+                "bootstrap_sha256", "release")
+    if any(key not in metadata for key in required):
+        raise UpdateRefusal("busy", "The existing update metadata is incomplete; no job was launched.")
+    try:
+        manifest_path = _path(metadata["manifest_path"])
+        bootstrap_path = _path(metadata["bootstrap_path"])
+    except (TypeError, ValueError):
+        raise UpdateRefusal("busy", "The existing update inputs are invalid; no job was launched.") from None
+    if (manifest_path.name != "manifest" or bootstrap_path.name != "bootstrap"
+            or manifest_path.parent != bootstrap_path.parent
+            or not platform.is_owner_only(manifest_path.parent, directory=True)):
+        raise UpdateRefusal("busy", "The existing update inputs are invalid; no job was launched.")
+    try:
+        manifest_raw = _bytes(manifest_path, limit=MAX_METADATA_BYTES)
+        bootstrap_raw = _bytes(bootstrap_path, limit=2 * MAX_METADATA_BYTES)
+        manifest = json.loads(manifest_raw)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        raise UpdateRefusal("busy", "The existing update inputs are invalid; no job was launched.") from None
+    if (not platform.is_owner_only(manifest_path) or not platform.is_owner_only(bootstrap_path)
+            or not isinstance(manifest, dict)
+            or hashlib.sha256(manifest_raw).hexdigest() != metadata["manifest_sha256"]
+            or hashlib.sha256(bootstrap_raw).hexdigest() != metadata["bootstrap_sha256"]
+            or type(metadata["release"]) is not int
+            or metadata["release"] <= installed
+            or manifest.get("release") != metadata["release"]):
+        raise UpdateRefusal("busy", "The existing update inputs are invalid; no job was launched.")
+
+    job_name = existing.get("job_name")
+    if job_name != f"astrid-update-{operation_id}":
+        raise UpdateRefusal("busy", "The existing update job name is invalid; no job was launched.")
+    log_path = existing.get("log_path")
+    try:
+        log = _output_path(log_path)
+    except (TypeError, ValueError):
+        raise UpdateRefusal("busy", "The existing update log path is invalid; no job was launched.") from None
+    if not log.is_relative_to(root) or log.is_symlink():
+        raise UpdateRefusal("busy", "The existing update log path is invalid; no job was launched.")
+    if (existing.get("target_release") is not None
+            and existing.get("target_release") != metadata["release"]):
+        raise UpdateRefusal("busy", "The existing update release does not match; no job was launched.")
+    return {
+        "action": "accept", "root": str(root), "data_root": str(data),
+        "selection_path": str(selection_path), "operation_id": operation_id,
+        "old_instance_id": existing["old_instance_id"],
+        "old_identity": dict(existing["old_identity"]),
+        "old_version": dict(existing["old_version"]),
+        "metadata": dict(metadata), "job_name": job_name, "log_path": str(log),
+    }
 
 
 def _path(value):
@@ -96,6 +176,21 @@ def _bytes(path, limit=MAX_METADATA_BYTES):
     if len(raw) > limit:
         raise ValueError("metadata is too large")
     return raw
+
+
+def _output_path(value):
+    """Normalize a managed output path without requiring it to exist yet."""
+    if not isinstance(value, str) or not value or not Path(value).is_absolute():
+        raise ValueError("absolute managed path required")
+    result = Path(os.path.abspath(value))
+    for part in (result, *result.parents):
+        try:
+            if part.is_symlink() or (getattr(part.lstat(), "st_file_attributes", 0) &
+                                     getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+                raise ValueError("linked managed path")
+        except FileNotFoundError:
+            continue
+    return result
 
 
 def _json(path, snapshots):
@@ -282,16 +377,11 @@ class UpdateAdmission:
                         # A recovery POST carries the durable operation's own
                         # identity. It must not prepare inputs or mint a new
                         # UUID before the locked helper reconciles it.
-                        operation_id = existing["operation_id"]
-                        durable = {"action": "accept", "root": str(root),
-                                   "data_root": str(data), "operation_id": operation_id,
-                                   "selection_path": str(selection_path),
-                                   "old_instance_id": self.daemon.instance_id,
-                                   "old_identity": self.daemon.startup_identity,
-                                   "old_version": old_version}
-                        for key in ("metadata", "job_name", "log_path"):
-                            if key in existing:
-                                durable[key] = existing[key]
+                        durable = _recovery_request(
+                            existing, root=root, data=data, selection_path=selection_path,
+                            old_version=old_version, installed=installed, daemon=self.daemon,
+                        )
+                        operation_id = durable["operation_id"]
                     else:
                         request = {"directory": str(temporary), "installed_release": installed,
                                    "manifest_url": MANIFEST_URL,
@@ -357,13 +447,17 @@ class UpdateAdmission:
                                 "operation_id": returned_operation,
                                 "message": job.get("message") or job.get("result")}
                     raise UpdateRefusal("busy", "The unresolved update was not safely reconciled; no job was launched.")
+                if existing is not None and returned_state in {"updated", "rolled_back", "failed", "recovery-needed"}:
+                    return {"accepted": False, "state": returned_state,
+                            "operation_id": operation_id,
+                            "message": job.get("message") or job.get("result")}
                 if returned_state not in {"accepted", "launching", "active"}:
                     raise UpdateRefusal("busy", "The update is not accepted for launch.")
                 # From this point the prepared inputs belong to the durable
                 # job; recovery-only terminal results returned above do not.
                 accepted = True
-                if existing is not None and returned_state in {"launching", "active"}:
-                    # The helper positively found the existing native attempt;
+                if existing is not None:
+                    # The helper positively reconciled the existing operation;
                     # repeating launch would replay an uncertain side effect.
                     return {"accepted": True, "state": "accepted",
                             "operation_id": operation_id, "message": "Update already accepted."}

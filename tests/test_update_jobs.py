@@ -258,6 +258,8 @@ def _admission_fixture(tmp_path, monkeypatch, launcher):
     _write(root / "install.json", {})
     (root / "current").parent.mkdir(parents=True, exist_ok=True)
     (root / "current").write_bytes(b"old\n")
+    (root / "versions/old").mkdir(parents=True, exist_ok=True)
+    (root / "versions/old/python").write_text("python")
     version = {"root": str(root / "versions/old"), "python": str(root / "versions/old/python"),
                "profile": str(root / "versions/old/profile.json"), "identity": {"release": 4, "managed_by": None}, "env": {}}
     version_path = _write(root / "versions/old/version.json", version)
@@ -286,8 +288,12 @@ def _admission_fixture(tmp_path, monkeypatch, launcher):
         if payload.get("action") == "accept":
             accepted.update(payload)
             record = {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": {
-                "operation_id": payload["operation_id"], "state": "accepted",
-                "log_path": payload["log_path"], "target_release": payload["metadata"]["release"],
+                "format": "astrid-update-job/v1", "operation_id": payload["operation_id"],
+                "state": "accepted", "job_name": payload["job_name"],
+                "log_path": payload["log_path"], "program_root": str(root),
+                "data_root": str(data), "old_instance_id": payload["old_instance_id"],
+                "old_identity": payload["old_identity"], "old_version": payload["old_version"],
+                "target_release": payload["metadata"]["release"], "metadata": payload["metadata"],
                 "message": "Update accepted.",
             }}
             _write(root / "install.json", record)
@@ -297,7 +303,13 @@ def _admission_fixture(tmp_path, monkeypatch, launcher):
         directory.mkdir(exist_ok=True)
         manifest = directory / "manifest"
         bootstrap = directory / "bootstrap"
-        manifest.write_bytes(b'{"release":5}')
+        manifest.write_bytes(json.dumps({
+            "schema_version": 1, "release": 5, "agent": {"sha": "a" * 40},
+            "runtime": {"sha": "b" * 40},
+            "tools": {**{name: {"version": "20.19.4" if name == "node" else "1.2.3"}
+                              for name in ("uv", "python", "bun", "node", "ffmpeg")},
+                      "omp": {"source": "@oh-my-pi/pi-coding-agent@18.12.6"}},
+        }).encode())
         bootstrap.write_bytes(b"bootstrap")
         update.platform.owner_only(manifest)
         update.platform.owner_only(bootstrap)
@@ -368,6 +380,125 @@ def test_lost_ack_retry_reconciles_existing_operation_without_new_acceptance_or_
     assert len(reconciliations) == 1
     assert len(launches) == 1
     assert accepted["operation_id"] == operation_id
+    assert prepared and prepared[0].exists()
+
+
+def test_recovery_request_matches_agent_accept_contract_and_preserves_journal(tmp_path, monkeypatch):
+    admission, accepted, prepared = _admission_fixture(tmp_path, monkeypatch, lambda _job: None)
+    real_helper = admission._helper
+    first_accept = True
+    validated = []
+    recovery_payloads = []
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "home" / ".local/share"))
+    agent_root = Path(__file__).resolve().parents[5] / "central" / "astrid-agent"
+    monkeypatch.syspath_prepend(str(agent_root))
+    from astrid.installer import update_job as agent_update_job
+
+    monkeypatch.setattr(
+        agent_update_job, "_probe_identity",
+        lambda _data: ("old-instance", {"release": 4, "managed_by": None}),
+    )
+
+    def helper(python, agent, runtime, payload, **kwargs):
+        nonlocal first_accept
+        if payload.get("action") == "accept" and not first_accept:
+            recovery_payloads.append(payload)
+            validated.append(agent_update_job._validate_request(payload, Path(payload["root"])))
+            assert payload["operation_id"] == accepted["operation_id"]
+            return {**validated[-1], "state": "active", "message": "Update active."}
+        if payload.get("action") == "accept":
+            first_accept = False
+        return real_helper(python, agent, runtime, payload, **kwargs)
+
+    admission._helper = helper
+    assert admission.request()["accepted"] is True
+    operation_id = accepted["operation_id"]
+    _, snapshots, *_ = admission._selection()
+    root = tmp_path / "program with spaces"
+    journal = {"operation_id": "c2-operation", "step": "stopping",
+               "update_job": {"operation_id": operation_id}}
+    _write(root / "update-transaction.json", journal)
+    snapshots[root / "update-transaction.json"] = (root / "update-transaction.json").read_bytes()
+    before_journal = (root / "update-transaction.json").read_bytes()
+
+    result = admission.request()
+
+    assert result == {"accepted": True, "state": "accepted", "operation_id": operation_id,
+                      "message": "Update already accepted."}
+    assert len(validated) == 1
+    assert recovery_payloads[0]["old_version"] == accepted["old_version"]
+    assert validated[0]["operation_id"] == operation_id
+    assert validated[0]["metadata"] == accepted["metadata"]
+    assert validated[0]["job_name"] == "astrid-update-" + operation_id
+    assert validated[0]["log_path"] == accepted["log_path"]
+    assert recovery_payloads[0]["old_identity"] == accepted["old_identity"]
+    assert (root / "update-transaction.json").read_bytes() == before_journal
+    assert prepared and prepared[0].exists()
+
+
+def test_incomplete_recovery_metadata_refuses_before_helper_or_mutation(tmp_path, monkeypatch):
+    helper_calls = []
+    admission, accepted, prepared = _admission_fixture(tmp_path, monkeypatch, lambda _job: None)
+    real_helper = admission._helper
+
+    def helper(python, agent, runtime, payload, **kwargs):
+        helper_calls.append(payload)
+        return real_helper(python, agent, runtime, payload, **kwargs)
+
+    admission._helper = helper
+    assert admission.request()["accepted"] is True
+    _, snapshots, *_ = admission._selection()
+    root = tmp_path / "program with spaces"
+    marker = json.loads(snapshots[root / "install.json"])
+    marker["update_job"]["metadata"].pop("bootstrap_sha256")
+    snapshots[root / "install.json"] = json.dumps(marker).encode()
+    before = (root / "install.json").read_bytes()
+
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
+
+    assert error.value.details["reason"] == "busy"
+    assert len([payload for payload in helper_calls if payload.get("action") == "accept"]) == 1
+    assert (root / "install.json").read_bytes() == before
+    assert prepared and prepared[0].exists()
+
+
+def test_existing_operation_returns_terminal_result_without_second_start(tmp_path, monkeypatch):
+    launches = []
+    admission, accepted, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: launches.append(job))
+    real_helper = admission._helper
+    first_accept = True
+
+    def helper(python, agent, runtime, payload, **kwargs):
+        nonlocal first_accept
+        if payload.get("action") == "accept" and not first_accept:
+            return {"operation_id": accepted["operation_id"], "state": "updated",
+                    "result": "Updated to release 5."}
+        if payload.get("action") == "accept":
+            first_accept = False
+        return real_helper(python, agent, runtime, payload, **kwargs)
+
+    admission._helper = helper
+    assert admission.request()["accepted"] is True
+    _, snapshots, *_ = admission._selection()
+    root = tmp_path / "program with spaces"
+    marker = json.loads(snapshots[root / "install.json"])
+    marker["update_job"].update(state="recovery-needed", result="Recovery needed.")
+    snapshots[root / "install.json"] = json.dumps(marker).encode()
+    _write(root / "update-transaction.json", {
+        "operation_id": "c2-operation", "step": "stopping",
+        "update_job": {"operation_id": accepted["operation_id"]},
+    })
+    snapshots[root / "update-transaction.json"] = (root / "update-transaction.json").read_bytes()
+
+    result = admission.request()
+
+    assert result == {"accepted": False, "state": "updated",
+                      "operation_id": accepted["operation_id"],
+                      "message": "Updated to release 5."}
+    assert len(launches) == 1
     assert prepared and prepared[0].exists()
 
 
