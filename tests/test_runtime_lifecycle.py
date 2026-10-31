@@ -112,7 +112,7 @@ def test_interruption_fence_serializes_with_admission_and_claim_writes(tmp_path)
         contender.close()
 
 
-def test_interruption_fence_keeps_http_owner_identity_reachable_during_claim(tmp_path):
+def test_interruption_fence_keeps_http_owner_identity_reachable_during_claim(tmp_path, monkeypatch):
     root = tmp_path / "realm"
     RealmStore.initialize(root).close()
     daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start()
@@ -122,10 +122,19 @@ def test_interruption_fence_keeps_http_owner_identity_reachable_during_claim(tmp
     restricted_token, _ = daemon.credentials.provision("restricted", ["handshake"])
     claim_started = threading.Event()
     claim_done = threading.Event()
+    maintenance_started = threading.Event()
     results, failures = [], []
 
+    reap = service.reap_task_lifetimes
+
+    def observed_reap():
+        maintenance_started.set()
+        return reap()
+
+    monkeypatch.setattr(service, "reap_task_lifetimes", observed_reap)
+
     def trace(statement):
-        if statement == "BEGIN IMMEDIATE":
+        if statement == "BEGIN IMMEDIATE" and threading.current_thread().name == "claim-during-stop":
             claim_started.set()
 
     service.store.conn.set_trace_callback(trace)
@@ -145,8 +154,13 @@ def test_interruption_fence_keeps_http_owner_identity_reachable_during_claim(tmp
     try:
         with interruption_fence(root) as report:
             assert report["safe"] is True
-            worker.start()
-            assert claim_started.wait(2), "claim did not reach the SQLite write fence"
+            with daemon.httpd._maintenance_lock:
+                worker.start()
+                assert claim_started.wait(2), "claim did not reach the SQLite write fence"
+                maintenance_started.clear()
+            # Wait for the serving loop's poll while the claim owns the store
+            # mutex and waits on SQLite. Identity must remain reachable then.
+            assert maintenance_started.wait(2), "periodic maintenance did not start"
             metadata = LocalRuntimeBoundary().endpoint_metadata(
                 endpoint=daemon.endpoint, credential_file=daemon.credential_path,
             )

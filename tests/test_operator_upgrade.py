@@ -68,6 +68,9 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
     paths.ensure_support_dirs()
     realm_root = paths.realms_dir / "realm-1"
     RealmStore.initialize(realm_root, realm_id="realm-1").close()
+    if version < 32:
+        with sqlite3.connect(realm_root / "realm.sqlite3") as connection:
+            connection.execute("DROP INDEX idx_generations_gen")
     if version < 30:
         # A fresh realm is the current schema; v30 -> v29 drops timelines.name (the only v30 change).
         with sqlite3.connect(realm_root / "realm.sqlite3") as connection:

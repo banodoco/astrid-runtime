@@ -567,10 +567,25 @@ def process_identity(pid: int, *, timeout: float = 1.0):
             kernel.CloseHandle(handle)
     root = Path("/proc") / str(pid)
     try:
+        # Start ticks alone can collide after reboot or in another PID namespace.
+        # Scope interfaces are optional in restricted proc mounts. An older
+        # scoped record cannot be reclaimed if its scope becomes unreadable.
+        scope = ""
+        try:
+            boot = (Path("/proc") / "sys/kernel/random/boot_id").read_text().strip()
+            if boot:
+                scope += f";boot:{boot}"
+        except (FileNotFoundError, PermissionError):
+            pass
+        try:
+            namespace = (root / "ns/pid").stat().st_ino
+            scope += f";pidns:{namespace}"
+        except (FileNotFoundError, PermissionError):
+            pass
         raw = (root / "stat").read_text()
         fields = raw.rsplit(")", 1)[1].split()
         value = {"pid": pid, "uid": root.stat().st_uid, "parent_pid": int(fields[1]),
-                 "birth_id": f"proc-start-ticks:{fields[19]}", "process_group": int(fields[2]), "session_id": int(fields[3])}
+                 "birth_id": f"proc-start-ticks:{fields[19]}{scope}", "process_group": int(fields[2]), "session_id": int(fields[3])}
         second = (root / "stat").read_text().rsplit(")", 1)[1].split()
         if fields[19] != second[19]:
             raise OSError("process identity changed during observation")
@@ -581,6 +596,27 @@ def process_identity(pid: int, *, timeout: float = 1.0):
         return None
     except (ValueError, IndexError) as exc:
         raise OSError("process identity observation was malformed") from exc
+
+
+def process_birth_matches(expected: str, actual: str) -> bool | None:
+    """Compare native births, accepting pre-scope Linux owner records.
+
+    None means scope could not be observed, never evidence for reclamation.
+    Legacy records cannot prove a reboot/namespace change with equal ticks.
+    """
+    if expected.startswith("proc-start-ticks:") and actual.startswith("proc-start-ticks:"):
+        old_tick, _, old_scope = expected.partition(";")
+        new_tick, _, new_scope = actual.partition(";")
+        if old_tick != new_tick:
+            return False
+        expected_scope = dict(part.split(":", 1) for part in old_scope.split(";") if ":" in part)
+        actual_scope = dict(part.split(":", 1) for part in new_scope.split(";") if ":" in part)
+        if any(actual_scope[key] != value for key, value in expected_scope.items() if key in actual_scope):
+            return False
+        if any(key not in actual_scope for key in expected_scope):
+            return None
+        return True
+    return expected == actual
 
 
 def process_executable(pid: int) -> str:
@@ -1174,6 +1210,39 @@ def _note_fallback(kind: str, detail: str) -> None:
     print(f"Runtime sandbox process control: {detail}", file=sys.stderr, flush=True)
 
 
+def _probe_process_group() -> str:
+    """Check a live group created in our PID namespace, never an inherited PGID.
+
+    An inherited group leader may be outside the visible PID namespace, so
+    getpgrp() followed by killpg(..., 0) can return ESRCH even though signalling
+    Runtime's own child groups works. Keep the probe child alive via stdin
+    until the observation completes, then close/reap it on every path.
+    """
+    try:
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", "import sys; sys.stdin.buffer.read()"],
+            start_new_session=True, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        return f"probe-error:{errno.errorcode.get(exc.errno, exc.errno)}"
+    try:
+        try:
+            os.killpg(child.pid, 0)
+            return "allowed"
+        except PermissionError:
+            return "denied"
+        except OSError as exc:
+            return f"error:{errno.errorcode.get(exc.errno, exc.errno)}"
+    finally:
+        child.stdin.close()
+        try:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=3)
+
+
 def process_control_probe(mode: str | None = None) -> dict:
     """What signalling actually works in this process, checked live.
 
@@ -1182,8 +1251,9 @@ def process_control_probe(mode: str | None = None) -> dict:
 
     ``ok`` is False when Runtime cannot stop what it starts: then tasks that
     spawn processes must be refused (in strict mode, the reason points at
-    sandbox mode). The probe sends no signal to anything but signal 0 to
-    this process's own group.
+    sandbox mode). The capability check sends signal 0 to a temporary child
+    group held alive until it completes. Cleanup closes stdin and reaps the
+    child, killing only that retained child if it fails to exit promptly.
     """
     mode = mode or process_control()
     if mode not in PROCESS_CONTROL_MODES:
@@ -1201,13 +1271,7 @@ def process_control_probe(mode: str | None = None) -> dict:
         pidfd = "enosys" if exc.errno == errno.ENOSYS else f"error:{errno.errorcode.get(exc.errno, exc.errno)}"
     except NotImplementedError:
         pidfd = "unsupported"
-    try:
-        os.killpg(os.getpgrp(), 0)
-        group = "allowed"
-    except PermissionError:
-        group = "denied"
-    except OSError as exc:
-        group = f"error:{errno.errorcode.get(exc.errno, exc.errno)}"
+    group = _probe_process_group()
     if pidfd == "available":
         signalling = "pidfd"
     elif pidfd == "enosys" and mode == "sandbox":
@@ -1227,7 +1291,9 @@ def process_control_probe(mode: str | None = None) -> dict:
         report["reason"] = (
             "Runtime cannot stop processes safely here (pidfd: %s, process-group kill: %s)%s"
             % (pidfd, group, "; if this is a seccomp sandbox such as OpenShell, install with --sandbox"
-               if mode == "strict" else ""))
+               if mode == "strict" and (pidfd == "enosys" or group == "denied") else
+               "; verify that the service can create and signal its own child process groups "
+               "and that /proc and PID namespaces are configured consistently"))
     return report
 
 
@@ -1640,3 +1706,26 @@ def handoff_child_identity(process):
     if not _windows_process_active(handle):
         raise ProcessLookupError("prepared Worker exited during authentication")
     return observed
+
+
+def reserve_loopback_listener(port: int, *, backlog: int = 128):
+    """Reserve a Linux listener for one retained, socket-activated child.
+
+    This is a local native resource, not a service registry or a recoverable
+    process reference. See ``linux_listener.RetainedListener`` for the caller's
+    adoption, sole-waiter, trust and cleanup obligations.
+    """
+    from .linux_listener import RetainedListener
+    return RetainedListener(port, backlog=backlog)
+
+
+def linux_abstract_listener(name: bytes, *, backlog: int = 8):
+    """Create a non-inheritable local AF_UNIX listener; caller owns authentication."""
+    from .linux_listener import abstract_listener
+    return abstract_listener(name, backlog=backlog)
+
+
+def linux_abstract_connect(name: bytes, *, deadline: float):
+    """Connect local AF_UNIX IPC; no identity or authority comes from its name."""
+    from .linux_listener import abstract_connect
+    return abstract_connect(name, deadline=deadline)

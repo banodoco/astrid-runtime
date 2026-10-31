@@ -41,7 +41,7 @@ from .visual_seam import (
 from .visual_boundary import finite as _visual_finite, js_round as _visual_js_round
 from .idempotency import command_result, compact_result, expired_result, EXPIRED, RESULT_WINDOW_SECONDS, IdempotencyWindowExpired
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 IDEMPOTENCY_RESULT_WINDOW_SECONDS = 24 * 60 * 60
 IDEMPOTENCY_RESULT_MARKER = "__runtime_idempotency_result_expired_v1"
 IDEMPOTENCY_RESULT_MARKER_PREFIX = '{"' + IDEMPOTENCY_RESULT_MARKER + '":'
@@ -152,6 +152,10 @@ def expired_publication_result(result_json):
 
 
 LEASE_SECONDS = 30
+# Hard Runtime bounds survive lease renewal, explicit retry and owner restart:
+# both are measured against the existing immutable admission/attempt facts.
+MAX_TASK_ATTEMPTS = 3
+TASK_DEADLINE_SECONDS = 24 * 60 * 60
 EXECUTOR_LIVENESS_SECONDS = 90
 REALM_ADMISSION_TIMEOUT_SECONDS = 5.0
 _ADMISSION_STATE = "admission-state.json"
@@ -1620,6 +1624,61 @@ class RealmStore:
                     details={"project_id": project_id, "object_id": object_id},
                 )
 
+    def _task_admission_facts(self, spec, expected_effect, project_id):
+        """Minimal classification from the authoritative admission envelope.
+
+        Producer intent and the nested caller spec are deliberately opaque. An
+        absent fact means unknown, never ordinary/root. In particular old
+        create_with_variant admissions were not all validated until settlement;
+        keep that compatibility without certifying an invalid declaration.
+        """
+        facts = {"version": 1}
+        if not (isinstance(spec, dict)
+                and {"input_object_ids", "schema_version", "capability_digest", "spec"} <= spec.keys()
+                and isinstance(spec["spec"], dict)):
+            return facts
+        lineage = spec.get("delegated_parent")
+        if lineage is None:
+            facts["is_root"] = True
+        elif (isinstance(lineage, dict)
+              and all(isinstance(lineage.get(key), str) and lineage[key]
+                      for key in ("parent_task_id", "parent_attempt_id"))):
+            facts["is_root"] = False
+        effects = [expected_effect] if expected_effect is not None else []
+        policy = spec.get("child_delegation")
+        if policy is not None:
+            if not isinstance(policy, dict):
+                return facts
+            declarations = []
+            if "final_publication" in policy:
+                declarations.append(policy["final_publication"])
+            if "publications" in policy:
+                if not isinstance(policy["publications"], dict):
+                    return facts
+                declarations.extend(policy["publications"].values())
+            for declaration in declarations:
+                if not isinstance(declaration, dict) or not isinstance(declaration.get("effect"), dict):
+                    return facts
+                effects.append(declaration["effect"])
+        generation = False
+        for effect in effects:
+            if not isinstance(effect, dict):
+                return facts
+            kind = effect.get("effect_type")
+            if not isinstance(kind, str) or not kind:
+                return facts
+            if kind in {"generation.publish_v1", "generation.create_with_variant"}:
+                try:
+                    self._validate_settlement_effect(
+                        effect, project_id=project_id,
+                        input_object_ids=spec["input_object_ids"],
+                    )
+                except (ValidationError, ConflictError, NotFoundError):
+                    return facts
+                generation = True
+        facts["is_generation"] = generation
+        return facts
+
     def _managed_render_object_bytes(self, project_id, object_id, *, media_type, expected_size=None):
         """Read one reachable prepared-scene object under project/CAS integrity."""
         match = OBJECT_ID_RE.fullmatch(object_id) if isinstance(object_id, str) else None
@@ -2605,7 +2664,10 @@ class RealmStore:
                             canonical_json({"selected": target}), timestamp, timestamp,
                         ),
                     )
-                admitted_event_id = self._append_event(run_id, task_id, "task.admitted", {"capability": capability})
+                admitted_event_id = self._append_event(run_id, task_id, "task.admitted", {
+                    "capability": capability,
+                    "classification": self._task_admission_facts(spec, expected_effect, project_id),
+                })
                 event_ids = [admitted_event_id]
                 if predecessors:
                     for ordinal, predecessor_task_id in enumerate(predecessors):
@@ -3306,14 +3368,80 @@ class RealmStore:
                 if not matches or any(a["durability"] != "durable" or a["lifecycle"]["state"] not in {"available", "promoted"} or a["size"] != output["size"] or a["media_type"] != output["media_type"] for a in matches):
                     raise ConflictError("accepted child output is not a verified durable managed output")
 
+    def _task_absolute_deadline(self, task):
+        # Task.created_at is the existing retry queue-age anchor and resets on
+        # explicit retry. Run.created_at retains the original admission time.
+        admission = self.conn.execute("SELECT created_at FROM runs WHERE id=?", (task["run_id"],)).fetchone()
+        admitted = datetime.fromisoformat(admission["created_at"])
+        if admitted.tzinfo is None:
+            raise ValueError("task admission timestamp has no timezone")
+        return admitted + timedelta(seconds=TASK_DEADLINE_SECONDS)
+
+    def _attempt_runtime_deadline(self, task, *, claimed_at=None):
+        request = self._execution_request_from_row(task)
+        limits = request.get("limits", {}) if request is not None else {}
+        if not isinstance(limits, dict):
+            raise ValueError("attempt limits must be an object")
+        seconds = limits.get("max_runtime_seconds")
+        if seconds is None:
+            return None
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+            raise ValueError("attempt runtime must be a positive integer")
+        if claimed_at is None:
+            # Attempts have no creation timestamp. The immutable claim event
+            # already records the exact task/fence and survives lease renewal.
+            claim = self.conn.execute(
+                "SELECT created_at FROM events WHERE task_id=? AND kind='task.claimed' "
+                "AND json_extract(payload_json, '$.fence')=? ORDER BY id DESC LIMIT 1",
+                (task["id"], int(task["lease_fence"] or 0)),
+            ).fetchone()
+            if claim is None:
+                raise ValueError("current attempt claim origin is missing")
+            claimed_at = claim["created_at"]
+        started = datetime.fromisoformat(claimed_at)
+        if started.tzinfo is None or started > datetime.now(timezone.utc):
+            raise ValueError("current attempt claim origin is invalid")
+        return started + timedelta(seconds=seconds)
+
+    def _task_lease_deadline(self, task, seconds, *, claimed_at=None):
+        deadline = min(datetime.now(timezone.utc) + timedelta(seconds=seconds), self._task_absolute_deadline(task))
+        attempt_deadline = self._attempt_runtime_deadline(task, claimed_at=claimed_at)
+        return min(deadline, attempt_deadline) if attempt_deadline is not None else deadline
+
+    def _task_lifetime_failure(self, task, current):
+        try:
+            deadline = self._task_absolute_deadline(task)
+            admitted = deadline - timedelta(seconds=TASK_DEADLINE_SECONDS)
+            if admitted > current:
+                raise ValueError("task admission timestamp is in the future")
+        except (TypeError, ValueError, OverflowError):
+            return {"code": "invalid_task_deadline"}
+        if deadline <= current:
+            return {"code": "task_deadline_exceeded"}
+        if task["status"] in {"running", "cancel_requested"}:
+            try:
+                attempt_deadline = self._attempt_runtime_deadline(task)
+            except (TypeError, ValueError, OverflowError):
+                return {"code": "invalid_task_deadline"}
+            if attempt_deadline is not None and attempt_deadline <= current:
+                return {"code": "timeout"}
+        if task["status"] == "queued" and int(task["attempt"] or 0) >= MAX_TASK_ATTEMPTS:
+            return {"code": "attempt_limit_exceeded"}
+        return None
+
     def _overdue_lease_rows(self):
         current = datetime.now(timezone.utc)
         overdue = []
         for row in self.conn.execute(
-            "SELECT id, run_id, attempt_id, lease_token, lease_expires_at FROM tasks "
+            "SELECT * FROM tasks "
             "INDEXED BY idx_tasks_executor_status "
-            "WHERE status IN ('running', 'cancel_requested') AND lease_expires_at IS NOT NULL"
+            "WHERE status IN ('queued', 'running', 'cancel_requested')"
         ).fetchall():
+            if self._task_lifetime_failure(row, current):
+                overdue.append(row)
+                continue
+            if row["status"] == "queued" or not row["lease_expires_at"]:
+                continue
             try:
                 expired = datetime.fromisoformat(row["lease_expires_at"]) <= current
             except (TypeError, ValueError):
@@ -3323,12 +3451,10 @@ class RealmStore:
         return overdue
 
     def reap_overdue_leases(self):
-        """Apply the claim path's lease-expiry transition outside a claim.
+        """Apply the claim path's lifetime checks outside a claim.
 
-        Reads call this so a dead worker's task is observed as requeued rather
-        than ``running`` forever.  It is a no-op (no write transaction) unless a
-        lease is actually overdue, and reuses ``_reap_expired_leases`` so the
-        transition and events stay single-sourced.
+        Reads and the server's poll hook share the claim path's reaper.
+        Ordinary expiry revokes worker authority, but is not stop evidence.
         """
         with self._mutex:
             if self.conn.in_transaction or not self._overdue_lease_rows():
@@ -3337,15 +3463,27 @@ class RealmStore:
                 self._reap_expired_leases()
 
     def _reap_expired_leases(self):
-        """Return expired attempts to the queue and release their resources.
+        """Contain expired authority and enforce absolute task bounds.
 
-        Called inside the caller's transaction; expiry only affects attempts
-        that carry the v2 lease deadline.
+        Called inside the caller's transaction. Ordinary expired executors
+        retain their task, attempt and reservation blockers until an explicit
+        settlement/reconciliation path closes them. Hard bounds still apply
+        before any worker has claimed and take precedence over lease expiry.
         """
         self._contain_orphaned_delegations()
         for row in self._overdue_lease_rows():
-            latest = self.conn.execute("SELECT status FROM tasks WHERE id=?", (row["id"],)).fetchone()
-            if latest["status"] not in {"running", "cancel_requested"}:
+            latest = self.conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
+            if latest["status"] not in {"queued", "running", "cancel_requested"}:
+                continue
+            failure = self._task_lifetime_failure(latest, datetime.now(timezone.utc))
+            if failure is None and int(latest["attempt"] or 0) >= MAX_TASK_ATTEMPTS:
+                failure = {"code": "attempt_limit_exceeded"}
+            if failure is not None:
+                binding = self.execution_binding(row["id"])
+                if binding is not None:
+                    failure["execution_binding"] = binding
+                    failure["remote_stop_confirmed"] = False
+                self._fail_task_in_transaction(latest, failure, attempt_id=latest["attempt_id"])
                 continue
             self.contain_delegated_children(row["id"], attempt_id=row["attempt_id"], reason="parent_lease_expired")
             timestamp = now()
@@ -3370,21 +3508,9 @@ class RealmStore:
                     },
                 )
                 continue
-            self.conn.execute("UPDATE tasks SET status='queued', executor_id=NULL, lease_token=NULL, lease_expires_at=NULL, waiting_reason='waiting_for_worker', updated_at=? WHERE id=?", (timestamp, row["id"]))
-            reconciled_attempt_id = self._reconcile_runtime_attempt(
-                row["id"], row["attempt_id"]
-            )
-            self.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=? AND status='running'", (timestamp, row["run_id"]))
-            self._release_reservations(row["id"], row["lease_token"])
-            self.reset_execution_attempt(row["id"])
-            self._append_event(
-                row["run_id"], row["id"], "task.lease_expired",
-                {
-                    "waiting_reason": "waiting_for_worker",
-                    "attempt_id": reconciled_attempt_id,
-                    "recovery_disposition": "runtime_owned_attempt_reconciled",
-                },
-            )
+            # Expiry fences renewal/publication, but cannot prove the executor
+            # stopped. Preserve its exact custody and lifecycle blockers;
+            # fail/cancel and explicit maintenance own reconciliation.
 
     def register_capability(self, capability_id, definition_digest, *, required_resource_keys=None, status="ready", unavailable_reason=None, estimated_scratch_bytes=0, estimated_output_bytes=0):
         if not capability_id or not definition_digest:
@@ -3666,12 +3792,18 @@ class RealmStore:
                             if occupied:
                                 waiting_reason = self._waiting_for_resource(key)
                                 break
+                # Preflight may read snapshots or storage before authority is
+                # granted. Recheck the existing hard bounds after that work so
+                # a task cannot acquire a fresh attempt past its deadline.
+                failure = self._task_lifetime_failure(task, datetime.now(timezone.utc))
+                if failure is not None:
+                    return self._fail_task_in_transaction(task, failure, attempt_id=task["attempt_id"])
                 if waiting_reason:
                     self._set_waiting_reason(task_id, waiting_reason)
                     return self.get_task(task_id)
                 timestamp = now()
                 fence = int(task["lease_fence"] or 0) + 1
-                deadline = (datetime.now(timezone.utc) + timedelta(seconds=LEASE_SECONDS)).isoformat(timespec="milliseconds")
+                deadline = self._task_lease_deadline(task, LEASE_SECONDS, claimed_at=timestamp).isoformat(timespec="milliseconds")
                 claimable_status = task["status"] if provider_recovery_claim else "queued"
                 updated = self.conn.execute(
                     "UPDATE tasks SET status='running', executor_id=?, lease_token=?, lease_fence=?, lease_expires_at=?, waiting_reason=NULL, attempt=attempt+1, runtime_epoch=?, updated_at=? WHERE id=? AND status=?",
@@ -5275,6 +5407,7 @@ class RealmStore:
 
     def _settle_attempt(self, task_id, lease_token, result, *, effect=None, fence=None, attempt_id, publish=None, record=None):
         with self._mutex:
+            self.reap_overdue_leases()
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise NotFoundError("task not found")
@@ -5282,6 +5415,8 @@ class RealmStore:
                 raise LeaseError("attempt lease is stale or already settled")
             if fence is not None and int(fence) != int(task["lease_fence"] or 0):
                 raise LeaseError("attempt fence is stale", details={"expected": task["lease_fence"], "actual": fence})
+            if self._task_lifetime_failure(task, datetime.now(timezone.utc)):
+                raise LeaseError("task absolute deadline has expired")
             if task["lease_expires_at"]:
                 try:
                     if datetime.fromisoformat(task["lease_expires_at"]) <= datetime.now(timezone.utc):
@@ -5359,6 +5494,8 @@ class RealmStore:
                     applied_effect=applied_effect,
                     created_at=timestamp,
                 )
+                if self._task_lifetime_failure(task, datetime.now(timezone.utc)):
+                    raise LeaseError("task absolute deadline has expired")
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
@@ -5385,6 +5522,7 @@ class RealmStore:
         if int(lease_seconds) <= 0:
             raise ValidationError("lease_seconds must be positive")
         with self._mutex:
+            self.reap_overdue_leases()
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise NotFoundError("task not found")
@@ -5397,7 +5535,7 @@ class RealmStore:
                     raise LeaseError("attempt lease has expired")
             except ValueError as exc:
                 raise LeaseError("attempt lease deadline is invalid") from exc
-            deadline = (datetime.now(timezone.utc) + timedelta(seconds=int(lease_seconds))).isoformat(timespec="milliseconds")
+            deadline = self._task_lease_deadline(task, int(lease_seconds)).isoformat(timespec="milliseconds")
             with self._transaction():
                 self.conn.execute("UPDATE tasks SET lease_expires_at=?, updated_at=? WHERE id=?", (deadline, now(), task_id))
                 self.conn.execute("UPDATE reservations SET lease_expires_at=? WHERE task_id=? AND lease_token=? AND released_at IS NULL", (deadline, task_id, lease_token))
@@ -5878,6 +6016,25 @@ class RealmStore:
                     self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.retry", run_id, idempotency_key, request_hash, canonical_json(result), now()))
             return result
 
+    def _fail_task_in_transaction(self, task, failure, *, attempt_id=None, record=None):
+        """Single terminal failure path; caller owns the settlement transaction."""
+        task_id, lease_token = task["id"], task["lease_token"]
+        self.contain_delegated_children(task_id, attempt_id=attempt_id, reason="parent_failed")
+        timestamp = now()
+        result = {"error": failure}
+        self.conn.execute("UPDATE tasks SET status='failed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
+        self.conn.execute("UPDATE runs SET status='failed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
+        if attempt_id is not None:
+            self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND task_id=? AND settled=0", (attempt_id, task_id))
+        self._release_reservations(task_id, lease_token)
+        self.release_execution_attempt(task_id)
+        event_id = self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
+        self._refresh_continuations_for_predecessor(task_id)
+        value = self.get_task(task_id)
+        if record is not None:
+            record(value, event_ids=[event_id], primary_stream_id=task["run_id"], resulting_stream_seq=None)
+        return value
+
     def fail_task(self, task_id, lease_token, failure, *, fence=None, attempt_id=None, record=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -5887,28 +6044,14 @@ class RealmStore:
                 raise LeaseError("attempt lease is stale or already settled")
             if fence is not None and int(fence) != int(task["lease_fence"] or 0):
                 raise LeaseError("attempt fence is stale", details={"expected": task["lease_fence"], "actual": fence})
-            if task["lease_expires_at"]:
-                try:
-                    if datetime.fromisoformat(task["lease_expires_at"]) <= datetime.now(timezone.utc):
-                        raise LeaseError("attempt lease has expired")
-                except ValueError as exc:
-                    raise LeaseError("attempt lease deadline is invalid") from exc
+            if attempt_id is not None and task["attempt_id"] != attempt_id:
+                raise LeaseError("attempt is no longer current")
+            # An expired owner may cede its exact retained attempt, but may
+            # neither renew nor publish. A replacement/reaped attempt is still
+            # rejected by the current lease, fence and attempt checks above.
+            failure = self._task_lifetime_failure(task, datetime.now(timezone.utc)) or failure
             with self._transaction():
-                self.contain_delegated_children(task_id, attempt_id=attempt_id, reason="parent_failed")
-                timestamp = now()
-                result = {"error": failure}
-                self.conn.execute("UPDATE tasks SET status='failed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
-                self.conn.execute("UPDATE runs SET status='failed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
-                if attempt_id is not None:
-                    self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
-                self._release_reservations(task_id, lease_token)
-                self.release_execution_attempt(task_id)
-                event_id = self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
-                self._refresh_continuations_for_predecessor(task_id)
-                value = self.get_task(task_id)
-                if record is not None:
-                    record(value, event_ids=[event_id], primary_stream_id=task["run_id"], resulting_stream_seq=None)
-                return value
+                return self._fail_task_in_transaction(task, failure, attempt_id=attempt_id, record=record)
 
     def doctor(self, *, catalog_path=None, deep=False):
         """Return a read-only, actionable integrity report.

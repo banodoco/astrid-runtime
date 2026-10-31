@@ -519,18 +519,50 @@ class AuthenticatedCleanupActor:
                 if before is None or any(before.get(key) != launched.get(key) for key in ("pid", "uid", "birth_id")):
                     raise CustodyError("retained child creation identity differs from launch")
             if before is None or before.get("parent_pid") != os.getpid():
-                raise CustodyError("retained child launch lineage is unavailable")
+                availability = "absent" if before is None else "available"
+                fields = "none" if before is None else "parent_pid"
+                raise CustodyError("retained child launch lineage is unavailable "
+                                   f"[stage=retained_child.before; identity={availability}; mismatched_fields={fields}]")
             actor = cls(lambda: token_provider(child.pid), identity_provider)
             after = identity_provider(child.pid)
             if after != before or actor._pinned["pid"] != child.pid:
-                raise CustodyError("retained child changed during kernel identity binding")
+                # Report names from the existing identity DTO, never its values
+                # (or arbitrary keys supplied by an observation provider).
+                fields = [key for key in ("pid", "uid", "birth_id", "parent_pid", "process_group", "session_id")
+                          if after is not None and after.get(key) != before.get(key)]
+                if actor._pinned["pid"] != child.pid and "pid" not in fields:
+                    fields.append("pid")
+                availability = "absent" if after is None else "available"
+                raise CustodyError("retained child changed during kernel identity binding "
+                                   f"[stage=retained_child.after; identity={availability}; mismatched_fields={','.join(fields) or 'none'}]")
         return actor
 
     def verify(self) -> dict[str, object]:
-        token = dict(self._token_reader())
-        identity = self._identity_provider(int(self._pinned["pid"]))
-        if identity is None or _incarnation(identity, token) != self._pinned:
-            raise CustodyError("designated cleanup actor incarnation changed or is unknown")
+        # These diagnostics travel through existing exception reporting. Do not
+        # include provider exceptions: they may contain token/credential values.
+        try:
+            token = dict(self._token_reader())
+        except (CustodyError, OSError):
+            raise CustodyError("cleanup actor token observation is unavailable "
+                               "[stage=verify.token; identity=unobserved; mismatched_fields=none]") from None
+        try:
+            identity = self._identity_provider(int(self._pinned["pid"]))
+        except (CustodyError, OSError):
+            raise CustodyError("cleanup actor identity observation is unavailable "
+                               "[stage=verify.identity; identity=unavailable; mismatched_fields=none]") from None
+        if identity is None:
+            raise CustodyError("designated cleanup actor incarnation changed or is unknown "
+                               "[stage=verify.identity; identity=absent; mismatched_fields=none]")
+        try:
+            observed = _incarnation(identity, token)
+        except CustodyError:
+            raise CustodyError("custody incarnation lacks authenticated identity "
+                               "[stage=verify.incarnation; identity=available; mismatched_fields=none]") from None
+        if observed != self._pinned:
+            # _incarnation supplies the bounded field names for both mappings.
+            fields = ",".join(key for key in self._pinned if observed[key] != self._pinned[key])
+            raise CustodyError("designated cleanup actor incarnation changed or is unknown "
+                               f"[stage=verify.compare; identity=available; mismatched_fields={fields}]")
         return dict(self._pinned)
 
 
@@ -693,10 +725,32 @@ class RoleCustodyAuthority:
             record = self._read()
             if record["state"] != "active" or self._reference(record) != dict(reference) or record["actor"] != dict(expected_actor) or record["owner_epoch"] != owner_epoch:
                 raise CustodyError("custody designation differs from selected owner/reference")
-            for identity in (record["actor"], reference["target"]):
-                observed = identity_provider(int(identity["pid"]))
-                if observed is None or _incarnation(observed, token_provider(int(identity["pid"]))) != dict(identity):
-                    raise CustodyError("custody designation has unavailable or changed kernel identity")
+            for role, identity in (("actor", record["actor"]), ("target", reference["target"])):
+                try:
+                    observed = identity_provider(int(identity["pid"]))
+                except (CustodyError, OSError):
+                    raise CustodyError("custody designation identity observation is unavailable "
+                                       f"[role={role}; stage=verify_reference.identity; identity=unavailable; mismatched_fields=none]") from None
+                if observed is None:
+                    raise CustodyError("custody designation has unavailable or changed kernel identity "
+                                       f"[role={role}; stage=verify_reference.identity; identity=absent; mismatched_fields=none]")
+                try:
+                    token = token_provider(int(identity["pid"]))
+                except (CustodyError, OSError):
+                    raise CustodyError("custody designation token observation is unavailable "
+                                       f"[role={role}; stage=verify_reference.token; identity=available; mismatched_fields=none]") from None
+                try:
+                    incarnation = _incarnation(observed, token)
+                except CustodyError:
+                    raise CustodyError("custody incarnation lacks authenticated identity "
+                                       f"[role={role}; stage=verify_reference.incarnation; identity=available; mismatched_fields=none]") from None
+                if incarnation != dict(identity):
+                    # Only these fixed incarnation fields may enter diagnostics;
+                    # full mapping equality above also rejects unknown keys.
+                    fields = ",".join(key for key in ("pid", "uid", "birth_id", "audit_token_sha256", "audit_token_pidversion")
+                                      if incarnation[key] != identity.get(key))
+                    raise CustodyError("custody designation has unavailable or changed kernel identity "
+                                       f"[role={role}; stage=verify_reference.compare; identity=available; mismatched_fields={fields or 'none'}]")
             return self._reference(record)
 
     def signal(self, *, actor: AuthenticatedCleanupActor, generation: int,

@@ -47,6 +47,7 @@ def _setup(tmp_path):
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute("ALTER TABLE timelines DROP COLUMN name")  # v30 -> v29: timelines.name is the only v30 change
         connection.execute("DROP TABLE user_app_state")
+        connection.execute("DROP INDEX idx_generations_gen")
         connection.execute("DROP INDEX IF EXISTS idx_tasks_retention")
         for table in ("runs", "tasks"):
             connection.execute(f"ALTER TABLE {table} ADD COLUMN spec_json TEXT")
@@ -226,6 +227,8 @@ def _rewrite_backup_database(backup, sql):
 
 def _historical_backup(backup, version):
     sql = []
+    if version < 32:
+        sql += ["DROP INDEX idx_generations_gen"]
     if version < 31:  # v31 -> v30: user_app_state is the only v31 change
         sql += ["DROP TABLE user_app_state"]
     if version < 30:  # v30 -> v29: timelines.name is the only v30 change

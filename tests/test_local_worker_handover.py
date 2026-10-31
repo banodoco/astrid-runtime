@@ -855,15 +855,26 @@ def test_owner_settlement_observation_does_not_reap_expired_work(tmp_path):
         _launch(daemon, workspace_uuid)
         named, attempt = _owned_cancel_claim(daemon, cancel=False)
         store = daemon.service.store
-        with store._mutex:
-            store.conn.execute("UPDATE tasks SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (named,))
-            before = "\n".join(store.conn.iterdump())
-        report = _settlement(daemon, named)
-        assert report["task"]["state"] == "running"
-        assert report["task"]["attempt_id"] == attempt["attempt_id"]
-        assert report["task"]["lease_expires_at"] == "2000-01-01T00:00:00+00:00"
-        assert not report["settled"]
-        with store._mutex:
-            assert "\n".join(store.conn.iterdump()) == before
+        # Drain any admitted maintenance and hold its scheduling gate across
+        # the observation, so the dump comparison attributes writes to GET.
+        with daemon.httpd._maintenance_lock:
+            with store._mutex:
+                store.conn.execute("UPDATE tasks SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (named,))
+                before = "\n".join(store.conn.iterdump())
+            report = _settlement(daemon, named)
+            assert report["task"]["state"] == "running"
+            assert report["task"]["attempt_id"] == attempt["attempt_id"]
+            assert report["task"]["lease_expires_at"] == "2000-01-01T00:00:00+00:00"
+            assert not report["settled"]
+            with store._mutex:
+                assert "\n".join(store.conn.iterdump()) == before
+        # Releasing the gate must still permit the real provider-unknown
+        # transition. This isolation must not disable lifetime maintenance.
+        daemon.httpd.service_actions()
+        with daemon.httpd._maintenance_lock, store._mutex:
+            assert store.conn.execute("SELECT waiting_reason FROM tasks WHERE id=?", (named,)).fetchone()[0] == "provider_state_unknown"
+            assert store.conn.execute(
+                "SELECT count(*) FROM events WHERE task_id=? AND kind='task.provider_state_unknown'", (named,)
+            ).fetchone()[0] >= 1
     finally:
         daemon.stop()

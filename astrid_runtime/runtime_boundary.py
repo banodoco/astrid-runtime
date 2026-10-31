@@ -774,7 +774,7 @@ class LocalRuntimeBoundary:
             # attest the durable runtime instance over its loopback health
             # endpoint; health alone is never an identity proof.
             pass
-        elif expected_birth != actual_birth:
+        elif platform.process_birth_matches(str(expected_birth), actual_birth) is not True:
             return False
         # A degraded runtime can still be the correct owner. Keep health
         # admission separate so database failures are not called PID conflicts.
@@ -986,7 +986,7 @@ class LocalRuntimeBoundary:
                 str(marker.get("realm_id")) == expected_realm,
                 marker_root == expected_root,
                 self.is_pid_alive(expected_pid),
-                self.process_birth_identity(expected_pid) == expected_birth,
+                platform.process_birth_matches(expected_birth, self.process_birth_identity(expected_pid) or "") is True,
                 bool(health and health.get("runtime_instance_id") == expected_instance),
                 bool(endpoint_identity and endpoint_identity.get("runtime_instance_id") == expected_instance),
                 bool(endpoint_identity and endpoint_identity.get("realm_id") == expected_realm),
@@ -1195,6 +1195,8 @@ class ForegroundRuntimeBoundary(LocalRuntimeBoundary):
                 local_worker_profiles=composition.profiles if composition else None,
                 local_worker_preparer=composition.preparer if composition else None,
                 local_worker_inspector=composition.inspector if composition else None, door=door,
+                _local_worker_composition=composition,
+                _local_worker_composition_required=bool(source_profile.worker_profile),
                 services=services, log_directory=self._log_directory)
             self.daemon = daemon
             cancellation.check()

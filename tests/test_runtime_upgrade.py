@@ -28,6 +28,7 @@ def _walk_back_to_v27(connection):
     # A fresh realm is the current schema; v31 -> v30 drops user_app_state, v30 -> v29 drops timelines.name
     # (the only v30 change), and v28 -> v27 restores inline specs and drops task_specs.
     connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("DROP INDEX IF EXISTS idx_generations_gen")
     connection.execute("DROP TABLE user_app_state")
     connection.execute("ALTER TABLE timelines DROP COLUMN name")
     connection.execute("DROP INDEX IF EXISTS idx_tasks_retention")
@@ -293,6 +294,8 @@ def _canonical_fixture(root, version):
     store.close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
+        if version < 32:
+            connection.execute("DROP INDEX IF EXISTS idx_generations_gen")
         if version < 28:
             _walk_back_to_v27(connection)  # also drops user_app_state and timelines.name
         else:
@@ -329,7 +332,7 @@ def _canonical_fixture(root, version):
     return f"realm-v{version}"
 
 
-@pytest.mark.parametrize("source_version, expected_steps", [(24, 7), (25, 6), (26, 5), (29, 2), (30, 1)])
+@pytest.mark.parametrize("source_version, expected_steps", [(24, 8), (25, 7), (26, 6), (29, 3), (30, 2), (31, 1)])
 def test_complete_canonical_migration_chain_reaches_current_schema(tmp_path, source_version, expected_steps):
     root = tmp_path / f"realm-{source_version}"
     realm_id = _canonical_fixture(root, source_version)

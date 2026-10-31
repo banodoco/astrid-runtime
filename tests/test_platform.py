@@ -259,12 +259,14 @@ def test_linux_proc_identity_parser_uses_stat_and_brackets_start_tick(monkeypatc
         def __truediv__(self, part):
             return FakePath(self.value.rstrip("/") + "/" + str(part))
         def read_text(self):
+            if self.value.endswith("boot_id"):
+                return "test-boot"
             reads.append(self.value)
             tick = start_ticks[min(len(reads) - 1, 1)]
             fields = ["S", "23", "24", "25"] + ["0"] * 15 + [tick, "0"]
             return "77 (worker ) with parens) " + " ".join(fields)
         def stat(self):
-            return SimpleNamespace(st_uid=501)
+            return SimpleNamespace(st_uid=501, st_ino=1234)
 
     monkeypatch.setattr(platform, "Path", FakePath)
     value = platform.process_identity(77)
@@ -273,7 +275,7 @@ def test_linux_proc_identity_parser_uses_stat_and_brackets_start_tick(monkeypatc
     assert value["parent_pid"] == 23
     assert value["process_group"] == 24
     assert value["session_id"] == 25
-    assert value["birth_id"] == "proc-start-ticks:4242"
+    assert value["birth_id"] == "proc-start-ticks:4242;boot:test-boot;pidns:1234"
     assert len(reads) == 2
 
 
@@ -285,9 +287,11 @@ def test_linux_proc_identity_rejects_pid_reuse_during_observation(monkeypatch):
         def __init__(self, value): self.value = str(value)
         def __truediv__(self, part): return FakePath(self.value.rstrip("/") + "/" + str(part))
         def read_text(self):
+            if self.value.endswith("boot_id"):
+                return "test-boot"
             fields = ["S", "23", "24", "25"] + ["0"] * 15 + [next(ticks), "0"]
             return "77 (worker) " + " ".join(fields)
-        def stat(self): return SimpleNamespace(st_uid=501)
+        def stat(self): return SimpleNamespace(st_uid=501, st_ino=1234)
 
     monkeypatch.setattr(platform, "Path", FakePath)
     with pytest.raises(OSError, match="changed"):
@@ -562,3 +566,51 @@ def test_windows_tree_drained_preserves_query_errors(monkeypatch):
     with pytest.raises(OSError, match="query failed"):
         platform.tree_drained(SimpleNamespace(_runtime_job=job))
     assert job.handle == 77
+
+
+@pytest.mark.parametrize("expected,actual,result", [
+    ("proc-start-ticks:1", "proc-start-ticks:1;boot:a;pidns:2", True),
+    ("proc-start-ticks:1", "proc-start-ticks:2;boot:a;pidns:2", False),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;boot:b;pidns:2", False),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;boot:a;pidns:3", False),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1", None),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;pidns:2", None),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;pidns:3", False),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:2", False),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;boot:a;pidns:2", True),
+])
+def test_process_birth_comparison_handles_reboot_namespace_and_legacy(expected, actual, result):
+    assert platform.process_birth_matches(expected, actual) is result
+
+
+def test_linux_identity_includes_incarnation_scope():
+    if sys.platform != "linux":
+        return  # Linux-specific fields; generic native identity is tested above.
+    identity = platform.process_identity(os.getpid())
+    assert ";boot:" in identity["birth_id"]
+    assert f";pidns:{Path('/proc/self/ns/pid').stat().st_ino}" in identity["birth_id"]
+
+
+@pytest.mark.parametrize("unavailable", ["boot", "namespace", "both"])
+def test_linux_identity_keeps_working_when_optional_scope_is_denied(monkeypatch, unavailable):
+    if sys.platform != "linux":
+        return
+    real_read = Path.read_text
+    real_stat = Path.stat
+
+    def read(path, *args, **kwargs):
+        if path.name == "boot_id" and unavailable in {"boot", "both"}:
+            raise PermissionError("restricted proc mount")
+        return real_read(path, *args, **kwargs)
+
+    def stat(path, *args, **kwargs):
+        if str(path).endswith("/ns/pid") and unavailable in {"namespace", "both"}:
+            raise PermissionError("restricted proc mount")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(Path, "stat", stat)
+    identity = platform.process_identity(os.getpid())
+    assert identity is not None
+    assert (";boot:" in identity["birth_id"]) is (unavailable == "namespace")
+    assert (";pidns:" in identity["birth_id"]) is (unavailable == "boot")

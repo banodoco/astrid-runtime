@@ -910,6 +910,7 @@ class RetainedProcess:
         self.guard = threading.RLock()
         self.exit_code = None
         self.actor = None
+        self.wait_ownership_lost = False
 
     def bind_actor(self):
         from astrid_runtime.custody_broker import AuthenticatedCleanupActor
@@ -918,17 +919,38 @@ class RetainedProcess:
         return self.actor
 
     def poll(self):
-        with self.guard, getattr(self.child, "_waitpid_lock", self.guard):
+        with self.guard:
             if self.exit_code is not None:
                 return self.exit_code
+            if self.wait_ownership_lost:
+                raise RelayError("retained child wait ownership is unknown")
             if self.child.returncode is not None:
                 raise RelayError("child was reaped outside retained launch ownership")
             try:
-                result = self.child.poll()
+                internal_poll = getattr(self.child, "_internal_poll", None)
+                if callable(internal_poll):
+                    # Popen owns its non-reentrant waitpid lock. Holding it
+                    # around poll() prevents poll from ever calling waitpid.
+                    # Its default ECHILD fallback is zero, which is not proof
+                    # that this waiter reaped the original child.
+                    unavailable = object()
+                    result = self.child._internal_poll(_deadstate=unavailable)
+                    if result is unavailable:
+                        self.wait_ownership_lost = True
+                        # Keep diagnostic returncode serializable. The latch
+                        # above permanently forbids another retained wait.
+                        self.child.returncode = None
+                        raise RelayError("retained child wait ownership is unknown")
+                else:
+                    result = self.child.poll()
             except (ChildProcessError, OSError) as exc:
+                self.wait_ownership_lost = True
                 raise RelayError("retained child wait ownership is unknown") from exc
             if result is None:
                 return None
+            if isinstance(result, bool) or not isinstance(result, int):
+                self.wait_ownership_lost = True
+                raise RelayError("retained child exit status is unknown")
             self.exit_code = result
             return self.exit_code
 

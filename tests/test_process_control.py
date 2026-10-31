@@ -335,3 +335,56 @@ def test_doctor_reports_mode_and_probe(tmp_path):
     (paths.process_control_path).write_text("{}")
     broken = doctor(paths)
     assert broken["healthy"] is False and any("process-control.json" in issue for issue in broken["issues"])
+
+
+@linux_only
+def test_probe_uses_live_child_group_when_inherited_group_is_unreachable(mode, monkeypatch):
+    original = os.killpg
+    observed = []
+    inherited = os.getpgrp()
+
+    def namespace_killpg(pgid, signum):
+        if pgid == inherited:
+            raise ProcessLookupError(errno.ESRCH, "group outside PID namespace")
+        assert signum == 0
+        assert platform.process_identity(pgid) is not None
+        assert os.getpgid(pgid) == pgid
+        observed.append(pgid)
+        return original(pgid, signum)
+
+    monkeypatch.setattr(platform.os, "killpg", namespace_killpg)
+    report = platform.process_control_probe()
+    assert report["process_group_kill"] == "allowed"
+    assert report["ok"] is (report["pidfd"] == "available")
+    assert observed and all(platform.process_identity(pid) is None for pid in observed)
+
+
+@linux_only
+@pytest.mark.parametrize("error", [errno.EPERM, errno.ESRCH])
+def test_probe_reaps_child_on_group_check_failure(mode, monkeypatch, error):
+    observed = []
+
+    def failed_check(pgid, signum):
+        observed.append(pgid)
+        raise OSError(error, "group check failed")
+
+    monkeypatch.setattr(platform.os, "killpg", failed_check)
+    report = platform.process_control_probe()
+    assert report["ok"] is False
+    assert report["process_group_kill"] == ("denied" if error == errno.EPERM else "error:ESRCH")
+    if error == errno.ESRCH:
+        assert "PID namespaces" in report["reason"]
+        assert "--sandbox" not in report["reason"]
+    assert observed and all(platform.process_identity(pid) is None for pid in observed)
+
+
+@linux_only
+def test_probe_child_creation_failure_is_actionable_and_not_a_sandbox_fallback(mode, monkeypatch):
+    def denied(*_args, **_kwargs):
+        raise PermissionError(errno.EACCES, "cannot create child")
+
+    monkeypatch.setattr(platform.subprocess, "Popen", denied)
+    report = platform.process_control_probe(mode="sandbox")
+    assert report["ok"] is False
+    assert report["process_group_kill"] == "probe-error:EACCES"
+    assert "create and signal" in report["reason"]
