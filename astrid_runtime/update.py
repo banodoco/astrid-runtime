@@ -486,6 +486,9 @@ def read_update_status(home=None, *, available=False, reason=None):
         # acknowledgement. It stays unresolved until an explicit Update asks
         # the installer to reconcile it.
         state = "recovery-needed"
+    elif state in {"updated", "rolled_back", "failed", "recovery-needed"} and step and step not in terminal_steps:
+        # A terminal result cannot be validated by an unfinished transaction.
+        state = "recovery-needed"
     elif step and step not in terminal_steps:
         state = "active" if matched and _installer_lock_held(home) else "recovery-needed"
     elif step in terminal_steps and matched and state in {"accepted", "active"}:

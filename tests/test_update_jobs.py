@@ -255,6 +255,7 @@ def test_status_rejects_uncorroborated_success(tmp_path, monkeypatch, job_state,
         journal["step"] = "rolled_back" if job_state == "updated" else "complete"
     elif defect == "pending_step":
         journal["step"] = "switched"
+        monkeypatch.setattr(update, "_installer_lock_held", lambda home: True)
     elif defect == "missing_version":
         (root / "versions/selected/version.json").unlink()
     elif defect == "wrong_version":
@@ -307,6 +308,19 @@ def test_status_preserves_pretransaction_failure_or_recovery(tmp_path, job_state
     assert status.get("outcome") == ("failed" if job_state == "failed" else None)
     assert {path: path.read_bytes() for path in sources} == before
     assert (root / "update-transaction.json").exists() == prior_journal
+
+
+@pytest.mark.parametrize("job_state", ["failed", "recovery-needed"])
+def test_terminal_failure_with_pending_transaction_stays_recovery_needed(tmp_path, monkeypatch, job_state):
+    home, root, data, selection, discovery, version, health, job, journal = _terminal_evidence(tmp_path, monkeypatch, job_state)
+    journal["step"] = "switched"
+    marker = _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": job})
+    journal_path = _write(root / "update-transaction.json", journal)
+    before = {path: path.read_bytes() for path in (selection, marker, journal_path)}
+    monkeypatch.setattr(update, "_installer_lock_held", lambda home: True)
+    status = update.read_update_status(home)
+    assert status["state"] == "recovery-needed" and "outcome" not in status
+    assert {path: path.read_bytes() for path in before} == before
 
 
 def test_status_exposes_bounded_job_and_cleanup_metadata(tmp_path):
