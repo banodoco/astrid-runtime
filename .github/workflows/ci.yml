@@ -16,10 +16,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Restore pip cache (C-08)
+        id: c08-runtime-ci-5
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
       - run: python -m pip install -e '.[test]'
       - run: python -m pip install -e packages/python
       - name: Verify Windows update backup daemon from a selected venv
@@ -52,6 +57,13 @@ jobs:
           'tests/test_profile_services.py::test_invalid_declaration_is_refused[document18]'
           'tests/test_profile_services.py::test_invalid_declaration_is_refused[document19]'
 
+      - name: Save pip cache on main or int branches (C-08)
+        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/')) && steps.c08-runtime-ci-5.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
+
   unit:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -60,10 +72,15 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      - name: Restore pip cache (C-08)
+        id: c08-runtime-ci-4
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
       - name: Install system media tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
@@ -74,19 +91,38 @@ jobs:
       - run: python -m pip install -e '.[test]'
       - run: python -m pytest -q -n 2
 
+      - name: Save pip cache on main or int branches (C-08)
+        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/')) && steps.c08-runtime-ci-4.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
+
   darwin-native:
     # The darwin_native lane is deselected by default and skipped off macOS; this
     # is the job where it runs (tests/lanes.py SKIP_REGISTRY).
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Restore pip cache (C-08)
+        id: c08-runtime-ci-3
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
       - run: brew install ffmpeg
       - run: python -m pip install -e '.[test]'
       - run: python -m pytest -q -m darwin_native
+
+      - name: Save pip cache on main or int branches (C-08)
+        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/')) && steps.c08-runtime-ci-3.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
 
   typescript-client:
     runs-on: ubuntu-latest
@@ -104,15 +140,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Restore pip cache (C-08)
+        id: c08-runtime-ci-2
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - run: python -m pip install -e '.[test]'
       - run: python -m pytest -q tests/test_second_client_e2e.py -m ""
+
+      - name: Save pip cache on main or int branches (C-08)
+        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/')) && steps.c08-runtime-ci-2.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
 
   sandbox-process-control:
     # Sandbox mode under a seccomp profile that denies what NVIDIA OpenShell's
@@ -137,10 +185,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: astrid-runtime
+      - name: Restore pip cache (C-08)
+        id: c08-runtime-ci-1
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
       # The override is an immutable test input; never modify the fixture pin.
       - name: Select Agent revision
         id: astrid-pin
@@ -190,3 +243,9 @@ jobs:
           tests/test_foreground.py
           tests/test_native_custody.py
           tests/test_portable_lifecycle.py
+      - name: Save pip cache on main or int branches (C-08)
+        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/')) && steps.c08-runtime-ci-1.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
