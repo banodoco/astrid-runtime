@@ -17,10 +17,15 @@ jobs:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     steps:
       - uses: actions/checkout@v4
+      - name: Restore pip cache (C-08)
+        id: c08-runtime-nightly-1
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
       # The override is an immutable test input; never modify the fixture pin.
       - name: Select Agent revision
         id: astrid-pin
@@ -52,3 +57,9 @@ jobs:
       - run: python -m pip install -e '.[test]'
       - run: python -m pip install -e "$ASTRID_CHECKOUT"
       - run: python -m pytest -q -m integration
+      - name: Save pip cache on main or int branches (C-08)
+        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/')) && steps.c08-runtime-nightly-1.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
