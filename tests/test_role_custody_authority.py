@@ -1,8 +1,12 @@
 """CPU-only ownership protocol proof; no kernel signaling qualification."""
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 import signal
+import socket
 import threading
+import traceback
+from types import SimpleNamespace
 
 import pytest
 
@@ -208,8 +212,177 @@ def test_retained_binding_serializes_waiter_and_refuses_changed_capture(graph):
         assert wait_guard.locked(), "waiter must be excluded throughout kernel binding"
         identities[103] = {**identities[103], "birth_id": "replacement"}
         return tokens[pid]
-    with pytest.raises(custody.CustodyError, match="changed"):
+    with pytest.raises(custody.CustodyError, match="changed") as error:
         custody.AuthenticatedCleanupActor.retained_child(child, reap_guard=threading.RLock(), identity_provider=identities.get, token_provider=token)
+    assert str(error.value).endswith("[stage=retained_child.after; identity=available; mismatched_fields=birth_id]")
+
+
+@pytest.mark.parametrize("edge,diagnostic", [
+    ("before-absent", "stage=retained_child.before; identity=absent; mismatched_fields=none"),
+    ("wrong-parent", "stage=retained_child.before; identity=available; mismatched_fields=parent_pid"),
+    ("after-absent", "stage=retained_child.after; identity=absent; mismatched_fields=none"),
+])
+def test_retained_binding_diagnostics_preserve_refusal(graph, edge, diagnostic):
+    identity = {**graph[2][103], "parent_pid": os.getpid()}
+    child = SimpleNamespace(pid=103, returncode=None, _waitpid_lock=threading.Lock())
+    if edge == "before-absent":
+        observations = iter([None])
+    elif edge == "wrong-parent":
+        observations = iter([{**identity, "parent_pid": os.getpid() + 1}])
+    else:
+        observations = iter([identity, identity, None])
+    with pytest.raises(custody.CustodyError) as error:
+        custody.AuthenticatedCleanupActor.retained_child(child, reap_guard=threading.RLock(),
+            identity_provider=lambda pid: next(observations), token_provider=graph[3].get)
+    assert str(error.value).endswith("[" + diagnostic + "]")
+    assert child.returncode is None
+
+
+@pytest.fixture
+def retained_diagnostics(tmp_path, monkeypatch):
+    """Production retained/report/abort path with only synthetic OS inputs."""
+    from runtime_protocol.local_execution_supervisor import RetainedProcess
+    from runtime_protocol import local_worker_composition as composition
+    from test_local_worker import host_only_profile_case
+
+    identity = {"pid": 103, "uid": 501, "birth_id": "private-birth", "parent_pid": os.getpid()}
+    token = {"pid": 103, "uid": 501, "pidversion": 17, "sha256": "private-token-digest",
+             "words": [987654321] * 8, "credential": "synthetic-private-credential"}
+    observations = {"identity": dict(identity), "token": dict(token)}
+
+    def observe(kind):
+        value = observations[kind]
+        if isinstance(value, Exception):
+            raise value
+        return dict(value) if value is not None else None
+
+    monkeypatch.setattr(custody, "default_process_identity", lambda pid: observe("identity"))
+    monkeypatch.setattr(custody, "current_process_audit_token", lambda pid: observe("token"))
+    child = SimpleNamespace(pid=103, returncode=None, _waitpid_lock=threading.Lock(), poll=lambda: None)
+    retained = RetainedProcess(child)
+    actor = retained.bind_actor()
+    pinned = retained.verify()
+    preparer = composition.CrossProcessWorkerPreparer(profile=host_only_profile_case(), config={}, environment={})
+    control, peer = socket.socketpair()
+    activation, activation_peer = socket.socketpair()
+    events = []
+    handle = composition._PreparedWorker(child, identity["birth_id"], control, {}, tmp_path / "config.json",
+        retained=retained, host_only=True, activation=activation, owner_epoch="epoch", custody_scope=str(tmp_path),
+        preparation={"version": "runtime.local-execution-preparation/v1", "operation_id": "op",
+                     "channel_id": "ch", "owner_epoch": "epoch"},
+        broker=SimpleNamespace(signal=lambda *a, **k: events.append("signal"),
+                               role_authority=SimpleNamespace(reference=lambda: {"unit": "reference"})),
+        launch_verifier=SimpleNamespace(verify_child=lambda *a, **k: None), verified_launch=object())
+    preparer._active = handle
+    retained.wait = lambda timeout: events.append("reap")
+    requests = []
+    monkeypatch.setattr(composition, "_frame_send", lambda channel, request: (requests.append(request), events.append("request")))
+
+    def acknowledge(channel):
+        events.append("ack")
+        return {**{k: v for k, v in requests[-1].items() if k != "command"},
+                "status": "cleaned", "cleanup": {"host_children": "absent"}}
+
+    monkeypatch.setattr(composition, "_frame_receive", acknowledge)
+    try:
+        yield SimpleNamespace(identity=identity, token=token, observations=observations, actor=actor,
+            pinned=pinned, retained=retained, preparer=preparer, handle=handle, events=events, composition=composition)
+    finally:
+        for channel in (control, peer, activation, activation_peer):
+            channel.close()
+
+
+def test_retained_diagnostics_healthy_identity_keeps_ack_before_signal_and_reap(retained_diagnostics, capsys, caplog):
+    case = retained_diagnostics
+    for _ in range(2):
+        assert case.retained.verify() == case.pinned
+        assert case.preparer._host_only_report(case.handle)["processes"]["host"]["pid"] == 103
+    case.preparer.abort(case.handle)
+    assert case.events == ["request", "ack", "signal", "reap"]
+    assert case.handle.closed and case.preparer._active is None
+    assert case.handle.control.fileno() == case.handle.activation.fileno() == -1
+    assert case.actor._pinned == case.pinned
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err and not caplog.text
+
+
+@pytest.mark.parametrize("edge,diagnostic", [
+    ("pid", "stage=verify.compare; identity=available; mismatched_fields=pid"),
+    ("uid", "stage=verify.compare; identity=available; mismatched_fields=uid"),
+    ("birth_id", "stage=verify.compare; identity=available; mismatched_fields=birth_id"),
+    ("sha256", "stage=verify.compare; identity=available; mismatched_fields=audit_token_sha256"),
+    ("pidversion", "stage=verify.compare; identity=available; mismatched_fields=audit_token_pidversion"),
+    ("multiple", "stage=verify.compare; identity=available; mismatched_fields=birth_id,audit_token_sha256,audit_token_pidversion"),
+    ("absent", "stage=verify.identity; identity=absent; mismatched_fields=none"),
+    ("identity-unavailable", "stage=verify.identity; identity=unavailable; mismatched_fields=none"),
+    ("token-unavailable", "stage=verify.token; identity=unobserved; mismatched_fields=none"),
+    ("token-custody-unavailable", "stage=verify.token; identity=unobserved; mismatched_fields=none"),
+    ("invalid-identity", "stage=verify.incarnation; identity=available; mismatched_fields=none"),
+    ("invalid-token", "stage=verify.incarnation; identity=available; mismatched_fields=none"),
+])
+def test_retained_diagnostics_reject_without_disclosing_or_rebinding(retained_diagnostics, edge, diagnostic, capsys, caplog):
+    case = retained_diagnostics
+    observed = case.observations
+    if edge in {"pid", "uid"}:
+        observed["identity"][edge] += 1
+        observed["token"][edge] += 1
+    elif edge in {"birth_id", "multiple"}:
+        observed["identity"]["birth_id"] = "changed-private-birth"
+    if edge in {"sha256", "multiple"}:
+        observed["token"]["sha256"] = "changed-private-token-digest"
+    if edge in {"pidversion", "multiple"}:
+        observed["token"]["pidversion"] += 1
+    if edge == "absent":
+        observed["identity"] = None
+    elif edge.endswith("unavailable"):
+        kind = edge.split("-")[0]
+        error_type = custody.CustodyError if "custody" in edge else OSError
+        observed[kind] = error_type("synthetic-private-credential 987654321 private-token-digest")
+    elif edge == "invalid-identity":
+        observed["identity"]["birth_id"] = ""
+    elif edge == "invalid-token":
+        observed["token"]["uid"] += 1
+    # Unknown DTO keys and credential-like data must never become field labels.
+    if isinstance(observed["identity"], dict):
+        observed["identity"]["private-field-label"] = "synthetic-private-credential"
+    for action in (lambda: case.preparer._host_only_report(case.handle), lambda: case.preparer.abort(case.handle)):
+        with pytest.raises(custody.CustodyError) as error:
+            action()
+        message = str(error.value)
+        assert message.endswith("[" + diagnostic + "]")
+        rendered = "".join(traceback.format_exception(error.value)) + caplog.text + str(capsys.readouterr())
+        for secret in ("private-birth", "private-token-digest", "987654321", "synthetic-private-credential", "private-field-label"):
+            assert secret not in rendered
+        assert len(message) < 300
+    assert case.retained.actor is case.actor and case.actor._pinned == case.pinned
+    assert case.retained.exit_code is None and case.handle.worker.returncode is None
+    assert not case.events  # No request/ACK, signal, or reap after rejection.
+    assert case.preparer._active is case.handle and not case.handle.closed
+    assert case.handle.control.fileno() >= 0 and case.handle.activation.fileno() >= 0
+
+
+@pytest.mark.parametrize("ack", ["missing", "wrong-epoch", "children-unresolved"])
+def test_retained_diagnostics_invalid_ack_keeps_handle_and_never_signals(retained_diagnostics, monkeypatch, ack):
+    case = retained_diagnostics
+    original_receive = case.composition._frame_receive
+
+    def receive(channel):
+        if ack == "missing":
+            raise OSError("synthetic missing ACK")
+        response = original_receive(channel)
+        if ack == "wrong-epoch":
+            response["owner_epoch"] = "other"
+        else:
+            response["cleanup"]["host_children"] = "unresolved"
+        return response
+
+    monkeypatch.setattr(case.composition, "_frame_receive", receive)
+    with pytest.raises((OSError, case.composition.ConflictError)):
+        case.preparer.abort(case.handle)
+    assert "signal" not in case.events and "reap" not in case.events
+    assert case.preparer._active is case.handle and not case.handle.closed
+    assert case.handle.control.fileno() >= 0 and case.handle.activation.fileno() >= 0
+    assert case.actor._pinned == case.pinned
 
 
 def test_reference_verification_is_read_only_and_requires_exact_designated_actor(graph):
@@ -220,6 +393,156 @@ def test_reference_verification_is_read_only_and_requires_exact_designated_actor
     assert authority.path.read_bytes() == before
     with pytest.raises(custody.CustodyError, match="designation differs"):
         authority.verify_reference(ref, expected_actor=actors[102].verify(), owner_epoch="runtime-A", identity_provider=identities.get, token_provider=tokens.get)
+
+
+def test_reference_diagnostics_success_is_repeatable_read_only_and_silent(graph, monkeypatch, capsys, caplog):
+    authority, actors, identities, tokens = graph
+    ref = authority.reference()
+    reference_before = {**ref, "target": dict(ref["target"])}
+    pins = {pid: dict(actor._pinned) for pid, actor in actors.items()}
+    before = authority.path.read_bytes()
+    calls = []
+    monkeypatch.setattr(authority, "_write", lambda _: pytest.fail("verification rewrote designation"))
+    for _ in range(2):
+        assert authority.verify_reference(ref, expected_actor=pins[101], owner_epoch="runtime-A",
+            identity_provider=lambda pid: calls.append(("identity", pid)) or identities[pid],
+            token_provider=lambda pid: calls.append(("token", pid)) or tokens[pid]) == reference_before
+    assert calls == [("identity", 101), ("token", 101), ("identity", 103), ("token", 103)] * 2
+    assert authority.path.read_bytes() == before
+    assert ref == reference_before
+    assert {pid: actor._pinned for pid, actor in actors.items()} == pins
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err and not caplog.text
+
+
+@pytest.mark.parametrize("role,pid", [("actor", 101), ("target", 103)])
+@pytest.mark.parametrize("edge,stage,availability,fields", [
+    ("pid", "compare", "available", "pid"),
+    ("uid", "compare", "available", "uid"),
+    ("birth_id", "compare", "available", "birth_id"),
+    ("sha256", "compare", "available", "audit_token_sha256"),
+    ("pidversion", "compare", "available", "audit_token_pidversion"),
+    ("multiple", "compare", "available", "pid,uid,birth_id,audit_token_sha256,audit_token_pidversion"),
+    ("absent", "identity", "absent", "none"),
+    ("identity-custody", "identity", "unavailable", "none"),
+    ("identity-oserror", "identity", "unavailable", "none"),
+    ("token-custody", "token", "available", "none"),
+    ("token-oserror", "token", "available", "none"),
+    ("invalid-identity", "incarnation", "available", "none"),
+    ("invalid-token", "incarnation", "available", "none"),
+    ("unknown-key-only", "compare", "available", "none"),
+])
+def test_reference_diagnostics_reject_without_disclosure_write_or_rebinding(
+        graph, monkeypatch, role, pid, edge, stage, availability, fields, capsys, caplog):
+    authority, actors, identities, tokens = graph
+    ref = authority.reference()
+    pins = {actor_pid: dict(actor._pinned) for actor_pid, actor in actors.items()}
+    selected_actor = dict(pins[101])
+    before = authority.path.read_bytes()
+    private = "synthetic-private-credential" + "x" * 4096
+    observed = {
+        "identity": {actor_pid: {**identity, "private-field-label": private} for actor_pid, identity in identities.items()},
+        "token": {actor_pid: {**token, "private-token-label": private, "words": [987654321] * 8}
+                  for actor_pid, token in tokens.items()},
+    }
+    for field in ("pid", "uid"):
+        if edge in {field, "multiple"}:
+            observed["identity"][pid][field] += 1
+            observed["token"][pid][field] += 1
+    if edge in {"birth_id", "multiple"}:
+        observed["identity"][pid]["birth_id"] = "private-birth" + private
+    if edge in {"sha256", "multiple"}:
+        observed["token"][pid]["sha256"] = "private-token-digest" + private
+    if edge in {"pidversion", "multiple"}:
+        observed["token"][pid]["pidversion"] += 1
+    if edge == "absent":
+        observed["identity"][pid] = None
+    elif edge.endswith(("-custody", "-oserror")):
+        kind, error_kind = edge.split("-")
+        error_type = custody.CustodyError if error_kind == "custody" else OSError
+        observed[kind][pid] = error_type(private + " private-token-digest 987654321")
+    elif edge == "invalid-identity":
+        observed["identity"][pid]["birth_id"] = ""
+    elif edge == "invalid-token":
+        observed["token"][pid]["uid"] += 1
+    elif edge == "unknown-key-only":
+        # Only full mapping equality catches an extra expected key; its label
+        # must not become a diagnostic field, even though no known field differs.
+        record = authority._read()
+        record[role]["private-field-label"] = private
+        monkeypatch.setattr(authority, "_read", lambda: record)
+        ref = authority._reference(record)
+        selected_actor = dict(record["actor"])
+    reference_before = {**ref, "target": dict(ref["target"])}
+    actor_before = dict(selected_actor)
+    calls = []
+
+    def observe(kind, observed_pid):
+        calls.append((kind, observed_pid))
+        value = observed[kind][observed_pid]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(authority, "_write", lambda _: pytest.fail("verification rewrote designation"))
+    with pytest.raises(custody.CustodyError) as error:
+        authority.verify_reference(ref, expected_actor=selected_actor, owner_epoch="runtime-A",
+            identity_provider=lambda observed_pid: observe("identity", observed_pid),
+            token_provider=lambda observed_pid: observe("token", observed_pid))
+    prefix = "custody designation has unavailable or changed kernel identity"
+    if availability == "unavailable" or stage == "token":
+        prefix = f"custody designation {stage} observation is unavailable"
+    elif stage == "incarnation":
+        prefix = "custody incarnation lacks authenticated identity"
+    metadata = f"[role={role}; stage=verify_reference.{stage}; identity={availability}; mismatched_fields={fields}]"
+    assert str(error.value) == prefix + " " + metadata
+    assert len(metadata) < 200 and len(str(error.value)) < 300
+    if availability == "unavailable" or stage in {"token", "incarnation"}:
+        assert error.value.__suppress_context__
+    expected_calls = [] if role == "actor" else [("identity", 101), ("token", 101)]
+    expected_calls.append(("identity", pid))
+    if stage != "identity":
+        expected_calls.append(("token", pid))
+    assert calls == expected_calls  # Absence never asks for a token; failure stops all later observations.
+    captured = capsys.readouterr()
+    rendered = "".join(traceback.format_exception(error.value)) + captured.out + captured.err + caplog.text
+    for secret in ("private-birth", "private-token-digest", "987654321", "synthetic-private-credential",
+                   "private-field-label", "private-token-label", "birth-101", "birth-103", "sha256:token-101", "sha256:token-103"):
+        assert secret not in rendered
+    assert not captured.out and not captured.err and not caplog.text
+    assert authority.path.read_bytes() == before
+    assert ref == reference_before and selected_actor == actor_before
+    assert {actor_pid: actor._pinned for actor_pid, actor in actors.items()} == pins
+
+
+@pytest.mark.parametrize("edge", ["state", "actor", "reference", "epoch"])
+def test_reference_diagnostics_owner_reference_and_epoch_precede_observation(graph, monkeypatch, edge):
+    authority, actors, identities, tokens = graph
+    ref = authority.reference()
+    pins = {pid: dict(actor._pinned) for pid, actor in actors.items()}
+    selected_actor, epoch = pins[101], "runtime-A"
+    before = authority.path.read_bytes()
+    if edge == "state":
+        record = authority._read()
+        record["state"] = "pending"
+        monkeypatch.setattr(authority, "_read", lambda: record)
+    elif edge == "actor":
+        selected_actor = pins[102]
+    elif edge == "reference":
+        ref["generation"] += 1
+    else:
+        epoch = "runtime-B"
+    reference_before = {**ref, "target": dict(ref["target"])}
+    calls = []
+    monkeypatch.setattr(authority, "_write", lambda _: pytest.fail("verification rewrote designation"))
+    with pytest.raises(custody.CustodyError) as error:
+        authority.verify_reference(ref, expected_actor=selected_actor, owner_epoch=epoch,
+            identity_provider=lambda pid: calls.append(("identity", pid)) or identities[pid],
+            token_provider=lambda pid: calls.append(("token", pid)) or tokens[pid])
+    assert str(error.value) == "custody designation differs from selected owner/reference"
+    assert not calls
+    assert authority.path.read_bytes() == before and ref == reference_before
+    assert {pid: actor._pinned for pid, actor in actors.items()} == pins
 
 
 @pytest.fixture

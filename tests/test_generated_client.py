@@ -27,6 +27,26 @@ def _patch_opener(monkeypatch, open_response):
     )
 
 
+@pytest.mark.parametrize("filters", [{}, {"kind": "video", "model": "X /&?", "target": "runpod", "tag": "hero +"}, {"tag": ""}])
+def test_generation_list_filters_encode_through_generated_transport(filters):
+    from urllib.parse import parse_qs, urlsplit
+
+    calls = []
+
+    def transport(method, path, headers, body):
+        calls.append((method, path))
+        return 200, {}, b'{"items":[],"next_cursor":"page-two"}'
+
+    client = WorkspaceClient("http://runtime", transport=transport)
+    assert client.list_generations("project /&?", cursor="page +", limit=7, **filters) == ([], "page-two")
+    method, path = calls.pop()
+    assert method == "GET"
+    assert urlsplit(path).path == "/v1/projects/project%20%2F%26%3F/generations"
+    assert parse_qs(urlsplit(path).query, keep_blank_values=True) == {
+        "cursor": ["page +"], "limit": ["7"], **{name: [value] for name, value in filters.items()},
+    }
+
+
 def test_generated_abandon_client_roundtrips_exact_identity_receipt_and_wire_schema(tmp_path):
     from jsonschema import Draft202012Validator
     from referencing import Registry, Resource
@@ -987,6 +1007,45 @@ def test_list_documents_generated_client_kind_filter_is_encoded() -> None:
         assert path == "/v1/projects/p%20%2F/documents?limit=5&cursor=next%2Fpage&kind=astrid.note%20%2F%3F"
         return 200, {}, b'{"items": [], "next_cursor": null}'
     assert WorkspaceClient("http://runtime", transport=transport).list_documents("p /", cursor="next/page", limit=5, kind="astrid.note /?") == ([], None)
+
+
+@pytest.mark.parametrize("name", ["kind", "model", "target", "tag"])
+def test_list_project_objects_generated_client_forwards_each_filter(name):
+    def transport(method, path, headers, body):
+        assert method == "GET"
+        assert path == f"/v1/projects/p/objects?limit=50&{name}=value"
+        return 200, {}, b'{"items": [], "next_cursor": "next"}'
+
+    assert getattr(WorkspaceClient("http://runtime", transport=transport), "list_project_objects")("p", **{name: "value"}) == ([], "next")
+
+
+def test_list_project_objects_generated_client_forwards_combined_filters_and_encodes_values():
+    from urllib.parse import parse_qs, urlsplit
+
+    filters = {
+        "kind": "astrid.video /?",
+        "model": "vendor/model&variant=fast",
+        "target": "runpod+gpu=1",
+        "tag": "scene #1",
+    }
+
+    def transport(method, path, headers, body):
+        parsed = urlsplit(path)
+        assert method == "GET"
+        assert parsed.path == "/v1/projects/p%20%2F/objects"
+        assert parse_qs(parsed.query, keep_blank_values=True) == {"limit": ["50"], **{key: [value] for key, value in filters.items()}}
+        return 200, {}, b'{"items": [], "next_cursor": null}'
+
+    assert WorkspaceClient("http://runtime", transport=transport).list_project_objects("p /", **filters) == ([], None)
+
+
+def test_list_project_objects_generated_client_without_filters_preserves_request_and_response():
+    def transport(method, path, headers, body):
+        assert method == "GET"
+        assert path == "/v1/projects/p%20%2F/objects?limit=50"
+        return 200, {}, b'{"items": [], "next_cursor": "existing-cursor"}'
+
+    assert WorkspaceClient("http://runtime", transport=transport).list_project_objects("p /") == ([], "existing-cursor")
 
 
 def test_stream_project_object_upload_sets_length_digest_and_does_not_buffer_or_close(monkeypatch) -> None:

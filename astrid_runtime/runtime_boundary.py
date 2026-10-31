@@ -1191,6 +1191,8 @@ class ForegroundRuntimeBoundary(LocalRuntimeBoundary):
                 local_worker_profiles=composition.profiles if composition else None,
                 local_worker_preparer=composition.preparer if composition else None,
                 local_worker_inspector=composition.inspector if composition else None, door=door,
+                _local_worker_composition=composition,
+                _local_worker_composition_required=bool(source_profile.worker_profile),
                 services=services, log_directory=self._log_directory)
             self.daemon = daemon
             cancellation.check()

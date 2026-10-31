@@ -1297,3 +1297,666 @@ def test_owned_cancel_whole_set_transaction_rolls_back_and_replays_once(runtime,
     assert service.store.conn.total_changes == before
     assert all(service.store.get_task(value["task_id"])["task"]["status"] == "cancelled" for value in attempts)
     assert all(service.store.execution_binding(value["task_id"])["status"] == "released" for value in attempts)
+
+
+# Named publication coverage shares the existing fenced Runtime fixtures above.
+def publication_effect(project, port):
+    return {"effect_type": "generation.publish_v1", "target_id": project, "payload": {
+        "version": 1, "modality": "video", "generation_type": "delegated_h3",
+        "metadata": {"publication": port}, "partial_success_policy": "reject",
+        "groups": [{"group_key": "main", "selectors": [{"selector": port,
+            "ordinal": 0, "variant_key": "original", "output_port": port}]}],
+    }}
+
+
+def publication_policy(project):
+    def stage(name, cap, inputs):
+        return {"name": name, "capability_id": cap, "capability_digest": digest(cap),
+                "target": {"kind": "default"}, "inputs": inputs}
+    def ref(name, producer, port):
+        return {"name": name, "producer_stage": producer, "output_port": port}
+    final_effect = publication_effect(project, "verified_candidate")
+    final_effect["payload"]["metadata"]["h3_av"] = {
+        "request_digest": digest("sealed-h3-request"), "publication_scope": "final_composition",
+    }
+    return {
+        "capabilities": [{"capability_id": cap, "capability_digest": digest(cap)} for cap in (CHILD, OTHER)],
+        "targets": [{"kind": "default"}, TARGET], "input_object_ids": [],
+        "stages": [stage("raw", CHILD, []), stage("compose", CHILD, [ref("raw", "raw", "raw_video")]),
+            stage("verify", OTHER, [ref("candidate", "compose", "candidate")]),
+            stage("final", CHILD, [ref("candidate", "compose", "candidate"), ref("verification", "verify", "verification")])],
+        "publications": {
+            "raw": {"stage": "raw", "output_port": "raw_video", "effect": publication_effect(project, "raw_video")},
+            "final": {"stage": "final", "output_port": "verified_candidate", "candidate_stage": "compose",
+                "candidate_output_port": "candidate", "verify_stage": "verify", "verify_output_port": "verification",
+                "effect": final_effect},
+        },
+    }
+
+
+def publication_parent(runtime, *, key="publication-parent", policy=None):
+    service, project = runtime
+    service.create_task({"project": project, "capability_id": PARENT, "capability_digest": digest(PARENT),
+        "input_object_ids": [], "spec": {}, "child_delegation": policy or publication_policy(project),
+        "idempotency_key": key}, enforce_readiness=True)
+    return claim(service, PARENT, "claim-" + key)
+
+
+def stage_task(service, p, policy, name, associations):
+    stage = next(stage for stage in policy["stages"] if stage["name"] == name)
+    refs = []
+    for item in stage["inputs"]:
+        association = associations[(item["producer_stage"], item["output_port"])]
+        refs.append({"name": item["name"], "producer_task_id": association["task_id"],
+                     "association_id": association["association_id"], "output_port": item["output_port"]})
+    return {"capability_id": stage["capability_id"], "capability_digest": stage["capability_digest"],
+            "stage": name, "input_refs": refs, "spec": {}}
+
+
+def admit_stage(service, p, policy, name, associations, *, key=None, task=None):
+    task = task or stage_task(service, p, policy, name, associations)
+    return service.admit_delegated_child({"authority": authority(service, p)["authority"], "task": task},
+                                       idempotency_key=key or "stage-" + name, identity=IDENTITY)
+
+
+def publication_output(data, port):
+    return {"name": port, "output_port": port, "kind": "object", "digest": digest(data),
+            "data_base64": base64.b64encode(data).decode(), "size": len(data),
+            "media_type": "application/json" if port in {"verification", "manifest", "final_receipt"} else "video/mp4",
+            "group_key": "main", "variant_key": "original", "ordinal": 0}
+
+
+def stage_settlement(service, attempt, data, port):
+    body = {**lease(attempt), "outputs": [publication_output(data, port)]}
+    if attempt.get("expected_effect"):
+        body["effect"] = attempt["expected_effect"]
+    return body
+
+
+def publication_journey(runtime, *, through="final"):
+    service, project = runtime
+    policy = publication_policy(project)
+    p = publication_parent(runtime, policy=policy)
+    attempts, associations, bodies = {}, {}, {}
+    values = [("raw", b"raw-generation-video", "raw_video"),
+              ("compose", b"composed-candidate-video", "candidate"),
+              ("verify", b'{"candidate_verified":true}', "verification"),
+              ("final", b"composed-candidate-video", "verified_candidate")]
+    for name, data, port in values:
+        admitted = admit_stage(service, p, policy, name, associations)
+        attempt = claim(service, admitted["task"]["capability"], "claim-stage-" + name)
+        attempts[name] = attempt
+        body = stage_settlement(service, attempt, data, port)
+        if name in {"raw", "final"}:
+            # Native H3 finalization also emits the existing result manifest.
+            manifest = publication_output(b'{"outputs":[]}', "manifest")
+            manifest["role"] = "manifest"
+            body["outputs"].insert(0, manifest)
+        bodies[name] = body
+        service.settle_attempt(attempt["attempt_id"], body, idempotency_key="settle-stage-" + name, identity=IDENTITY)
+        associations[(name, port)] = next(item for item in service.managed_outputs(attempt["task_id"]) if item["output_port"] == port)
+        if name == through:
+            break
+    return p, policy, attempts, associations, bodies
+
+
+def test_named_publications_preserve_distinct_raw_final_and_parent_result(runtime):
+    service, project = runtime
+    p, policy, attempts, associations, bodies = publication_journey(runtime)
+    raw = associations[("raw", "raw_video")]
+    candidate = associations[("compose", "candidate")]
+    verification = associations[("verify", "verification")]
+    final = associations[("final", "verified_candidate")]
+    assert raw["object_id"] != candidate["object_id"] == final["object_id"]
+    assert raw["association_id"] != final["association_id"]
+    assert raw["generation_id"] != final["generation_id"]
+    assert raw["generation_id"] and final["generation_id"]
+    for publication in (raw, final):
+        outputs = service.managed_outputs(publication["task_id"])
+        assert {item["output_port"] for item in outputs} == {publication["output_port"], "manifest"}
+        manifest = next(item for item in outputs if item["output_port"] == "manifest")
+        assert "delegated_publication" not in manifest["provenance"]
+        assert publication["manifest_ref"] == manifest["object_id"]
+    binding = final["provenance"]["delegated_publication"]
+    assert binding["name"] == "final" and binding["parent_attempt_id"] == p["attempt_id"]
+    assert binding["candidate"]["association_id"] == candidate["association_id"]
+    assert binding["verification"]["association_id"] == verification["association_id"]
+    assert binding["raw"]["association_id"] == raw["association_id"]
+    assert binding["raw_publication"] == service.task(raw["task_id"])["task"]["result"]["generation_publish_v1"]
+    for item in (raw, final):
+        assert service.get_generation(item["generation_id"])["source_task_id"] == item["task_id"]
+        published = service.task(item["task_id"])["task"]["result"]["generation_publish_v1"]["publications"][0]["variants"][0]
+        assert service.get_variant(published["variant_id"])["generation_id"] == item["generation_id"]
+    final_effect = service.task(final["task_id"])["task"]["expected_effect"]
+    h3_binding = final_effect["payload"]["metadata"]["h3_av"]
+    raw_variant = binding["raw_publication"]["publications"][0]["variants"][0]
+    assert h3_binding == {
+        "request_digest": digest("sealed-h3-request"), "publication_scope": "final_composition",
+        "candidate_sha256": candidate["object_id"].removeprefix("sha256:"),
+        "raw_sha256": raw["object_id"].removeprefix("sha256:"),
+        "raw_generation_id": raw["generation_id"], "raw_variant_id": raw_variant["variant_id"],
+        "raw_association_id": raw["association_id"], "raw_group_key": raw["group_key"],
+        "raw_variant_key": raw["variant_key"], "raw_output_port": raw["output_port"],
+    }
+    assert service.get_generation(final["generation_id"])["metadata"]["h3_av"] == h3_binding
+    for name, attempt in attempts.items():
+        lineage = load_task_spec(service, attempt["task_id"])["delegated_parent"]
+        assert lineage["parent_attempt_id"] == p["attempt_id"]
+        assert lineage["parent_fence"] == p["fence"]
+        assert lineage["project_id"] == project
+    final_spec = load_task_spec(service, attempts["final"]["task_id"])
+    assert {ref["association_id"] for ref in final_spec["delegated_inputs"]} == {
+        candidate["association_id"], verification["association_id"]}
+    # The parent uses the canonical output mechanism for its final video and receipt.
+    receipt = json.dumps({"overall_status": "candidate_verified", "raw": raw["association_id"],
+                          "final": final["association_id"]}).encode()
+    result = {"overall_status": "candidate_verified"}
+    settled = service.settle_attempt(p["attempt_id"], {**lease(p), "result": result,
+        "outputs": [publication_output(b"composed-candidate-video", "verified_candidate"),
+                    publication_output(receipt, "final_receipt")]}, idempotency_key="settle-publication-parent", identity=IDENTITY)
+    task = service.task(p["task_id"])["task"]
+    assert task["status"] == "completed" and task["result"]["overall_status"] == "candidate_verified"
+    assert {item["output_port"] for item in service.managed_outputs(p["task_id"])} == {"verified_candidate", "final_receipt"}
+    assert settled["data"]["state"] == "succeeded"
+    parent_final = next(item for item in service.managed_outputs(p["task_id"]) if item["output_port"] == "verified_candidate")
+    assert parent_final["provenance"]["delegated_publication"]["source_association_id"] == final["association_id"]
+    assert parent_final["provenance"]["delegated_publication"]["raw"]["association_id"] == raw["association_id"]
+    # Both existing managed publication associations survive a fresh reader.
+    realm_root = service.store.root
+    service.close()
+    reader = RuntimeService(realm_root)
+    try:
+        assert reader.managed_output(raw["association_id"])["generation_id"] == raw["generation_id"]
+        assert reader.managed_output(final["association_id"])["generation_id"] == final["generation_id"]
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("field", ["candidate_stage", "candidate_output_port", "verify_stage", "verify_output_port", "output_port"])
+def test_named_publication_policy_rejects_mismatched_relationships(runtime, field):
+    service, project = runtime
+    policy = publication_policy(project)
+    policy["publications"]["final"][field] = "substitution"
+    with pytest.raises((ValidationError, AuthorizationError)):
+        publication_parent(runtime, policy=policy)
+    assert service.store.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("mutation", ["candidate_without_raw", "verify_without_candidate", "extra_final_input", "same_effect", "both_policy_forms", "partial_policy"])
+def test_named_publication_policy_requires_exact_dependency_graph(runtime, mutation):
+    _, project = runtime
+    policy = publication_policy(project)
+    if mutation == "candidate_without_raw":
+        policy["stages"][1]["inputs"] = []
+    elif mutation == "verify_without_candidate":
+        policy["stages"][2]["inputs"] = []
+    elif mutation == "extra_final_input":
+        policy["stages"][-1]["inputs"].append({"name": "raw", "producer_stage": "raw", "output_port": "raw_video"})
+    elif mutation == "same_effect":
+        policy["publications"]["final"]["effect"] = copy.deepcopy(policy["publications"]["raw"]["effect"])
+    elif mutation == "partial_policy":
+        policy["publications"]["raw"]["effect"]["payload"]["partial_success_policy"] = "allow"
+    else:
+        policy["final_publication"] = {"stage": "final", "verify_stage": "verify", "verify_output_port": "verification", "effect": policy["publications"]["final"]["effect"]}
+    with pytest.raises((ValidationError, AuthorizationError)):
+        publication_parent(runtime, policy=policy)
+
+
+@pytest.mark.parametrize("input_name", ["candidate", "verification"])
+def test_named_final_rejects_substituted_managed_input(runtime, input_name):
+    service, _ = runtime
+    p, policy, attempts, associations, _ = publication_journey(runtime, through="verify")
+    task = stage_task(service, p, policy, "final", associations)
+    ref = next(item for item in task["input_refs"] if item["name"] == input_name)
+    wrong = associations[("raw", "raw_video")]
+    ref.update(producer_task_id=wrong["task_id"], association_id=wrong["association_id"])
+    before = service.store.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    with pytest.raises((AuthorizationError, ConflictError)):
+        admit_stage(service, p, policy, "final", associations, task=task)
+    assert service.store.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+
+
+def test_named_final_rejects_nested_path_and_caller_effect_authority(runtime):
+    service, _ = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="verify")
+    task = stage_task(service, p, policy, "final", associations)
+    task["input_refs"][0]["path"] = "/caller/chosen/video.mp4"
+    with pytest.raises(AuthorizationError):
+        admit_stage(service, p, policy, "final", associations, task=task)
+    task = stage_task(service, p, policy, "final", associations)
+    task["settlement_effect"] = policy["publications"]["final"]["effect"]
+    with pytest.raises(ValidationError):
+        admit_stage(service, p, policy, "final", associations, task=task)
+    task.pop("settlement_effect")
+    task["spec"]["verified_publication_source"] = {"path": "/caller/chosen/video.mp4"}
+    with pytest.raises(ValidationError):
+        admit_stage(service, p, policy, "final", associations, task=task)
+
+
+@pytest.mark.parametrize("replacement", [b"raw-generation-video", b"unrelated-video"])
+def test_named_final_rejects_raw_or_unverified_output_bytes(runtime, replacement):
+    service, _ = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="verify")
+    admit_stage(service, p, policy, "final", associations)
+    final = claim(service, CHILD, "claim-final-invalid")
+    with pytest.raises(AuthorizationError):
+        service.settle_attempt(final["attempt_id"], stage_settlement(service, final, replacement, "verified_candidate"),
+                               idempotency_key="settle-final-invalid", identity=IDENTITY)
+    assert not service.managed_outputs(final["task_id"])
+    assert service.store.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("field", ["fence", "lease_id", "runtime_epoch"])
+def test_named_final_rejects_stale_fence_lease_epoch(runtime, field):
+    service, _ = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="verify")
+    admit_stage(service, p, policy, "final", associations)
+    final = claim(service, CHILD, "claim-final-stale")
+    body = stage_settlement(service, final, b"composed-candidate-video", "verified_candidate")
+    body[field] = "stale" if field == "lease_id" else body[field] + (1 if field == "runtime_epoch" else -1)
+    with pytest.raises((LeaseError, ConflictError)):
+        service.settle_attempt(final["attempt_id"], body, idempotency_key="settle-final-stale", identity=IDENTITY)
+    assert not service.managed_outputs(final["task_id"])
+
+
+@pytest.mark.parametrize("publication_name", ["raw", "final"])
+def test_named_publications_exact_replay_is_idempotent_and_new_replay_rejected(runtime, publication_name):
+    service, _ = runtime
+    p, policy, attempts, associations, bodies = publication_journey(runtime)
+    final = attempts[publication_name]
+    before = service.task(final["task_id"])
+    service.settle_attempt(final["attempt_id"], bodies[publication_name], idempotency_key="settle-stage-" + publication_name, identity=IDENTITY)
+    assert service.task(final["task_id"]) == before
+    assert service.store.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0] == 2
+    with pytest.raises(LeaseError):
+        service.settle_attempt(final["attempt_id"], bodies[publication_name], idempotency_key="new-final-replay", identity=IDENTITY)
+    changed = copy.deepcopy(bodies[publication_name])
+    changed["result"] = {"forged": True}
+    with pytest.raises(ConflictError):
+        service.settle_attempt(final["attempt_id"], changed, idempotency_key="settle-stage-" + publication_name, identity=IDENTITY)
+    with pytest.raises(ConflictError, match="already admitted"):
+        admit_stage(service, p, policy, "final", associations, key="duplicate-final")
+
+
+@pytest.mark.parametrize("result", [
+    {"overall_status": "complete"},
+    {"overall_status": "complete", "states": {"editorially_approved": {"status": "passed", "evidence": {"source": "review"}}}},
+    {"overall_status": "complete", "states": {"editorially_approved": {"status": "passed", "evidence": {"source": "review"}},
+        "cleanup_verified": {"status": "cleanup_pending", "evidence": {"resources": []}}}},
+    {"overall_status": "complete", "states": {"editorially_approved": {"status": "passed", "evidence": {}},
+        "cleanup_verified": {"status": "passed", "evidence": {"resources": ["fixture"]}}}},
+    {"overall_status": "candidate_verified", "status": "task_failed"},
+    {"overall_status": "complete", "states": {"editorially_approved": {"status": "passed", "evidence": {"source": "review"}},
+        "cleanup_verified": {"status": "passed", "evidence": {"resources": []}}}},
+    {"overall_status": "complete", "states": {"editorially_approved": {"status": "passed", "evidence": {"source": "review"}},
+        "cleanup_verified": {"status": "passed", "evidence": {"resources": [{"verified": False}]}}}},
+])
+def test_named_parent_rejects_incomplete_complete_or_conflicting_outcomes(runtime, result):
+    service, _ = runtime
+    p, _, _, _, _ = publication_journey(runtime)
+    with pytest.raises((ValidationError, AuthorizationError)):
+        service.settle_attempt(p["attempt_id"], {**lease(p), "outputs": [publication_output(b"composed-candidate-video", "verified_candidate")], "result": result},
+                               idempotency_key="invalid-outcome", identity=IDENTITY)
+    assert service.task(p["task_id"])["task"]["status"] == "running"
+
+
+def test_named_parent_complete_requires_native_editorial_cleanup_evidence(runtime):
+    service, _ = runtime
+    p, _, _, _, _ = publication_journey(runtime)
+    result = {"overall_status": "complete", "states": {
+        "editorially_approved": {"status": "passed", "evidence": {"source": "fixture-review"}},
+        "cleanup_verified": {"status": "passed", "evidence": {"resources": [{"kind": "fixture", "verified": True}]}},
+    }}
+    service.settle_attempt(p["attempt_id"], {**lease(p), "outputs": [publication_output(b"composed-candidate-video", "verified_candidate")], "result": result},
+                           idempotency_key="complete-outcome", identity=IDENTITY)
+    assert service.task(p["task_id"])["task"]["result"]["overall_status"] == "complete"
+
+
+def test_named_parent_task_failed_uses_existing_fenced_failure(runtime):
+    service, _ = runtime
+    p = publication_parent(runtime)
+    with pytest.raises((ValidationError, AuthorizationError), match="fail_attempt"):
+        service.settle_attempt(p["attempt_id"], {**lease(p), "outputs": [], "result": {"overall_status": "task_failed"}},
+                               idempotency_key="cannot-succeed-failed", identity=IDENTITY)
+    service.fail_attempt(p["attempt_id"], {**lease(p), "error": {"code": "h3_task_failed", "message": "H3 task_failed"}},
+                         idempotency_key="fail-h3", identity=IDENTITY)
+    assert service.task(p["task_id"])["task"]["status"] == "failed"
+
+
+@pytest.mark.parametrize("corruption", ["raw_generation", "raw_result", "candidate_raw_input", "verification_candidate_input"])
+def test_named_final_revalidates_actual_lineage_at_settlement(runtime, corruption):
+    service, _ = runtime
+    p, policy, attempts, associations, _ = publication_journey(runtime, through="verify")
+    admit_stage(service, p, policy, "final", associations)
+    final = claim(service, CHILD, "claim-final-corruption")
+    raw = associations[("raw", "raw_video")]
+    if corruption == "raw_generation":
+        service.store.conn.execute("UPDATE managed_output_associations SET generation_id=NULL WHERE association_id=?", (raw["association_id"],))
+    elif corruption == "raw_result":
+        result = service.task(raw["task_id"])["task"]["result"]
+        result["generation_publish_v1"]["publications"][0]["variants"][0]["variant_id"] = "foreign-variant"
+        service.store.conn.execute("UPDATE tasks SET result_json=? WHERE id=?", (json.dumps(result), raw["task_id"]))
+    else:
+        task_id = attempts["compose" if corruption == "candidate_raw_input" else "verify"]["task_id"]
+        spec = load_task_spec(service, task_id)
+        spec["delegated_inputs"][0]["association_id"] = "foreign-association"
+        store_task_spec(service, task_id, spec)
+    with pytest.raises((AuthorizationError, ConflictError)):
+        service.settle_attempt(final["attempt_id"], stage_settlement(service, final, b"composed-candidate-video", "verified_candidate"),
+                               idempotency_key="settle-final-corrupt", identity=IDENTITY)
+    assert not service.managed_outputs(final["task_id"])
+    assert service.store.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0] == 1
+
+
+def test_named_final_is_fenced_when_parent_lease_expires(runtime):
+    service, _ = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="verify")
+    admit_stage(service, p, policy, "final", associations)
+    final = claim(service, CHILD, "claim-final-parent-stale")
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    service.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expired, p["attempt_id"]))
+    service.store.conn.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (expired, p["task_id"]))
+    with pytest.raises((LeaseError, AuthorizationError)):
+        service.settle_attempt(final["attempt_id"], stage_settlement(service, final, b"composed-candidate-video", "verified_candidate"),
+                               idempotency_key="settle-expired-parent", identity=IDENTITY)
+    assert not service.managed_outputs(final["task_id"])
+
+
+def test_legacy_single_verified_publication_still_settles(runtime):
+    service, project = runtime
+    policy = publication_policy(project)
+    policy.pop("publications")
+    policy["stages"] = [
+        {"name": "verify", "capability_id": OTHER, "capability_digest": digest(OTHER), "target": {"kind": "default"}, "inputs": []},
+        {"name": "final", "capability_id": CHILD, "capability_digest": digest(CHILD), "target": {"kind": "default"},
+         "inputs": [{"name": "verified", "producer_stage": "verify", "output_port": "video"}]},
+    ]
+    policy["final_publication"] = {"stage": "final", "verify_stage": "verify", "verify_output_port": "video", "effect": publication_effect(project, "video")}
+    p = publication_parent(runtime, policy=policy)
+    associations = {}
+    for name, cap in (("verify", OTHER), ("final", CHILD)):
+        admit_stage(service, p, policy, name, associations)
+        attempt = claim(service, cap, "claim-legacy-" + name)
+        service.settle_attempt(attempt["attempt_id"], stage_settlement(service, attempt, b"verified-legacy-video", "video"),
+                               idempotency_key="settle-legacy-" + name, identity=IDENTITY)
+        associations[(name, "video")] = service.managed_outputs(attempt["task_id"])[0]
+    settle(service, p, "legacy-parent")
+    assert service.task(p["task_id"])["task"]["status"] == "completed"
+    assert associations[("final", "video")]["generation_id"]
+
+
+@pytest.mark.parametrize("field", ["fence", "lease_id", "runtime_epoch"])
+def test_named_raw_publication_is_fenced_before_mutation(runtime, field):
+    service, project = runtime
+    policy = publication_policy(project)
+    p = publication_parent(runtime, policy=policy)
+    admit_stage(service, p, policy, "raw", {})
+    raw = claim(service, CHILD, "claim-raw-stale")
+    body = stage_settlement(service, raw, b"raw-generation-video", "raw_video")
+    body[field] = "stale" if field == "lease_id" else body[field] + 1
+    with pytest.raises((LeaseError, ConflictError)):
+        service.settle_attempt(raw["attempt_id"], body, idempotency_key="stale-raw", identity=IDENTITY)
+    assert not service.managed_outputs(raw["task_id"])
+    assert service.store.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("mutation", ["effect", "provenance"])
+def test_named_publication_rejects_caller_effect_and_provenance_substitution(runtime, mutation):
+    service, project = runtime
+    policy = publication_policy(project)
+    p = publication_parent(runtime, policy=policy)
+    admit_stage(service, p, policy, "raw", {})
+    raw = claim(service, CHILD, "claim-raw-substitution")
+    body = stage_settlement(service, raw, b"raw-generation-video", "raw_video")
+    if mutation == "effect":
+        body["effect"] = policy["publications"]["final"]["effect"]
+    else:
+        body["outputs"][0]["provenance"] = {"delegated_publication": {"name": "final", "raw": {"association_id": "foreign"}}}
+    with pytest.raises((ValidationError, AuthorizationError)):
+        service.settle_attempt(raw["attempt_id"], body, idempotency_key="caller-substitution", identity=IDENTITY)
+    assert not service.managed_outputs(raw["task_id"])
+
+
+def test_named_parent_cannot_expose_raw_as_verified_final(runtime):
+    service, _ = runtime
+    p, _, _, _, _ = publication_journey(runtime)
+    with pytest.raises(AuthorizationError):
+        service.settle_attempt(p["attempt_id"], {**lease(p), "result": {"overall_status": "candidate_verified"},
+            "outputs": [publication_output(b"raw-generation-video", "verified_candidate")]},
+            idempotency_key="parent-raw-substitution", identity=IDENTITY)
+    assert not service.managed_outputs(p["task_id"])
+
+
+@pytest.mark.parametrize("input_name", ["candidate", "verification"])
+def test_named_final_rejects_same_bytes_same_port_from_foreign_task(runtime, input_name):
+    service, project = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="verify")
+    foreign = service.create_task({"project": project, "capability_id": OTHER, "capability_digest": digest(OTHER),
+                                   "idempotency_key": "foreign-producer"})
+    foreign_attempt = claim(service, OTHER, "claim-foreign-producer")
+    value = b"composed-candidate-video" if input_name == "candidate" else b'{"candidate_verified":true}'
+    settle(service, foreign_attempt, "settle-foreign-producer", [publication_output(value, input_name)])
+    wrong = service.managed_outputs(foreign["task"]["id"])[0]
+    task = stage_task(service, p, policy, "final", associations)
+    ref = next(ref for ref in task["input_refs"] if ref["name"] == input_name)
+    ref.update(producer_task_id=wrong["task_id"], association_id=wrong["association_id"])
+    with pytest.raises((AuthorizationError, ConflictError)):
+        admit_stage(service, p, policy, "final", associations, task=task)
+
+
+@pytest.mark.parametrize("corruption", ["raw_publication", "final_binding"])
+def test_named_parent_revalidates_final_and_raw_before_association(runtime, corruption):
+    service, _ = runtime
+    p, _, _, associations, _ = publication_journey(runtime)
+    if corruption == "raw_publication":
+        raw = associations[("raw", "raw_video")]
+        service.store.conn.execute("UPDATE managed_output_associations SET generation_id=NULL WHERE association_id=?", (raw["association_id"],))
+    else:
+        final = associations[("final", "verified_candidate")]
+        provenance = copy.deepcopy(final["provenance"])
+        provenance["delegated_publication"]["parent_attempt_id"] = "foreign-parent"
+        service.store.conn.execute("UPDATE managed_output_associations SET provenance_json=? WHERE association_id=?", (json.dumps(provenance), final["association_id"]))
+    with pytest.raises((AuthorizationError, ConflictError)):
+        service.settle_attempt(p["attempt_id"], {**lease(p), "result": {"overall_status": "candidate_verified"},
+            "outputs": [publication_output(b"composed-candidate-video", "verified_candidate")]},
+            idempotency_key="parent-corrupt-final", identity=IDENTITY)
+    assert not service.managed_outputs(p["task_id"])
+
+
+def test_named_publication_accepts_raw_as_candidate_with_distinct_final_association(runtime):
+    service, project = runtime
+    policy = publication_policy(project)
+    policy["stages"].pop(1)
+    for stage in policy["stages"]:
+        for ref in stage["inputs"]:
+            if ref["producer_stage"] == "compose":
+                ref.update(producer_stage="raw", output_port="raw_video")
+    policy["publications"]["final"].update(candidate_stage="raw", candidate_output_port="raw_video")
+    p = publication_parent(runtime, policy=policy)
+    associations = {}
+    for name, cap, data, port in (("raw", CHILD, b"same-candidate-video", "raw_video"),
+                                 ("verify", OTHER, b'{"verified":true}', "verification"),
+                                 ("final", CHILD, b"same-candidate-video", "verified_candidate")):
+        admit_stage(service, p, policy, name, associations)
+        attempt = claim(service, cap, "claim-direct-candidate-" + name)
+        service.settle_attempt(attempt["attempt_id"], stage_settlement(service, attempt, data, port),
+                               idempotency_key="settle-direct-candidate-" + name, identity=IDENTITY)
+        associations[(name, port)] = service.managed_outputs(attempt["task_id"])[0]
+    raw, final = associations[("raw", "raw_video")], associations[("final", "verified_candidate")]
+    assert raw["object_id"] == final["object_id"]
+    assert raw["association_id"] != final["association_id"] and raw["generation_id"] != final["generation_id"]
+
+
+@pytest.mark.parametrize("field", ["candidate_sha256", "raw_association_id"])
+def test_named_final_rejects_effect_metadata_substitution(runtime, field):
+    service, _ = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="verify")
+    admit_stage(service, p, policy, "final", associations)
+    final = claim(service, CHILD, "claim-final-effect-substitution")
+    body = stage_settlement(service, final, b"composed-candidate-video", "verified_candidate")
+    body["effect"] = copy.deepcopy(body["effect"])
+    body["effect"]["payload"]["metadata"]["h3_av"][field] = "foreign-lineage"
+    with pytest.raises(ValidationError, match="predeclared"):
+        service.settle_attempt(final["attempt_id"], body, idempotency_key="final-effect-substitution", identity=IDENTITY)
+    assert not service.managed_outputs(final["task_id"])
+
+
+def test_named_selector_tracks_video_with_same_port_auxiliary_audio(runtime):
+    service, project = runtime
+    policy = publication_policy(project)
+    p = publication_parent(runtime, policy=policy)
+    associations = {}
+    for name, data, port in (("raw", b"raw-video", "raw_video"),
+                             ("compose", b"candidate-video", "candidate"),
+                             ("verify", b'{"verified":true}', "verification"),
+                             ("final", b"candidate-video", "verified_candidate")):
+        admit_stage(service, p, policy, name, associations)
+        attempt = claim(service, CHILD if name != "verify" else OTHER, "selector-claim-" + name)
+        body = stage_settlement(service, attempt, data, port)
+        if name in {"raw", "final"}:
+            audio = publication_output(("audio-" + name).encode(), port)
+            audio.update(media_type="audio/wav", variant_key="auxiliary", ordinal=1)
+            body["outputs"].insert(0, audio)
+        service.settle_attempt(attempt["attempt_id"], body, idempotency_key="selector-settle-" + name, identity=IDENTITY)
+        outputs = service.managed_outputs(attempt["task_id"])
+        association = next(item for item in outputs if item["variant_key"] == "original")
+        associations[(name, port)] = association
+        if name in {"raw", "final"}:
+            audio = next(item for item in outputs if item["variant_key"] == "auxiliary")
+            assert audio["generation_id"] is None
+            assert "delegated_publication" not in audio["provenance"]
+            assert association["provenance"]["delegated_publication"]["name"] == name
+    raw = associations[("raw", "raw_video")]
+    final = associations[("final", "verified_candidate")]
+    assert final["provenance"]["delegated_publication"]["raw"]["association_id"] == raw["association_id"]
+    service.settle_attempt(p["attempt_id"], {**lease(p), "result": {"overall_status": "candidate_verified"},
+        "outputs": [publication_output(b"candidate-video", "verified_candidate")]},
+        idempotency_key="selector-settle-parent", identity=IDENTITY)
+    parent_output = service.managed_outputs(p["task_id"])[0]
+    assert parent_output["provenance"]["delegated_publication"]["source_association_id"] == final["association_id"]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "temporary"])
+def test_named_selector_rejects_invalid_selected_settlement(runtime, mutation):
+    service, project = runtime
+    policy = publication_policy(project)
+    p = publication_parent(runtime, policy=policy)
+    admit_stage(service, p, policy, "raw", {})
+    raw = claim(service, CHILD, "selector-invalid-claim")
+    body = stage_settlement(service, raw, b"raw-video", "raw_video")
+    if mutation == "missing":
+        body["outputs"][0]["variant_key"] = "other"
+    elif mutation == "duplicate":
+        body["outputs"].append(copy.deepcopy(body["outputs"][0]))
+    else:
+        body["outputs"][0]["durability"] = "temporary"
+    with pytest.raises((ConflictError, AuthorizationError, ValidationError)):
+        service.settle_attempt(raw["attempt_id"], body, idempotency_key="selector-invalid", identity=IDENTITY)
+    assert not service.managed_outputs(raw["task_id"])
+    assert service.store.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0] == 0
+
+
+def test_named_selector_rejects_compose_using_same_port_auxiliary(runtime):
+    service, project = runtime
+    policy = publication_policy(project)
+    p = publication_parent(runtime, policy=policy)
+    admit_stage(service, p, policy, "raw", {})
+    attempt = claim(service, CHILD, "selector-raw-claim")
+    body = stage_settlement(service, attempt, b"raw-video", "raw_video")
+    auxiliary = publication_output(b"raw-audio", "raw_video")
+    auxiliary.update(media_type="audio/wav", variant_key="auxiliary", ordinal=1)
+    body["outputs"].append(auxiliary)
+    service.settle_attempt(attempt["attempt_id"], body, idempotency_key="selector-raw", identity=IDENTITY)
+    wrong = next(item for item in service.managed_outputs(attempt["task_id"]) if item["variant_key"] == "auxiliary")
+    refs = {("raw", "raw_video"): wrong}
+    with pytest.raises(AuthorizationError, match="selected raw"):
+        admit_stage(service, p, policy, "compose", refs)
+    assert len(service.store.delegated_children(p["task_id"], p["attempt_id"])) == 1
+
+
+@pytest.mark.parametrize("include_selected", [True, False])
+def test_named_compose_allows_same_port_auxiliary_only_with_selected_video(runtime, include_selected):
+    service, project = runtime
+    policy = publication_policy(project)
+    policy["stages"][1]["inputs"].append({"name": "audio", "producer_stage": "raw", "output_port": "raw_video"})
+    p = publication_parent(runtime, policy=policy)
+    admit_stage(service, p, policy, "raw", {})
+    attempt = claim(service, CHILD, "selector-pair-claim")
+    body = stage_settlement(service, attempt, b"raw-video", "raw_video")
+    audio = publication_output(b"raw-audio", "raw_video")
+    audio.update(media_type="audio/wav", variant_key="auxiliary", ordinal=1)
+    body["outputs"].append(audio)
+    other = publication_output(b"other-audio", "raw_video")
+    other.update(media_type="audio/wav", variant_key="other", ordinal=2)
+    body["outputs"].append(other)
+    service.settle_attempt(attempt["attempt_id"], body, idempotency_key="selector-pair", identity=IDENTITY)
+    outputs = service.managed_outputs(attempt["task_id"])
+    selected = next(item for item in outputs if item["variant_key"] == "original")
+    auxiliary = next(item for item in outputs if item["variant_key"] == "auxiliary")
+    other = next(item for item in outputs if item["variant_key"] == "other")
+    task = stage_task(service, p, policy, "compose", {("raw", "raw_video"): selected})
+    task["input_refs"][1]["association_id"] = auxiliary["association_id"]
+    if not include_selected:
+        task["input_refs"][0]["association_id"] = other["association_id"]
+        with pytest.raises(AuthorizationError, match="selected raw"):
+            admit_stage(service, p, policy, "compose", {}, task=task)
+    else:
+        admitted = admit_stage(service, p, policy, "compose", {}, task=task)
+        recorded = load_task_spec(service, admitted["task"]["id"])["delegated_inputs"]
+        assert [ref["association_id"] for ref in recorded] == [selected["association_id"], auxiliary["association_id"]]
+
+
+def test_named_final_rejects_raw_selector_drift_after_admission(runtime):
+    service, _ = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="verify")
+    admit_stage(service, p, policy, "final", associations)
+    final = claim(service, CHILD, "selector-drift-final")
+    raw = associations[("raw", "raw_video")]
+    service.store.conn.execute("UPDATE managed_output_associations SET variant_key=? WHERE association_id=?",
+                               ("drifted", raw["association_id"]))
+    with pytest.raises(ConflictError, match="selector"):
+        service.settle_attempt(final["attempt_id"], stage_settlement(service, final, b"composed-candidate-video", "verified_candidate"),
+                               idempotency_key="selector-drift", identity=IDENTITY)
+    assert not service.managed_outputs(final["task_id"])
+
+
+@pytest.mark.parametrize("corruption", ["wrong_attempt", "stale"])
+def test_named_compose_rejects_unusable_selected_raw_association(runtime, corruption):
+    service, _ = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="raw")
+    raw = associations[("raw", "raw_video")]
+    if corruption == "wrong_attempt":
+        service.store.conn.execute("UPDATE managed_output_associations SET attempt_id=? WHERE association_id=?",
+                                   (p["attempt_id"], raw["association_id"]))
+    else:
+        service.store.conn.execute("UPDATE managed_output_lifecycle SET state='reclaimed' WHERE association_id=?",
+                                   (raw["association_id"],))
+    with pytest.raises((AuthorizationError, ConflictError)):
+        admit_stage(service, p, policy, "compose", associations)
+    assert len(service.store.delegated_children(p["task_id"], p["attempt_id"])) == 1
+
+
+@pytest.mark.parametrize("corruption", ["selector", "wrong_attempt", "stale", "omission", "substitution"])
+def test_named_compose_revalidates_selected_raw_at_settlement(runtime, corruption):
+    service, _ = runtime
+    p, policy, _, associations, _ = publication_journey(runtime, through="raw")
+    admitted = admit_stage(service, p, policy, "compose", associations)
+    attempt = claim(service, CHILD, "compose-revalidate-claim")
+    body = stage_settlement(service, attempt, b"candidate", "candidate_video")
+    raw = associations[("raw", "raw_video")]
+    if corruption == "selector":
+        service.store.conn.execute("UPDATE managed_output_associations SET variant_key='substituted' WHERE association_id=?", (raw["association_id"],))
+    elif corruption == "wrong_attempt":
+        service.store.conn.execute("UPDATE managed_output_associations SET attempt_id=? WHERE association_id=?", (p["attempt_id"], raw["association_id"]))
+    elif corruption == "stale":
+        service.store.conn.execute("UPDATE managed_output_lifecycle SET state='reclaimed' WHERE association_id=?", (raw["association_id"],))
+    else:
+        spec = load_task_spec(service, admitted["task"]["id"])
+        if corruption == "omission":
+            spec["delegated_inputs"] = []
+        else:
+            spec["delegated_inputs"][0]["association_id"] = "substituted-association"
+        store_task_spec(service, admitted["task"]["id"], spec)
+    with pytest.raises((AuthorizationError, ConflictError)):
+        service.settle_attempt(attempt["attempt_id"], body, idempotency_key="compose-revalidate", identity=IDENTITY)
+    assert not service.managed_outputs(attempt["task_id"])

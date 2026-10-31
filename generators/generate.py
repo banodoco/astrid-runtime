@@ -114,6 +114,10 @@ def render_python_client(manifest_path: Path = MANIFEST) -> str:
 def render_typescript_client() -> str:
     """Render the source-frame thumbnail operations into the typed TS client."""
     source = _regular(TYPESCRIPT_CLIENT_OUTPUT, "TypeScript client").decode("utf-8")
+    generation_query_method = '  async listGenerations(projectId: string, cursor?: string, limit = 50, filters: { kind?: string; model?: string; target?: string; tag?: string } = {}): Promise<Page<Generation>> { const query = new URLSearchParams({ limit: String(limit) }); if (cursor) query.set("cursor", cursor); for (const name of ["kind", "model", "target", "tag"] as const) { const value = filters[name]; if (value !== undefined) query.set(name, value); } return this.page((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/generations?${query}`)).body) }'
+    source = '\n'.join(generation_query_method if line.startswith('  async listGenerations(') else line for line in source.split('\n'))
+    task_query_method = '  async listProjectTasks(projectId: string, cursor?: string, limit = 50, kind?: "root_generation", order?: "admitted_desc"): Promise<Page<Task>> { return this.page((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/tasks?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}${kind !== undefined ? `&kind=${encodeURIComponent(kind)}` : ""}${order !== undefined ? `&order=${encodeURIComponent(order)}` : ""}`)).body) }'
+    source = '\n'.join(task_query_method if line.startswith('  async listProjectTasks(') else line for line in source.split('\n'))
     abandon_types = ('export interface TaskAbandonRequest { expected_task_version: number; attempt_id: string; lease_id: string; fence: number; runtime_epoch: number; execution_binding: NonNullable<Task["execution_binding"]>; reason: string }\n'
         'export interface TaskAbandonResult { task_id: string; run_id: string; attempt_id: string; disposition: "lost"; reason: string; remote_stop_confirmed: false; billing_stop_confirmed: false; task: Task }')
     if 'export interface TaskAbandonRequest ' not in source:
@@ -135,6 +139,9 @@ def render_typescript_client() -> str:
         'JSON.stringify({ executor_incarnation: executorIncarnation, evidence_digest: evidenceDigest })',
         'JSON.stringify({ executor_incarnation: executorIncarnation, evidence_digest: evidenceDigest, ...(expectedTaskIds === undefined ? {} : { expected_task_ids: expectedTaskIds }) })',
     )
+    exact_claim_method = '  async claimDelegatedChild(taskId: string, body: { executor_id: string; capability_ids: string[]; runtime_epoch: number; target: ExecutionTarget; authority: string }, idempotencyKey: string): Promise<AttemptFence> { return this.json<AttemptFence>((await this.request("POST", `/v1/tasks/${encodeURIComponent(taskId)}/claim-delegated-child`, new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [200])).body) }'
+    if "  async claimDelegatedChild(" not in source:
+        source = source.replace("  async claimTask(", exact_claim_method + "\n  async claimTask(", 1)
     child_authority_types = (
         'export interface ChildAuthorityChild { child_id: string; capability_id: string; capability_digest: string }\n'
         'export interface DerivedInputDescriptor { name: string; output_port: string; filename: string; object_id: string; size: number; media_type: string }\n'

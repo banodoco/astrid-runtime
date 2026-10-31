@@ -84,6 +84,10 @@ def test_service_import_settles_one_generation_and_primary_variant(
     assert generation["status"] == "completed"
     assert generation["type"] == media_type.split("/")[0]
     assert generation["metadata"]["provenance"] == imported["provenance"]
+    assert generation["metadata"]["gen"] == {"kind": media_type.split("/")[0], "origin": "imported"}
+    assert [row["generation_id"] for row in service.list_generations(
+        project["id"], kind=media_type.split("/")[0],
+    )["items"]] == [imported["generation_id"]]
     assert len(variants) == 1
     assert variants[0]["variant_id"] == imported["variant_id"]
     assert variants[0]["object_id"] == imported["asset_id"]

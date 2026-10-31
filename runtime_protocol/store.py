@@ -41,7 +41,7 @@ from .visual_seam import (
 from .visual_boundary import finite as _visual_finite, js_round as _visual_js_round
 from .idempotency import command_result, compact_result, expired_result, EXPIRED, RESULT_WINDOW_SECONDS, IdempotencyWindowExpired
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 IDEMPOTENCY_RESULT_WINDOW_SECONDS = 24 * 60 * 60
 IDEMPOTENCY_RESULT_MARKER = "__runtime_idempotency_result_expired_v1"
 IDEMPOTENCY_RESULT_MARKER_PREFIX = '{"' + IDEMPOTENCY_RESULT_MARKER + '":'
@@ -1624,6 +1624,61 @@ class RealmStore:
                     details={"project_id": project_id, "object_id": object_id},
                 )
 
+    def _task_admission_facts(self, spec, expected_effect, project_id):
+        """Minimal classification from the authoritative admission envelope.
+
+        Producer intent and the nested caller spec are deliberately opaque. An
+        absent fact means unknown, never ordinary/root. In particular old
+        create_with_variant admissions were not all validated until settlement;
+        keep that compatibility without certifying an invalid declaration.
+        """
+        facts = {"version": 1}
+        if not (isinstance(spec, dict)
+                and {"input_object_ids", "schema_version", "capability_digest", "spec"} <= spec.keys()
+                and isinstance(spec["spec"], dict)):
+            return facts
+        lineage = spec.get("delegated_parent")
+        if lineage is None:
+            facts["is_root"] = True
+        elif (isinstance(lineage, dict)
+              and all(isinstance(lineage.get(key), str) and lineage[key]
+                      for key in ("parent_task_id", "parent_attempt_id"))):
+            facts["is_root"] = False
+        effects = [expected_effect] if expected_effect is not None else []
+        policy = spec.get("child_delegation")
+        if policy is not None:
+            if not isinstance(policy, dict):
+                return facts
+            declarations = []
+            if "final_publication" in policy:
+                declarations.append(policy["final_publication"])
+            if "publications" in policy:
+                if not isinstance(policy["publications"], dict):
+                    return facts
+                declarations.extend(policy["publications"].values())
+            for declaration in declarations:
+                if not isinstance(declaration, dict) or not isinstance(declaration.get("effect"), dict):
+                    return facts
+                effects.append(declaration["effect"])
+        generation = False
+        for effect in effects:
+            if not isinstance(effect, dict):
+                return facts
+            kind = effect.get("effect_type")
+            if not isinstance(kind, str) or not kind:
+                return facts
+            if kind in {"generation.publish_v1", "generation.create_with_variant"}:
+                try:
+                    self._validate_settlement_effect(
+                        effect, project_id=project_id,
+                        input_object_ids=spec["input_object_ids"],
+                    )
+                except (ValidationError, ConflictError, NotFoundError):
+                    return facts
+                generation = True
+        facts["is_generation"] = generation
+        return facts
+
     def _managed_render_object_bytes(self, project_id, object_id, *, media_type, expected_size=None):
         """Read one reachable prepared-scene object under project/CAS integrity."""
         match = OBJECT_ID_RE.fullmatch(object_id) if isinstance(object_id, str) else None
@@ -2609,7 +2664,10 @@ class RealmStore:
                             canonical_json({"selected": target}), timestamp, timestamp,
                         ),
                     )
-                admitted_event_id = self._append_event(run_id, task_id, "task.admitted", {"capability": capability})
+                admitted_event_id = self._append_event(run_id, task_id, "task.admitted", {
+                    "capability": capability,
+                    "classification": self._task_admission_facts(spec, expected_effect, project_id),
+                })
                 event_ids = [admitted_event_id]
                 if predecessors:
                     for ordinal, predecessor_task_id in enumerate(predecessors):

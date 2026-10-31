@@ -666,8 +666,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if len(path) == 4 and path[3] == "generations":
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 if method == "GET":
-                    query = parse_qs(urlsplit(self.path).query)
-                    return self._send(200, self.runtime.list_generations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
+                    query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    filters = {name: query[name][0] for name in ("kind", "model", "target", "tag") if name in query}
+                    return self._send(200, self.runtime.list_generations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0], **filters))
                 if method == "POST": return self._send(201, self.runtime.create_generation(selector, self._body(), idempotency_key=self._idempotency_key()))
             if len(path) == 4 and path[3] == "objects":
                 # Project association is control-plane mutation.  A worker may
@@ -675,8 +676,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 # to a project without the user-scoped project authority.
                 self._identity("objects:read" if method == "GET" else "projects:write")
                 if method == "GET":
+                    filter_query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    filters = {name: filter_query[name][0] for name in ("kind", "model", "target", "tag") if name in filter_query}
+                    # Keep legacy blank cursor/limit handling; blank filters are invalid.
                     query = parse_qs(urlsplit(self.path).query)
-                    return self._send(200, self.runtime.list_project_objects(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
+                    return self._send(200, self.runtime.list_project_objects(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0], **filters))
                 if method == "POST":
                     key = self._idempotency_key()
                     with self.runtime.stage_object(self._binary_chunks(), expected_digest=self.headers.get("X-Expected-Digest")) as data:
@@ -688,7 +692,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if len(path) == 4 and path[3] in ("tasks", "runs") and method == "GET":
                 self._identity("tasks:read")
                 query = parse_qs(urlsplit(self.path).query)
-                value = self.runtime.list_project_tasks(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]) if path[3] == "tasks" else self.runtime.list_project_runs(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0])
+                filters = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                task_query = {key: filters[key][0] for key in ("kind", "order") if key in filters}
+                value = self.runtime.list_project_tasks(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0], **task_query) if path[3] == "tasks" else self.runtime.list_project_runs(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0])
                 return self._send(200, value)
             if len(path) == 4 and path[3] in ("shots", "references") and method == "GET":
                 self._identity("projects:read")
@@ -872,6 +878,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             resource = self.runtime._task_resource(value)
             project_id = value["run"].get("project_id") or "unscoped"
             return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("task.create", project_id, key, project_id=project_id)})
+        if len(path) == 4 and path[:2] == ["v1", "tasks"] and path[3] == "claim-delegated-child" and method == "POST":
+            identity = self._identity("worker:execute")
+            return self._send(200, self.runtime.claim_delegated_child(
+                path[2], self._body(), idempotency_key=self._idempotency_key(), identity=identity,
+            ))
         if path == ["v1", "tasks", "claim"] and method == "POST":
             identity = self._identity("worker:execute")
             key = self.headers.get("Idempotency-Key")

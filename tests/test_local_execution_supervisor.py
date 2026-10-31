@@ -545,6 +545,65 @@ def test_retained_process_echild_is_not_successful_exit(monkeypatch):
     assert retained.exit_code is None
 
 
+def test_retained_process_reaps_real_child_and_caches_exact_exit():
+    import subprocess
+    import sys
+    from runtime_protocol.local_execution_supervisor import RetainedProcess
+
+    child = subprocess.Popen([sys.executable, "-I", "-c", "raise SystemExit(23)"])
+    retained = RetainedProcess(child)
+    try:
+        assert retained.wait(5.0) == 23
+        assert retained.poll() == retained.wait(0.0) == child.returncode == 23
+    finally:
+        child.wait(timeout=5.0)
+
+
+def test_retained_process_rejects_real_child_reaped_by_another_waiter():
+    import subprocess
+    import sys
+    from runtime_protocol.local_execution_supervisor import RetainedProcess
+
+    child = subprocess.Popen([sys.executable, "-I", "-c", "raise SystemExit(23)"])
+    retained = RetainedProcess(child)
+    assert child.wait(timeout=5.0) == 23
+    with pytest.raises(RelayError, match="outside retained launch ownership"):
+        retained.poll()
+    assert retained.exit_code is None
+
+
+def test_retained_process_real_popen_echild_cannot_become_zero(monkeypatch):
+    import errno
+    import subprocess
+    import sys
+    from runtime_protocol.local_execution_supervisor import RetainedProcess
+
+    child = subprocess.Popen([sys.executable, "-I", "-c", "raise SystemExit(23)"])
+    retained = RetainedProcess(child)
+    if hasattr(subprocess, "_del_safe"):
+        # Keep the real Popen ECHILD handler. Its wait syscall alone is the
+        # synthetic boundary, making this regression independent of the OS.
+        def unavailable(*args):
+            raise ChildProcessError(errno.ECHILD, "another waiter consumed the child")
+        monkeypatch.setattr(subprocess._del_safe, "waitpid", unavailable)
+    else:
+        # Windows has retained process handles rather than waitpid/ECHILD.
+        def lost_handle(*, _deadstate=None):
+            child.returncode = _deadstate
+            return _deadstate
+        monkeypatch.setattr(child, "_internal_poll", lost_handle)
+    try:
+        for _ in range(2):
+            with pytest.raises(RelayError, match="ownership is unknown"):
+                retained.poll()
+        assert retained.exit_code is None
+        assert child.returncode != 0
+    finally:
+        monkeypatch.undo()
+        child.returncode = None
+        child.wait(timeout=5.0)
+
+
 def _cr1a_abort_case(revision=1):
     from runtime_protocol.local_execution_supervisor import host_abort_request_v2
     preparation, prepared = _prepare_case()

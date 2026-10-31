@@ -3,6 +3,7 @@ from __future__ import annotations
 from . import platform
 
 from .cas import ContentAddressedStore, StagedObject, DEFAULT_MAX_OBJECT_BYTES, file_identity
+from .canonical_schema import generation_tag_expression
 from .backup import create_backup, restore_backup, structured_export
 from .store import (
     GENERATION_INTENT_STORAGE_KEY,
@@ -12,6 +13,7 @@ from .store import (
     normalize_execution_facts,
     normalize_verified_execution_placement,
     _normalize_execution_target,
+    _normalize_execution_request,
     public_task_spec,
     command_result,
     expired_command_result,
@@ -387,6 +389,31 @@ def _probe_media_bytes(data):
     return {"stream_types": tuple(stream_types), "durations": durations, "format_duration": format_duration}
 
 
+def _generation_filters(*, kind=None, model=None, target=None, tag=None):
+    """Share exact metadata.gen matching between generation and object pages."""
+    filters = {name: value for name, value in
+               (("kind", kind), ("model", model), ("target", target), ("tag", tag))
+               if value is not None}
+    predicates, parameters = [], []
+    for name, value in filters.items():
+        if not isinstance(value, str) or not value:
+            raise InvalidRequestError(f"{name} must be a non-empty string")
+        if name == "tag":
+            # Historical optional fields may be absent or have the wrong
+            # shape. json_each must only receive a verified JSON array.
+            predicates.append(
+                "EXISTS (SELECT 1 FROM json_each("
+                "CASE WHEN json_valid(metadata_json) THEN "
+                "CASE WHEN json_type(metadata_json, '$.gen.tags')='array' "
+                "THEN json_extract(metadata_json, '$.gen.tags') ELSE '[]' END "
+                "ELSE '[]' END) WHERE type='text' AND value=?)"
+            )
+        else:
+            predicates.append(f"{generation_tag_expression(name)}=?")
+        parameters.append(value)
+    return filters, predicates, parameters
+
+
 def _page_args(cursor, limit):
     """Validate the public page arguments and decode an opaque keyset cursor."""
     if isinstance(limit, bool):
@@ -485,7 +512,12 @@ def _durable_mutation(function=None, *, reap_task_lifetimes=False):
 class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
-    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None, _admission_fd=None):
+    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None, _admission_fd=None, _local_worker_composition=None, _local_worker_composition_required=False):
+        from .local_worker_composition import _retain_local_worker_composition
+        # Retain owner declarations before opening the realm; this neither
+        # invokes a producer nor changes ordinary task admission below.
+        self._local_worker_composition = _retain_local_worker_composition(
+            _local_worker_composition, required=_local_worker_composition_required)
         configured_max = os.environ.get("RUNTIME_MAX_OBJECT_BYTES", str(OBJECT_MAX_BYTES))
         if not re.fullmatch(r"[0-9]{1,20}", configured_max):
             raise ValidationError("RUNTIME_MAX_OBJECT_BYTES must be a positive decimal integer")
@@ -1151,6 +1183,13 @@ class RuntimeService:
                 or recorded.get("evidence_digest") != placement.get("verification", {}).get("evidence_digest")
                 or recorded.get("effective_target") != placement.get("actual")):
             return False
+        if require_fresh:
+            try:
+                actor = self.prepared_child_executor(owner_id, require_live=True)
+            except (AuthorizationError, ConflictError, LeaseError, ValidationError):
+                return False
+            if actor is not None and recorded.get("credential_actor") != actor:
+                return False
         if not self._activation_scope_matches(task_id, recorded, placement):
             return False
         from .remote_worker_deployment import deployment_binding_from_task
@@ -1167,6 +1206,9 @@ class RuntimeService:
         from .remote_worker_deployment import deployment_binding_from_task
         task = self._task_resource(self.store.get_task(task_id))
         binding = deployment_binding_from_task(task)
+        actor = self.prepared_child_executor(task_id, require_live=True)
+        if actor is not None and qualification.get("credential_actor") != actor:
+            raise ConflictError("prepared child executor differs from its admitted identity")
         if (qualification.get("task_id") != str(task_id)
                 or qualification.get("run_id") != binding.admission_identity.run_id
                 or qualification.get("binding_digest") != binding.digest()
@@ -1204,6 +1246,50 @@ class RuntimeService:
         if current["status"] != "prepared":
             raise ConflictError("recovered activation has no prepared replacement binding")
 
+    def prepared_child_executor(self, task_id, *, require_live=False):
+        """Derive child custody from the existing admitted staged lineage.
+
+        This is owner composition, not worker authority. No caller-supplied
+        actor or parent can select a credential generation. Terminal cleanup
+        retains the same immutable child/parent identity without requiring a
+        live parent; starting or claiming always requires its exact live lease.
+        """
+        child = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+        if child is None:
+            raise NotFoundError("prepared child task is unavailable")
+        spec = self.store._spec(child)
+        lineage = spec.get("delegated_parent")
+        if lineage is None:
+            return None
+        request = self.store._execution_request_from_row(child)
+        if (child["capability"] != "vibecomfy.run" or not isinstance(request, dict)
+                or request.get("remote_activation_required") is not True):
+            return None
+        if not isinstance(lineage, dict) or request.get("target", {}).get("kind") != "runpod":
+            raise ConflictError("remote child is not an admitted prepared run stage")
+        parent = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (lineage.get("parent_task_id"),)).fetchone()
+        attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (lineage.get("parent_attempt_id"),)).fetchone()
+        if parent is None or attempt is None:
+            raise ConflictError("prepared child parent binding is unavailable")
+        project = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (child["run_id"],)).fetchone()[0]
+        parent_project = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (parent["run_id"],)).fetchone()[0]
+        policy = self._child_policy(self.store._spec(parent).get("child_delegation"))
+        stage = next((item for item in policy.get("stages", []) if item["name"] == spec.get("delegated_stage")), None)
+        if (stage is None or stage["capability_id"] != child["capability"]
+                or stage["capability_digest"] != child["capability_digest"]
+                or stage.get("execution_request") != {k: v for k, v in request.items() if k != "inputs"}
+                or lineage.get("policy_digest") != sha256_bytes(canonical_json(policy).encode())
+                or project != parent_project or lineage.get("project_id") != project
+                or attempt["task_id"] != parent["id"]
+                or any(lineage.get(key) != attempt[column] for key, column in (
+                    ("parent_lease_id", "lease_id"), ("parent_fence", "fence"),
+                    ("runtime_epoch", "runtime_epoch"), ("executor_id", "executor_id")))):
+            raise ConflictError("prepared child differs from its admitted parent stage")
+        if require_live:
+            lease = {"lease_id": lineage["parent_lease_id"], "fence": lineage["parent_fence"], "runtime_epoch": lineage["runtime_epoch"]}
+            self._live_delegating_parent(attempt["id"], lease, identity=None)
+        return "astrid-prepared-" + hashlib.sha256(str(task_id).encode()).hexdigest()[:32]
+
     @_durable_mutation
     def record_remote_activation(self, task_id, qualification, *, identity=None):
         """Commit owner-observed acceptance before the private final ACK.
@@ -1229,6 +1315,9 @@ class RuntimeService:
         from .remote_worker_deployment import deployment_binding_from_task
         task = self._task_resource(self.store.get_task(task_id))
         binding = deployment_binding_from_task(task)
+        prepared_actor = self.prepared_child_executor(task_id)
+        if prepared_actor is not None and qualification["credential_actor"] != prepared_actor:
+            raise ConflictError("prepared activation executor differs from its admitted child")
         if (qualification["run_id"] != binding.admission_identity.run_id
                 or qualification["binding_digest"] != binding.digest()
                 or qualification["effective_target"] != binding.placement.effective_target
@@ -2347,13 +2436,130 @@ class RuntimeService:
         timeline = self.store.conn.execute("SELECT project_id FROM timelines WHERE id=?", (row["timeline_id"],)).fetchone()
         return {"reference_id": row["id"], "timeline_id": row["timeline_id"], "project_id": timeline["project_id"], "object_id": row["object_id"], **({"role": row["role"]} if row["role"] else {}), "version": int(state["version"] if state else 1), "archived": bool(state and state["archived_at"])}
 
-    def list_project_tasks(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
+    def _root_generation_cursor(self, scope, *, key=None, cursor=None):
+        """Purpose/project/query-scoped cursor using the existing session signer."""
+        if key is not None:
+            encoded = _page_cursor(scope, key, numeric=True)
+            signature = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
+            return encoded + "." + signature
+        if cursor in (None, ""):
+            return None
+        if not isinstance(cursor, str) or cursor.count(".") != 1:
+            raise InvalidRequestError("cursor is invalid")
+        encoded, signature = cursor.split(".")
+        expected = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise InvalidRequestError("cursor is invalid or expired")
+        _, decoded = _page_args(encoded, PAGE_DEFAULT_LIMIT)
+        if decoded["s"] != scope:
+            raise InvalidRequestError("cursor does not belong to this collection")
+        key = decoded["k"]
+        if (len(key) != 2 or type(key[0]) is not int or key[0] < 1
+                or not isinstance(key[1], str) or not key[1]):
+            raise InvalidRequestError("cursor is invalid")
+        return tuple(key)
+
+    def _root_generation_task_page(self, project_id, *, cursor, limit):
+        limit, _ = _page_args(None, limit)
+        scope = f"tasks:{project_id}:root_generation:admitted_desc"
+        after = self._root_generation_cursor(scope, cursor=cursor)
+        rows = self.store.conn.execute(
+            "SELECT t.id, t.spec_digest, t.expected_effect_json, s.body_json, "
+            "e.id AS admission_sequence, e.payload_json, "
+            "(SELECT c.payload_json FROM events c WHERE c.task_id=t.id "
+            "AND c.kind='task.parent_contained' ORDER BY c.id DESC LIMIT 1) AS containment_json FROM tasks t "
+            "JOIN runs r ON r.id=t.run_id LEFT JOIN task_specs s ON s.digest=t.spec_digest "
+            "LEFT JOIN events e ON e.id=(SELECT MIN(a.id) FROM events a "
+            "WHERE a.task_id=t.id AND a.kind='task.admitted') "
+            "WHERE r.project_id=? ORDER BY e.id DESC, t.id DESC", (project_id,),
+        ).fetchall()
+
+        def classification(row):
+            try:
+                contained = json.loads(row["containment_json"]) if row["containment_json"] else None
+            except (TypeError, ValueError):
+                contained = None
+            if (isinstance(contained, dict) and isinstance(contained.get("parent_task_id"), str)
+                    and contained["parent_task_id"] and contained["parent_task_id"] != row["id"]):
+                # Runtime emits this on the child under its delegated parent
+                # authority. It can prove non-root after legacy spec retirement;
+                # its absence cannot prove root.
+                return False
+            try:
+                payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+            except (TypeError, ValueError):
+                payload = {}
+            facts = payload.get("classification") if isinstance(payload, dict) else None
+            if isinstance(facts, dict) and type(facts.get("version")) is int and facts["version"] == 1:
+                if facts.get("is_root") is False or facts.get("is_generation") is False:
+                    return False
+                if facts.get("is_root") is True and facts.get("is_generation") is True:
+                    return True
+            if row["body_json"] is None:
+                return None
+            try:
+                retained = self.store._task_admission_facts(
+                    json.loads(row["body_json"]),
+                    json.loads(row["expected_effect_json"]) if row["expected_effect_json"] else None,
+                    project_id,
+                )
+            except (TypeError, ValueError):
+                return None
+            if retained.get("is_root") is False or retained.get("is_generation") is False:
+                return False
+            if retained.get("is_root") is True and retained.get("is_generation") is True:
+                return True
+            return None
+
+        def barrier(row, reason):
+            raise ConflictError(
+                "latest root generation cannot be proven from retained admission evidence",
+                details={"reason": "root_generation_selection_barrier", "project_id": project_id,
+                         "task_id": row["id"], "admission_sequence": row["admission_sequence"],
+                         "missing": reason},
+            )
+
+        # An unanchored possible root cannot safely be placed before or after
+        # any known root. Never substitute a mutable task timestamp.
+        for row in rows:
+            if row["admission_sequence"] is None and classification(row) is not False:
+                barrier(row, "original_admission_sequence")
+        selected = []
+        has_more = False
+        for row in rows:
+            if row["admission_sequence"] is None:
+                continue
+            key = (int(row["admission_sequence"]), str(row["id"]))
+            if after is not None and key >= after:
+                continue
+            known_root = classification(row)
+            if known_root is None:
+                if not selected:
+                    barrier(row, "validated_root_generation_classification")
+                # Return the proven newer prefix. The next page reaches this
+                # barrier; it must never silently skip to older known roots.
+                has_more = True
+                break
+            if known_root:
+                if len(selected) == limit:
+                    has_more = True
+                    break
+                selected.append((key, row["id"]))
+        return {"items": [task_id for _, task_id in selected],
+                "next_cursor": self._root_generation_cursor(scope, key=selected[-1][0]) if has_more else None}
+
+    def list_project_tasks(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT, kind=None, order=None):
+        if (kind, order) not in ((None, None), ("root_generation", "admitted_desc")):
+            raise InvalidRequestError("task kind/order must be root_generation/admitted_desc together")
         self.store.reap_overdue_leases()
         project = self.store.get_project(project_id)
-        rows = self.store.conn.execute("SELECT id, created_at FROM tasks WHERE run_id IN (SELECT id FROM runs WHERE project_id=?) ORDER BY created_at, id", (project["id"],)).fetchall()
-        page = _page_rows(rows, scope=f"tasks:{project['id']}", cursor=cursor, limit=limit,
-                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
-                          resource_fn=lambda row: row["id"])
+        if kind is not None:
+            page = self._root_generation_task_page(project["id"], cursor=cursor, limit=limit)
+        else:
+            rows = self.store.conn.execute("SELECT id, created_at FROM tasks WHERE run_id IN (SELECT id FROM runs WHERE project_id=?) ORDER BY created_at, id", (project["id"],)).fetchall()
+            page = _page_rows(rows, scope=f"tasks:{project['id']}", cursor=cursor, limit=limit,
+                              key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                              resource_fn=lambda row: row["id"])
         tasks, progress = self.store._task_page(tuple(page["items"]))
         page["items"] = [self._task_resource(tasks[task_id], progress=progress.get(task_id), related_loaded=True)
                          for task_id in page["items"]]
@@ -2495,7 +2701,7 @@ class RuntimeService:
         if idempotency_key is None:
             return False, None
         validate_idempotency_key(idempotency_key)
-        if kind in {"task.claim", "executor.register"}:
+        if kind in {"task.claim", "task.claim_delegated_child", "executor.register"}:
             query = (
                 "SELECT NULL AS txn_id, command_kind, idempotency_key, request_hash, result_json, "
                 "NULL AS first_project_seq, NULL AS last_project_seq, NULL AS event_ids_json, created_at "
@@ -2515,7 +2721,7 @@ class RuntimeService:
         result = self._publication_replay_result(prior) if kind == "parent_composition.publish" else command_result(
             prior["result_json"], kind=kind, connection=self.store.conn,
             created_at=None if kind in {"object.ingest", "media.import"} else prior["created_at"],
-            window_seconds=SESSION_IDEMPOTENCY_WINDOW_SECONDS if kind in {"task.claim", "executor.register"} else IDEMPOTENCY_RESULT_WINDOW_SECONDS,
+            window_seconds=SESSION_IDEMPOTENCY_WINDOW_SECONDS if kind in {"task.claim", "task.claim_delegated_child", "executor.register"} else IDEMPOTENCY_RESULT_WINDOW_SECONDS,
         )
         if project_id is not None and with_receipt:
             result = {"data": result, "receipt": self._receipt_payload(prior, project_id=project_id)}
@@ -2531,7 +2737,7 @@ class RuntimeService:
     def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, with_receipt=True, created_at=None):
         if idempotency_key is not None:
             validate_idempotency_key(idempotency_key)
-            if kind in {"task.claim", "executor.register"}:
+            if kind in {"task.claim", "task.claim_delegated_child", "executor.register"}:
                 self.store.conn.execute(
                     "INSERT INTO session_command_replay(command_kind,aggregate_id,idempotency_key,request_hash,result_json,created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
@@ -4996,10 +5202,22 @@ class RuntimeService:
         result = self._generation_resource(self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone())
         return self._command_record("generation.create", generation_id, idempotency_key, request_hash, result, project_id=project["id"])
 
-    def list_generations(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
+    def list_generations(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT,
+                         kind=None, model=None, target=None, tag=None):
         project = self.store.get_project(project_id)
-        rows = self.store.conn.execute("SELECT * FROM generations WHERE project_id=? ORDER BY created_at DESC, id ASC", (project["id"],)).fetchall()
-        return _page_rows(rows, scope=f"generations:{project['id']}", cursor=cursor, limit=limit,
+        filters, predicates, parameters = _generation_filters(
+            kind=kind, model=model, target=target, tag=tag,
+        )
+        predicates.insert(0, "project_id=?")
+        parameters.insert(0, project["id"])
+        rows = self.store.conn.execute(
+            "SELECT * FROM generations WHERE " + " AND ".join(predicates)
+            + " ORDER BY created_at DESC, id ASC", parameters,
+        ).fetchall()
+        scope = f"generations:{project['id']}"
+        if filters:
+            scope += ":" + hashlib.sha256(canonical_json(filters).encode()).hexdigest()
+        return _page_rows(rows, scope=scope, cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
                           resource_fn=self._generation_resource,
                           skip_after=lambda key, after: (
@@ -5538,6 +5756,7 @@ class RuntimeService:
             "payload": {
                 "generation_type": prepared["content_type"],
                 "metadata": {
+                    "gen": {"kind": prepared["content_type"], "origin": "imported"},
                     "provenance": provenance,
                     "params": {"content_type": prepared["content_type"], **details},
                 },
@@ -5888,9 +6107,31 @@ class RuntimeService:
     def objects(self, project):
         return self.store.list_project_objects(project)
 
-    def list_project_objects(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
-        rows = self.store.list_project_objects(project)
-        return _page_rows(rows, scope=f"objects:{self.store.get_project(project)['id']}", cursor=cursor, limit=limit,
+    def list_project_objects(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT,
+                             kind=None, model=None, target=None, tag=None):
+        project_id = self.store.get_project(project)["id"]
+        filters, predicates, parameters = _generation_filters(
+            kind=kind, model=model, target=target, tag=tag,
+        )
+        scope = f"objects:{project_id}"
+        if filters:
+            # All predicates belong to ONE generation in the object's project.
+            # Existence checks avoid multiplying objects by variants/generations.
+            # MIN retains one deterministic relation if a promoted ref also exists.
+            rows = [dict(row) for row in self.store.conn.execute(
+                "SELECT o.*, MIN(po.relation) AS relation FROM objects o "
+                "JOIN project_objects po ON po.digest=o.digest WHERE po.project_id=? "
+                "AND EXISTS (SELECT 1 FROM generations WHERE project_id=po.project_id AND "
+                + " AND ".join(predicates)
+                + " AND EXISTS (SELECT 1 FROM generation_variants "
+                "WHERE generation_id=generations.id AND object_id=o.digest)) "
+                "GROUP BY o.digest ORDER BY o.created_at, o.digest",
+                [project_id, *parameters],
+            ).fetchall()]
+            scope += ":" + hashlib.sha256(canonical_json(filters).encode()).hexdigest()
+        else:
+            rows = self.store.list_project_objects(project)
+        return _page_rows(rows, scope=scope, cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["created_at"]), str(row["digest"])),
                           resource_fn=lambda row: self._object_resource(row) | {"relation": row["relation"]})
 
@@ -6046,7 +6287,7 @@ class RuntimeService:
     @staticmethod
     def _child_policy(value):
         required = {"capabilities", "targets", "input_object_ids"}
-        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"stages", "final_publication", "limits", "recoverable_outputs", "discovery_grant"}:
+        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"stages", "final_publication", "publications", "limits", "recoverable_outputs", "discovery_grant"}:
             raise ValidationError("child_delegation requires capabilities, targets, and input_object_ids")
         capabilities = value["capabilities"]
         if not isinstance(capabilities, list) or not capabilities or len(capabilities) > 32:
@@ -6109,7 +6350,8 @@ class RuntimeService:
             normalized_stages = []
             preceding = set()
             for stage in stages:
-                if not isinstance(stage, dict) or set(stage) != {"name", "capability_id", "capability_digest", "target", "inputs"}:
+                if (not isinstance(stage, dict) or not {"name", "capability_id", "capability_digest", "target", "inputs"} <= set(stage)
+                        or set(stage) - {"name", "capability_id", "capability_digest", "target", "inputs", "execution_request"}):
                     raise ValidationError("each child stage requires name, capability, target, and inputs")
                 name = stage["name"]
                 if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) or name in preceding:
@@ -6135,7 +6377,15 @@ class RuntimeService:
                             raise ValidationError("child stage producer must be an earlier declared stage and port")
                     else:
                         raise ValidationError("child stage input must name a root object or producer stage and port")
-                normalized_stages.append({**stage, "target": target, "inputs": [dict(ref) for ref in declared_inputs]})
+                normalized_stage = {**stage, "target": target, "inputs": [dict(ref) for ref in declared_inputs]}
+                if "execution_request" in stage:
+                    if not isinstance(stage["execution_request"], dict) or "inputs" in stage["execution_request"]:
+                        raise ValidationError("stage execution_request inputs are resolved by Runtime")
+                    frozen_request = _normalize_execution_request(stage["execution_request"], [])
+                    if frozen_request["target"] != target:
+                        raise ValidationError("stage execution_request differs from its declared target")
+                    normalized_stage["execution_request"] = frozen_request
+                normalized_stages.append(normalized_stage)
                 preceding.add(name)
             policy["stages"] = normalized_stages
         if "final_publication" in value:
@@ -6158,6 +6408,50 @@ class RuntimeService:
             if len(selectors) != 1 or selectors[0].get("output_port") != final["verify_output_port"]:
                 raise ValidationError("final publication effect must select the verified output port")
             policy["final_publication"] = dict(final)
+        if "publications" in value:
+            publications = value["publications"]
+            if ("final_publication" in value or "stages" not in policy
+                    or not isinstance(publications, dict) or set(publications) != {"raw", "final"}):
+                raise ValidationError("publications requires exactly named raw and final declarations and stages")
+            raw, final = publications["raw"], publications["final"]
+            if (not isinstance(raw, dict) or set(raw) != {"stage", "output_port", "effect"}
+                    or not isinstance(final, dict) or set(final) != {"stage", "output_port", "candidate_stage", "candidate_output_port", "verify_stage", "verify_output_port", "effect"}):
+                raise ValidationError("named publications require exact raw and final source declarations")
+            stages = {stage["name"]: stage for stage in policy["stages"]}
+            order = list(stages)
+            for publication in (raw, final):
+                if (not isinstance(publication["stage"], str) or publication["stage"] not in stages or not isinstance(publication["output_port"], str)
+                        or not publication["output_port"] or len(publication["output_port"]) > 255):
+                    raise ValidationError("named publication stage or output port is invalid")
+                effect = publication["effect"]
+                groups = effect.get("payload", {}).get("groups") if isinstance(effect, dict) and isinstance(effect.get("payload"), dict) else None
+                selectors = groups[0].get("selectors") if isinstance(groups, list) and len(groups) == 1 and isinstance(groups[0], dict) else None
+                if (not isinstance(effect, dict) or effect.get("effect_type") != "generation.publish_v1"
+                        or not isinstance(selectors, list) or len(selectors) != 1
+                        or not isinstance(selectors[0], dict) or selectors[0].get("output_port") != publication["output_port"]
+                        or effect["payload"].get("partial_success_policy") != "reject"):
+                    raise ValidationError("named publication effect must select its one declared output port with partial_success_policy reject")
+            candidate, verify = final["candidate_stage"], final["verify_stage"]
+            if (not isinstance(candidate, str) or not isinstance(verify, str) or candidate not in stages or verify not in stages
+                    or not isinstance(final["candidate_output_port"], str) or not final["candidate_output_port"]
+                    or not isinstance(final["verify_output_port"], str) or not final["verify_output_port"]
+                    or not (order.index(raw["stage"]) <= order.index(candidate) < order.index(verify) < order.index(final["stage"]))
+                    or final["stage"] != order[-1] or raw["effect"] == final["effect"]):
+                raise ValidationError("named publications must order raw, candidate, verification, and distinct final effects")
+            def consumes(stage, producer, port, *, allow_auxiliary=False):
+                count = sum(ref.get("producer_stage") == producer and ref.get("output_port") == port for ref in stages[stage]["inputs"])
+                return count >= 1 if allow_auxiliary else count == 1
+            if candidate == raw["stage"]:
+                if final["candidate_output_port"] != raw["output_port"]:
+                    raise ValidationError("raw candidate must use the declared raw output port")
+            elif not consumes(candidate, raw["stage"], raw["output_port"], allow_auxiliary=True):
+                raise ValidationError("candidate stage must consume the actual raw publication")
+            if (not consumes(verify, candidate, final["candidate_output_port"])
+                    or len(stages[final["stage"]]["inputs"]) != 2
+                    or not consumes(final["stage"], candidate, final["candidate_output_port"])
+                    or not consumes(final["stage"], verify, final["verify_output_port"])):
+                raise ValidationError("verification and final publication must consume their declared candidate lineage")
+            policy["publications"] = copy.deepcopy(publications)
         return policy
 
     def _validate_discovery_grant_binding(self, policy, project, capability, digest):
@@ -6223,12 +6517,15 @@ class RuntimeService:
                 self._validate_discovery_grant_binding(
                     task_spec["child_delegation"], project["id"] if project else None, capability, digest,
                 )
+            declarations = list(task_spec["child_delegation"].get("publications", {}).values())
             final = task_spec["child_delegation"].get("final_publication")
             if final is not None:
+                declarations.append(final)
+            for publication in declarations:
                 project = self.store.get_project(body.get("project")) if body.get("project") else None
                 if project is None:
                     raise ValidationError("final publication requires a project-scoped parent")
-                self.store._validate_settlement_effect(final["effect"], project_id=project["id"])
+                self.store._validate_settlement_effect(publication["effect"], project_id=project["id"])
         if _delegated_lineage is not None:
             task_spec["delegated_parent"] = dict(_delegated_lineage)
         if _recoverable_outputs is not None:
@@ -6485,10 +6782,140 @@ class RuntimeService:
             raise ValidationError("resolved delegated inputs must have unique object IDs")
         return object_ids, resolved
 
-    @_durable_mutation
-    def admit_delegated_child(self, body, *, idempotency_key, identity):
-        body = _wire_object(body, required=("authority", "task"), allowed=("authority", "task"))
-        payload = self._decode_child_authority(body["authority"])
+    @staticmethod
+    def _named_publication_output(effect, outputs):
+        """Resolve the admitted GEN selector, including legacy output defaults."""
+        group = effect["payload"]["groups"][0]
+        selector = group["selectors"][0]
+        key = (selector["output_port"], group["group_key"], selector["variant_key"], selector["ordinal"])
+        if not isinstance(outputs, list):
+            raise ValidationError("named publication requires an outputs list")
+        matches = []
+        for output in outputs:
+            if not isinstance(output, dict) or output.get("role") == "thumbnail":
+                continue
+            ordinal = output.get("ordinal", 0)
+            if type(ordinal) is not int or ordinal < 0:
+                continue
+            alias = output.get("selector")
+            alias = alias if isinstance(alias, dict) else {}
+            actual = (output.get("output_port", output.get("name", "output")),
+                      output.get("group_key", alias.get("group_key", "default")),
+                      output.get("variant_key", alias.get("variant_key", str(ordinal))), ordinal)
+            if actual == key:
+                matches.append(output)
+        if len(matches) != 1:
+            raise ConflictError("named publication selector must resolve exactly one output")
+        return matches[0]
+
+    def _named_publication_association(self, task, publication):
+        outputs = [output for output in self.store.list_managed_outputs(task["id"])
+                   if output["attempt_id"] == task["attempt_id"]]
+        output = self._named_publication_output(publication["effect"], outputs)
+        if (output["role"] == "recoverable_snapshot" or output["durability"] != "durable"
+                or output["lifecycle"]["state"] not in {"available", "promoted"}):
+            raise ConflictError("named publication selected association is no longer available")
+        return output
+
+    def _assert_delegated_publication_source(self, source, project):
+        association = self.store.get_managed_output(source["association_id"])
+        producer = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (source["producer_task_id"],)).fetchone()
+        attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (source["producer_attempt_id"],)).fetchone()
+        obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (source["object_id"].removeprefix("sha256:"),)).fetchone()
+        if (producer is None or producer["status"] != "completed" or producer["attempt_id"] != source["producer_attempt_id"]
+                or attempt is None or not attempt["settled"] or int(attempt["runtime_epoch"]) != self.store._current_runtime_epoch()
+                or obj is None or int(obj["size"]) != association["size"] or obj["media_type"] != association["media_type"]
+                or (project is not None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project, source["object_id"].removeprefix("sha256:"))).fetchone())
+                or association["task_id"] != source["producer_task_id"]
+                or association["attempt_id"] != source["producer_attempt_id"]
+                or association["project_id"] != project or association["object_id"] != source["object_id"]
+                or association["output_port"] != source["output_port"]
+                or association["role"] == "recoverable_snapshot" or association["durability"] != "durable"
+                or association["lifecycle"]["state"] not in {"available", "promoted"}):
+            raise ConflictError("delegated publication source is no longer available")
+        self._verify_child_object_bytes(source["object_id"].removeprefix("sha256:"), association["size"], label="delegated publication source CAS object")
+        return producer, association
+
+    def _read_delegated_publication(self, source, effect, project):
+        """Read the existing effect result and Generation rows, never caller receipts."""
+        producer, association = self._assert_delegated_publication_source(source, project)
+        declared = json.loads(producer["expected_effect_json"]) if producer["expected_effect_json"] else None
+        result = json.loads(producer["result_json"] or "{}")
+        publication = result.get("generation_publish_v1")
+        if declared != effect or not isinstance(publication, dict) or publication.get("effect_type") != "generation.publish_v1":
+            raise ConflictError("raw publication does not match its admitted effect")
+        groups = publication.get("publications", [])
+        variants = [variant for group in groups for variant in group.get("variants", [])]
+        if (len(groups) != 1 or len(variants) != 1
+                or variants[0].get("generation_id") != association["generation_id"]
+                or variants[0].get("object_id") != source["object_id"]
+                or variants[0].get("output_port") != source["output_port"]
+                or variants[0].get("variant_key") != association["variant_key"]
+                or variants[0].get("ordinal") != association["ordinal"]
+                or groups[0].get("group_key") != association["group_key"]
+                or groups[0].get("generation_id") != association["generation_id"]
+                or variants[0].get("variant_id") != "variant-" + hashlib.sha256(canonical_json({"generation_id": association["generation_id"], "ordinal": association["ordinal"], "variant_key": association["variant_key"]}).encode()).hexdigest()):
+            raise ConflictError("raw publication result does not match its actual managed association")
+        variant = self.store.conn.execute(
+            "SELECT v.object_id, v.generation_id, g.project_id, g.source_task_id FROM generation_variants v JOIN generations g ON g.id=v.generation_id WHERE v.id=?",
+            (variants[0].get("variant_id"),),
+        ).fetchone()
+        if (variant is None or variant["object_id"] != source["object_id"].removeprefix("sha256:")
+                or variant["generation_id"] != association["generation_id"]
+                or variant["project_id"] != project or variant["source_task_id"] != source["producer_task_id"]):
+            raise ConflictError("raw publication Generation readback does not match its lineage")
+        return publication
+
+    def _bound_named_final_publication_effect(self, effect, source):
+        """Fill only native H3 lineage metadata from Runtime-owned readback."""
+        effect = copy.deepcopy(effect)
+        metadata = effect["payload"].get("metadata")
+        h3 = metadata.get("h3_av") if isinstance(metadata, dict) else None
+        if isinstance(h3, dict):
+            raw = source["raw"]
+            association = self.store.get_managed_output(raw["association_id"])
+            variant = source["raw_publication"]["publications"][0]["variants"][0]
+            h3.update({
+                "candidate_sha256": source["candidate"]["object_id"].removeprefix("sha256:"),
+                "raw_sha256": raw["object_id"].removeprefix("sha256:"),
+                "raw_generation_id": association["generation_id"],
+                "raw_variant_id": variant["variant_id"],
+                "raw_association_id": association["association_id"],
+                "raw_group_key": association["group_key"],
+                "raw_variant_key": association["variant_key"],
+                "raw_output_port": association["output_port"],
+            })
+        return effect
+
+    def _validate_named_publication_lineage(self, source, project, lineage):
+        producers = {}
+        for key in ("candidate", "verification", "raw"):
+            producer, _ = self._assert_delegated_publication_source(source[key], project)
+            spec = self.store._spec(producer)
+            if spec.get("delegated_parent") != lineage or spec.get("delegated_stage") != source[key]["producer_stage"]:
+                raise ConflictError("named publication source escaped its parent lineage")
+            producers[key] = spec
+        raw_task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (source["raw"]["producer_task_id"],)).fetchone()
+        selected_raw = self._named_publication_association(raw_task, {"effect": source["raw_effect"]})
+        if selected_raw["association_id"] != source["raw"]["association_id"]:
+            raise ConflictError("raw publication selector no longer resolves its frozen association")
+        def consumes(spec, selected):
+            return any(all(ref.get(key) == selected[key] for key in ("producer_task_id", "producer_attempt_id", "association_id", "output_port", "object_id"))
+                       for ref in spec.get("delegated_inputs", []))
+        if (source["candidate"]["producer_task_id"] != source["raw"]["producer_task_id"]
+                and not consumes(producers["candidate"], source["raw"])):
+            raise AuthorizationError("candidate does not descend from the actual raw publication")
+        if (source["candidate"]["producer_task_id"] == source["raw"]["producer_task_id"]
+                and source["candidate"]["association_id"] != source["raw"]["association_id"]):
+            raise AuthorizationError("candidate substituted the raw publication")
+        if not consumes(producers["verification"], source["candidate"]):
+            raise AuthorizationError("verification does not consume this candidate")
+        actual = self._read_delegated_publication(source["raw"], source["raw_effect"], project)
+        if actual != source["raw_publication"]:
+            raise ConflictError("actual raw publication changed after final admission")
+
+    def _live_child_authority(self, authority, *, identity):
+        payload = self._decode_child_authority(authority)
         if payload.get("identity_digest") != self._child_identity_digest(identity):
             raise AuthorizationError("child authority is bound to another worker identity")
         lease = {"lease_id": payload.get("parent_lease_id"), "fence": payload.get("parent_fence"), "runtime_epoch": payload.get("runtime_epoch")}
@@ -6515,6 +6942,12 @@ class RuntimeService:
                 or payload.get("effective_target") != effective_target
                 or payload.get("placement_version") != placement_version):
             raise AuthorizationError("child authority no longer matches parent attempt")
+        return payload, row, parent, project, policy, recovery, placement_version, effective_target
+
+    @_durable_mutation
+    def admit_delegated_child(self, body, *, idempotency_key, identity):
+        body = _wire_object(body, required=("authority", "task"), allowed=("authority", "task"))
+        payload, row, parent, project, policy, recovery, placement_version, effective_target = self._live_child_authority(body["authority"], identity=identity)
         task = _wire_object(body["task"], required=("capability_id", "capability_digest"), allowed=("capability_id", "capability_digest", "input_object_ids", "input_refs", "stage", "schema_version", "spec", "execution_request", "generation_intent", "required_facts", "storage_estimate"))
         if {"capability_id": task["capability_id"], "capability_digest": task["capability_digest"]} not in policy["capabilities"]:
             raise AuthorizationError("child capability is outside parent policy")
@@ -6538,6 +6971,7 @@ class RuntimeService:
             raise ValidationError("execution_request must be an object")
         resolved_inputs = None
         verified_source = None
+        publication_effect = None
         if stages is None:
             if stage_name is not None or "input_refs" in task:
                 raise ValidationError("parent policy does not declare child stages")
@@ -6568,6 +7002,10 @@ class RuntimeService:
             supplied_target = _normalize_execution_target(request.get("target")) if request is not None else {"kind": "default"}
             if supplied_target not in (stage["target"], effective_target):
                 raise AuthorizationError("child target does not match declared stage")
+            if "execution_request" in stage:
+                if request is None or _normalize_execution_request(request, []) != stage["execution_request"]:
+                    raise AuthorizationError("child execution request differs from its admitted stage")
+                request = dict(stage["execution_request"])
             lineage_keys = {"parent_task_id": parent["id"], "parent_attempt_id": row["id"], "parent_lease_id": row["lease_id"], "parent_fence": int(row["fence"]), "runtime_epoch": int(row["runtime_epoch"]), "executor_id": row["executor_id"], "parent_placement": self._trusted_execution_placement(identity), "parent_effective_target": effective_target, "parent_placement_version": placement_version, "project_id": project}
             siblings = self._delegated_stage_rows(project, lineage_keys)
             existing = siblings.get(stage_name)
@@ -6583,6 +7021,43 @@ class RuntimeService:
             final = policy.get("final_publication")
             if final is not None and stage_name == final["stage"]:
                 verified_source = next(ref for ref in resolved_inputs if ref.get("producer_stage") == final["verify_stage"] and ref.get("output_port") == final["verify_output_port"])
+                publication_effect = final["effect"]
+            publications = policy.get("publications")
+            if publications is not None:
+                raw = publications["raw"]
+                final = publications["final"]
+                raw_consumer = (final["candidate_stage"] if final["candidate_stage"] != raw["stage"]
+                                else final["verify_stage"])
+                if stage_name == raw_consumer:
+                    raw_task = siblings[raw["stage"]]
+                    selected_raw = self._named_publication_association(raw_task, raw)
+                    consumed = [ref for ref in resolved_inputs if ref.get("producer_stage") == raw["stage"]
+                                and ref.get("output_port") == raw["output_port"]]
+                    if sum(ref.get("association_id") == selected_raw["association_id"] for ref in consumed) != 1:
+                        raise AuthorizationError("candidate lineage must consume the selected raw publication")
+                for publication_name, publication in publications.items():
+                    if stage_name == publication["stage"]:
+                        publication_effect = publication["effect"]
+                        verified_source = {"publication_name": publication_name, "output_port": publication["output_port"]}
+                        if publication_name == "final":
+                            candidate = next(ref for ref in resolved_inputs if ref.get("producer_stage") == publication["candidate_stage"] and ref.get("output_port") == publication["candidate_output_port"])
+                            verification = next(ref for ref in resolved_inputs if ref.get("producer_stage") == publication["verify_stage"] and ref.get("output_port") == publication["verify_output_port"])
+                            raw = publications["raw"]
+                            raw_task = siblings[raw["stage"]]
+                            raw_association = self._named_publication_association(raw_task, raw)
+                            raw_source = {"producer_stage": raw["stage"], "producer_task_id": raw_task["id"], "producer_attempt_id": raw_task["attempt_id"], "association_id": raw_association["association_id"], "output_port": raw["output_port"], "object_id": raw_association["object_id"]}
+                            if candidate["producer_task_id"] != raw_task["id"]:
+                                candidate_task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (candidate["producer_task_id"],)).fetchone()
+                                if not any(ref.get("association_id") == raw_association["association_id"] for ref in self.store._spec(candidate_task).get("delegated_inputs", [])):
+                                    raise AuthorizationError("candidate does not descend from the actual raw publication")
+                            elif candidate["association_id"] != raw_association["association_id"]:
+                                raise AuthorizationError("candidate substituted the raw publication")
+                            verification_task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (verification["producer_task_id"],)).fetchone()
+                            if not any(ref.get("association_id") == candidate["association_id"] for ref in self.store._spec(verification_task).get("delegated_inputs", [])):
+                                raise AuthorizationError("verification does not consume this candidate")
+                            verified_source.update({"candidate": candidate, "verification": verification, "raw": raw_source, "raw_effect": raw["effect"]})
+                            verified_source["raw_publication"] = self._read_delegated_publication(raw_source, raw["effect"], project)
+                            publication_effect = self._bound_named_final_publication_effect(publication_effect, verified_source)
         target = _normalize_execution_target(request.get("target")) if isinstance(request, dict) else {"kind": "default"}
         derived_object_ids = {ref["object_id"] for ref in (resolved_inputs or []) if "association_id" in ref}
         total_input_bytes = 0
@@ -6648,12 +7123,12 @@ class RuntimeService:
             request["inputs"] = canonical_inputs
         if request is not None:
             request = dict(request)
-            # A supplied default is an explicit choice; the Agent bridge
-            # resolves inheritance before admission. Retain recovery projection
-            # of the parent's original non-default selector.
-            if target["kind"] != "default" and (
-                recovery is not None and target == recovery["original_target"]
-            ):
+            # Supplied default is explicit; absent requests inherit below.
+            # An admitted frozen stage keeps its exact request, while ordinary
+            # children retain authorized parent-selector recovery projection.
+            if (not (stages is not None and "execution_request" in stage)
+                    and target["kind"] != "default" and recovery is not None
+                    and target == recovery["original_target"]):
                 target = effective_target or target
             request["target"] = target
         elif effective_target is not None:
@@ -6681,8 +7156,8 @@ class RuntimeService:
         admitted["input_object_ids"] = inputs
         if request is not None:
             admitted["execution_request"] = request
-        if verified_source is not None:
-            admitted["settlement_effect"] = policy["final_publication"]["effect"]
+        if publication_effect is not None:
+            admitted["settlement_effect"] = publication_effect
         admitted["project"] = project
         admitted["idempotency_key"] = idempotency_key
         recoverable = self._recoverable_child_grant(policy, task, lineage)
@@ -7818,6 +8293,18 @@ class RuntimeService:
         for item in rows:
             if caps and item["capability"] not in caps:
                 continue
+            activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
+            if isinstance(activation, dict) and not self._activation_scope_matches(item["id"], activation, trusted_placement):
+                # An exact prepared generation cannot block, mutate, or claim
+                # an earlier queued sibling merely sharing capability/target.
+                try:
+                    prepared_actor = self.prepared_child_executor(activation.get("task_id"))
+                except (AuthorizationError, ConflictError, LeaseError, ValidationError, NotFoundError):
+                    continue
+                if prepared_actor is not None:
+                    continue
+                # Ordinary remote generations retain the existing waiting
+                # response; remote activation authorization still runs below.
             binding = self.store.execution_binding(item["id"])
             targeted_request = self.store._execution_request_from_row(item)
             targeted = targeted_request is not None
@@ -7937,6 +8424,178 @@ class RuntimeService:
                 result["storage_estimate"] = dict(admitted_spec["storage_estimate"])
         return self._command_record("task.claim", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
+    @_durable_mutation
+    def claim_delegated_child(self, task_id, body, *, idempotency_key, identity):
+        """Claim only the named admitted child under its still-live parent.
+
+        Authority, immutable lineage, verified machine placement, exact target,
+        shared store preflight, attempt fence and command receipt share one
+        transaction. A rejected claim rolls back and never searches the queue.
+        Replays authenticate the parent again and require the same live child
+        attempt; a historical command receipt is never fresh lease authority.
+        """
+        fields = ("executor_id", "capability_ids", "runtime_epoch", "target", "authority")
+        body = _wire_object(body, required=fields, allowed=fields)
+        executor_id = _wire_string(body, "executor_id")
+        _wire_string(body, "authority")
+        _wire_integer(body, "runtime_epoch", positive=True)
+        idempotency_key = require_idempotency_key(idempotency_key)
+        caps = body["capability_ids"]
+        if (not isinstance(caps, list) or not caps
+                or any(not isinstance(cap, str) or not cap for cap in caps)
+                or len(set(caps)) != len(caps)):
+            raise ValidationError("capability_ids must contain unique non-empty strings")
+        target = _normalize_execution_target(body["target"])
+        # Unlike ordinary administrative claim, delegated authority belongs to
+        # the authenticated executor itself. Admin scope cannot impersonate it.
+        if not isinstance(identity, dict) or identity.get("actor") != executor_id:
+            raise AuthorizationError("delegated claim requires the parent executor actor")
+        self._assert_local_claim_admission(executor_id, identity=identity)
+        placement = self._trusted_execution_placement(identity)
+        if placement is None or placement["actual"]["kind"] != "machine":
+            raise AuthorizationError("delegated claim requires verified machine placement")
+        epoch = self.store._validate_runtime_epoch(body["runtime_epoch"], identity="executor", identity_id=executor_id, required=True)
+        registered = self.store.conn.execute("SELECT runtime_epoch FROM executors WHERE id=?", (executor_id,)).fetchone()
+        if registered is None or int(registered["runtime_epoch"]) != epoch:
+            raise LeaseError("delegated claim executor registration belongs to another runtime epoch")
+        payload, parent_attempt, parent, project, policy, _, placement_version, effective_target = self._live_child_authority(body["authority"], identity=identity)
+        if executor_id != parent_attempt["executor_id"]:
+            raise AuthorizationError("delegated claim must use the verified parent executor")
+        if (not parent_attempt["lease_expires_at"]
+                or parent["lease_expires_at"] != parent_attempt["lease_expires_at"]):
+            raise LeaseError("parent attempt lease deadline is missing or inconsistent")
+        parent_binding = self.store.execution_binding(parent["id"])
+        if self.store._execution_request_from_row(parent) is not None and parent_binding is None:
+            raise LeaseError("parent execution binding is missing")
+        if parent_binding is not None and (
+                parent_binding["status"] != "claimed"
+                or parent_binding.get("actual_target") != placement["actual"]
+                or parent_binding.get("verification") != placement["verification"]
+                or parent_binding.get("executor_incarnation") != placement["executor_incarnation"]
+                or any(parent_binding.get(field) != parent_attempt[source] for field, source in (
+                    ("attempt_id", "id"), ("lease_id", "lease_id"), ("fence", "fence"),
+                    ("executor_id", "executor_id"), ("runtime_epoch", "runtime_epoch")))):
+            raise LeaseError("parent execution binding fence is stale")
+        child = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+        if child is None:
+            raise NotFoundError("delegated child not found")
+        lineage = self.store._spec(child).get("delegated_parent")
+        expected_lineage = {
+            "parent_task_id": parent["id"], "parent_attempt_id": parent_attempt["id"],
+            "parent_lease_id": parent_attempt["lease_id"], "parent_fence": int(parent_attempt["fence"]),
+            "runtime_epoch": epoch, "executor_id": executor_id, "project_id": project,
+            "parent_placement": placement, "parent_effective_target": effective_target,
+            "parent_placement_version": placement_version, "policy_digest": payload["policy_digest"],
+        }
+        child_run = self.store.conn.execute("SELECT * FROM runs WHERE id=?", (child["run_id"],)).fetchone()
+        if lineage != expected_lineage or child_run["project_id"] != project:
+            raise AuthorizationError("delegated child lineage or project does not match parent authority")
+        if (child["capability"] not in caps
+                or {"capability_id": child["capability"], "capability_digest": child["capability_digest"]} not in policy["capabilities"]):
+            raise AuthorizationError("delegated child capability is outside claim or parent policy")
+        exact_child = payload.get("child")
+        if exact_child is not None and (exact_child["child_id"] != child_run["idempotency_key"]
+                or exact_child["capability_id"] != child["capability"]
+                or exact_child["capability_digest"] != child["capability_digest"]):
+            raise AuthorizationError("child authority is bound to another exact child")
+        selected = self.store.effective_execution_target(str(task_id))
+        # Untargeted scalar children retain their ordinary path; explicit
+        # default is the only selector for their exact delegated claim.
+        if target not in policy["targets"] or target != (selected if selected is not None else {"kind": "default"}):
+            raise AuthorizationError("delegated child target does not match explicit selector")
+        binding = self.store.execution_binding(str(task_id))
+        if (not execution_placement_matches(target, placement)
+                or (selected is not None and binding is None)
+                or (binding is not None and binding["resolved_target"] != target)
+                or not self._placement_recovery_qualification_matches(str(task_id), placement)
+                or not self._placement_recovery_qualification_matches(parent["id"], placement)):
+            raise AuthorizationError("delegated child execution placement does not match")
+        if self._task_drain(str(task_id)) is not None or self._task_drain(parent["id"]) is not None:
+            raise ConflictError("remote drain blocks fresh delegated claims")
+        if (self._task_requires_remote_activation(str(task_id))
+                or isinstance(identity.get("qualified_activation"), dict)) and not self._remote_activation_matches(str(task_id), identity, placement, require_fresh=True):
+            raise AuthorizationError("delegated child activation is missing, revoked, or stale")
+        failure = self.store._task_lifetime_failure(child, datetime.now(timezone.utc))
+        if failure is not None or child["waiting_reason"] in {"provider_state_unknown", "runtime_recovery"}:
+            raise ConflictError("delegated child requires recovery or exhausted its lifetime", details=failure or {"waiting_reason": child["waiting_reason"]})
+        accounting = self.store.delegated_child_accounting(parent["id"], parent_attempt["id"])
+        if (accounting["lifetime"] > policy["limits"]["max_children"]
+                or accounting["active"] > policy["limits"]["max_active_children"]):
+            raise ConflictError("delegated child exceeds parent child capacity")
+        request_hash = sha256_bytes(canonical_json({
+            "task_id": str(task_id), "body": body, "target": target,
+            "trusted_execution_placement": placement,
+        }).encode())
+        replayed, replay = self._command_replay_state("task.claim_delegated_child", "claim", idempotency_key, request_hash, with_receipt=False)
+        if replayed:
+            # Reuse the store's readiness/resource predicates, but count the
+            # replayed attempt's own occupied slot and reservation as its own.
+            executor = self.store.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+            child_spec = self.store._spec(child)
+            active = self.store.conn.execute("SELECT COUNT(*) FROM tasks WHERE executor_id=? AND status='running'", (executor_id,)).fetchone()[0]
+            if (not self.store._executor_can_run(executor, child["capability"], child["capability_digest"], include_storage=False, required_facts=child_spec.get("required_facts"))
+                    or active > executor["max_concurrency"]
+                    or not self.store.storage_preflight(child["capability"], storage_estimate=child_spec.get("storage_estimate"))["ok"]):
+                raise ConflictError("delegated child replay preflight rejected claim")
+            for key in self.store._required_resource_keys(child["capability"]):
+                reservations = self.store.conn.execute("SELECT * FROM reservations WHERE executor_id=? AND resource_key=? AND released_at IS NULL", (executor_id, key)).fetchall()
+                if (key not in json.loads(executor["resource_keys_json"]) or len(reservations) != 1
+                        or any(reservations[0][field] != replay[source] for field, source in (
+                            ("task_id", "task_id"), ("lease_token", "lease_id"), ("fence", "fence"), ("runtime_epoch", "runtime_epoch"), ("lease_expires_at", "lease_expires_at")))):
+                    raise ConflictError("delegated child replay resource reservation changed")
+            attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (replay["attempt_id"],)).fetchone()
+            self._assert_attempt_identity(attempt, identity)
+            self._validate_attempt_lease(attempt, replay, epoch)
+            if (attempt["task_id"] != str(task_id) or attempt["executor_id"] != executor_id
+                    or attempt["lease_expires_at"] != replay["lease_expires_at"]
+                    or child["status"] != "running" or child["attempt_id"] != replay["attempt_id"]
+                    or child["lease_token"] != replay["lease_id"] or child["lease_fence"] != replay["fence"]
+                    or child["executor_id"] != executor_id or child["runtime_epoch"] != epoch
+                    or child["lease_expires_at"] != replay["lease_expires_at"]
+                    or binding != replay.get("execution_binding")):
+                raise LeaseError("delegated child claim is no longer the same live attempt")
+            return replay
+        if child["status"] != "queued":
+            raise ConflictError("delegated child is not queued")
+        if binding is not None and binding["status"] != "prepared":
+            raise ConflictError("delegated child binding requires recovery")
+        if self.store.conn.execute("SELECT 1 FROM attempts WHERE task_id=? AND settled=0 LIMIT 1", (str(task_id),)).fetchone():
+            raise ConflictError("delegated child has an unresolved prior attempt")
+        attempt_id, lease_id = new_id(), new_id()
+        value = self.store._claim_task(str(task_id), executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
+        task = value["task"]
+        if task["status"] != "running":
+            raise ConflictError("delegated child preflight rejected claim", details={"waiting_reason": task.get("waiting_reason")})
+        executor = self.store.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+        if not self.store._executor_can_run(executor, child["capability"], child["capability_digest"], include_storage=False, required_facts=self.store._spec(child).get("required_facts")):
+            raise ConflictError("delegated child executor qualification changed")
+        # Shared preflight can reap expired leases; recheck parent before any
+        # attempt or receipt is committed, including a deadline crossing here.
+        self._live_child_authority(body["authority"], identity=identity)
+        fence, expires = int(task["lease_fence"]), task["lease_expires_at"]
+        self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", (attempt_id, str(task_id), lease_id, fence, executor_id, expires, epoch))
+        self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, str(task_id)))
+        binding = self.store.bind_execution_attempt(str(task_id), attempt_id=attempt_id, lease_id=lease_id, fence=fence, executor_id=executor_id, runtime_epoch=epoch, placement=placement)
+        if binding is not None:
+            self.store._append_event(value["run"]["id"], str(task_id), "task.execution_bound", {
+                "attempt_id": attempt_id, "lease_id": lease_id, "fence": fence,
+                "runtime_epoch": epoch, "execution_binding": binding,
+            })
+        admitted_spec, generation_intent = public_task_spec(task.get("spec") or {})
+        generation_intent = task.get("generation_intent") or generation_intent
+        result = {"attempt_id": attempt_id, "task_id": str(task_id), "run_id": value["run"]["id"], "project_id": project, "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+        for field in ("execution_request", "expected_effect"):
+            if task.get(field) is not None:
+                result[field] = dict(task[field])
+        for field in ("required_facts", "storage_estimate"):
+            if field in admitted_spec:
+                result[field] = dict(admitted_spec[field])
+        if binding is not None:
+            result["execution_binding"] = binding
+        if generation_intent is not None:
+            result["generation_intent"] = generation_intent
+        return self._command_record("task.claim_delegated_child", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
+
     @_durable_mutation(reap_task_lifetimes=True)
     def settle_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None, _verified_objects=None):
         idempotency_key = require_idempotency_key(idempotency_key)
@@ -7992,10 +8651,25 @@ class RuntimeService:
                 raise AuthorizationError("parent attempt child authority has ended")
             lineage = admitted_spec.get("delegated_parent")
             if lineage is not None:
-                self._live_delegating_parent(lineage["parent_attempt_id"], {
+                _, parent, _, policy = self._live_delegating_parent(lineage["parent_attempt_id"], {
                     "lease_id": lineage["parent_lease_id"], "fence": lineage["parent_fence"],
                     "runtime_epoch": lineage["runtime_epoch"],
                 }, identity=None)
+                publications = policy.get("publications")
+                if publications is not None:
+                    raw, final = publications["raw"], publications["final"]
+                    consumer = final["candidate_stage"] if final["candidate_stage"] != raw["stage"] else final["verify_stage"]
+                    if admitted_spec.get("delegated_stage") == consumer:
+                        siblings = self._delegated_stage_rows(project_id, lineage)
+                        producer = siblings[raw["stage"]]
+                        selected = self._named_publication_association(producer, raw)
+                        consumed = [ref for ref in admitted_spec.get("delegated_inputs", [])
+                                    if ref.get("producer_stage") == raw["stage"]
+                                    and ref.get("output_port") == raw["output_port"]]
+                        matching = [ref for ref in consumed if ref.get("association_id") == selected["association_id"]]
+                        if len(matching) != 1:
+                            raise AuthorizationError("candidate settlement omitted or substituted the selected raw publication")
+                        self._read_delegated_publication(matching[0], raw["effect"], project_id)
             self.store.assert_delegated_children_completed(task["id"], attempt_id)
             for child in self.store.delegated_children(task["id"], attempt_id):
                 for association in self.store.list_managed_outputs(child["id"]):
@@ -8009,7 +8683,7 @@ class RuntimeService:
                         raise ConflictError("accepted child managed output metadata changed")
                     self._verify_child_object_bytes(digest, association["size"], label="accepted child output CAS object")
             verified_source = admitted_spec.get("verified_publication_source")
-            if verified_source is not None:
+            if verified_source is not None and "publication_name" not in verified_source:
                 lineage = admitted_spec["delegated_parent"]
                 self._live_delegating_parent(lineage["parent_attempt_id"], {
                     "lease_id": lineage["parent_lease_id"], "fence": lineage["parent_fence"],
@@ -8034,6 +8708,71 @@ class RuntimeService:
                         or outputs[0].get("kind", "object") != "object"
                         or outputs[0].get("durability", "durable") != "durable"):
                     raise AuthorizationError("final publication must use the declared verified output")
+            publication_binding = None
+            if verified_source is not None and "publication_name" in verified_source:
+                name = verified_source["publication_name"]
+                outputs = body.get("outputs") or []
+                selected = self._named_publication_output(declared, outputs)
+                if (selected.get("kind", "object") != "object"
+                        or selected.get("durability", "durable") != "durable"
+                        or selected.get("role") == "recoverable_snapshot"):
+                    raise AuthorizationError("named publication must use its one declared durable output")
+                publication_binding = {"name": name, **{key: lineage[key] for key in ("parent_task_id", "parent_attempt_id", "parent_fence", "runtime_epoch")}}
+                if name == "final":
+                    self._validate_named_publication_lineage(verified_source, project_id, lineage)
+                    if selected.get("digest") != verified_source["candidate"]["object_id"]:
+                        raise AuthorizationError("final publication must use the declared candidate bytes")
+                    publication_binding.update({key: verified_source[key] for key in ("candidate", "verification", "raw", "raw_publication")})
+            parent_publication = None
+            publications = admitted_spec.get("child_delegation", {}).get("publications")
+            if publications is not None:
+                result = body.get("result") or {}
+                statuses = [result[key] for key in ("status", "overall_status") if key in result]
+                if not statuses or any(not isinstance(status, str) or status != statuses[0] for status in statuses):
+                    raise ValidationError("named publication parent requires one consistent H3 outcome")
+                if statuses[0] == "task_failed":
+                    raise ValidationError("task_failed must use fail_attempt, not successful settlement")
+                if statuses[0] not in {"candidate_verified", "complete"}:
+                    raise ValidationError("named publication parent H3 outcome is invalid")
+                if statuses[0] == "complete":
+                    states = result.get("states")
+                    if not isinstance(states, dict) or any(
+                            not isinstance(states.get(key), dict) or states[key].get("status") != "passed"
+                            or not isinstance(states[key].get("evidence"), dict) or not states[key]["evidence"]
+                            for key in ("editorially_approved", "cleanup_verified")):
+                        raise ValidationError("complete requires editorial approval and cleanup evidence")
+                    resources = states["cleanup_verified"]["evidence"].get("resources")
+                    if (not isinstance(resources, list) or not resources
+                            or any(not isinstance(resource, dict) or resource.get("verified") is not True for resource in resources)):
+                        raise ValidationError("complete requires editorial approval and verified cleanup evidence")
+                children = self.store.delegated_children(task["id"], attempt_id)
+                final_children = [child for child in children if self.store._spec(child).get("delegated_stage") == publications["final"]["stage"]]
+                if len(final_children) != 1:
+                    raise ConflictError("parent requires its actual settled final publication")
+                final_output = self._named_publication_association(final_children[0], publications["final"])
+                if not isinstance(final_output["provenance"].get("delegated_publication"), dict):
+                    raise ConflictError("parent requires its actual settled final publication")
+                final_spec = self.store._spec(final_children[0])
+                final_source = final_spec.get("verified_publication_source")
+                final_lineage = final_spec.get("delegated_parent")
+                expected_parent = {"parent_task_id": task["id"], "parent_attempt_id": attempt_id, "parent_fence": int(row["fence"]), "runtime_epoch": int(row["runtime_epoch"])}
+                if (not isinstance(final_source, dict) or final_source.get("publication_name") != "final"
+                        or not isinstance(final_lineage, dict) or any(final_lineage.get(key) != value for key, value in expected_parent.items())
+                        or any(final_output["provenance"]["delegated_publication"].get(key) != value for key, value in expected_parent.items())):
+                    raise ConflictError("parent final publication lineage does not match its current attempt")
+                self._validate_named_publication_lineage(final_source, project_id, final_lineage)
+                final_ref = {"producer_task_id": final_children[0]["id"], "producer_attempt_id": final_children[0]["attempt_id"], "association_id": final_output["association_id"], "object_id": final_output["object_id"], "output_port": final_output["output_port"]}
+                final_effect = self._bound_named_final_publication_effect(publications["final"]["effect"], final_source)
+                self._read_delegated_publication(final_ref, final_effect, project_id)
+                if (final_output["object_id"] != final_source["candidate"]["object_id"]
+                        or any(final_output["provenance"]["delegated_publication"].get(key) != final_source[key] for key in ("candidate", "verification", "raw", "raw_publication"))):
+                    raise ConflictError("parent final publication binding no longer matches its frozen sources")
+                parent_selected = self._named_publication_output(final_effect, body.get("outputs", []))
+                if (parent_selected.get("digest") != final_output["object_id"]
+                        or parent_selected.get("kind", "object") != "object"
+                        or parent_selected.get("durability", "durable") != "durable"):
+                    raise AuthorizationError("parent must retain the actual final publication output")
+                parent_publication = final_output
             if _verified_objects is not None and (row["executor_id"] != MEDIA_IMPORT_EXECUTOR or task["capability"] != MEDIA_IMPORT_CAPABILITY):
                 raise AuthorizationError("verified import proof requires the host import executor")
             staged = self._stage_outputs(
@@ -8045,6 +8784,14 @@ class RuntimeService:
                 lease_body=body,
                 verified_objects=_verified_objects,
             )
+            if publication_binding is not None:
+                selected_staged = self._named_publication_output(declared, staged["outputs"])
+                selected_staged["provenance"] = {**(selected_staged.get("provenance") or {}), "delegated_publication": publication_binding}
+            if parent_publication is not None:
+                output = self._named_publication_output(final_effect, staged["outputs"])
+                binding = dict(parent_publication["provenance"]["delegated_publication"])
+                binding.update({"source_association_id": parent_publication["association_id"], "source_task_id": parent_publication["task_id"], "source_attempt_id": parent_publication["attempt_id"]})
+                output["provenance"] = {**(output.get("provenance") or {}), "delegated_publication": binding}
             try:
                 # Persist one flat result object. Outputs are the only
                 # reserved field and are added atomically with user fields.
@@ -8480,6 +9227,8 @@ class RuntimeService:
                 provenance = output.get("provenance", {})
                 if not isinstance(producer, dict) or not isinstance(provenance, dict):
                     raise ValidationError("output producer and provenance must be objects")
+                if "delegated_publication" in provenance:
+                    raise AuthorizationError("delegated publication provenance is Runtime-owned")
                 regeneration = output.get("regeneration")
                 if regeneration is not None:
                     regeneration = _validate_regeneration(regeneration)

@@ -23,6 +23,7 @@ from .upgrade import (
     GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION,
     compact_idempotency_ledger,
     migrate_historical_managed_outputs,
+    migrate_generation_tags,
     migrate_canonical_v24_to_v25,
     migrate_canonical_to_current,
     compact_idempotency_ledger,
@@ -100,6 +101,18 @@ def _parser():
     reconcile.add_argument("--task-id")
     reconcile.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
     reconcile.add_argument("--confirm", required=True)
+    generation_tags = sub.add_parser("migrate-generation-tags", help="offline backfill explicit Runtime generation metadata")
+    generation_tags.add_argument("--root", required=True)
+    generation_tags.add_argument("--project-id")
+    tag_action = generation_tags.add_mutually_exclusive_group()
+    tag_action.add_argument("--dry-run", dest="dry_run", action="store_true", default=True, help="report candidates without changes (default)")
+    tag_action.add_argument("--apply", dest="dry_run", action="store_false", help="apply after stopped-owner confirmation")
+    generation_tags.add_argument("--skip-ledger", action="store_true", help="ledger data is always skipped")
+    generation_tags.add_argument("--manifest-root", action="append", default=[], help="explicit absolute JSON file/directory; repeatable")
+    generation_tags.add_argument("--receipt-root", action="append", default=[], help="explicit absolute JSON receipt file/directory; repeatable")
+    generation_tags.add_argument("--template-model-map", help="absolute JSON file mapping template ids to model names")
+    generation_tags.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    generation_tags.add_argument("--confirm")
     repair = sub.add_parser("repair-media-types", help="repair generic published MIME values from managed filenames")
     repair.add_argument("--root", required=True)
     repair.add_argument("--project-id")
@@ -264,6 +277,19 @@ def _main(args):
             return 1
         print(json.dumps(result, sort_keys=True))
         return 0
+    if args.command == "migrate-generation-tags":
+        try:
+            result = migrate_generation_tags(
+                args.root, project_id=args.project_id, dry_run=args.dry_run,
+                manifest_roots=args.manifest_root, receipt_roots=args.receipt_root,
+                template_model_map=args.template_model_map,
+                timeout_seconds=args.timeout, confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "compact":
         try:
             result = compact_idempotency_ledger(args.root, confirmation=args.confirm,
@@ -395,6 +421,8 @@ def _main(args):
             local_worker_profiles=composition.profiles if composition else None,
             local_worker_preparer=composition.preparer if composition else None,
             local_worker_inspector=composition.inspector if composition else None,
+            _local_worker_composition=composition,
+            _local_worker_composition_required=bool(getattr(args, "worker_profile", None)),
             door=door,
             services=services,
             log_directory=Path(args.log_file).parent if args.log_file else None,
