@@ -170,19 +170,69 @@ def test_status_reads_authoritative_job_and_c2_journal_without_recovery(tmp_path
     ("rolled_back", "terminal", "rolled_back"),
     ("failed", "terminal", "failed"),
 ])
-def test_status_reports_terminal_job_result(tmp_path, job_state, expected, outcome):
+@pytest.mark.parametrize("journal_step", ["complete", "rolled_back"])
+def test_status_reports_terminal_job_result(tmp_path, job_state, expected, outcome, journal_step):
     home, root = tmp_path / "home", tmp_path / "program"
     data = tmp_path / "data"
     _write(home / ".local/share/astrid-install.json", {
         "owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data),
     })
     _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": {
-        "operation_id": "22222222222222222222222222222222", "state": job_state, "result": "line one\nline two",
+        "operation_id": "22222222222222222222222222222222", "transaction_id": "c" * 32,
+        "state": job_state, "result": "line one\nline two",
     }})
+    _write(root / "update-transaction.json", {
+        "format": "astrid-install-update/v1", "operation_id": "c" * 32, "step": journal_step,
+        "update_job": {"operation_id": "22222222222222222222222222222222"},
+    })
     status = update.read_update_status(home)
     assert status["state"] == expected
     assert status["outcome"] == outcome
     assert status["result"] == "line one line two"
+
+
+@pytest.mark.parametrize("job_state", ["updated", "rolled_back", "failed"])
+@pytest.mark.parametrize("defect", [
+    "missing_journal", "wrong_format", "missing_format", "wrong_operation", "missing_operation",
+    "wrong_transaction", "missing_transaction", "empty_transaction", "missing_journal_transaction",
+])
+def test_status_rejects_terminal_job_without_valid_journal_link(tmp_path, job_state, defect):
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    _write(home / ".local/share/astrid-install.json", {
+        "owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data),
+    })
+    job = {"operation_id": "2" * 32, "transaction_id": "c" * 32, "state": job_state,
+           "result": "untrusted terminal result"}
+    journal = {"format": "astrid-install-update/v1", "operation_id": "c" * 32, "step": "complete",
+               "update_job": {"operation_id": "2" * 32}}
+    if defect == "wrong_format":
+        journal["format"] = "astrid-install-update/v2"
+    elif defect == "missing_format":
+        del journal["format"]
+    elif defect == "wrong_operation":
+        journal["update_job"]["operation_id"] = "3" * 32
+    elif defect == "missing_operation":
+        del journal["update_job"]
+    elif defect == "wrong_transaction":
+        journal["operation_id"] = "d" * 32
+    elif defect == "missing_transaction":
+        del job["transaction_id"]
+    elif defect == "empty_transaction":
+        job["transaction_id"] = journal["operation_id"] = ""
+    elif defect == "missing_journal_transaction":
+        del journal["operation_id"]
+    marker = _write(root / "install.json", {
+        "owner": "haus.astrid.runtime", "data_root": str(data), "update_job": job,
+    })
+    sources = [marker]
+    if defect != "missing_journal":
+        sources.append(_write(root / "update-transaction.json", journal))
+    before = {path: path.read_bytes() for path in sources}
+    status = update.read_update_status(home)
+    assert status["state"] == "recovery-needed"
+    assert status["result"] == "Recovery needed."
+    assert "outcome" not in status
+    assert {path: path.read_bytes() for path in sources} == before
 
 
 def test_status_exposes_bounded_job_and_cleanup_metadata(tmp_path):
@@ -774,8 +824,12 @@ def test_post_update_terminal_result_line_reads_back_through_status(tmp_path, mo
         marker = tmp_path / "program with spaces" / "install.json"
         record = json.loads(marker.read_text())
         assert record["update_job"]["operation_id"] == operation_id
-        record["update_job"].update(state="updated", result="line one\nline two")
+        record["update_job"].update(state="updated", transaction_id="c" * 32, result="line one\nline two")
         _write(marker, record)
+        _write(marker.parent / "update-transaction.json", {
+            "format": "astrid-install-update/v1", "operation_id": "c" * 32, "step": "complete",
+            "update_job": {"operation_id": operation_id},
+        })
         status = world.call("/api/runtime/v1/update/status").json()
         assert status["operation_id"] == operation_id
         assert status["state"] == "terminal" and status["outcome"] == "updated"

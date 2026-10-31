@@ -455,6 +455,17 @@ def read_update_status(home=None, *, available=False, reason=None):
         # means the worker still owns the final result write; after release,
         # report the unresolved handoff without inferring success or rollback.
         state = "active" if _installer_lock_held(home) else "recovery-needed"
+    elif state in {"updated", "rolled_back", "failed"}:
+        # A terminal F1 result is evidence only when its C2 journal binds both
+        # the job operation and the transaction recorded on the job.
+        transaction_id = job.get("transaction_id")
+        if (transaction.get("format") != "astrid-install-update/v1"
+                or step not in terminal_steps
+                or not isinstance(journal_job, dict)
+                or journal_job.get("operation_id") != operation_id
+                or not isinstance(transaction_id, str) or not transaction_id
+                or transaction_id != transaction.get("operation_id")):
+            state = "recovery-needed"
     outcome = state if state in {"updated", "rolled_back", "failed"} else None
     api_state = "active" if state in {"accepted", "launching", "active"} else "terminal" if outcome else state
     result = "Recovery needed." if state == "recovery-needed" else job.get("result") or job.get("message") or (outcome or api_state)
