@@ -14,7 +14,7 @@
     "conformance/fixtures/task.json": "sha256:7dc2f5d3f82219b439f1c1147aa230f39e706a3c3b24a7d177efc1b975f543b9",
     "conformance/fixtures/visual-boundary-v1.json": "sha256:1fc778b42f7a5ef91a1fd8620fd92417131e44f97dd5c6a238c78f13bcabfc55",
     "conformance/fixtures/visual-seam-cases-v1.json": "sha256:1f8363394e0b7049096365d38d00bf2dfed888eab30c3b2bce95cd44537a02e7",
-    "conformance/responses/events_page_1_200.json": "sha256:6aaaabe512589beddddd5ef64f2307c39d365a99565c5a3291a15933a114be0d",
+    "conformance/responses/events_page_1_200.json": "sha256:235b4de800c6a234d537c2607682f0ba9a03331af76c664e4bbf890acba285fb",
     "conformance/responses/events_page_2_200.json": "sha256:d5bffdc93e9939779c92a18c047e70df21711f12e16c345f43f3cbdec5b27eb2",
     "conformance/responses/invalid_cursor_400.json": "sha256:16a1db399e06b8d059472f567a091b4bd579d13d8885595376f61835646bfbff",
     "conformance/responses/managed_outputs_200.json": "sha256:6bcef19aca4ad8d574c60d738b54ba57fce6a3a9d4e1481c6f8f088dd460858d",
@@ -77,5 +77,5 @@
     "packages/typescript/tsconfig.json": "sha256:48bc718286b70c7ff5af00d1adfea37ad7c7f8820d3050117dc9d6aea239181b"
   },
   "producer": "astrid-runtime",
-  "version": "sha256:0ea29424b8e99a94dbda2e8960fe3b2ba49e71904198ce1e071f5481c1d71f85"
+  "version": "sha256:31d29d03e433032645386320676c3578d3fc38658205da8b7cc8494720bbd9be"
 }
