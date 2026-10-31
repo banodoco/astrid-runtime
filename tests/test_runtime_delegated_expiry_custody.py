@@ -137,16 +137,24 @@ def _assert_custody(runtime, attempt, expired_at, *, cpu):
     assert unsettled["lease_expired"] is True
 
 
-def _assert_ordinary_expiry(runtime, attempt):
+def _assert_expiry_requires_owner_stop(runtime, attempt, expired_at, *, cpu=False):
     service, _, root = runtime
-    for _ in range(2):
-        task = service.task(attempt["task_id"])["task"]
-        assert task["status"] == "queued"
-        assert task["waiting_reason"] == "waiting_for_worker"
-        assert task["lease_token"] is None
-        assert task["lease_expires_at"] is None
-        assert _attempt(service, attempt)["settled"] == 1
+    for index in range(2):
+        _assert_custody(runtime, attempt, expired_at, cpu=cpu)
+        assert _claim(service, PARENT, f"no-claim-before-stop-{index}") is None
+    with pytest.raises(LeaseError):
+        service.heartbeat_attempt(attempt["attempt_id"], _lease(attempt),
+            idempotency_key="expired-ordinary-heartbeat", identity=IDENTITY)
+    with pytest.raises(LeaseError):
+        service.settle_attempt(attempt["attempt_id"], {**_lease(attempt), "outputs": []},
+            idempotency_key="expired-ordinary-settle", identity=IDENTITY)
+    stopped = service.fail_attempt(attempt["attempt_id"], {
+        **_lease(attempt), "error": {"code": "owner_stopped"},
+    }, idempotency_key="ordinary-owner-stop", identity=IDENTITY)
+    assert stopped["data"]["state"] == "failed"
+    assert _attempt(service, attempt)["settled"] == 1
     assert inspect_interruption_state(root)["safe"] is True
+    service.retry_task(attempt["task_id"], idempotency_key="retry-stopped-ordinary-owner")
 
 
 @pytest.mark.parametrize("child_state,cpu", [
@@ -220,26 +228,30 @@ def test_expired_delegating_owner_retains_custody_until_explicit_failure(runtime
     with pytest.raises(LeaseError):
         _admit(service, receipt, "old-authority-after-retry")
 
-    # Accepted lineage from the old attempt cannot confer custody on a new
-    # attempt which has never delegated. Ordinary expiry/reclaim still works.
+    # Historical lineage cannot confer current delegation authority. Ordinary
+    # expiry also retains exact custody until an explicit owner stop report.
     assert not service.store.delegated_children(retried["task_id"], retried["attempt_id"])
     assert len(service.store.delegated_children(parent["task_id"], parent["attempt_id"])) == 1
-    _expire(service, retried)
-    _assert_ordinary_expiry(runtime, retried)
+    retried_expiry = _expire(service, retried)
+    _assert_expiry_requires_owner_stop(runtime, retried, retried_expiry, cpu=cpu)
     reclaimed = _claim(service, PARENT, "reclaim-undelegated-retry")
     assert reclaimed["task_id"] == parent["task_id"]
+    assert reclaimed["attempt_id"] != retried["attempt_id"]
+    assert reclaimed["lease_id"] != retried["lease_id"]
     assert reclaimed["fence"] > retried["fence"]
 
 
 @pytest.mark.parametrize("issued_authority", [False, True])
-def test_policy_without_an_accepted_child_keeps_ordinary_expiry(runtime, issued_authority):
+def test_policy_without_an_accepted_child_retains_custody_until_owner_stop(runtime, issued_authority):
     service, _, _ = runtime
     parent = _parent(runtime)
     if issued_authority:
         _authority(service, parent)
     assert not service.store.delegated_children(parent["task_id"], parent["attempt_id"])
-    _expire(service, parent)
-    _assert_ordinary_expiry(runtime, parent)
+    expired_at = _expire(service, parent)
+    _assert_expiry_requires_owner_stop(runtime, parent, expired_at)
     reclaimed = _claim(service, PARENT, "claim-after-ordinary-expiry")
     assert reclaimed["task_id"] == parent["task_id"]
+    assert reclaimed["attempt_id"] != parent["attempt_id"]
+    assert reclaimed["lease_id"] != parent["lease_id"]
     assert reclaimed["fence"] > parent["fence"]
