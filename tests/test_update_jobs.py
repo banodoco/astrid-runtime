@@ -165,24 +165,162 @@ def test_status_reads_authoritative_job_and_c2_journal_without_recovery(tmp_path
     assert selection.exists()
 
 
-@pytest.mark.parametrize(("job_state", "expected", "outcome"), [
-    ("updated", "terminal", "updated"),
-    ("rolled_back", "terminal", "rolled_back"),
-    ("failed", "terminal", "failed"),
-])
-def test_status_reports_terminal_job_result(tmp_path, job_state, expected, outcome):
-    home, root = tmp_path / "home", tmp_path / "program"
-    data = tmp_path / "data"
-    _write(home / ".local/share/astrid-install.json", {
+def _terminal_evidence(tmp_path, monkeypatch, state):
+    from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    identity = {"release": 5 if state == "updated" else 4, "managed_by": None}
+    folder = root / "versions" / "selected"
+    version = {"root": str(folder), "python": str(folder / "python"),
+               "profile": str(folder / "profile.json"), "env": {}, "identity": identity}
+    selection = _write(home / ".local/share/astrid-install.json", {
         "owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data),
+        "identity": identity,
     })
-    _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": {
-        "operation_id": "22222222222222222222222222222222", "state": job_state, "result": "line one\nline two",
-    }})
+    _write(folder / "version.json", version)
+    (root / "current").write_text("selected\n")
+    discovery = _write(data / "runtime/discovery.json", {
+        "runtime_instance_id": "new-instance", "endpoint": "http://127.0.0.1:1234"})
+    health = {"status": "ok", "runtime_instance_id": "new-instance", "identity": identity}
+    monkeypatch.setattr(LocalRuntimeBoundary, "owner_startup_identity", lambda self, **kwargs: health)
+    job = {"operation_id": "2" * 32, "transaction_id": "c" * 32, "state": state,
+           "target_release": 5, "old_instance_id": "old-instance", "old_identity": identity,
+           "old_version": version, "result": "line one\nline two"}
+    journal = {"format": "astrid-install-update/v1", "operation_id": "c" * 32,
+               "step": "rolled_back" if state == "rolled_back" else "complete",
+               "update_job": {"operation_id": "2" * 32}, "candidate": version, "old": version}
+    return home, root, data, selection, discovery, version, health, job, journal
+
+
+@pytest.mark.parametrize("job_state", ["updated", "rolled_back", "failed"])
+def test_status_reports_terminal_job_result(tmp_path, monkeypatch, job_state):
+    home, root, data, selection, discovery, version, health, job, journal = _terminal_evidence(tmp_path, monkeypatch, job_state)
+    marker = _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": job})
+    journal_path = _write(root / "update-transaction.json", journal)
+    sources = [selection, marker, journal_path, discovery, root / "current", root / "versions/selected/version.json"]
+    before = {path: path.read_bytes() for path in sources}
     status = update.read_update_status(home)
-    assert status["state"] == expected
-    assert status["outcome"] == outcome
+    assert status["state"] == "terminal"
+    assert status["outcome"] == job_state
     assert status["result"] == "line one line two"
+    assert {path: path.read_bytes() for path in sources} == before
+
+
+@pytest.mark.parametrize("job_state", ["updated", "rolled_back", "failed"])
+@pytest.mark.parametrize("defect", [
+    "missing_journal", "corrupt_journal", "wrong_format", "missing_format", "wrong_operation", "missing_operation",
+    "wrong_transaction", "missing_transaction", "empty_transaction", "malformed_transaction", "missing_journal_transaction",
+])
+def test_status_rejects_terminal_job_without_valid_journal_link(tmp_path, monkeypatch, job_state, defect):
+    home, root, data, selection, discovery, version, health, job, journal = _terminal_evidence(tmp_path, monkeypatch, job_state)
+    if defect == "wrong_format":
+        journal["format"] = "astrid-install-update/v2"
+    elif defect == "missing_format":
+        del journal["format"]
+    elif defect == "wrong_operation":
+        journal["update_job"]["operation_id"] = "3" * 32
+    elif defect == "missing_operation":
+        del journal["update_job"]
+    elif defect == "wrong_transaction":
+        journal["operation_id"] = "d" * 32
+    elif defect == "missing_transaction":
+        del job["transaction_id"]
+    elif defect == "empty_transaction":
+        job["transaction_id"] = journal["operation_id"] = ""
+    elif defect == "malformed_transaction":
+        job["transaction_id"] = journal["operation_id"] = "not-a-transaction-id"
+    elif defect == "missing_journal_transaction":
+        del journal["operation_id"]
+    marker = _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": job})
+    sources = [selection, marker]
+    if defect != "missing_journal":
+        path = _write(root / "update-transaction.json", journal)
+        if defect == "corrupt_journal":
+            path.write_text("{")
+        sources.append(path)
+    before = {path: path.read_bytes() for path in sources}
+    status = update.read_update_status(home)
+    assert status["state"] == "recovery-needed"
+    assert status["result"] == "Recovery needed."
+    assert "outcome" not in status
+    assert {path: path.read_bytes() for path in sources} == before
+
+
+@pytest.mark.parametrize("job_state", ["updated", "rolled_back"])
+@pytest.mark.parametrize("defect", ["wrong_step", "pending_step", "missing_version", "wrong_version", "wrong_release",
+                                    "wrong_prior", "missing_discovery", "old_instance", "missing_old_instance", "unready", "wrong_instance", "wrong_identity"])
+def test_status_rejects_uncorroborated_success(tmp_path, monkeypatch, job_state, defect):
+    home, root, data, selection, discovery, version, health, job, journal = _terminal_evidence(tmp_path, monkeypatch, job_state)
+    if defect == "wrong_step":
+        journal["step"] = "rolled_back" if job_state == "updated" else "complete"
+    elif defect == "pending_step":
+        journal["step"] = "switched"
+        monkeypatch.setattr(update, "_installer_lock_held", lambda home: True)
+    elif defect == "missing_version":
+        (root / "versions/selected/version.json").unlink()
+    elif defect == "wrong_version":
+        journal["candidate" if job_state == "updated" else "old"] = {"root": "other"}
+    elif defect == "wrong_release":
+        if job_state == "updated":
+            job["target_release"] = 6
+        else:
+            job["old_identity"] = {"release": 6, "managed_by": None}
+    elif defect == "wrong_prior":
+        if job_state == "rolled_back":
+            job["old_version"] = {"root": "other"}
+        else:
+            job["target_release"] = 6
+    elif defect == "missing_discovery":
+        discovery.unlink()
+    elif defect == "old_instance":
+        job["old_instance_id"] = "new-instance"
+    elif defect == "missing_old_instance":
+        del job["old_instance_id"]
+    elif defect == "unready":
+        health["status"] = "degraded"
+    elif defect == "wrong_instance":
+        health["runtime_instance_id"] = "other"
+    elif defect == "wrong_identity":
+        health["identity"] = {"release": 99, "managed_by": None}
+    marker = _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": job})
+    journal_path = _write(root / "update-transaction.json", journal)
+    before = {path: path.read_bytes() for path in (selection, marker, journal_path)}
+    status = update.read_update_status(home)
+    assert status["state"] == "recovery-needed" and "outcome" not in status
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("job_state", ["failed", "recovery-needed"])
+@pytest.mark.parametrize("prior_journal", [False, True])
+def test_status_preserves_pretransaction_failure_or_recovery(tmp_path, job_state, prior_journal):
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    selection = _write(home / ".local/share/astrid-install.json", {
+        "owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data)})
+    marker = _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data),
+                    "update_job": {"operation_id": "2" * 32, "state": job_state, "message": "Failure."}})
+    sources = [selection, marker]
+    if prior_journal:
+        sources.append(_write(root / "update-transaction.json", {"format": "astrid-install-update/v1",
+                       "operation_id": "c" * 32, "step": "complete", "update_job": {"operation_id": "3" * 32}}))
+    before = {path: path.read_bytes() for path in sources}
+    status = update.read_update_status(home)
+    assert status["state"] == ("terminal" if job_state == "failed" else "recovery-needed")
+    assert status.get("outcome") == ("failed" if job_state == "failed" else None)
+    assert {path: path.read_bytes() for path in sources} == before
+    assert (root / "update-transaction.json").exists() == prior_journal
+
+
+@pytest.mark.parametrize("job_state", ["failed", "recovery-needed"])
+def test_terminal_failure_with_pending_transaction_stays_recovery_needed(tmp_path, monkeypatch, job_state):
+    home, root, data, selection, discovery, version, health, job, journal = _terminal_evidence(tmp_path, monkeypatch, job_state)
+    journal["step"] = "switched"
+    marker = _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": job})
+    journal_path = _write(root / "update-transaction.json", journal)
+    before = {path: path.read_bytes() for path in (selection, marker, journal_path)}
+    monkeypatch.setattr(update, "_installer_lock_held", lambda home: True)
+    status = update.read_update_status(home)
+    assert status["state"] == "recovery-needed" and "outcome" not in status
+    assert {path: path.read_bytes() for path in before} == before
 
 
 def test_status_exposes_bounded_job_and_cleanup_metadata(tmp_path):
@@ -774,11 +912,11 @@ def test_post_update_terminal_result_line_reads_back_through_status(tmp_path, mo
         marker = tmp_path / "program with spaces" / "install.json"
         record = json.loads(marker.read_text())
         assert record["update_job"]["operation_id"] == operation_id
-        record["update_job"].update(state="updated", result="line one\nline two")
+        record["update_job"].update(state="failed", result="line one\nline two")
         _write(marker, record)
         status = world.call("/api/runtime/v1/update/status").json()
         assert status["operation_id"] == operation_id
-        assert status["state"] == "terminal" and status["outcome"] == "updated"
+        assert status["state"] == "terminal" and status["outcome"] == "failed"
         assert status["result"] == "line one line two"
     finally:
         world.stop()
