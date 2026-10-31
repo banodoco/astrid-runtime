@@ -3,13 +3,19 @@ name: CI
 
 on:
   push:
+    branches: [main, release-1, "int/**"]
   pull_request:
+  merge_group:
   workflow_dispatch:
     inputs:
       agent_sha:
         description: Full immutable Agent commit SHA (empty uses fixture pin)
         required: false
         type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows-realm-publication:
