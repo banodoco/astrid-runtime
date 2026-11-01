@@ -44,7 +44,13 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
     _write(folder / "manifest.json", {"release": 4})
     (root / "current").write_text("old\n")
     realm = data / "runtime" / "realms" / "test"
-    create_realm(realm)
+    try:
+        create_realm(realm)
+    except subprocess.CalledProcessError as exc:
+        pytest.fail(
+            f"realm CLI failed: {exc}\nstdout:\n{exc.stdout}\nstderr:\n{exc.stderr}",
+            pytrace=True,
+        )
     credential = home / "astrid.json"
     daemon = RuntimeDaemon(realm, support_root=data / "runtime", door=DoorConfig(origin=HOSTED, port=0, credential_file=credential), agent_checkout=agent, runtime_checkout=runtime).start()
     world = DoorWorld(tmp_path, daemon, credential)
