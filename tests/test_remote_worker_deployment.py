@@ -133,10 +133,18 @@ def test_projection_is_deterministic_and_secret_free(tmp_path: Path) -> None:
     assert tuple(sorted(first.env_items)) == first.env_items
 
 
-@pytest.mark.parametrize("capacity", [0, 2, True])
+@pytest.mark.parametrize("capacity", [0, 3, -1, True, 1.0, "2"])
 def test_projection_rejects_capacity_without_a_real_worker_loop(tmp_path: Path, capacity) -> None:
-    with pytest.raises(DeploymentReferenceError, match="single GenericPackHost"):
+    with pytest.raises(DeploymentReferenceError, match="supported GenericPackHost slot count"):
         DeploymentReference(**{**_reference(tmp_path).__dict__, "capacity": capacity})
+
+
+def test_projection_binds_two_serving_slots(tmp_path: Path) -> None:
+    single = _reference(tmp_path)
+    reference = DeploymentReference(**{**single.__dict__, "capacity": 2})
+    launch = project_launch(reference)
+    assert launch.argv[launch.argv.index("--max-concurrency") + 1] == "2"
+    assert reference.digest() != single.digest()
 
 
 def test_projection_rejects_conflicting_target(tmp_path: Path) -> None:

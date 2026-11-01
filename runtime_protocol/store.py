@@ -5628,23 +5628,66 @@ class RealmStore:
             association_id = "managed-output-" + hashlib.sha256(
                 canonical_json(identity).encode()
             ).hexdigest()
-            self.conn.execute(
-                "INSERT OR IGNORE INTO managed_output_associations("
-                "association_id, task_id, attempt_id, project_id, output_port, group_key, "
-                "generation_id, variant_key, object_digest, manifest_digest, size, filename, "
-                "media_type, ordinal, role, producer_json, provenance_json, durability, "
-                "regeneration_json, coverage_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    association_id, str(task_id), str(attempt_id), project_id, output_port,
-                    group_key, generation_id, variant_key, digest, manifest_digest,
-                    int(output["size"]), output.get("filename", output.get("name", "output")),
-                    output.get("media_type", "application/octet-stream"), ordinal, role,
-                    canonical_json(producer), canonical_json(provenance), durability,
-                    canonical_json(output["regeneration"]) if output.get("regeneration") is not None else None,
-                    canonical_json(output["coverage"]) if output.get("coverage") is not None else None,
-                    timestamp,
-                ),
+            immutable = {
+                "task_id": str(task_id),
+                "attempt_id": str(attempt_id),
+                "project_id": project_id,
+                "output_port": output_port,
+                "group_key": group_key,
+                "generation_id": generation_id,
+                "variant_key": variant_key,
+                "object_digest": digest,
+                "manifest_digest": manifest_digest,
+                "size": int(output["size"]),
+                "filename": output.get("filename", output.get("name", "output")),
+                "media_type": output.get("media_type", "application/octet-stream"),
+                "ordinal": ordinal,
+                "role": role,
+                "producer_json": canonical_json(producer),
+                "provenance_json": canonical_json(provenance),
+                "durability": durability,
+                "regeneration_json": canonical_json(output["regeneration"]) if output.get("regeneration") is not None else None,
+                "coverage_json": canonical_json(output["coverage"]) if output.get("coverage") is not None else None,
+            }
+            output_identity = (
+                immutable["task_id"], immutable["output_port"], immutable["group_key"],
+                immutable["ordinal"], immutable["variant_key"],
             )
+            existing = self.conn.execute(
+                "SELECT * FROM managed_output_associations "
+                "WHERE task_id=? AND output_port=? AND group_key=? AND ordinal=? AND variant_key=?",
+                output_identity,
+            ).fetchone()
+            if existing is None:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO managed_output_associations("
+                    "association_id, task_id, attempt_id, project_id, output_port, group_key, "
+                    "generation_id, variant_key, object_digest, manifest_digest, size, filename, "
+                    "media_type, ordinal, role, producer_json, provenance_json, durability, "
+                    "regeneration_json, coverage_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        association_id, immutable["task_id"], immutable["attempt_id"], immutable["project_id"],
+                        immutable["output_port"], immutable["group_key"], immutable["generation_id"],
+                        immutable["variant_key"], immutable["object_digest"], immutable["manifest_digest"],
+                        immutable["size"], immutable["filename"], immutable["media_type"], immutable["ordinal"],
+                        immutable["role"], immutable["producer_json"], immutable["provenance_json"],
+                        immutable["durability"], immutable["regeneration_json"], immutable["coverage_json"], timestamp,
+                    ),
+                )
+                existing = self.conn.execute(
+                    "SELECT * FROM managed_output_associations "
+                    "WHERE task_id=? AND output_port=? AND group_key=? AND ordinal=? AND variant_key=?",
+                    output_identity,
+                ).fetchone()
+            if existing is None:
+                raise ConflictError("managed output association was not recorded")
+            changed = [field for field, value in immutable.items() if existing[field] != value]
+            if changed:
+                raise ConflictError(
+                    "managed output association conflicts with existing immutable output",
+                    details={"association_id": existing["association_id"], "fields": changed},
+                )
+            association_id = existing["association_id"]
             lifecycle_state = "temporary" if durability == "temporary" else "available"
             self.conn.execute(
                 "INSERT OR IGNORE INTO managed_output_lifecycle(association_id, state, version, expires_at, pinned_at, lease_id, lease_owner, lease_expires_at, updated_at, created_at) VALUES (?, ?, 1, NULL, NULL, NULL, NULL, NULL, ?, ?)",
@@ -7098,11 +7141,11 @@ class RealmStore:
             association_rows = self.conn.execute("SELECT * FROM managed_output_associations").fetchall()
             for association in association_rows:
                 object_row = self.conn.execute(
-                    "SELECT size, media_type FROM objects WHERE digest=?",
+                    "SELECT size FROM objects WHERE digest=?",
                     (association["object_digest"],),
                 ).fetchone()
-                if not object_row or int(object_row["size"]) != int(association["size"]) or object_row["media_type"] != association["media_type"]:
-                    relational_errors.append({"association_id": association["association_id"], "reason": "object_metadata"})
+                if not object_row or int(object_row["size"]) != int(association["size"]):
+                    relational_errors.append({"association_id": association["association_id"], "reason": "object_size"})
                 attempt = self.conn.execute(
                     "SELECT task_id FROM attempts WHERE id=?", (association["attempt_id"],)
                 ).fetchone()

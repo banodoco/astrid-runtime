@@ -62,6 +62,8 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
             if payload == {"action": "availability"}:
                 availability_queries.append(payload)
                 return {"available": True}
+            if payload.get("action") == "reconcile":
+                return {"disposition": "prepare-new"}
             calls.append(payload)
             if payload.get("action") == "accept":
                 job = {"operation_id": payload["operation_id"], "state": "accepted"}
@@ -625,6 +627,8 @@ def _admission_fixture(tmp_path, monkeypatch, launcher):
     accepted = {}
 
     def helper(_python, _agent, _runtime, payload, **_kwargs):
+        if payload.get("action") == "reconcile":
+            return {"disposition": "prepare-new"}
         if payload.get("action") == "accept":
             accepted.update(payload)
             record = {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": {
@@ -648,6 +652,51 @@ def _admission_fixture(tmp_path, monkeypatch, launcher):
 
     admission._helper = helper
     return admission, accepted, prepared
+
+
+def test_reconcile_before_manifest_and_newer_target_checks(tmp_path, monkeypatch):
+    launches = []
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: launches.append(job))
+    calls = []
+    operation_id = "c" * 32
+
+    def helper(_python, _agent, _runtime, payload, **_kwargs):
+        calls.append(payload)
+        assert payload["action"] == "reconcile"
+        return {"disposition": "continued-existing", "job": {
+            "operation_id": operation_id, "state": "launching",
+        }}
+
+    admission._helper = helper
+
+    assert admission.request() == {
+        "accepted": True, "state": "accepted", "operation_id": operation_id,
+        "message": "Update continued.",
+    }
+    assert [call["action"] for call in calls] == ["reconcile"]
+    assert prepared == []
+    assert launches == []
+
+
+def test_reconcile_terminal_result_prevents_preparation_and_new_launch(tmp_path, monkeypatch):
+    launches = []
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: launches.append(job))
+    operation_id = "d" * 32
+
+    admission._helper = lambda _python, _agent, _runtime, payload, **_kwargs: {
+        "disposition": "recovered-this-request", "job": {
+            "operation_id": operation_id, "state": "rolled_back",
+            "message": "Recovered your previous version — run Update again",
+        },
+    } if payload["action"] == "reconcile" else pytest.fail("P1 must finish before preparation")
+
+    assert admission.request() == {
+        "accepted": False, "state": "rolled_back", "operation_id": operation_id,
+        "message": "Recovered your previous version — run Update again",
+        "disposition": "recovered-this-request",
+    }
+    assert prepared == []
+    assert launches == []
 
 
 def test_lost_launcher_ack_keeps_durable_job_and_inputs_without_retry(tmp_path, monkeypatch):
@@ -690,7 +739,7 @@ def test_record_write_failure_cleans_prepared_inputs_and_never_launches(tmp_path
     assert calls == []
 
 
-def test_explicit_update_returns_agent_recovery_without_a_second_launch(tmp_path, monkeypatch):
+def test_unconfirmed_legacy_recovery_is_refused_without_a_second_launch(tmp_path, monkeypatch):
     launches = []
     admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: launches.append(job))
     real_selection = admission._selection
@@ -714,16 +763,138 @@ def test_explicit_update_returns_agent_recovery_without_a_second_launch(tmp_path
         return real_helper(python, agent, runtime, payload, **kwargs)
 
     admission._helper = helper
-    result = admission.request()
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
 
-    assert selection_calls == [{"allow_pending": True}]
-    assert helper_actions == [None, "accept"]
+    assert selection_calls == [{"allow_pending": True, "require_autostart": False}]
+    assert helper_actions == ["reconcile", None, "accept"]
     assert launches == []
-    assert result == {
-        "accepted": False, "state": "rolled_back", "operation_id": "b" * 32,
-        "message": "Recovered your previous version — run Update again",
-    }
+    assert error.value.details["reason"] == "acknowledgement-unknown"
+    assert str(error.value) == "The update result is uncertain. Check update status before taking another action."
     assert prepared and not prepared[0].exists()
+
+
+@pytest.mark.parametrize(("disposition", "outcome", "message"), [
+    ("recovered-this-request", "rolled_back", "Recovered your previous version — run Update again"),
+    ("confirmed-prior", "updated", "Astrid updated. Reload to continue."),
+])
+def test_update_route_h3_returns_confirmed_reconciliation_conflict(
+    tmp_path, monkeypatch, disposition, outcome, message,
+):
+    world = start_door_world(tmp_path)
+    operation_id = "d" * 32
+    try:
+        admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, None)
+        admission.daemon = world.daemon
+        admission._helper = lambda _python, _agent, _runtime, payload, **_kwargs: {
+            "disposition": disposition,
+            "job": {
+                "operation_id": operation_id,
+                "state": outcome,
+                "message": message,
+            },
+        } if payload["action"] == "reconcile" else pytest.fail("H3 must not prepare or launch")
+        world.daemon.update_admission = admission
+
+        response = world.call("/api/runtime/v1/update", "POST", body=b"")
+
+        assert response.status == 409
+        body = response.json()
+        assert body["code"] == "conflict"
+        assert body["message"] == message
+        assert isinstance(body["request_id"], str) and body["request_id"]
+        assert body["details"] == {
+            "kind": "update-reconciliation",
+            "disposition": disposition,
+            "operation_id": operation_id,
+            "outcome": outcome,
+            "confirmed": True,
+            "blocker": "cleared",
+            "new_admission": False,
+            "next_action": "observe",
+        }
+        assert prepared == []
+    finally:
+        world.stop()
+
+
+def test_update_route_h4_returns_recovery_refusal(tmp_path, monkeypatch):
+    world = start_door_world(tmp_path)
+    try:
+        admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, None)
+        admission.daemon = world.daemon
+        admission._helper = lambda _python, _agent, _runtime, payload, **_kwargs: {
+            "disposition": "refused",
+            "remediation": "M4",
+        } if payload["action"] == "reconcile" else pytest.fail("H4 must not prepare or launch")
+        world.daemon.update_admission = admission
+
+        response = world.call("/api/runtime/v1/update", "POST", body=b"")
+
+        assert response.status == 409
+        body = response.json()
+        assert body["code"] == "conflict"
+        assert body["message"] == "Update needs recovery. No update was launched."
+        assert isinstance(body["request_id"], str) and body["request_id"]
+        assert body["details"] == {
+            "reason": "busy",
+            "kind": "update-recovery-refusal",
+            "operation_id": None,
+            "blocker": "held",
+            "remediation": "M4",
+        }
+        assert prepared == []
+    finally:
+        world.stop()
+
+
+def test_update_route_h5_returns_uncertain_acknowledgement(tmp_path, monkeypatch):
+    world = start_door_world(tmp_path)
+    launches = []
+    try:
+        def lose_ack(job):
+            launches.append(job)
+            raise OSError("launcher response lost")
+
+        admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lose_ack)
+        admission.daemon = world.daemon
+        world.daemon.update_admission = admission
+
+        response = world.call("/api/runtime/v1/update", "POST", body=b"")
+
+        assert response.status == 409
+        body = response.json()
+        assert body["code"] == "conflict"
+        assert body["message"] == "The update result is uncertain. Check update status before taking another action."
+        assert isinstance(body["request_id"], str) and body["request_id"]
+        assert body["details"] == {
+            "reason": "acknowledgement-unknown",
+            "operation_id": None,
+            "next_action": "observe",
+        }
+        assert len(launches) == 1
+        assert prepared and prepared[0].exists()
+    finally:
+        world.stop()
+
+
+def test_update_route_preserves_frozen_accepted_response(tmp_path):
+    world = start_door_world(tmp_path)
+    accepted = {
+        "accepted": True,
+        "state": "accepted",
+        "operation_id": "c" * 32,
+        "message": "Update accepted.",
+    }
+    try:
+        world.daemon.update_admission.request = lambda: accepted
+
+        response = world.call("/api/runtime/v1/update", "POST", body=b"")
+
+        assert response.status == 202
+        assert response.json() == accepted
+    finally:
+        world.stop()
 
 
 @pytest.mark.parametrize("choice", [False, "off"])

@@ -153,8 +153,8 @@ class ProducerReads:
                     ("runtime_epoch", attempt["runtime_epoch"]), ("capability_id", task["capability"])))):
             raise _unavailable()
         digest = association["object_id"][7:]
-        obj = self.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
-        if (not obj or obj["size"] != output["size"] or obj["media_type"] != output["media_type"]
+        obj = self.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+        if (not obj or obj["size"] != output["size"]
                 or not self.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=? AND relation='managed'",
                                          (project, digest)).fetchone()):
             raise _unavailable()

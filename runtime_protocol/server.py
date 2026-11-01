@@ -495,6 +495,80 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _require_update_context(self):
         raise AuthorizationError("updates require the trusted browser door")
 
+    @staticmethod
+    def _update_operation_id(value):
+        return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) else None
+
+    def _update_uncertain(self, operation_id=None):
+        """Raise the bounded H5 response without exposing helper internals."""
+        raise ConflictError(
+            "The update result is uncertain. Check update status before taking another action.",
+            details={
+                "reason": "acknowledgement-unknown",
+                "operation_id": self._update_operation_id(operation_id),
+                "next_action": "observe",
+            },
+        )
+
+    def _update_reconciliation_response(self, result):
+        """Map a verified terminal reconciliation result to the H3 envelope.
+
+        ``UpdateAdmission`` returns this private discriminator only for the
+        route to consume. It never appears in the frozen successful POST
+        response, and malformed helper output is H5 rather than a 202.
+        """
+        if not isinstance(result, dict):
+            self._update_uncertain()
+        operation_id = self._update_operation_id(result.get("operation_id"))
+        disposition = result.get("disposition")
+        outcome = result.get("state")
+        message = result.get("message")
+        if (result.get("accepted") is not False or operation_id is None
+                or disposition not in {"recovered-this-request", "confirmed-prior"}
+                or outcome not in {"updated", "rolled_back", "failed"}
+                or not isinstance(message, str) or not message):
+            self._update_uncertain(operation_id)
+        raise ConflictError(
+            message,
+            details={
+                "kind": "update-reconciliation",
+                "disposition": disposition,
+                "operation_id": operation_id,
+                "outcome": outcome,
+                "confirmed": True,
+                "blocker": "cleared",
+                "new_admission": False,
+                "next_action": "observe",
+            },
+        )
+
+    def _update_refusal(self, refusal):
+        """Normalize only the R-11 recovery outcomes at the HTTP boundary."""
+        details = refusal.details if isinstance(refusal.details, dict) else {}
+        reason = details.get("reason")
+        operation_id = self._update_operation_id(details.get("operation_id"))
+        if reason in {
+            "acknowledgement-unknown",
+            "accept-acknowledgement-unknown",
+            "launch-acknowledgement-unknown",
+        }:
+            self._update_uncertain(operation_id)
+        if reason in {"busy", "update-busy", "installer-busy", "recovery-needed"}:
+            remediation = details.get("remediation")
+            if remediation not in {"M1", "M2", "M3", "M4", "M5", "M6", "wait"}:
+                remediation = "wait" if reason in {"update-busy", "installer-busy"} else "M1"
+            raise ConflictError(
+                "Update needs recovery. No update was launched.",
+                details={
+                    "reason": "busy",
+                    "kind": "update-recovery-refusal",
+                    "operation_id": operation_id,
+                    "blocker": "held",
+                    "remediation": remediation,
+                },
+            )
+        raise refusal
+
     def _update_route(self):
         self.close_connection = True
         self._require_update_context()
@@ -510,7 +584,15 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         admission = update_admission(self.server.daemon_runtime)
         if self.command == "GET":
             return self._send(200, admission.status())
-        return self._send(202, admission.request())
+        try:
+            result = admission.request()
+        except ConflictError as refusal:
+            self._update_refusal(refusal)
+        if isinstance(result, dict) and result.get("accepted") is False:
+            self._update_reconciliation_response(result)
+        # This is the frozen accepted/continued response. In particular, it
+        # remains 202 and its body is relayed without a route-added field.
+        return self._send(202, result)
 
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
