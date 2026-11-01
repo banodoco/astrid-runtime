@@ -198,14 +198,20 @@ WORKSPACE_ROUTES = (
     _entry("GET,POST", "/v1/projects"),
     _entry("PUT", "/v1/projects/selection"),
     _entry("GET,PATCH", "/v1/projects/:"),
-    _entry("GET", "/v1/projects/:/timelines"),
+    _entry("GET,POST", "/v1/projects/:/timelines"),
     _entry("POST", "/v1/projects/:/timelines/import"),
     _entry("GET,PATCH", "/v1/projects/:/timelines/:"),
+    _entry("POST", "/v1/projects/:/timelines/:/commit"),
+    _entry("GET", "/v1/projects/:/timelines/:/commits"),
     _entry("GET", "/v1/projects/:/timelines/:/revisions/:"),
     _entry("GET,POST", "/v1/projects/:/timelines/:/composition-revisions"),
     _entry("GET", "/v1/projects/:/timelines/:/composition-revisions/:"),
     _entry("POST", "/v1/projects/:/timelines/:/composition-revisions/:/restore"),
     _entry("POST", "/v1/projects/:/timelines/:/inspect"),
+    _entry("GET", "/v1/projects/:/media-selection"),
+    _entry("GET", "/v1/projects/:/media-selection/verified"),
+    _entry("GET", "/v1/projects/:/document-objects/verified"),
+    _entry("GET", "/v1/projects/:/document-inputs/verified"),
     _entry("GET", "/v1/projects/:/shots/:/revisions/:"),
     _entry("GET,POST", "/v1/projects/:/documents"),
     _entry("GET,PATCH", "/v1/projects/:/documents/:"),
@@ -645,17 +651,25 @@ class DoorHandler(RuntimeHandler):
 
     def _product_token(self) -> str:
         """The product credential, once the Runtime is ready to be used through it."""
-        if not self.server.accepting_authenticated_requests or not getattr(self.runtime, "_verified", False):
+        from .timeline_commit_execution import _emit_redacted_diagnostic
+
+        def unavailable(reason):
+            _emit_redacted_diagnostic(self._request_id(), reason=reason)
             raise _Refusal(503, "runtime_unavailable")
+
+        if not self.server.accepting_authenticated_requests:
+            unavailable("not_accepting")
+        if not getattr(self.runtime, "_verified", False):
+            unavailable("not_verified")
         credential = _owner_only_json(Path(self.server.door.credential_file))
         token = credential.get("token") if credential else None
         actor = credential.get("actor_id") if credential else None
         if not isinstance(token, str) or not token or not isinstance(actor, str) or not actor:
-            raise _Refusal(503, "runtime_unavailable")
+            unavailable("credential_missing")
         try:
             identity = self.server.credentials.require(token, "handshake")
         except AuthorizationError:
-            raise _Refusal(503, "runtime_unavailable") from None
+            unavailable("auth_rejected")
         if (identity.get("actor") != actor or actor in NON_PRODUCT_ACTORS
                 or tuple(sorted(identity.get("scopes", []))) not in (PRODUCT_SCOPES, LEGACY_PRODUCT_SCOPES)):
             raise _Refusal(503, "runtime_identity_mismatch")

@@ -1,16 +1,9 @@
 """Every declared skip is tied to its condition and to the CI jobs that really run the test.
 
-The workflows are parsed, not grepped: for each job the runner OSes (the matrix with its ``include`` / ``exclude``
-applied), the per-OS ``continue-on-error`` at job and at step level, the pytest commands (their ``-m`` expression,
-``-k`` expression and paths) and the triggers. For each registry entry the tests it guards are found
+The workflows are parsed, not grepped: for each job the runner OSes, the per-OS ``continue-on-error``, the pytest
+commands (their ``-m`` expression and paths) and the triggers. For each registry entry the tests it guards are found
 in the test files, and a job counts as running the entry only when its commands select such a test on a runner OS
 where the entry's condition is false.
-
-``-k`` cannot be evaluated against test names statically, so the rule is deliberately blunt: a command with ``-k`` is
-credited with a test only when the expression is a plain ``not <term>`` and ``<term>`` matches nothing about that test
-(its name, classes, file name or marks). Any other ``-k`` is never credited and is flagged by
-``test_k_filters_are_plain_exclusions``. (Parametrize ids are not visible statically; ``<term>`` is not checked
-against them.)
 """
 
 from __future__ import annotations
@@ -18,6 +11,7 @@ from __future__ import annotations
 import ast
 import re
 import shlex
+import sys
 import textwrap
 import tomllib
 from dataclasses import dataclass, field
@@ -26,8 +20,6 @@ from pathlib import Path
 import pytest
 import yaml
 from _pytest.mark.expression import Expression
-
-import sys
 
 from tests import lanes
 from tests.lanes import HOSTS, SKIP_REGISTRY, DeclaredSkip
@@ -54,7 +46,7 @@ class PytestCommand:
 class Job:
     workflow: str
     name: str
-    oses: dict[str, bool]  # OS key -> job blocking (False when job-level continue-on-error holds on every leg)
+    oses: dict[str, bool]  # OS key -> blocking (False when continue-on-error holds on it)
     commands: list[PytestCommand] = field(default_factory=list)
     triggers: set[str] = field(default_factory=set)
 
@@ -170,7 +162,8 @@ def _jobs() -> dict[str, Job]:
         triggers = data.get("on", data.get(True))  # PyYAML reads the key ``on`` as True
         triggers = {triggers} if isinstance(triggers, str) else set(triggers)
         for name, spec in data["jobs"].items():
-            assert name not in jobs, f"{workflow.name}:{name}: job name used twice"
+            where = f"{workflow.name}:{name}"
+            assert name not in jobs, f"{where}: job name used twice"
             jobs[name] = _job_from_spec(workflow.name, name, spec, triggers)
     return jobs
 
@@ -243,7 +236,7 @@ _PLAIN_EXCLUSION = re.compile(r"^\s*not\s+([A-Za-z0-9_.\-]+)\s*$", re.IGNORECASE
 
 
 def _k_keeps(expression: str, use: Use) -> bool:
-    """True only for ``-k "not <term>"`` where <term> matches nothing pytest's -k would look at on this test."""
+    """True only for ``-k \"not <term>\"`` where <term> matches nothing pytest's -k would look at on this test."""
     match = _PLAIN_EXCLUSION.match(expression)
     if not match:
         return False

@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 from runtime_protocol.errors import ConflictError, NotFoundError, ValidationError
+from runtime_protocol.timeline_commit import CommitRejected
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 from runtime_protocol.util import canonical_json
@@ -113,6 +114,26 @@ def test_import_pins_fresh_shot_text_and_is_idempotent(tmp_path):
         service.import_timeline(project, changed, idempotency_key="import-one")
 
 
+def test_import_retries_receipt_accepted_on_main_without_provenance(tmp_path):
+    service, project = _service(tmp_path)
+    prepared = _prepared(service, project, timeline="legacy-import")
+    # Main accepted this request before provenance was added to the contract.
+    original_hash = hashlib.sha256(canonical_json({
+        "project_id": project, "prepared": prepared,
+    }).encode()).hexdigest()
+    with service.store._mutex, service.store._transaction():
+        original = service._command_record(
+            "timeline.import", project, "legacy-key", original_hash,
+            {"timeline_id": "legacy-import", "new_head": "legacy-head"}, project_id=project,
+        )
+
+    assert service.import_timeline(project, prepared, idempotency_key="legacy-key") == original
+    assert service.store.conn.execute("SELECT COUNT(*) FROM timelines").fetchone()[0] == 0
+    with pytest.raises(ConflictError, match="idempotency key"):
+        service.import_timeline(project, {**prepared, "source": {"via": "app"}},
+                                idempotency_key="legacy-key")
+
+
 def test_import_accepts_minimal_prepare_binding_descriptor(tmp_path):
     service, project = _service(tmp_path)
     prepared = _prepared(service, project, text=True, timeline="minimal-pin")
@@ -141,6 +162,30 @@ def test_import_commits_unresolved_unpinned_effect_warning_and_returns_receipt(t
     assert result["data"]["missing_effects"] == [unresolved]
     assert result["data"]["different_effects"] == []
     assert service.store.conn.execute("SELECT 1 FROM timelines WHERE id=?", (prepared["timeline_id"],)).fetchone()
+
+
+@pytest.mark.parametrize("via,prepared_object", [("cli", True), ("app", False)])
+def test_import_source_and_publication_are_preserved_in_commit_history(tmp_path, via, prepared_object):
+    service, project = _service(tmp_path)
+    prepared = _prepared(service, project, timeline="source-" + via)
+    if prepared_object:
+        encoded = canonical_json(prepared).encode("utf-8")
+        object_id = _managed(service, project, encoded, "application/json", "prepared.json", "prepared-" + via)
+        body = {"prepared_object_id": object_id, "source": {"via": via}}
+    else:
+        body = {**prepared, "source": {"via": via}}
+
+    imported = service.import_timeline(project, body, idempotency_key="source-" + via)
+    history = service.list_timeline_commits(
+        project, prepared["timeline_id"], authorize=lambda: None,
+    )
+
+    assert len(history["items"]) == 1
+    entry = history["items"][0]
+    assert entry["publication_id"] == imported["data"]["new_publication_id"]
+    assert entry["revision_id"] == imported["data"]["accepted_revision_id"]
+    assert entry["source"] == {"via": via}
+    assert imported["data"]["source"] == {"via": via}
 
 
 @pytest.mark.parametrize("field,descriptor", [
@@ -191,17 +236,18 @@ def test_import_failure_rolls_back_shell_projections_bindings_documents_and_rece
     service, project = _service(tmp_path)
     prepared = _prepared(service, project, text=True, transcript=True)
     if failure_stage == "create":
-        original = service._apply_published_shot_projection
+        original = service.create_timeline
         def fail_after_create(*args, **kwargs):
             original(*args, **kwargs)
-            raise RuntimeError("fault after shell and projection")
-        monkeypatch.setattr(service, "_apply_published_shot_projection", fail_after_create)
+            raise RuntimeError("fault after shell creation")
+        monkeypatch.setattr(service, "create_timeline", fail_after_create)
     elif failure_stage == "binding":
-        original = service.set_project_shot_text_binding
+        commits, _ = service._timeline_commits()
+        original = commits._project_text_binding
         def fail_after_binding(*args, **kwargs):
             original(*args, **kwargs)
             raise RuntimeError("fault after binding")
-        monkeypatch.setattr(service, "set_project_shot_text_binding", fail_after_binding)
+        monkeypatch.setattr(commits, "_project_text_binding", fail_after_binding)
     else:
         original = service.create_document
         def fail_after_document(*args, **kwargs):
@@ -249,21 +295,22 @@ def test_import_prepared_object_success_and_project_ownership(tmp_path):
     assert service.store.conn.execute("SELECT 1 FROM timelines WHERE id='foreign-object'").fetchone() is None
 
 
-def test_import_tampered_parent_digest_reaches_normal_publisher_unchanged(tmp_path, monkeypatch):
+def test_import_tampered_parent_digest_reaches_commit_store_unchanged(tmp_path, monkeypatch):
     service, project = _service(tmp_path)
     prepared = _prepared(service, project, timeline="tampered-digest")
     publication = prepared["publication"]
     tampered = "sha256:" + "f" * 64
     publication["content_digest"] = tampered
-    original = service.publish_parent_composition
+    commits, _ = service._timeline_commits()
+    original = commits.bootstrap
     seen = {}
 
-    def observe_and_publish(project_id, timeline_id, body, *, idempotency_key):
-        seen["digest"] = body["content_digest"]
-        return original(project_id, timeline_id, body, idempotency_key=idempotency_key)
+    def observe_and_publish(project_id, timeline_id, **kwargs):
+        seen["digest"] = kwargs["document"]["parent_revision"]["content_digest"]
+        return original(project_id, timeline_id, **kwargs)
 
-    monkeypatch.setattr(service, "publish_parent_composition", observe_and_publish)
-    with pytest.raises((ConflictError, ValidationError)):
+    monkeypatch.setattr(commits, "bootstrap", observe_and_publish)
+    with pytest.raises((CommitRejected, ConflictError, ValidationError)):
         service.import_timeline(project, prepared, idempotency_key="tampered-digest-import")
 
     assert seen["digest"] == tampered
@@ -344,14 +391,15 @@ def test_import_rejects_malformed_hashable_identities_without_mutation(tmp_path,
     ).fetchone() is None
 
 
-def test_import_fault_after_normal_publication_rolls_back_all_import_metadata(tmp_path, monkeypatch):
+def test_import_fault_after_commit_store_publication_rolls_back_all_import_metadata(tmp_path, monkeypatch):
     service, project = _service(tmp_path)
     prepared = _prepared(service, project, text=True, transcript=True, timeline="publish-rollback")
-    publish = service.publish_parent_composition
+    commits, _ = service._timeline_commits()
+    publish = commits.bootstrap
     def fail_after_publish(*args, **kwargs):
         publish(*args, **kwargs)
         raise RuntimeError("fault after completed publication")
-    monkeypatch.setattr(service, "publish_parent_composition", fail_after_publish)
+    monkeypatch.setattr(commits, "bootstrap", fail_after_publish)
     key = "publish-rollback-key"
 
     with pytest.raises(RuntimeError, match="completed publication"):

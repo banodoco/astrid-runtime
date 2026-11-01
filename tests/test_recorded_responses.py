@@ -11,8 +11,11 @@ import json
 from pathlib import Path
 
 import pytest
+from astrid_runtime_client import ApiError, WorkspaceClient
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
+
+from tests.astrid_checkout import astrid_checkout
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMITTED = ROOT / "conformance" / "responses"
@@ -24,7 +27,8 @@ _spec.loader.exec_module(record_responses)
 ERROR = "common.json#/$defs/Error"
 # case -> (schema ref for the body or for each item of body["items"], validate the committed envelope's "data")
 SCHEMA_FOR = {
-    "publish_conflict_409": (ERROR, None),
+    "retired_route_410": (ERROR, None),
+    "commit_conflict_409": (ERROR, None),
     "task_admission_201": ("task.json", "data"),
     "task_read_200": ("task.json", None),
     "managed_outputs_200": ("managed-output.json", "items"),
@@ -39,7 +43,9 @@ SCHEMA_FOR = {
 @pytest.fixture(scope="module")
 def recorded(tmp_path_factory):
     out = tmp_path_factory.mktemp("responses")
-    return out, record_responses.record(out)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(str(astrid_checkout()))
+        return out, record_responses.record(out)
 
 
 def _validator(ref: str) -> Draft202012Validator:
@@ -85,3 +91,39 @@ def test_unnormalized_bodies_satisfy_their_contract_schema(recorded, case: str) 
     for value in values:
         errors = [error.message for error in validator.iter_errors(value)]
         assert not errors, f"{case}: {errors}"
+
+
+def test_recorded_retirement_and_canonical_conflict_are_distinct(recorded):
+    _, raw = recorded
+    retired, conflict = raw["retired_route_410"], raw["commit_conflict_409"]
+    assert retired["status"] == 410 and retired["body"]["code"] == "retired_route"
+    assert conflict["status"] == 409 and conflict["body"]["code"] == "conflict"
+    details = conflict["body"]["details"]
+    assert details["reason"] == "stale_head"
+    assert details["base"] != details["current"]
+
+
+@pytest.mark.parametrize("case", ["retired_route_410", "commit_conflict_409"])
+def test_product_client_preserves_recorded_errors(recorded, case):
+    out, raw = recorded
+    response = raw[case]
+    entry = json.loads((out / f"{case}.json").read_text())
+
+    def transport(method, path, headers, body):
+        assert method == entry["request"]["method"]
+        assert path.endswith("/commit" if case == "commit_conflict_409" else "/composition-revisions")
+        expected = dict(entry["request"]["body"])
+        if case == "retired_route_410":
+            expected.update(project_id="project", timeline_id="main")
+        assert json.loads(body) == expected
+        return response["status"], {}, json.dumps(response["body"]).encode()
+
+    client = WorkspaceClient("http://runtime", "token", transport=transport)
+    with pytest.raises(ApiError) as caught:
+        if case == "commit_conflict_409":
+            client.commit_timeline("project", "main", entry["request"]["body"], idempotency_key=case)
+        else:
+            client.publish_parent_composition("project", "main", entry["request"]["body"], idempotency_key=case)
+    assert caught.value.status == response["status"]
+    assert caught.value.code == response["body"]["code"]
+    assert caught.value.details == response["body"]["details"]

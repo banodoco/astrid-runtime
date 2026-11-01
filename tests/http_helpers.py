@@ -5,6 +5,12 @@ import urllib.error
 import urllib.request
 
 
+def legacy_call(client, method, path, payload, *, key=None):
+    """Raw request for a route the generated client no longer exposes (retired operations)."""
+    headers = {"Content-Type": "application/json", **({"Idempotency-Key": key} if key else {})}
+    return client._json(client._request(method, path, body=json.dumps(payload).encode(), headers=headers, expected=(200, 201))[2])
+
+
 class Api:
     """Test-only neutral HTTP actor; production bindings are generated elsewhere."""
 

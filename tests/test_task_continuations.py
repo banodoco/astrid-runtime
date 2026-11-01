@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from runtime_protocol.errors import ConflictError, LeaseError
+from runtime_protocol.errors import ConflictError, LeaseError, ValidationError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 
@@ -120,6 +120,87 @@ def _event_pages(service: RuntimeService, run_id: str):
         cursor = page["next_cursor"]
         if cursor is None:
             return events
+
+
+def test_registered_outer_producer_with_ordered_input_is_not_an_assembly_continuation(tmp_path):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
+    try:
+        project_id = service.create_project({"slug": "outer-producer", "name": "Outer producer"})["id"]
+        capability = "video_editing.sync_draft_voiceover"
+        capability_digest = _digest(capability)
+        service.register_capability({"capability_id": capability, "definition_digest": capability_digest})
+        service.register_executor(
+            {"executor_id": "outer-producer-executor", "capabilities": [capability], "max_concurrency": 1},
+            idempotency_key="outer-producer-executor",
+        )
+        object_id = service.ingest(
+            project_id,
+            b"Long new narration",
+            media_type="text/plain",
+            original_name="script.txt",
+            idempotency_key="outer-script",
+        )["data"]["digest"]
+        target = {
+            "project_id": project_id,
+            "timeline_id": "film",
+            "base_revision_id": "bootstrap-revision",
+            "base_publication_id": "bootstrap-publication",
+        }
+        descriptor = {
+            "name": "script",
+            "object_id": object_id,
+            "digest": object_id,
+            "filename": "script.txt",
+            "required": True,
+        }
+        admission = {
+            "project": project_id,
+            "capability_id": capability,
+            "capability_digest": capability_digest,
+            "input_object_ids": [object_id],
+            "execution_request": {"target": {"kind": "default"}, "inputs": [descriptor]},
+            "spec": {
+                "capability_id": capability,
+                "kind": "executor",
+                "inputs": {
+                    "project": project_id,
+                    "timeline_ref": "film",
+                    "timing_policy": "ripple",
+                    "occurrence_ids": ["o1"],
+                    "script": descriptor,
+                },
+                "runtime_dependencies": {"publication": {"admitted_target": target}},
+                "outputs": {},
+            },
+            "idempotency_key": "outer-producer-admission",
+        }
+
+        admitted = service.create_task(admission)
+        task = admitted["task"]
+        assert task["status"] == "queued"
+        assert task.get("waiting_reason") is None
+        assert task["spec"]["input_object_ids"] == [object_id]
+        assert task["spec"]["spec"]["inputs"]["script"] == descriptor
+        assert task["spec"]["spec"]["runtime_dependencies"]["publication"]["admitted_target"] == target
+        assert service.store.conn.execute("SELECT COUNT(*) FROM task_dependencies").fetchone()[0] == 0
+        assert service.store.conn.execute("SELECT COUNT(*) FROM continuation_admissions").fetchone()[0] == 0
+
+        before = list(service.store.conn.iterdump())
+        malformed = {
+            **admission,
+            "idempotency_key": "outer-producer-malformed",
+            "spec": {
+                **admission["spec"],
+                "runtime_dependencies": {"publication": {"admitted_target": target, "scope": "project"}},
+            },
+        }
+        with pytest.raises(ValidationError, match="exactly two ordered dependency edges"):
+            service.create_task(malformed)
+        assert list(service.store.conn.iterdump()) == before
+    finally:
+        service.close()
 
 
 def test_out_of_order_completion_admits_once_in_declared_order_and_paginates(tmp_path):

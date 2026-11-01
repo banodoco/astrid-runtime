@@ -4,20 +4,85 @@ import copy
 import hashlib
 import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from precut_realm_fixture import FIXTURE_BACKUP_KEY, _extract_archive
+from runtime_protocol.backup import restore_backup, verify_backup
 from runtime_protocol.errors import ConflictError, NotFoundError, ValidationError
 from runtime_protocol.managed_render_snapshot import ShotExpansionError, expand_shot_clips
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
+from runtime_protocol.timeline_commit_store import TimelineCommitStore, digest, request_identity
+from runtime_protocol.timeline_commit_validation import validate_commit_value
 from runtime_protocol.util import canonical_json
 
 
 def _digest(value: bytes | str) -> str:
     raw = value.encode() if isinstance(value, str) else value
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _admit_timeline(service, project_id, timeline, *, idempotency_key):
+    """Host acceptance fixture, without claiming Agent command/compiler semantics.
+
+    Keep the original raw config/registry, including incomplete editor shapes.
+    Runtime's real acceptance store checks the closure, media custody and schema,
+    and writes the publication/history/receipt; no legacy writer installs rows.
+    """
+    timeline_id = timeline["timeline_id"]
+    service.create_timeline(project_id, timeline_id, name=timeline.get("name"), idempotency_key=idempotency_key)
+    commits = TimelineCommitStore(service.store, validate_prepared=lambda value: validate_commit_value(value, "PreparedCommit"))
+    head = commits.bootstrap(project_id, timeline_id, authorize=lambda: None)
+    document = commits.revision_closure(project_id, timeline_id, head["revision_id"])
+    parent = document["parent_revision"]
+    before = copy.deepcopy(parent["payload"])
+    parent["payload"] = {
+        "config": copy.deepcopy(timeline["config"]),
+        "registry": copy.deepcopy(timeline["registry"]),
+        "clips": copy.deepcopy(timeline["config"].get("clips", [])),
+        "occurrences": [],
+    }
+    parent["revision_id"] = "direct-render-" + timeline_id
+    parent["content_digest"] = digest(parent["payload"])
+    # Only the long-render case uses a CAS media_id. Opaque IDs in the other
+    # registries retain their separate content_sha256 binding exactly as authored.
+    media_ids = sorted({asset["media_id"] for asset in timeline["registry"].get("assets", {}).values()
+                        if asset.get("media_id", "").startswith("sha256:")})
+    document["dependency_manifest"]["media"] = [{"media_id": value, "content_digest": value} for value in media_ids]
+    command = {"schema_version": 1, "op": "fixture.direct-render-source", "version": "1", "select": None, "args": {}}
+    request = {"api_version": 1, "project_id": project_id, "timeline_id": timeline_id,
+               "base_revision_id": head["revision_id"], "base_publication_id": head["publication_id"], "commands": [command]}
+    context = {"request": request, "invocation": {"operation": "commitTimeline",
+               "path": f"/v1/projects/{project_id}/timelines/{timeline_id}/commit", "body": copy.deepcopy(request)},
+               "idempotency_key": idempotency_key + "-source", "realm_id": service.realm["id"], "publisher": "host-render-fixture"}
+    context["request_hash"] = request_identity(context)
+    record = {"ordinal": 0, "command": command, "writes": [
+        {"ref": "parent", "path": [key], "before": {"state": "present", "value": before[key]},
+         "after": {"state": "present", "value": value}} for key, value in parent["payload"].items()
+    ], "reads": [], "selections": [], "bindings": [], "created": [], "dependencies": [], "derived_writes": []}
+    accepted = commits.accept(context, {
+        "expected_head": head, "canonical_document": document, "document_digest": digest(document),
+        "records": {"schema_version": 1, "commands": [record], "undo_of": [], "restored_from": None},
+        "id_map": {}, "semantic_events": [], "provider_version": "host-render-fixture", "compiler_version": "host-render-fixture",
+    }, authorize=lambda: None)
+    assert accepted["data"]["status"] == "accepted"
+    pinned = service.get_project_parent_composition_revision(project_id, timeline_id, accepted["data"]["accepted_revision_id"])
+    assert pinned["payload"] == parent["payload"]
+    return service.get_project_timeline(project_id, timeline_id)["version"]
+
+
+def _legacy_shot_service(tmp_path, label):
+    """Restore authenticated M1 API bytes; M2 never saves these invalid shapes."""
+    archive = Path(__file__).with_name("fixtures") / f"precut-direct-render-{label}-v31.tar.gz"
+    backup = _extract_archive(tmp_path / "legacy-archive", archive)
+    assert verify_backup(backup, key=FIXTURE_BACKUP_KEY)["manifest"]["schema"]["version"] == 31
+    root = tmp_path / "realm"
+    restore_backup(backup, root, key=FIXTURE_BACKUP_KEY)
+    service = RuntimeService(root)
+    return service, service.list_projects()["items"][0]["project_id"]
 
 
 def test_direct_managed_render_admission_freezes_snapshot_before_claim(tmp_path):
@@ -44,7 +109,7 @@ def test_direct_managed_render_admission_freezes_snapshot_before_claim(tmp_path)
             "config": {"clips": [{"id": "source", "type": "video"}]},
             "registry": {"assets": {"source": {"media_id": "media-source", "content_sha256": source_id}}},
         }
-        service.create_timeline_document(project["id"], timeline, idempotency_key="timeline")
+        config_version = _admit_timeline(service, project["id"], timeline, idempotency_key="timeline")
 
         admitted = service.create_task({
             "project": project["id"],
@@ -57,7 +122,7 @@ def test_direct_managed_render_admission_freezes_snapshot_before_claim(tmp_path)
                 "family": "render",
                 "params": {
                     "timeline_ref": "main",
-                    "expected_version": 1,
+                    "expected_version": config_version,
                     "selector": "rendering.remotion",
                 },
             },
@@ -78,7 +143,7 @@ def test_direct_managed_render_admission_freezes_snapshot_before_claim(tmp_path)
         assert admitted_spec["inputs"]["selector"] == "rendering.remotion"
         assert admitted_spec["inputs"]["timeline_authority"]["project_id"] == project["id"]
         assert admitted_spec["inputs"]["timeline_authority"]["project_slug"] == "managed-render"
-        assert admitted_spec["inputs"]["timeline_authority"]["config_version"] == 1
+        assert admitted_spec["inputs"]["timeline_authority"]["config_version"] == config_version
         assert admitted_spec["inputs"]["timeline_authority"]["managed_media_admissions"] == {"media-source": source_id}
         assert task["spec"]["input_object_ids"] == [source_id, snapshot_ref["digest"]]
         assert task["spec"]["storage_estimate"]["scratch_bytes"] >= 128 * 1024 * 1024
@@ -120,7 +185,7 @@ def test_direct_long_render_admission_budgets_current_fallback(tmp_path, monkeyp
             ]}
         if alpha_mode == "stamp":
             timeline_config["metadata"] = {"astrid_layer": {"alpha": True}}
-        service.create_timeline_document(project["id"], {
+        _admit_timeline(service, project["id"], {
             "timeline_id": "main", "slug": "main",
             "config": timeline_config,
             "registry": {"assets": {"source": {
@@ -210,7 +275,8 @@ def test_direct_managed_render_rejects_stale_scope_and_path_injection(tmp_path):
     service = RuntimeService(root)
     try:
         project = service.create_project({"slug": "managed-render", "name": "Managed Render"}, idempotency_key="project")
-        service.create_timeline_document(
+        config_version = _admit_timeline(
+            service,
             project["id"],
             {"timeline_id": "main", "slug": "main", "config": {}, "registry": {}},
             idempotency_key="timeline",
@@ -220,7 +286,7 @@ def test_direct_managed_render_rejects_stale_scope_and_path_injection(tmp_path):
             "project": project["id"],
             "capability_id": "rendering.render",
             "capability_digest": capability_digest,
-            "spec": {"params": {"timeline_ref": "main", "expected_version": 2}},
+            "spec": {"params": {"timeline_ref": "main", "expected_version": config_version + 1}},
         }
         with pytest.raises(ConflictError, match="expected_version"):
             service.create_task(body)
@@ -257,72 +323,10 @@ def test_direct_managed_render_rejects_stale_scope_and_path_injection(tmp_path):
 
 
 def test_direct_managed_render_rejects_legacy_shot_before_claim(tmp_path):
-    root = tmp_path / "realm"
-    RealmStore.initialize(root).close()
-    service = RuntimeService(root)
+    service, project_id = _legacy_shot_service(tmp_path, "legacy-shot")
+    project = {"id": project_id}
     try:
         capability_digest = _digest("rendering.render")
-        service.register_capability({
-            "capability_id": "rendering.render",
-            "definition_digest": capability_digest,
-        })
-        project = service.create_project({"slug": "shot-render", "name": "Shot Render"}, idempotency_key="project")
-        source = service.ingest(project["id"], b"shot-source", media_type="video/mp4", idempotency_key="source")
-        source_id = source["data"]["object_id"]
-
-        service.create_timeline_document(
-            project["id"],
-            {
-                "timeline_id": "shot-child",
-                "slug": "shot-child",
-                "config": {
-                    "clips": [{
-                        "id": "child-clip",
-                        "at": 0,
-                        "hold": 2,
-                        "track": "visual",
-                        "clipType": "media",
-                        "asset": "child-source",
-                    }],
-                },
-                "registry": {
-                    "assets": {
-                        "child-source": {
-                            "media_id": "media-child",
-                            "content_sha256": source_id,
-                        },
-                    },
-                },
-            },
-            idempotency_key="child-timeline",
-        )
-        service.create_project_shot(
-            project["id"],
-            {"shot_id": "shot-1", "name": "Opening shot"},
-            idempotency_key="shot",
-        )
-        service.create_timeline_document(
-            project["id"],
-            {
-                "timeline_id": "main",
-                "slug": "main",
-                "config": {
-                    "clips": [{
-                        "id": "shot-clip",
-                        "at": 1,
-                        "hold": 3,
-                        "track": "visual",
-                        "clipType": "shot",
-                        "params": {
-                            "shot_id": "shot-1",
-                            "timeline_document_id": "shot-child",
-                        },
-                    }],
-                },
-                "registry": {"assets": {}},
-            },
-            idempotency_key="parent-timeline",
-        )
 
         with pytest.raises(ConflictError, match="legacy clipType 'shot'"):
             service.create_task({
@@ -359,7 +363,8 @@ def test_direct_managed_render_accepts_root_static_image_hold(tmp_path):
         project = service.create_project({"slug": "overlay-render", "name": "Overlay Render"}, idempotency_key="project")
         overlay = service.ingest(project["id"], b"overlay-png", media_type="image/png", idempotency_key="overlay")
         overlay_id = overlay["data"]["object_id"]
-        service.create_timeline_document(
+        _admit_timeline(
+            service,
             project["id"],
             {
                 "timeline_id": "main",
@@ -412,49 +417,10 @@ def test_direct_managed_render_accepts_root_static_image_hold(tmp_path):
 
 
 def test_direct_managed_render_rejects_nested_shot_before_queueing(tmp_path):
-    root = tmp_path / "realm"
-    RealmStore.initialize(root).close()
-    service = RuntimeService(root)
+    service, project_id = _legacy_shot_service(tmp_path, "nested-shot")
+    project = {"id": project_id}
     try:
         capability_digest = _digest("rendering.render")
-        service.register_capability({
-            "capability_id": "rendering.render",
-            "definition_digest": capability_digest,
-        })
-        project = service.create_project({"slug": "nested-shot", "name": "Nested Shot"}, idempotency_key="project")
-        service.create_timeline_document(
-            project["id"],
-            {
-                "timeline_id": "child",
-                "slug": "child",
-                "config": {"clips": [{
-                    "id": "nested",
-                    "clipType": "shot",
-                    "at": 0,
-                    "hold": 1,
-                    "params": {"shot_id": "nested", "timeline_document_id": "missing"},
-                }]},
-                "registry": {"assets": {}},
-            },
-            idempotency_key="child",
-        )
-        service.create_project_shot(project["id"], {"shot_id": "outer", "name": "Outer"}, idempotency_key="outer")
-        service.create_timeline_document(
-            project["id"],
-            {
-                "timeline_id": "main",
-                "slug": "main",
-                "config": {"clips": [{
-                    "id": "outer-clip",
-                    "clipType": "shot",
-                    "at": 0,
-                    "hold": 1,
-                    "params": {"shot_id": "outer", "timeline_document_id": "child"},
-                }]},
-                "registry": {"assets": {}},
-            },
-            idempotency_key="main",
-        )
 
         with pytest.raises(ConflictError, match="legacy clipType 'shot'"):
             service.create_task({

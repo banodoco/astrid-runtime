@@ -327,6 +327,8 @@ def relocate(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCo
                     platform.replace_path(entry, new_support / entry.name)
                     merged_aux.append(entry)
                     platform.flush_replace(entry, new_support / entry.name)
+            from runtime_protocol.v33_lifecycle import rebind_after_relocation
+            rebind_after_relocation(new_support / Path(str(realm["data_root"])).relative_to(old_support), Path(str(realm["data_root"])))
             # The renamed bootstrap.lock is the same inode we already hold.
             # Calling bootstrap() would acquire it again and deadlock.
             relocated_source = replace(source, runtime_environment=_rewrite_path(source.runtime_environment, old_support, new_support))
@@ -393,6 +395,8 @@ def relocate(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCo
                 })
                 if flush_errors:
                     raise RelocationError("rollback rename durability is uncertain") from flush_errors[0]
+                from runtime_protocol.v33_lifecycle import rebind_after_relocation
+                rebind_after_relocation(Path(str(realm["data_root"])), new_support / Path(str(realm["data_root"])).relative_to(old_support))
                 restored = _bootstrap_locked(paths, boundary, config)
                 if not restored.ready or restored.realm_id != realm_id:
                     raise RelocationError("old owner could not be restored after relocation failure")

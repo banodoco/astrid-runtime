@@ -480,7 +480,7 @@ def test_successor_accept_and_trickled_frame_share_absolute_budget(monkeypatch, 
         return result
     monkeypatch.setattr(relay._DeadlineIO, "_call", observe)
     errors = []
-    with tempfile.TemporaryDirectory(prefix="i05-succ-") as root:
+    with tempfile.TemporaryDirectory(prefix="i05-succ-", dir="/tmp") as root:
         listener = handoff.HandoffSuccessorListener.__new__(handoff.HandoffSuccessorListener)
         listener.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.socket.settimeout(0.2); listener.timeout = 0.2

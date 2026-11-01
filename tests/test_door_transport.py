@@ -52,6 +52,24 @@ def _assert_health_answers(world):
     raise AssertionError("door did not answer health after the abandoned connection")
 
 
+def _read_complete_audit_lines(path, expected_count):
+    """Wait briefly for handler-finally audit writes that follow the HTTP response."""
+    deadline = time.monotonic() + 1.0
+    raw = ""
+    while True:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw = ""
+        if raw.endswith("\n"):
+            lines = [json.loads(line) for line in raw.splitlines()]
+            if len(lines) >= expected_count:
+                return lines
+        if time.monotonic() >= deadline:
+            return [json.loads(line) for line in raw.splitlines()]
+        time.sleep(0.01)
+
+
 # 1. Admission order -----------------------------------------------------------
 
 def test_admission_order_host_origin_and_route(tmp_path):
@@ -504,17 +522,7 @@ def test_audit_lines_without_credentials(tmp_path):
         assert world.call(object_path).status == 200
         assert world.call(f"{API_RUNTIME}/v1/health", origin=EVIL).status == 403
 
-        deadline = time.monotonic() + 10
-        while True:
-            audit_text = audit.read_text(encoding="utf-8") if audit.exists() else ""
-            audit_lines = audit_text.splitlines()
-            if audit_text.count("\n") >= 3:
-                break
-            if time.monotonic() >= deadline:
-                pytest.fail(f"expected 3 audit lines within 10 seconds, found {len(audit_lines)}")
-            time.sleep(0.01)
-
-        lines = [json.loads(line) for line in audit_lines]
+        lines = _read_complete_audit_lines(audit, 3)
         for entry in lines:
             assert set(entry) == {"at", "method", "path", "origin", "status", "response_bytes"}
 

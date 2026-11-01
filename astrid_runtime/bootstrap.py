@@ -978,6 +978,11 @@ def _validated_matching_owner_identity(
 
 
 def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig) -> BootstrapResult:
+    upgrade_journal = _read_support_json(paths.runtime_support / "upgrade-journal.json")
+    if (upgrade_journal and upgrade_journal.get("operation") == "astrid-runtime-upgrade/v1"
+            and upgrade_journal.get("state") not in {"complete", "rolled_back", "failed"}
+            and os.environ.get("ASTRID_V33_OPERATOR_OPERATION") != upgrade_journal.get("operation_id")):
+        raise BootstrapError("An upgrade is incomplete; use astrid-runtime upgrade --recover before starting this installation.")
     if config.profile != "astrid":
         raise BootstrapError("Stage 1 supports only the astrid profile.")
     source = config.resolve_source_profile(paths)

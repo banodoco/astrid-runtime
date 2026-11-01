@@ -121,6 +121,44 @@ def test_custody_wrapper_enables_utf8_before_isolation():
     assert result.stdout.strip() == "1"
 
 
+def test_default_product_runtime_argv_forwards_validated_authoring_profile(tmp_path):
+    profile = SourceProfile(profile="astrid", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path))
+    argv = LocalRuntimeBoundary()._argv(
+        profile,
+        realm_id="realm",
+        realm_root=tmp_path / "realm",
+        support_root=tmp_path / "support",
+        display_name="Astrid Workspace",
+        owner_lock=tmp_path / "support" / "instance.lock",
+        token_file=tmp_path / "support" / "bootstrap-token",
+    )
+
+    assert argv[argv.index("--authoring-profile") + 1] == "astrid"
+
+
+def test_default_product_runtime_argv_rejects_unmapped_authoring_profile(tmp_path):
+    profile = SourceProfile(profile="unknown", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path))
+
+    with pytest.raises(BootstrapError, match="no supported Runtime authoring profile"):
+        LocalRuntimeBoundary()._argv(
+            profile,
+            realm_id="realm",
+            realm_root=tmp_path / "realm",
+            support_root=tmp_path / "support",
+            display_name="Astrid Workspace",
+            owner_lock=tmp_path / "support" / "instance.lock",
+            token_file=tmp_path / "support" / "bootstrap-token",
+        )
+
+
+def test_direct_runtime_defaults_remain_neutral(tmp_path):
+    from runtime_protocol.cli import _parser
+    from runtime_protocol.daemon import RuntimeDaemon
+
+    assert _parser().parse_args(["start"]).authoring_profile == "neutral"
+    assert RuntimeDaemon(tmp_path / "realm").authoring_profile is None
+
+
 def test_worker_profile_is_validated_through_installed_source_boundary(tmp_path):
     worker_profile = tmp_path / "worker-profile.json"
     worker_profile.write_text("{}")

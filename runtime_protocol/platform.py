@@ -19,6 +19,7 @@ import ctypes
 import errno
 import hashlib
 import os
+import re
 from pathlib import Path
 import signal
 import stat
@@ -26,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 from . import cancellation
 
@@ -584,6 +586,8 @@ def process_identity(pid: int, *, timeout: float = 1.0):
             pass
         raw = (root / "stat").read_text()
         fields = raw.rsplit(")", 1)[1].split()
+        if not fields[19].isascii() or not fields[19].isdigit():
+            raise ValueError("invalid process start tick")
         value = {"pid": pid, "uid": root.stat().st_uid, "parent_pid": int(fields[1]),
                  "birth_id": f"proc-start-ticks:{fields[19]}{scope}", "process_group": int(fields[2]), "session_id": int(fields[3])}
         second = (root / "stat").read_text().rsplit(")", 1)[1].split()
@@ -599,24 +603,49 @@ def process_identity(pid: int, *, timeout: float = 1.0):
 
 
 def process_birth_matches(expected: str, actual: str) -> bool | None:
-    """Compare native births, accepting pre-scope Linux owner records.
+    """Compare Linux birth encodings; missing scope is not proof of death."""
+    def linux_birth(value):
+        if value.startswith("proc-start-ticks:"):
+            tick, *parts = value[len("proc-start-ticks:"):].split(";")
+            if not tick.isascii() or not tick.isdigit():
+                return None
+            scope = {}
+            for part in parts:
+                key, sep, val = part.partition(":")
+                if not sep or key not in {"boot", "pidns"} or not val or key in scope:
+                    return None
+                scope[key] = val
+            return tick, scope
+        boot, sep, tick = value.partition(":")
+        if sep and tick.isascii() and tick.isdigit():
+            try:
+                if str(uuid.UUID(boot)) == boot:
+                    return tick, {"boot": boot}
+            except ValueError:
+                pass
+        return None
 
-    None means scope could not be observed, never evidence for reclamation.
-    Legacy records cannot prove a reboot/namespace change with equal ticks.
-    """
-    if expected.startswith("proc-start-ticks:") and actual.startswith("proc-start-ticks:"):
-        old_tick, _, old_scope = expected.partition(";")
-        new_tick, _, new_scope = actual.partition(";")
-        if old_tick != new_tick:
-            return False
-        expected_scope = dict(part.split(":", 1) for part in old_scope.split(";") if ":" in part)
-        actual_scope = dict(part.split(":", 1) for part in new_scope.split(";") if ":" in part)
-        if any(actual_scope[key] != value for key, value in expected_scope.items() if key in actual_scope):
-            return False
-        if any(key not in actual_scope for key in expected_scope):
-            return None
-        return True
-    return expected == actual
+    if not expected or not actual:
+        return None
+    left, right = linux_birth(expected), linux_birth(actual)
+    linux_like = lambda value: value.startswith("proc-start-ticks:") or bool(re.match(r"^[0-9a-fA-F-]{36}:", value))
+    if left is None or right is None:
+        return None if linux_like(expected) or linux_like(actual) else expected == actual
+    old_tick, old_scope = left
+    new_tick, new_scope = right
+    # Birth strings alone cannot establish missing PID-coordinate scope.
+    # In particular, Timeline's boot:tick encoding carries no namespace.
+    if not all(scope.get("boot") and scope.get("pidns") for scope in (old_scope, new_scope)):
+        return None
+    if old_scope.get("pidns") and new_scope.get("pidns") and old_scope["pidns"] != new_scope["pidns"]:
+        return None
+    if old_scope.get("boot") and new_scope.get("boot") and old_scope["boot"] != new_scope["boot"]:
+        return False
+    if not old_scope.get("boot") or not new_scope.get("boot"):
+        return None
+    if old_tick != new_tick:
+        return False
+    return True
 
 
 def process_executable(pid: int) -> str:
@@ -1149,7 +1178,11 @@ def pidfd_open(pid: int, flags: int = 0) -> int:
         raise NotImplementedError("identity-safe process signaling requires Linux pidfd support")
     opener = getattr(os, "pidfd_open", None)
     if opener is not None:
-        return opener(pid, flags)
+        try:
+            return opener(pid, flags)
+        except TypeError:
+            # Keep compatibility with narrow test doubles and older wrappers.
+            return opener(pid)
     return _linux_pidfd_syscall("pidfd_open", pid, flags)
 
 

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from tests import lanes
+
 pytest_plugins = ["pytester"]
 
 REPO = Path(__file__).resolve().parent.parent
@@ -57,6 +59,37 @@ def test_skip_mark_importorskip_and_xfail_fail_the_run(sandbox):
         "UNDECLARED SKIP *::test_unknown_tag: *",
         "UNDECLARED SKIP *::test_xfail: xfail is not allowed*",
     ])
+
+
+@pytest.mark.parametrize("variant", ["new-node", "moved-function", "new-parameter", "changed-reason", "missing-reason"])
+def test_xfail_reason_does_not_authorize_a_different_node_or_contract(sandbox, variant):
+    reason = lanes.DECLARED_XFAILS["runtime-domains-update"].reason
+    if variant == "new-node":
+        marker = f'pytest.mark.xfail(strict=True, raises=RuntimeError, reason={reason!r})'
+        test = f"@{marker}\ndef test_new_node(): raise RuntimeError('known')"
+    elif variant == "moved-function":
+        marker = f'pytest.mark.xfail(strict=True, raises=RuntimeError, reason={reason!r})'
+        test = f"@{marker}\ndef test_generated_direct_timeline_shot_reference_writers_remain_retired_moved(): raise RuntimeError('known')"
+    elif variant == "new-parameter":
+        test = (
+            "@pytest.mark.parametrize('case', [pytest.param('new', marks=pytest.mark.xfail("
+            f"strict=True, raises=RuntimeError, reason={reason!r}))])\n"
+            "def test_generated_direct_timeline_shot_reference_writers_remain_retired(case): raise RuntimeError('known')"
+        )
+    elif variant == "changed-reason":
+        marker = f'pytest.mark.xfail(strict=True, raises=RuntimeError, reason={(reason + " changed")!r})'
+        test = f"@{marker}\ndef test_generated_direct_timeline_shot_reference_writers_remain_retired(): raise RuntimeError('known')"
+    else:
+        test = "@pytest.mark.xfail(strict=True, raises=RuntimeError)\ndef test_generated_direct_timeline_shot_reference_writers_remain_retired(): raise RuntimeError('known')"
+    result = _run(sandbox, f"import pytest\n{test}\ndef test_control(): pass\n")
+    assert result.ret != 0
+    result.stdout.fnmatch_lines(["UNDECLARED SKIP *xfail is not allowed*"])
+
+
+def test_xfail_declarations_are_immutable_and_semantic():
+    # Nine: 09a106f0 declared p1-top-level-text-hook as the ninth strict xfail.
+    assert len(lanes.DECLARED_XFAILS) == 9
+    assert all(spec.strict is True and spec.nodeids and spec.reason and spec.raises for spec in lanes.DECLARED_XFAILS.values())
 
 
 def _foreign_helper() -> str:
@@ -141,18 +174,17 @@ def test_a_skip_raised_in_a_fixture_teardown_fails_the_run(sandbox):
 
 
 def test_a_declared_skip_raised_in_a_fixture_teardown_is_listed(sandbox):
-    name = "windows-security" if sys.platform != "win32" else "posix-process-groups"  # its condition holds on this host
-    result = _run(sandbox, f"""
+    result = _run(sandbox, """
         import pytest
         @pytest.fixture
         def late():
             yield
-            pytest.skip("[declared:{name}] declared reason")
+            pytest.skip("[declared:windows-security] native Windows socket exclusivity and file DACL APIs")
         def test_a(late): pass
         def test_b(): pass
         """)
     assert result.ret == 0, result.stdout.str()
-    result.stdout.fnmatch_lines(["declared skips (1):", f"  SKIP *::test_a: [[]declared:{name}]*"])
+    result.stdout.fnmatch_lines(["declared skips (1):", "  SKIP *::test_a: [[]declared:windows-security]*"])
 
 
 def test_skips_of_non_blocking_entries_are_listed_under_their_own_header(sandbox):

@@ -493,3 +493,47 @@ def test_discovery_grant_closed_schema_and_source_budget_parity() -> None:
                 {**grant, "capability_digest": "a" * 64}, {**grant, "capability_digest": "unpinned"},
                 {**grant, "limits": {}}, {**grant, "limits": {**grant["limits"], "extra": 1}}):
         assert list(validator.iter_errors({**policy, "discovery_grant": bad}))
+
+
+@pytest.mark.parametrize("selector", [
+    {"project_id": "P", "timeline_id": "T", "revision_id": "A", "publication_id": "receipt-A", "content_digest": "sha256:" + "a" * 64},
+    None, {}, {"revision_id": "A"},
+    {"project_id": "P", "timeline_id": "T", "revision_id": "A", "publication_id": "receipt-A", "content_digest": "sha256:" + "a" * 64, "extra": True},
+])
+def test_historical_selector_source_schema_is_closed_and_optional(selector):
+    admission, _ = _execution_wire_validators()
+    body = {"capability_id": "rendering.render", "capability_digest": "sha256:" + "b" * 64,
+            "input_object_ids": [], "project": "P",
+            "spec": {"family": "render", "params": {"timeline_ref": "T"}}}
+    assert not list(admission.iter_errors(body))
+    body["spec"]["params"]["canonical_revision"] = selector
+    valid = isinstance(selector, dict) and set(selector) == {"project_id", "timeline_id", "revision_id", "publication_id", "content_digest"}
+    assert bool(list(admission.iter_errors(body))) is not valid
+
+
+def test_historical_handshake_uses_existing_capabilities_schema(tmp_path):
+    from runtime_protocol.service import RuntimeService
+    from runtime_protocol.store import RealmStore
+
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
+    try:
+        value = service.handshake({"authenticated_actor": "client", "authenticated_scopes": ["tasks:write"],
+                                   "requested_scopes": ["tasks:write"]})
+        assert "execution_binding.targeted.v1" in value["capabilities"]
+        assert "rendering.render.historical_revision.v1" in value["capabilities"]
+        external = json.loads((ROOT / "contract/schemas/handshake-response.json").read_text())
+        inline = yaml.safe_load((ROOT / "contract/openapi/workspace-v1.yaml").read_text())["components"]["schemas"]["HandshakeResponse"]
+        assert not list(Draft202012Validator(external).iter_errors(value))
+        assert not list(Draft202012Validator(inline).iter_errors(value))
+    finally:
+        service.close()
+
+
+
+def test_historical_source_preserves_other_capabilities_opaque_spec_params():
+    admission, _ = _execution_wire_validators()
+    body = {"capability_id": "other.capability", "capability_digest": "sha256:" + "b" * 64,
+            "input_object_ids": [], "spec": {"family": "other", "params": [None, "opaque", 3]}}
+    assert not list(admission.iter_errors(body))

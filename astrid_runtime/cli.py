@@ -131,6 +131,7 @@ def parser() -> argparse.ArgumentParser:
 
     upgrade = sub.add_parser("upgrade", help="stop, upgrade/reconcile, verify, and optionally relocate the Astrid runtime")
     _profile_args(upgrade, data_root_required=True)
+    upgrade.add_argument("--recover", action="store_true", help="restore the full matching pre-admission recovery set and prior executable")
     upgrade.add_argument("--destination", type=Path, help="optional support root for the verified relocation cutover")
     upgrade.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS, help="bounded offline upgrade/reconciliation budget in seconds")
 
@@ -610,9 +611,13 @@ def main(argv: list[str] | None = None) -> int:
             _emit(result, json_mode=args.json)
             return 0
         if args.command == "upgrade":
-            from .operator_upgrade import upgrade_workspace
+            from .operator_upgrade import upgrade_workspace, recover_workspace
 
             config = _config(args, paths)
+            if args.recover:
+                result = recover_workspace(paths, LocalRuntimeBoundary(), config, timeout_seconds=args.timeout)
+                _emit(result, json_mode=args.json)
+                return 0
             result = upgrade_workspace(
                 paths, LocalRuntimeBoundary(), config,
                 destination=args.destination, timeout_seconds=args.timeout,

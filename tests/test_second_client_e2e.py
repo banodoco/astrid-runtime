@@ -8,9 +8,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from runtime_protocol.daemon import RuntimeDaemon, WORKER_ACTOR
+from runtime_protocol.daemon import WORKER_ACTOR, RuntimeDaemon
 from runtime_protocol.store import RealmStore
-
 
 ROOT = Path(__file__).parents[1]
 FIXTURE = ROOT / "conformance" / "second-client-core-v1.yaml"

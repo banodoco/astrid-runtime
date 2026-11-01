@@ -11,9 +11,51 @@ import pytest
 from tests.runtime_credentials import provision_executor_token
 
 from astrid_runtime_client import ApiError, WorkspaceClient
+from http_helpers import legacy_call
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.errors import RetiredRouteError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
+
+
+class _RetiredTimelineUpdate(ApiError):
+    """Marker for the one direct timeline writer expected to remain retired."""
+
+
+class _RetiredTimelinePublication(ApiError):
+    """Marker for the retired timeline publication call expected to remain retired."""
+
+
+def _retired_timeline_update(client, payload):
+    try:
+        return legacy_call(client, "PATCH", "/v1/timelines/timeline", payload, key="timeline-update")
+    except ApiError as error:
+        if (
+            error.status == 410
+            and error.code == "retired_route"
+            and error.message == "legacy timeline writes are retired; submit EditCommands through commitTimeline"
+            and error.details.get("reason") == "timeline_commit_required"
+        ):
+            raise _RetiredTimelineUpdate(
+                error.status, error.code, error.message, error.request_id, error.details
+            ) from error
+        raise
+
+
+def _retired_timeline_publication(client, timeline_id, payload):
+    try:
+        return legacy_call(client, "PATCH", f"/v1/timelines/{timeline_id}", payload, key=f"{timeline_id}-update")
+    except ApiError as error:
+        if (
+            error.status == 410
+            and error.code == "retired_route"
+            and error.message == "legacy timeline writes are retired; submit EditCommands through commitTimeline"
+            and error.details.get("reason") == "timeline_commit_required"
+        ):
+            raise _RetiredTimelinePublication(
+                error.status, error.code, error.message, error.request_id, error.details
+            ) from error
+        raise
 
 
 def _digest(value: str) -> str:
@@ -190,14 +232,6 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
             client.update_document(project.project_id, "doc-1", expected_version=1, idempotency_key="doc-1-stale", content={"text": "three"})
         assert stale_document.value.status == 409
 
-        timeline = client.create_timeline(project.project_id, "timeline-1", idempotency_key="timeline-1")
-        assert timeline["version"] == 1
-        saved = client.update_timeline("timeline-1", expected_version=1, idempotency_key="timeline-1-update", shots=[{"shot_id": "shot-1", "start_ms": 0, "duration_ms": 1000, "reference_ids": []}])
-        assert saved["version"] == 2 and saved["shots"][0]["shot_id"] == "shot-1"
-        with pytest.raises(ApiError) as stale_timeline:
-            client.update_timeline("timeline-1", expected_version=1, idempotency_key="timeline-1-stale", shots=[])
-        assert stale_timeline.value.status == 409
-
         object_row = client.ingest_object(b"variant", media_type="application/octet-stream", idempotency_key="variant-object")
         # Generated clients retain these wire methods, but publication now
         # requires an admitted settlement effect rather than direct mutation.
@@ -226,6 +260,64 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         assert failed.task_id == failed_task.task_id and failed.state == "failed"
         events, _cursor = client.list_run_events(failed_task.run_id)
         assert events[-1].event_type == "task.failed"
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=_RetiredTimelinePublication,
+    reason="[declared-xfail:runtime-domains-publication] RT02/D04 held: legacy timeline publication (update_timeline) is retired (410); restored by the /v1 commit replacement",
+)
+def test_generated_python_client_timeline_publication_is_retired_pending_commit_replacement(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Domain Project", idempotency_key="domain-project")
+        timeline = client.create_timeline(project.project_id, "timeline-1", idempotency_key="timeline-1")
+        assert timeline["version"] == 1
+        saved = _retired_timeline_publication(
+            client,
+            "timeline-1",
+            {"expected_version": 1, "shots": [{"shot_id": "shot-1", "start_ms": 0, "duration_ms": 1000, "reference_ids": []}]},
+        )
+        assert saved["version"] == 2 and saved["shots"][0]["shot_id"] == "shot-1"
+        with pytest.raises(ApiError) as stale_timeline:
+            legacy_call(client, "PATCH", "/v1/timelines/timeline-1", {"expected_version": 1, "shots": []}, key="timeline-1-stale")
+        assert stale_timeline.value.status == 409
+    finally:
+        daemon.stop()
+
+
+def test_generated_direct_reference_writer_is_refused_without_writes(tmp_path):
+    """The retired /v1/references writer refuses before changing timeline state."""
+    RealmStore.initialize(tmp_path / "realm").close()
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Reference refusal", idempotency_key="reference-refusal-project")
+        client.create_timeline(project.project_id, "timeline", idempotency_key="reference-refusal-timeline")
+        before = client.get_project_timeline(project.project_id, "timeline")
+        before_changes = daemon.service.store.conn.total_changes
+
+        with pytest.raises(ApiError) as error:
+            legacy_call(
+                client,
+                "PATCH",
+                "/v1/references/reference-refused",
+                {"expected_version": 1, "role": "source"},
+                key="reference-refused",
+            )
+        assert error.value.status == 410
+        assert error.value.code == "retired_route"
+        assert error.value.message == "legacy timeline writes are retired; submit EditCommands through commitTimeline"
+        assert error.value.details["reason"] == "timeline_commit_required"
+        assert client.get_project_timeline(project.project_id, "timeline") == before
+        assert daemon.service.store.conn.total_changes == before_changes
+        assert daemon.service.store.conn.execute(
+            "SELECT 1 FROM command_idempotency WHERE idempotency_key=?", ("reference-refused",)
+        ).fetchone() is None
     finally:
         daemon.stop()
 
@@ -273,12 +365,32 @@ def test_timeline_document_replay_is_retired_after_runtime_restart(tmp_path):
         second.stop()
 
 
-def test_project_media_mutations_roll_back_before_idempotency_replay(tmp_path, monkeypatch):
+def test_project_reference_mutations_roll_back_before_idempotency_replay(tmp_path, monkeypatch):
     RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     project = service.create_project({"slug": "atomic", "name": "Atomic"})
     service.store.record_object("a" * 64, 1, "application/octet-stream")
     service.store.add_object_ref(project["id"], "a" * 64)
+    original = service._command_record
+    reference_body = {"reference_id": "atomic-ref", "kind": "character", "name": "Ref", "media_id": "sha256:" + "a" * 64}
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("response serialization failed")
+
+    monkeypatch.setattr(service, "_command_record", fail)
+    with pytest.raises(RuntimeError):
+        service.create_project_reference(project["id"], reference_body, idempotency_key="atomic-ref")
+    assert service.store.conn.execute("SELECT 1 FROM project_references WHERE id='atomic-ref'").fetchone() is None
+    monkeypatch.setattr(service, "_command_record", original)
+    reference = service.create_project_reference(project["id"], reference_body, idempotency_key="atomic-ref")
+    assert service.create_project_reference(project["id"], reference_body, idempotency_key="atomic-ref") == reference
+    service.close()
+
+
+def test_project_shot_mutations_roll_back_before_idempotency_replay(tmp_path, monkeypatch):
+    RealmStore.initialize(tmp_path / "realm").close()
+    service = RuntimeService(tmp_path / "realm")
+    project = service.create_project({"slug": "atomic", "name": "Atomic"})
     original = service._command_record
 
     def fail(*args, **kwargs):
@@ -287,17 +399,67 @@ def test_project_media_mutations_roll_back_before_idempotency_replay(tmp_path, m
     monkeypatch.setattr(service, "_command_record", fail)
     with pytest.raises(RuntimeError):
         service.create_project_shot(project["id"], {"shot_id": "atomic-shot", "name": "Shot"}, idempotency_key="atomic-shot")
-    with pytest.raises(RuntimeError):
-        service.create_project_reference(project["id"], {"reference_id": "atomic-ref", "kind": "character", "name": "Ref", "media_id": "sha256:" + "a" * 64}, idempotency_key="atomic-ref")
     assert service.store.conn.execute("SELECT 1 FROM project_shots WHERE id='atomic-shot'").fetchone() is None
-    assert service.store.conn.execute("SELECT 1 FROM project_references WHERE id='atomic-ref'").fetchone() is None
     monkeypatch.setattr(service, "_command_record", original)
     shot = service.create_project_shot(project["id"], {"shot_id": "atomic-shot", "name": "Shot"}, idempotency_key="atomic-shot")
     assert service.create_project_shot(project["id"], {"shot_id": "atomic-shot", "name": "Shot"}, idempotency_key="atomic-shot") == shot
     service.close()
 
 
-def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path):
+def test_project_shot_replay_precedes_live_membership_checks(tmp_path, monkeypatch):
+    RealmStore.initialize(tmp_path / "realm").close()
+    service = RuntimeService(tmp_path / "realm")
+    project = service.create_project({"slug": "replay", "name": "Replay"})
+    service.store.record_object("b" * 64, 1, "application/octet-stream")
+    service.store.add_object_ref(project["id"], "b" * 64)
+    service.create_project_shot(project["id"], {"shot_id": "replay-shot", "name": "Shot"}, idempotency_key="seed")
+    replayed = {"data": {"replayed": True}}
+    monkeypatch.setattr(service, "_command_replay", lambda *args, **kwargs: replayed)
+    monkeypatch.setattr(
+        service,
+        "_require_unplaced_project_shot",
+        lambda *args, **kwargs: pytest.fail("live film membership check preceded receipt replay"),
+    )
+
+    calls = (
+        ("create_project_shot", (project["id"], {"shot_id": "replay-shot", "name": "Shot"}), {}, "shot.create"),
+        ("update_project_shot", (project["id"], "replay-shot", {"expected_version": 1, "name": "Changed"}), {}, "shot.update"),
+        ("update_project_shot", (project["id"], "replay-shot", {"expected_version": 1}), {"archived": True}, "shot.archive"),
+        ("add_shot_item", (project["id"], "replay-shot", {"media_id": "b" * 64}), {}, "shot.item.add"),
+        ("remove_shot_item", (project["id"], "replay-shot", "item", {"expected_version": 1}), {}, "shot.item.remove"),
+        ("reorder_shot_items", (project["id"], "replay-shot", {"expected_version": 1, "item_ids": ["item"]}), {}, "shot.item.reorder"),
+    )
+    for method, args, kwargs, _ in calls:
+        assert getattr(service, method)(*args, idempotency_key="replay-" + method, **kwargs) == replayed
+    service.close()
+
+
+def test_project_shot_catalog_refuses_legacy_timeline_membership(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
+    service = RuntimeService(tmp_path / "realm")
+    project = service.create_project({"slug": "legacy", "name": "Legacy"})
+    service.create_project_shot(project["id"], {"shot_id": "legacy-shot", "name": "Shot"}, idempotency_key="legacy-shot")
+    service.create_timeline(project["id"], "legacy-timeline", idempotency_key="legacy-timeline")
+    with service.store._transaction():
+        service.store.conn.execute(
+            "INSERT INTO timeline_shots(id, timeline_id, start_ms, duration_ms, reference_ids_json) VALUES (?, ?, 0, 1000, '[]')",
+            ("legacy-shot", "legacy-timeline"),
+        )
+        service.store.conn.execute(
+            "INSERT INTO timeline_revisions(timeline_id, version, shots_json, references_json, created_at) VALUES (?, 2, ?, '[]', ?)",
+            ("legacy-timeline", json.dumps([{"id": "legacy-shot"}]), "2026-01-01T00:00:00Z"),
+        )
+    before = tuple(service.store.conn.iterdump())
+    with pytest.raises(RetiredRouteError) as error:
+        service.update_project_shot(
+            project["id"], "legacy-shot", {"expected_version": 1, "name": "Changed"}, idempotency_key="legacy-update",
+        )
+    assert error.value.details["reason"] == "shot_in_film_history"
+    assert tuple(service.store.conn.iterdump()) == before
+    service.close()
+
+
+def test_generated_domains_preserve_project_media_and_task_listing(tmp_path):
     RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
@@ -311,32 +473,6 @@ def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path
 
         client.create_document(project.project_id, "settings", "settings", {"theme": "dark"}, idempotency_key="settings-document")
         client.create_document(project.project_id, "review", "review", {"approved": False}, idempotency_key="review-document")
-        timeline = client.create_timeline(project.project_id, "timeline", idempotency_key="timeline")
-        saved = client.update_timeline("timeline", expected_version=1, idempotency_key="timeline-update", shots=[{"shot_id": "shot", "start_ms": 0, "duration_ms": 100}])
-        history, _ = client.list_timeline_history("timeline")
-        assert [item["version"] for item in history] == [1, 2]
-        assert client.diff_timeline("timeline", from_version=1, to_version=2)["changes"]["shots"]["added"]
-        archived = client.archive_timeline("timeline", expected_version=saved["version"], idempotency_key="archive")
-        recovered = client.recover_timeline("timeline", expected_version=archived["version"], version=saved["version"], idempotency_key="recover")
-        assert archived["archived"] is True and recovered["archived"] is False and recovered["shots"] == saved["shots"]
-
-        shot = client.create_shot("timeline", {"shot_id": "shot-mounted", "start_ms": 0, "duration_ms": 100, "reference_ids": []}, idempotency_key="shot")
-        reference = client.create_reference("timeline", {"reference_id": "reference-mounted", "object_id": object_row.object_id, "role": "source"}, idempotency_key="reference")
-        shots, _ = client.list_project_shots(project.project_id)
-        references, _ = client.list_project_references(project.project_id)
-        assert all(item["shot_id"] != shot["shot_id"] for item in shots)
-        assert all(item["reference_id"] != reference["reference_id"] for item in references)
-        shot = client.update_shot("shot-mounted", expected_version=1, duration_ms=200)
-        reference = client.update_reference("reference-mounted", expected_version=1, role="hero")
-        shot = client.archive_shot("shot-mounted", expected_version=shot["version"], idempotency_key="archive-shot")
-        reference = client.archive_reference("reference-mounted", expected_version=reference["version"], idempotency_key="archive-reference")
-        assert shot["archived"] is True and reference["archived"] is True
-        assert all(item["shot_id"] != "shot-mounted" for item in client.list_project_shots(project.project_id)[0])
-        assert all(item["shot_id"] != "shot-mounted" for item in client.list_project_shots(project.project_id, include_archived=True)[0])
-        shot = client.recover_shot("shot-mounted", expected_version=shot["version"], idempotency_key="recover-shot")
-        reference = client.recover_reference("reference-mounted", expected_version=reference["version"], idempotency_key="recover-reference")
-        assert shot["archived"] is False and reference["archived"] is False
-
         second_object = client.ingest_project_object(project.project_id, b"second-managed", media_type="application/octet-stream", idempotency_key="media-2")
         relation = client.create_media_relation(project.project_id, object_row.object_id, second_object.object_id, "derived_from", idempotency_key="relation")
         relations, _ = client.list_media_relations(project.project_id)
@@ -355,5 +491,110 @@ def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path
         tasks, _ = client.list_project_tasks(project.project_id)
         runs, _ = client.list_project_runs(project.project_id)
         assert [item.task_id for item in tasks] == [task.task_id] and runs[0]["id"] == task.run_id
+    finally:
+        daemon.stop()
+
+
+def test_generated_timeline_visibility_is_project_catalog_state(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Settings", idempotency_key="project", slug="settings", metadata={"theme": "dark"})
+        created = client.create_timeline(project.project_id, "timeline", idempotency_key="timeline")
+        before = client.get_project_timeline(project.project_id, "timeline")
+        history_before, _ = client.list_timeline_history("timeline")
+        archived = client.archive_timeline("timeline", expected_version=created["version"], idempotency_key="archive")
+        assert archived["archived"] is True
+        assert archived["shots"] == before["shots"] and archived["references"] == before["references"]
+        recovered = client.recover_timeline("timeline", expected_version=archived["version"], version=archived["version"], idempotency_key="recover")
+        assert recovered["archived"] is False and recovered["shots"] == before["shots"]
+        assert recovered["references"] == before["references"]
+        after = client.get_project_timeline(project.project_id, "timeline")
+        assert {key: after[key] for key in ("head_revision_id", "head_publication_id", "shots", "references")} == {
+            key: before[key] for key in ("head_revision_id", "head_publication_id", "shots", "references")}
+        history_after, _ = client.list_timeline_history("timeline")
+        assert history_after == history_before
+        assert client.archive_timeline("timeline", expected_version=created["version"], idempotency_key="archive") == archived
+        assert client.recover_timeline("timeline", expected_version=archived["version"], version=archived["version"], idempotency_key="recover") == recovered
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("timeline_state", ("tracked", "fresh", "unused"))
+def test_generated_historical_timeline_recover_refuses_before_writes(tmp_path, monkeypatch, timeline_state):
+    RealmStore.initialize(tmp_path / "realm").close()
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Settings", idempotency_key="project", slug="settings", metadata={"theme": "dark"})
+        timeline = timeline_state
+        if timeline_state == "unused":
+            expected_version, target_version = 1, 1
+        else:
+            created = client.create_timeline(project.project_id, timeline, idempotency_key=timeline)
+            archived = client.archive_timeline(timeline, expected_version=created["version"], idempotency_key=f"{timeline}-archive")
+            expected_version, target_version = archived["version"], created["version"]
+        before = client.get_project_timeline(project.project_id, timeline) if timeline_state != "unused" else None
+        before_store = daemon.service.store.conn.total_changes
+
+        def replay(*args, **kwargs):
+            pytest.fail("historical recover consulted an accepted retry")
+
+        monkeypatch.setattr(daemon.service, "_command_replay", replay)
+        with pytest.raises(ApiError) as error:
+            client.recover_timeline(timeline, expected_version=expected_version, version=target_version,
+                                    idempotency_key=f"{timeline}-historical-recover")
+        if timeline_state == "unused":
+            assert error.value.status == 404
+            assert error.value.code == "not_found"
+        else:
+            assert error.value.status == 410
+            assert error.value.code == "retired_route"
+            assert "timeline.restore" in error.value.message
+            assert error.value.details["replacement"] == "timeline.restore"
+            assert client.get_project_timeline(project.project_id, timeline) == before
+        assert daemon.service.store.conn.total_changes == before_store
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.xfail(strict=True, raises=_RetiredTimelineUpdate,
+                  reason="[declared-xfail:runtime-domains-update] direct timeline update writer remains retired")
+def test_generated_direct_timeline_shot_reference_writers_remain_retired(tmp_path):
+    """Keep the former direct-writer expectations until their command paths land."""
+    RealmStore.initialize(tmp_path / "realm").close()
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Settings", idempotency_key="project", slug="settings", metadata={"theme": "dark"})
+        object_row = client.ingest_project_object(project.project_id, b"managed", media_type="application/octet-stream", idempotency_key="media", filename="managed.bin")
+        client.create_timeline(project.project_id, "timeline", idempotency_key="timeline")
+        saved = _retired_timeline_update(
+            client, {"expected_version": 1, "shots": [{"shot_id": "shot", "start_ms": 0, "duration_ms": 100}]}
+        )
+        history, _ = client.list_timeline_history("timeline")
+        assert [item["version"] for item in history] == [1, 2]
+        assert client.diff_timeline("timeline", from_version=1, to_version=2)["changes"]["shots"]["added"]
+        archived = client.archive_timeline("timeline", expected_version=saved["version"], idempotency_key="archive")
+        recovered = client.recover_timeline("timeline", expected_version=archived["version"], version=saved["version"], idempotency_key="recover")
+        assert archived["archived"] is True and recovered["archived"] is False and recovered["shots"] == saved["shots"]
+
+        shot = legacy_call(client, "POST", "/v1/timelines/timeline/shots", {"shot_id": "shot-mounted", "start_ms": 0, "duration_ms": 100, "reference_ids": []}, key="shot")
+        reference = legacy_call(client, "POST", "/v1/timelines/timeline/references", {"reference_id": "reference-mounted", "object_id": object_row.object_id, "role": "source"}, key="reference")
+        shots, _ = client.list_project_shots(project.project_id)
+        references, _ = client.list_project_references(project.project_id)
+        assert all(item["shot_id"] != shot["shot_id"] for item in shots)
+        assert all(item["reference_id"] != reference["reference_id"] for item in references)
+        shot = legacy_call(client, "PATCH", "/v1/shots/shot-mounted", {"expected_version": 1, "duration_ms": 200})
+        reference = legacy_call(client, "PATCH", "/v1/references/reference-mounted", {"expected_version": 1, "role": "hero"})
+        shot = legacy_call(client, "POST", "/v1/shots/shot-mounted/archive", {"expected_version": shot["version"]}, key="archive-shot")
+        reference = legacy_call(client, "POST", "/v1/references/reference-mounted/archive", {"expected_version": reference["version"]}, key="archive-reference")
+        assert shot["archived"] is True and reference["archived"] is True
+        assert all(item["shot_id"] != "shot-mounted" for item in client.list_project_shots(project.project_id)[0])
+        assert all(item["shot_id"] != "shot-mounted" for item in client.list_project_shots(project.project_id, include_archived=True)[0])
+        shot = legacy_call(client, "POST", "/v1/shots/shot-mounted/recover", {"expected_version": shot["version"]}, key="recover-shot")
+        reference = legacy_call(client, "POST", "/v1/references/reference-mounted/recover", {"expected_version": reference["version"]}, key="recover-reference")
+        assert shot["archived"] is False and reference["archived"] is False
     finally:
         daemon.stop()

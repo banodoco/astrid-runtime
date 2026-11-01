@@ -11,12 +11,26 @@ import hashlib
 import json
 import math
 from collections import ChainMap, defaultdict
+from itertools import pairwise
 
 from .errors import ConflictError, NotFoundError, ValidationError
+from .seam_intent import (
+    boundary_intent_owners,
+    intent_context,
+    opaque_activation_cues,
+    pause_covers,
+    relevant_intent_owners,
+)
+from .seam_intent import cue_identity as portable_cue_identity
 from .util import canonical_json
-from .visual_boundary import VERSION, DISCLOSURE_VERSION, boundary_report, finite, js_round, transition_frames
-from .seam_intent import (boundary_intent_owners, intent_context, cue_identity as portable_cue_identity,
-                          pause_covers, relevant_intent_owners, opaque_activation_cues)
+from .visual_boundary import (
+    DISCLOSURE_VERSION,
+    VERSION,
+    boundary_report,
+    finite,
+    js_round,
+    transition_frames,
+)
 
 MAX_METADATA_CLIPS = 20_000
 AUXILIARY = frozenset({"end-spanning-layer", "effect-layer", "frame-overlay", "text"})
@@ -105,10 +119,50 @@ def clip_seconds(clip, fallback=0, *, speed=None):
     return value / (speed if speed is not None else speed_value(clip.get("speed", 1)))
 
 
+def audio_clip(clip, track, registry):
+    """Classify audio from the authored track, then explicit clip/asset metadata.
+
+    Track IDs are arbitrary and never imply media kind. A declared visual or
+    audio track is authoritative; legacy rows without a usable kind may fall
+    back to an explicit audio clip type or the selected asset's media type.
+    """
+    track_kind = track.get("kind") if isinstance(track, dict) else None
+    if track_kind in ("audio", "visual"):
+        return track_kind == "audio"
+    clip_type = clip.get("clipType", clip.get("clip_type", clip.get("type")))
+    if isinstance(clip_type, str) and clip_type.lower() == "audio":
+        return True
+    asset_key = clip.get("asset", clip.get("asset_id"))
+    assets = registry.get("assets", {}) if isinstance(registry, dict) else {}
+    asset = assets.get(asset_key, {}) if hasattr(assets, "get") and isinstance(asset_key, str) else {}
+    source = asset.get("source", {}) if isinstance(asset, dict) else {}
+    for value in (
+        asset.get("media_type"), asset.get("type"), asset.get("role"),
+        source.get("media_type") if isinstance(source, dict) else None,
+        source.get("type") if isinstance(source, dict) else None,
+    ):
+        if isinstance(value, str) and (value.strip().lower() == "audio" or value.strip().lower().startswith("audio/")):
+            return True
+    return False
+
+
+def projected_speed(clip, track, registry, inherited_speed):
+    child_speed = clip.get("speed")
+    if child_speed is not None:
+        return speed_value(child_speed)
+    return 1 if audio_clip(clip, track, registry) else speed_value(inherited_speed)
+
+
 def parent_clips(parent):
-    clips, configured = parent.get("clips", []), parent.get("config", {}).get("clips", [])
+    config = parent.get("config", {})
+    clips, configured = parent.get("clips", []), config.get("clips", []) if isinstance(config, dict) else None
     if not isinstance(clips, list) or not isinstance(configured, list):
         raise ValidationError("canonical parent clips must be lists")
+    return agreed_clips(clips, configured)
+
+
+def agreed_clips(clips, configured):
+    """Return the canonical clip list; the two authorities must agree when both are present."""
     if clips and configured and clips != configured:
         raise ConflictError("canonical parent clips and config.clips disagree", details={"reason": "canonical_payload_mismatch"})
     return clips or configured
@@ -147,6 +201,19 @@ def load_closure(conn, project_id, timeline_id, parent_row):
     return parent, shots, internal
 
 
+def _fps(value):
+    """Read raw authored FPS locally without changing the stored payload."""
+    if isinstance(value, (dict, list)):
+        from .timeline_inspection import _fraction
+
+        try:
+            result = float(_fraction(value, "fps", nonnegative=False))
+        except (OverflowError, ValidationError):
+            return None
+        return result if math.isfinite(result) else None
+    return finite(value, None)
+
+
 def _strip_derived(value):
     if isinstance(value, dict):
         # Most authored clips have no app/report/intent. Keep their immutable
@@ -162,7 +229,7 @@ def _strip_derived(value):
 def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False):
     """Authored geometry plus effective spans. No mutable heads or clipping loss."""
     config = parent.get("config", {})
-    fps = finite((config.get("output") or {}).get("fps", config.get("fps", 30)), None)
+    fps = _fps((config.get("output") or {}).get("fps", config.get("fps", 30)))
     if fps is None or fps <= 0:
         raise ValidationError("visual timing fps must be finite and positive")
     policy = (config.get("app") or {}).get("visualSeamContract") or {}
@@ -185,7 +252,7 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
     next_start = {}
     for group in occurrence_groups.values():
         ordered = sorted(group, key=lambda o: seconds(o, "at", finite(o.get("placement", {}).get("start_ms"), 0) / 1000))
-        for a, b in zip(ordered, ordered[1:]):
+        for a, b in pairwise(ordered):
             next_start[a["occurrence_id"]] = seconds(b, "at", finite(b.get("placement", {}).get("start_ms"), 0) / 1000)
 
     def add(raw, registry, path, *, offset=0, bound=None, inherited_speed=1, inherited_track=None, source_offset=0, inherited_gain=1, muted=False, render=True, track_definitions=None):
@@ -198,13 +265,21 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
         if kind in ("shot", "composition", "sequence"):
             raise ValidationError("nested composition is not supported by visual admission")
         clip["clipType"] = kind
-        clip["speed"] = speed_value(clip.get("speed", inherited_speed))
         at = seconds(clip, "at")
         if finite(clip.get("at_ms", clip.get("at", 0)), None) is None:
             raise ValidationError("visual timing start must be finite")
-        duration = clip_seconds(clip, (bound[1] - offset) * clip["speed"] if bound else 0, speed=clip["speed"])
         track = clip.get("track", inherited_track or "video")
         definition = (track_definitions if track_definitions is not None else tracks).get(track, {})
+        is_audio = audio_clip(clip, definition, registry)
+        child_speed = clip.get("speed")
+        effective_speed = projected_speed(clip, definition, registry, inherited_speed)
+        if child_speed is not None:
+            clip["speed"] = effective_speed
+        elif not is_audio and effective_speed != 1:
+            clip["speed"] = effective_speed
+        else:
+            clip.pop("speed", None)
+        duration = clip_seconds(clip, (bound[1] - offset) * effective_speed if bound else 0, speed=effective_speed)
         # Canonical child clips may carry the schema's asset_id spelling. Resolve
         # that reference before coverage classification so media aliases retain
         # the same full-frame semantics as clips already normalized to asset.
@@ -233,14 +308,15 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
         clip["at"] = (offset + at)
         clip.pop("at_ms", None)
         if "duration_ms" in clip or "duration" in clip:
-            clip["hold"] = duration * clip["speed"]
+            clip["hold"] = duration * effective_speed
             clip.pop("duration_ms", None)
             clip.pop("duration", None)
-        if "from" in clip or "from_ms" in clip or source_offset:
-            clip["from"] = seconds(raw, "from") + source_offset
+        applied_source_offset = 0 if is_audio else source_offset
+        if "from" in clip or "from_ms" in clip or applied_source_offset:
+            clip["from"] = seconds(raw, "from") + applied_source_offset
             clip.pop("from_ms", None)
         if "to" in clip or "to_ms" in clip:
-            clip["to"] = seconds(raw, "to") + source_offset
+            clip["to"] = seconds(raw, "to") + applied_source_offset
             clip.pop("to_ms", None)
         asset = (registry.get("assets") or {}).get(asset_key, {})
         source = next((asset[k] for k in ("content_sha256", "object_id", "media_id", "digest", "file") if isinstance(asset.get(k), str)), None)
@@ -259,13 +335,20 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
             rendered["volume"] = 0 if muted else finite(clip.get("volume", clip.get("gain", inherited_gain)), 1)
         if rendered is not None and bound:
             rendered.setdefault("app", {})["canonical"] = {"parentDocumentId": timeline_id, "occurrenceId": path[3], "sourceClipId": path[-1]}
-            rendered["app"]["canonicalTiming"] = {"occurrenceStartMs": bound[0] * 1000, "occurrenceDurationMs": (bound[1] - bound[0]) * 1000}
+            rendered["app"]["canonicalTiming"] = {
+                "occurrenceStartMs": bound[0] * 1000,
+                "occurrenceDurationMs": (bound[1] - bound[0]) * 1000,
+                "sourceOffsetMs": source_offset * 1000,
+                "occurrenceSpeed": inherited_speed,
+            }
             visible_seconds = (end - start) / fps
             rendered["at"] = start / fps
             if "hold" in rendered or "to" not in rendered:
-                rendered["hold"] = visible_seconds * rendered["speed"]
+                rendered["hold"] = visible_seconds * effective_speed
             else:
-                rendered["to"] = rendered.get("from", 0) + visible_seconds * rendered["speed"]
+                rendered["to"] = rendered.get("from", 0) + visible_seconds * effective_speed
+            if is_audio and child_speed is None:
+                rendered.pop("speed", None)
             if isinstance(asset_key, str):
                 qualified = path[3] + ":" + asset_key
                 rendered["asset"] = qualified
@@ -317,8 +400,16 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
         offset = seconds(o, "at", finite(o.get("placement", {}).get("start_ms"), 0) / 1000)
         fallback_duration = o["duration_ms"] / 1000
         inherited_speed = speed_value(o.get("speed", 1))
-        extent = max((seconds(c, "at") + clip_seconds({**c, "speed": c.get("speed", inherited_speed)}, fallback_duration * inherited_speed)
-                      for c in clips if active(c) and child_tracks.get(c.get("track", o["track"]), {}).get("role") != "source"),
+
+        def child_end(c):
+            definition = child_tracks.get(c.get("track", o["track"]), {})
+            effective_speed = projected_speed(c, definition, child_registry, inherited_speed)
+            return seconds(c, "at") + clip_seconds(
+                c, fallback_duration * effective_speed, speed=effective_speed,
+            )
+
+        extent = max((child_end(c) for c in clips
+                      if active(c) and child_tracks.get(c.get("track", o["track"]), {}).get("role") != "source"),
                      default=fallback_duration)
         extent = math.ceil(extent * 1000 - 1e-6) / 1000
         end = min(offset + extent, next_start.get(o["occurrence_id"], offset + extent))
@@ -340,7 +431,6 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
                     render_config.setdefault("tracks", []).append(copy.deepcopy(t))
                     known_tracks.add(t.get("id"))
         for c in clips:
-            track = c.get("track", o["track"])
             add(c, child_registry, path + ["clip", str(c.get("id", "?"))], offset=offset, bound=(offset, end), inherited_speed=inherited_speed,
                 inherited_track=o["track"], source_offset=source_offset, inherited_gain=o.get("gain", 1), muted=o.get("muted", o.get("mute", False)),
                 track_definitions=child_tracks)

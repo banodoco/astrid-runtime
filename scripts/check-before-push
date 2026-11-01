@@ -1,16 +1,143 @@
 #!/usr/bin/env bash
-# One pre-push command (testing plan R-12): the default run, plus a reminder when R-11 paths changed.
+# One pre-push command (testing plan R-12): the default run plus the real
+# provider smoke when R-11 paths changed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [ -x .venv/bin/python ]; then
+if [ -n "${PYTHON_BIN:-}" ]; then
+  PY=$PYTHON_BIN
+elif [ -x .venv/bin/python ]; then
   PY=.venv/bin/python
 else
   PY=python3
 fi
-"$PY" -m pytest -q
 
-changed=$({ git diff --name-only origin/main...HEAD 2>/dev/null || true; git diff --name-only HEAD; } | sort -u)
-if printf '%s\n' "$changed" | grep -qE '^(runtime_protocol|astrid_runtime)/'; then
-  echo "Runtime protocol changed: run the Astrid smoke journey before merging (testing plan R-11)."
-fi
+readonly SMOKE_NODES=(
+  "tests/test_timeline_native_asset_union.py::test_genuine_native_capture_is_retained_with_lossless_union[raw]"
+  "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-None]"
+)
+
+usage() {
+  echo "usage: $0 [--native-provider-smoke]" >&2
+}
+
+run_python_bounded() {
+  "$PY" -B - "$@" <<'PY'
+import subprocess
+import sys
+
+try:
+    result = subprocess.run(
+        [sys.executable, *sys.argv[1:]],
+        check=False,
+        timeout=45,
+    )
+except subprocess.TimeoutExpired:
+    print("native provider smoke command exceeded 45 seconds", file=sys.stderr)
+    raise SystemExit(124)
+raise SystemExit(result.returncode)
+PY
+}
+
+run_native_provider_smoke() {
+  if [ -z "${ASTRID_CHECKOUT:-}" ]; then
+    echo "native provider smoke requires ASTRID_CHECKOUT" >&2
+    return 2
+  fi
+
+  local checkout
+  checkout=$(cd -- "$ASTRID_CHECKOUT" 2>/dev/null && pwd -P) || {
+    echo "native provider smoke checkout is unavailable: $ASTRID_CHECKOUT" >&2
+    return 2
+  }
+  if [ ! -f "$checkout/astrid/core/execution/generic_host.py" ] ||
+     [ ! -f "$checkout/astrid/sdk/timeline/commit.py" ]; then
+    echo "native provider smoke requires an Astrid checkout with the Agent provider" >&2
+    return 2
+  fi
+
+  local provider_probe
+  provider_probe='import inspect, os
+from pathlib import Path
+from astrid.sdk.timeline import commit
+
+checkout = Path(os.environ["ASTRID_CHECKOUT"]).resolve()
+factory = getattr(commit, "create_runtime_commit_service", None)
+if not callable(factory):
+    raise SystemExit("Agent provider factory is unavailable")
+origin = Path(inspect.getfile(factory)).resolve()
+if not origin.is_relative_to(checkout):
+    raise SystemExit(f"Agent provider origin is outside ASTRID_CHECKOUT: {origin}")
+provider = factory()
+if getattr(provider, "provider_id", None) != "astrid-v1":
+    raise SystemExit("Agent provider identity is not astrid-v1")
+print(f"verified Agent provider origin: {origin}")'
+
+  PYTHONDONTWRITEBYTECODE=1 \
+  ASTRID_CHECKOUT="$checkout" \
+  PYTHONPATH="$checkout:$PWD/packages/python:$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+    run_python_bounded -c "$provider_probe"
+
+  local collected
+  collected=$(PYTHONDONTWRITEBYTECODE=1 \
+    ASTRID_CHECKOUT="$checkout" \
+    PYTHONPATH="$checkout:$PWD/packages/python:$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+    run_python_bounded -m pytest --collect-only -q -o addopts= -p no:cacheprovider "${SMOKE_NODES[@]}") || {
+      echo "native provider smoke could not collect its required D101 nodes" >&2
+      return 2
+    }
+  local node
+  for node in "${SMOKE_NODES[@]}"; do
+    if ! grep -Fqx -- "$node" <<<"$collected"; then
+      echo "native provider smoke selected node is missing: $node" >&2
+      return 2
+    fi
+  done
+  local selected_count
+  selected_count=$(grep -E -c '^tests/test_timeline_native_asset_union\.py::' <<<"$collected" || true)
+  if [ "$selected_count" -ne "${#SMOKE_NODES[@]}" ]; then
+    echo "native provider smoke selected $selected_count D101 nodes; expected ${#SMOKE_NODES[@]}" >&2
+    return 2
+  fi
+
+  local smoke_output=""
+  local smoke_status=0
+  smoke_output=$(PYTHONDONTWRITEBYTECODE=1 \
+    ASTRID_CHECKOUT="$checkout" \
+    PYTHONPATH="$checkout:$PWD/packages/python:$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+    run_python_bounded -m pytest -q -ra -o addopts= -p no:cacheprovider "${SMOKE_NODES[@]}") || smoke_status=$?
+  printf '%s\n' "$smoke_output"
+  if [ "$smoke_status" -ne 0 ]; then
+    return "$smoke_status"
+  fi
+  if grep -Eq '(^|[[:space:],])[0-9]+ (skipped|deselected|xfailed|xpassed)' <<<"$smoke_output"; then
+    echo "native provider smoke cannot pass with skipped or non-executed tests" >&2
+    return 2
+  fi
+}
+
+case "${1:-}" in
+  --native-provider-smoke)
+    if [ "$#" -ne 1 ]; then
+      usage
+      exit 2
+    fi
+    run_native_provider_smoke
+    ;;
+  "")
+    "$PY" -m pytest -q
+
+    changed=$({ git diff --name-only origin/main...HEAD 2>/dev/null || true; git diff --name-only HEAD; } | sort -u)
+    if printf '%s\n' "$changed" | grep -qE '^(runtime_protocol|astrid_runtime)/'; then
+      echo "Runtime protocol changed: running the real Astrid native-provider smoke (testing plan R-11)."
+      run_native_provider_smoke
+    fi
+    ;;
+  -h|--help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from astrid_runtime import cli
-from astrid_runtime.bootstrap import BootstrapError, BootstrapResult, DoorSettings
+from astrid_runtime.bootstrap import BootstrapError, BootstrapResult, DoorSettings, SourceProfile
 from astrid_runtime.io import atomic_write_json
 from astrid_runtime.paths import RuntimePaths
 
@@ -217,6 +217,30 @@ def test_run_foreground_stops_only_when_handler_event_is_set(tmp_path, monkeypat
     assert boundary.stops == 1
 
 
+def test_run_foreground_treats_stop_during_startup_as_failure(tmp_path, monkeypatch, capsys):
+    paths = RuntimePaths.sandbox(tmp_path / "support")
+    boundary = _Boundary()
+    registration = {}
+    monkeypatch.setattr(cli, "platform", SimpleNamespace(
+        log_dir=lambda _home: tmp_path / "logs",
+        owner_only=lambda _path: None,
+        install_stop_handlers=lambda callback: (registration.update(handler=callback) or (lambda: None)),
+    ))
+    monkeypatch.setattr(cli, "ForegroundRuntimeBoundary", lambda: boundary)
+
+    def stop_during_bootstrap(*_):
+        registration["handler"](None, None)
+        return _result()
+
+    monkeypatch.setattr(cli, "bootstrap", stop_during_bootstrap)
+    monkeypatch.setattr(cli, "_wait_for_door", lambda *_: pytest.fail("startup continued after a stop request"))
+    assert cli._run_foreground(paths, cli.BootstrapConfig(door=DoorSettings(ORIGIN, 17340)), json_mode=True) == 1
+    assert boundary.stops == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["ok"] is False
+    assert "cancelled" in output["error"]
+
+
 def test_run_foreground_treats_stop_after_readiness_as_orderly(tmp_path, monkeypatch, capsys):
     paths = RuntimePaths.sandbox(tmp_path / "support")
     boundary = _Boundary()
@@ -348,7 +372,7 @@ def test_foreground_constructor_failure_removes_private_bootstrap_token(tmp_path
     monkeypatch.setattr(boundary, "_validate_source", lambda _source: None)
     monkeypatch.setattr(daemon, "RuntimeDaemon", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("bad daemon config")))
     support = tmp_path / "support"
-    source = SimpleNamespace(runtime_command=None, runtime_environment=None, worker_profile=None)
+    source = SimpleNamespace(profile="astrid", runtime_command=None, runtime_environment=None, worker_profile=None)
     with pytest.raises(OSError, match="bad daemon config"):
         boundary.start(realm_id="realm", realm_root=tmp_path / "realm", owner_lock=support / "instance.lock", source_profile=source)
     assert not list(support.glob(".bootstrap-token-*"))
@@ -358,3 +382,38 @@ def test_foreground_constructor_failure_removes_private_bootstrap_token(tmp_path
 def test_run_reports_invalid_data_root_without_traceback(capsys):
     assert cli.main(["run", "--data-root", "relative"]) == 1
     assert "absolute" in json.loads(capsys.readouterr().out)["error"]
+
+
+@pytest.mark.parametrize("profile", ["astrid", "unmapped"])
+def test_both_boundaries_resolve_the_same_authoring_profile(tmp_path, monkeypatch, profile):
+    from astrid_runtime.runtime_boundary import ForegroundRuntimeBoundary, LocalRuntimeBoundary
+    from runtime_protocol import daemon
+
+    source = SourceProfile(profile=profile, runtime_checkout=str(tmp_path), source_checkout=str(tmp_path))
+    support = tmp_path / "support"
+    arguments = dict(realm_id="realm", realm_root=tmp_path / "realm", owner_lock=support / "instance.lock")
+    captured = {}
+
+    def capture(*_args, **kwargs):
+        captured.update(kwargs)
+        raise OSError("captured daemon configuration")
+
+    monkeypatch.setattr(daemon, "RuntimeDaemon", capture)
+    foreground = ForegroundRuntimeBoundary()
+    local = LocalRuntimeBoundary()
+    if profile == "unmapped":
+        for start in (
+            lambda: local._argv(source, **arguments, support_root=support,
+                                display_name="Workspace", token_file=support / "token"),
+            lambda: foreground.start(**arguments, source_profile=source),
+        ):
+            with pytest.raises(BootstrapError, match="no supported Runtime authoring profile: 'unmapped'"):
+                start()
+        assert captured == {}
+        assert not support.exists()
+    else:
+        argv = local._argv(source, **arguments, support_root=support,
+                           display_name="Workspace", token_file=support / "token")
+        with pytest.raises(OSError, match="captured daemon configuration"):
+            foreground.start(**arguments, source_profile=source)
+        assert captured["authoring_profile"] == argv[argv.index("--authoring-profile") + 1] == "astrid"

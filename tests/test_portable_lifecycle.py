@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-import contextlib
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.error
 import urllib.request
@@ -23,6 +25,161 @@ from astrid_runtime import update
 
 HOSTED_ORIGIN = "https://hosted.test"
 ROOT = Path(__file__).resolve().parents[1]
+_CHILD_OUTPUT_LIMIT = 4096
+_PHASE_EVENT_LIMIT = 16
+_PRE_TIMEOUT_STACK_DELAY_SECONDS = 15
+
+
+def _redacted_tail(value: str | bytes | None) -> str:
+    """Keep readiness-failure output small without exposing credential values."""
+    if isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    value = value or ""
+    tail = value[-_CHILD_OUTPUT_LIMIT:]
+    tail = re.sub(
+        r'(?i)(["\']?(?:token|authorization|credential|secret|password)["\']?\s*[:=]\s*)'
+        r'(?:["\'][^"\']*["\']|\S+)',
+        r"\1<redacted>",
+        tail,
+    )
+    tail = re.sub(r"(?i)\b(bearer\s+)[-A-Za-z0-9._~+/]{8,}", r"\1<redacted>", tail)
+    return re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,})\b",
+        "<redacted>",
+        tail,
+    )
+
+
+def _bounded_file_tail(path: Path | None) -> str:
+    """Read only a redacted tail, so timeout evidence never expands with child output."""
+    if path is None:
+        return ""
+    try:
+        with path.open("rb") as source:
+            source.seek(0, os.SEEK_END)
+            source.seek(max(0, source.tell() - _CHILD_OUTPUT_LIMIT))
+            return _redacted_tail(source.read())
+    except OSError as exc:
+        return f"<unavailable: {type(exc).__name__}>"
+
+
+def _readiness_failure(
+    process: subprocess.Popen[str], *, started_monotonic: float, started_unix: float, polls: int,
+    phase_path: Path | None = None, stack_path: Path | None = None,
+    spawn_started_monotonic: float | None = None, spawn_started_unix: float | None = None,
+    spawned_monotonic: float | None = None, spawned_unix: float | None = None,
+) -> str:
+    """Return bounded child state after an early exit or readiness timeout."""
+    observed_monotonic = time.monotonic()
+    observed_unix = time.time()
+    exit_before_capture = process.poll()
+    phase_events = _bounded_file_tail(phase_path)
+    pre_timeout_stack = _bounded_file_tail(stack_path)
+    if exit_before_capture is None:
+        process.kill()
+    try:
+        stdout, stderr = process.communicate(timeout=5)
+        drain = "completed"
+    except subprocess.TimeoutExpired as first_timeout:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+            drain = "completed after forced child kill"
+        except subprocess.TimeoutExpired as second_timeout:
+            stdout, stderr = second_timeout.output or first_timeout.output, (
+                second_timeout.stderr or first_timeout.stderr
+            )
+            drain = "timed out after bounded 5s + 5s drain"
+    details = {
+        "child_exit_after_capture": process.returncode,
+        "child_exit_before_capture": exit_before_capture,
+        "child_output_drain": drain,
+        "child_pid": process.pid,
+        "child_spawn_started_monotonic": spawn_started_monotonic,
+        "child_spawn_started_unix": spawn_started_unix,
+        "child_spawned_monotonic": spawned_monotonic,
+        "child_spawned_unix": spawned_unix,
+        "child_stderr_tail": _redacted_tail(stderr),
+        "child_stdout_tail": _redacted_tail(stdout),
+        "pre_timeout_python_stack_tail": pre_timeout_stack,
+        "readiness_phase_events_tail": phase_events,
+        "readiness_elapsed_seconds": round(observed_monotonic - started_monotonic, 3),
+        "readiness_observed_monotonic": observed_monotonic,
+        "readiness_observed_unix": observed_unix,
+        "readiness_polls": polls,
+        "readiness_started_monotonic": started_monotonic,
+        "readiness_started_unix": started_unix,
+    }
+    return f"RuntimeDaemon child did not publish readiness: {json.dumps(details, sort_keys=True)}"
+
+
+def test_readiness_failure_reports_live_child_state(tmp_path: Path):
+    started = tmp_path / "child-started"
+    phase_path = tmp_path / "phases.json"
+    phase_path.write_text(
+        json.dumps([{"sequence": 1, "phase": "child_entry", "monotonic_ns": 1, "time_utc": "x"}]),
+        encoding="utf-8",
+    )
+    stack_path = tmp_path / "stack.txt"
+    stack_path.write_text("Bearer value-for-stack\nghp_0123456789abcdefghijklmnop\n", encoding="utf-8")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, sys, time; print('token=not-for-output', flush=True); "
+            "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(60)",
+            str(started),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 5
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+    diagnostics = _readiness_failure(
+        process,
+        started_monotonic=time.monotonic(),
+        started_unix=time.time(),
+        polls=400,
+        phase_path=phase_path,
+        stack_path=stack_path,
+        spawn_started_monotonic=0.5,
+        spawn_started_unix=1.5,
+        spawned_monotonic=1.0,
+        spawned_unix=2.0,
+    )
+    assert '"child_exit_before_capture": null' in diagnostics
+    assert '"child_exit_after_capture":' in diagnostics
+    assert '"child_stdout_tail": "token=<redacted>\\n"' in diagnostics
+    assert '"child_spawned_monotonic": 1.0' in diagnostics
+    assert "child_entry" in diagnostics
+    assert "Bearer <redacted>" in diagnostics
+    assert "ghp_0123456789abcdefghijklmnop" not in diagnostics
+    assert "not-for-output" not in diagnostics
+
+
+def test_pre_timeout_python_stack_snapshot_is_bounded(tmp_path: Path):
+    stack_path = tmp_path / "stack.txt"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import faulthandler, pathlib, sys, time; "
+            "output=pathlib.Path(sys.argv[1]).open('w', encoding='utf-8'); "
+            "faulthandler.dump_traceback_later(0.01, file=output); time.sleep(0.1); output.close()",
+            str(stack_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    assert result.returncode == 0, result.stderr
+    snapshot = _bounded_file_tail(stack_path)
+    assert snapshot
+    assert len(snapshot) <= _CHILD_OUTPUT_LIMIT
 
 
 def _python(environment: Path) -> Path:
@@ -117,6 +274,8 @@ def test_real_post_worker_finishes_after_runtime_daemon_process_is_killed(tmp_pa
     agent_root = ROOT.parent / "astrid-agent"
     ready, trigger, worker_result = (tmp_path / "daemon.json", tmp_path / "worker.start",
                                      tmp_path / "worker.json")
+    phase_path = tmp_path / "readiness-phases.json"
+    stack_path = tmp_path / "readiness-stack.txt"
     worker_pid = tmp_path / "worker.pid"
     worker_script = tmp_path / "update-worker.py"
     worker_script.write_text(f"""\
@@ -133,13 +292,27 @@ result = jobs.run_job(pathlib.Path(sys.argv[1]), sys.argv[2])
 pathlib.Path(sys.argv[4]).write_text(json.dumps(result))
 """, encoding="utf-8")
     child = f"""\
-import contextlib, hashlib, json, os, pathlib, secrets, subprocess, sys, time
+import contextlib, faulthandler, hashlib, json, os, pathlib, secrets, subprocess, sys, time
 from types import SimpleNamespace
+phase_path=pathlib.Path({str(phase_path)!r}); stack_path=pathlib.Path({str(stack_path)!r})
+phases=[]
+def phase(name):
+    timestamp_ns=time.time_ns(); seconds,nanos=divmod(timestamp_ns,1_000_000_000)
+    phases.append({{'sequence':len(phases)+1,'phase':name,'monotonic_ns':time.monotonic_ns(),'time_utc':time.strftime('%Y-%m-%dT%H:%M:%S',time.gmtime(seconds))+f'.{{nanos:09d}}Z'}})
+    pending=phase_path.with_name(phase_path.name+'.tmp')
+    pending.write_text(json.dumps(phases[-{_PHASE_EVENT_LIMIT}:]),encoding='utf-8')
+    os.replace(pending,phase_path)
+phase('child_entry')
+stack_output=stack_path.open('w',encoding='utf-8')
+faulthandler.dump_traceback_later({_PRE_TIMEOUT_STACK_DELAY_SECONDS},repeat=False,file=stack_output)
+phase('runtime_import_begin')
 sys.path[:0] = [{str(ROOT)!r}, {str(agent_root)!r}]
 from astrid_runtime import update
+from astrid.installer.service import install_selection
 from runtime_protocol import platform
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.door import DoorConfig, PRODUCT_SCOPES
+phase('runtime_import_complete')
 home=pathlib.Path(os.environ['HOME']); program=pathlib.Path({str(program)!r}); data=pathlib.Path({str(data)!r})
 version=pathlib.Path({str(version)!r}); realm=pathlib.Path({str(realm)!r})
 version.mkdir(parents=True); (program/'logs').mkdir(); data.mkdir(parents=True)
@@ -148,13 +321,13 @@ python=version/'python'; python.write_text('')
 profile=version/'profile.json'; profile.write_text(json.dumps({{'profile':'astrid','source_checkout':str(agent),'runtime_checkout':str(runtime)}}))
 old={{'root':str(version),'python':str(python),'profile':str(profile),'identity':{{'release':4,'managed_by':None}},'env':{{'ASTRID_INSTALL_RELEASE':'4','ASTRID_INSTALL_MANAGED_BY':''}}}}
 (version/'version.json').write_text(json.dumps(old)); (program/'current').write_text('old\\n')
-selection=data_home=pathlib.Path(os.environ['XDG_DATA_HOME']); selection=selection/'astrid-install.json'; selection.parent.mkdir(parents=True,exist_ok=True)
+selection=install_selection(home, sys.platform); selection.parent.mkdir(parents=True,exist_ok=True)
 selected={{'owner':'haus.astrid.runtime','program_root':str(program),'data_root':str(data),'realm_root':str(realm),'realm_id':'test-realm'}}
 selection.write_text(json.dumps(selected)); marker=program/'install.json'; marker.write_text(json.dumps({{'owner':'haus.astrid.runtime','data_root':str(data)}}))
 snapshots={{path:path.read_bytes() for path in (selection,program/'current',version/'version.json',profile,marker)}}
 fake=SimpleNamespace(root=realm,instance_id='old-instance',startup_identity={{'release':4,'managed_by':None}},startup_identity_instance_id='old-instance',support_root=data/'runtime',service=SimpleNamespace(realm={{'id':'test-realm'}}),_identity_agent_checkout=agent,_identity_runtime_checkout=runtime)
 admission=update.UpdateAdmission(fake)
-admission._selection=lambda:(selection,snapshots,python,agent,runtime,4)
+admission._selection=lambda *, allow_pending=False:(selection,snapshots,python,agent,runtime,4)
 admission._installer_idle=lambda _path: contextlib.nullcontext()
 update.assert_interruption_safe=lambda _root:None
 def helper(_python,_agent,_runtime,payload,**kwargs):
@@ -174,25 +347,63 @@ def launch(job):
     return {{'state':'launching','launch_status':'acknowledged'}}
 admission.launcher=launch
 door_credential=pathlib.Path({str(tmp_path/'door.json')!r})
-daemon=RuntimeDaemon(realm,support_root=data/'runtime',door=DoorConfig(origin={HOSTED!r},credential_file=door_credential,port=0)).start()
+phase('runtime_daemon_construction_begin')
+daemon=RuntimeDaemon(realm,support_root=data/'runtime',door=DoorConfig(origin={HOSTED!r},credential_file=door_credential,port=0))
+phase('runtime_daemon_constructed')
+phase('runtime_daemon_start_begin')
+daemon=daemon.start()
+phase('runtime_daemon_started')
 daemon.update_admission=admission
 fake.instance_id=daemon.instance_id; fake.startup_identity_instance_id=daemon.instance_id
-discovery=data/'runtime'/'discovery.json'; discovery.parent.mkdir(parents=True,exist_ok=True); discovery.write_text(json.dumps({{'runtime_instance_id':daemon.instance_id,'endpoint':daemon.endpoint,'door_endpoint':daemon.endpoint}}))
+discovery=data/'runtime'/'discovery.json'
+phase('product_discovery_read_begin')
+published=json.loads(discovery.read_text()); assert published['runtime_instance_id']==daemon.instance_id
+phase('product_discovery_published')
+phase('fixture_discovery_rewrite_begin')
+discovery.parent.mkdir(parents=True,exist_ok=True); discovery.write_text(json.dumps({{'runtime_instance_id':daemon.instance_id,'endpoint':daemon.endpoint,'door_endpoint':daemon.endpoint}}))
+phase('fixture_discovery_rewritten')
+phase('door_credential_setup_begin')
 token,_=daemon.credentials.provision('astrid-door-product',list(PRODUCT_SCOPES))
 platform.private_directory(door_credential.parent); door_credential.write_text(json.dumps({{'version':1,'scope':'astrid','actor_id':'astrid-door-product','token':token}})); platform.owner_only(door_credential)
+phase('door_credential_setup_complete')
+phase('fixture_marker_write_begin')
 pathlib.Path({str(ready)!r}).write_text(json.dumps({{'port':daemon.door_httpd.server_port}}))
+phase('fixture_marker_written')
 while True: time.sleep(1)
 """
+    spawn_started_monotonic = time.monotonic()
+    spawn_started_unix = time.time()
     runtime_process = subprocess.Popen([sys.executable, "-c", child], cwd=ROOT, env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    spawned_monotonic = time.monotonic()
+    spawned_unix = time.time()
     worker_result_payload = None
     try:
+        readiness_started_monotonic = time.monotonic()
+        readiness_started_unix = time.time()
         deadline = time.monotonic() + 20
+        readiness_polls = 0
         while not ready.exists() and time.monotonic() < deadline:
+            readiness_polls += 1
             if runtime_process.poll() is not None:
-                stdout, stderr = runtime_process.communicate()
-                raise AssertionError(f"RuntimeDaemon child failed: {stderr}{stdout}")
+                raise AssertionError(_readiness_failure(
+                    runtime_process, started_monotonic=readiness_started_monotonic,
+                    started_unix=readiness_started_unix, polls=readiness_polls,
+                    phase_path=phase_path, stack_path=stack_path,
+                    spawn_started_monotonic=spawn_started_monotonic,
+                    spawn_started_unix=spawn_started_unix,
+                    spawned_monotonic=spawned_monotonic, spawned_unix=spawned_unix,
+                ))
             time.sleep(0.05)
+        if not ready.exists():
+            raise AssertionError(_readiness_failure(
+                runtime_process, started_monotonic=readiness_started_monotonic,
+                started_unix=readiness_started_unix, polls=readiness_polls,
+                phase_path=phase_path, stack_path=stack_path,
+                spawn_started_monotonic=spawn_started_monotonic,
+                spawn_started_unix=spawn_started_unix,
+                spawned_monotonic=spawned_monotonic, spawned_unix=spawned_unix,
+            ))
         port = json.loads(ready.read_text(encoding="utf-8"))["port"]
         response = door_call(port, "/api/runtime/v1/update", "POST", body=b"")
         assert response.status == 202, response.body
@@ -359,6 +570,54 @@ def test_installed_foreground_runtime_owns_discovery_door_and_stops_cleanly(
     assert process.returncode == 0
     assert log_path.is_file()
     assert "door_endpoint" in log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.integration
+def test_installed_foreground_use_down_then_up_again(
+    tmp_path: Path, stage1_runtime_environment: Path,
+):
+    manifest = _manifest(tmp_path)
+    env = _environment(tmp_path)
+    # The offline Runtime wheel fixture contains no optional Agent dependencies.
+    # Supply the test interpreter's dependencies without changing that venv.
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (env.get("PYTHONPATH"), sysconfig.get_path("purelib"))))
+    created = _prepare_workspace(stage1_runtime_environment, manifest, env)
+    assert created.returncode == 0, created.stderr + created.stdout
+    discovery_path = tmp_path / "support" / "runtime" / "discovery.json"
+    for _ in range(2):
+        process = platform.spawn_tree(
+            _command(stage1_runtime_environment, manifest, "run", "--door-port", "0"),
+            cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        try:
+            discovery = _wait_for_discovery(discovery_path, process)
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    assert _door_json(discovery["door_endpoint"], "/api/runtime/v1/realm")["realm_id"] == discovery["active_realm"]
+                    break
+                except (OSError, urllib.error.URLError):
+                    assert time.monotonic() < deadline
+                    time.sleep(0.1)
+            stopped = _down(stage1_runtime_environment, manifest, env)
+            assert stopped.returncode == 0, stopped.stderr + stopped.stdout
+            assert _json_output(stopped)["status"] == "stopped"
+            assert process.wait(timeout=30) == 0
+        finally:
+            if process.poll() is None:
+                _stop_foreground(process)
+    up = subprocess.run(
+        _command(stage1_runtime_environment, manifest, "up", "--wait", "--door-port", "0"),
+        capture_output=True, text=True, timeout=90, env=env,
+    )
+    try:
+        assert up.returncode == 0, up.stderr + up.stdout
+        discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+        assert _door_json(discovery["door_endpoint"], "/api/runtime/v1/realm")["realm_id"] == discovery["active_realm"]
+    finally:
+        if discovery_path.exists():
+            _cleanup_discovered_owner(stage1_runtime_environment, manifest, env, json.loads(discovery_path.read_text(encoding="utf-8")))
 
 
 @pytest.mark.integration

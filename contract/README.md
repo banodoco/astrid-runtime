@@ -116,3 +116,35 @@ page size may change. Existing unfiltered object cursors remain compatible when
 no filters are supplied. Cursors retain the existing live keyset behavior;
 they do not freeze associations or metadata between requests. Clients forward
 all filters unchanged on every page and consume object rows directly.
+## Timeline commit ABI
+
+`schemas/timeline-commit.json` defines detached ABI 1 envelopes and the complete
+immutable closure. `schemas/edit-command.json` is the byte-identical Agent-owned
+command schema pin, including recorder leaves; Runtime does not redefine them.
+`python generators/generate.py` also emits the Runtime/Python TypedDict modules
+and TypeScript commit types. These are plain JSON-shaped values, with no runtime
+validation or renderer dependency. Acceptance validates finite JSON, closure
+identity and recorder consistency separately; types alone do not grant authority.
+Commit clients preserve the `{data, receipt}` envelope, including the distinct
+preview status with a null receipt. Restore requires both current head pins.
+
+
+The unpublished 0.2.13 candidate combines the connector and write-authorized,
+keyed persisted views with the complete frozen Agent S2 command schema from
+`26ef2bbb31b4892fdd7c15ee5b20700bd40cb933`, raw SHA256
+`a6f1aaa9dfcc31828bd04c908158fd7fd9a825df6c9f88f79b81779273a190ef`
+(48 definitions, 22 operations). S2 only adds the optional existing DocumentPin
+`schema_source` to ClipSetElementArgs and updates its description. S1 remains
+an immutable compatibility floor alongside Runtime 0.2.10, 0.2.3 and 0.2.2.
+Normal generation checks the complete schemas before writing any outputs;
+the 0.2.2 check proves the five explicit additive regex changes. Other rewrites
+still require review. Source snapshots and provenance live in
+`tests/fixtures/published-command-schemas/`.
+
+After copying an authorized schema and updating `generators/release.json`, run
+`python generators/generate.py`, normally regenerate the independent TypeScript
+conformance client as described in the repository README, then run
+`python scripts/artifact_manifest.py`. Run each generator again with `--check`.
+This candidate does not publish a release or change consumer pins. Agent view
+callers must adopt the explicit key and write authority together with the final
+qualified client pin.

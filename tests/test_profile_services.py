@@ -155,6 +155,117 @@ def test_shutdown_retry_publishes_pack_host_cleanup_receipt(tmp_path, monkeypatc
     assert item.process is None and item.cleanup_identity is None
 
 
+def test_cleanup_receipt_write_failure_retains_identity_and_stop_retries(tmp_path, monkeypatch):
+    supervisor = _supervisor(tmp_path, [ServiceSpec("pack-host", (sys.executable,), "always", ready_file="ready.json")])
+    item = supervisor._services[0]
+    monkeypatch.setattr(services_module, "sys", SimpleNamespace(platform="win32"))
+    process = SimpleNamespace(pid=321, stdout=io.BytesIO(b""), returncode=0)
+    monkeypatch.setattr(platform, "spawn_tree", lambda *args, **kwargs: process)
+    monkeypatch.setattr(platform, "process_identity", lambda _pid: {"pid": 321, "birth_id": "windows-creation:10"})
+    ready = supervisor.support / "ready.json"
+    def tree_exited(_process):
+        ready.write_text("ready", encoding="utf-8")
+        return True
+    monkeypatch.setattr(platform, "tree_exited", tree_exited)
+    monkeypatch.setattr(platform, "stop_tree", lambda *_args, **_kwargs: None)
+    writes = []
+    original_record = supervisor._record_service_cleanup
+    def fail_once(*args):
+        writes.append(args)
+        if len(writes) == 1:
+            raise OSError("transient receipt write failure")
+        return original_record(*args)
+    monkeypatch.setattr(supervisor, "_record_service_cleanup", fail_once)
+
+    with RotatingLog(tmp_path / "logs/service-pack-host.log") as log:
+        with pytest.raises(OSError):
+            supervisor._attempt(item, log)
+    assert item.process is None
+    assert item.cleanup_identity is not None
+    assert not ready.exists()
+
+    supervisor.stop()
+    assert writes[-1] == ("pack-host", 321, "windows-creation:10", writes[0][3])
+    assert item.cleanup_identity is None
+
+
+def test_pending_cleanup_blocks_replacement_attempt(tmp_path, monkeypatch):
+    supervisor = _supervisor(tmp_path, [ServiceSpec("pack-host", (sys.executable,), "always")])
+    item = supervisor._services[0]
+    item.cleanup_identity = (321, "windows-creation:10", "a" * 32)
+    item.cleanup_drained = True
+    monkeypatch.setattr(services_module, "sys", SimpleNamespace(platform="win32"))
+    writes, launches = [], []
+    def record(*args):
+        writes.append(args)
+        if len(writes) == 1:
+            raise OSError("receipt unavailable")
+    monkeypatch.setattr(supervisor, "_record_service_cleanup", record)
+    monkeypatch.setattr(supervisor, "_attempt", lambda *_: launches.append("launch") or (0, 1, None))
+    def wait(_delay):
+        supervisor._stop.set()
+        return True
+    monkeypatch.setattr(supervisor._stop, "wait", wait)
+    with RotatingLog(tmp_path / "logs/service-pack-host.log") as log:
+        supervisor._run(item)
+    assert launches == []
+    assert supervisor.snapshot()[0]["reason"] == "cleanup_failed"
+
+
+def test_cleanup_retry_preserves_on_failure_clean_exit_policy(tmp_path, monkeypatch):
+    supervisor = _supervisor(tmp_path, [ServiceSpec("pack-host", (sys.executable,), "on-failure")])
+    item = supervisor._services[0]
+    monkeypatch.setattr(services_module, "sys", SimpleNamespace(platform="win32"))
+    attempts, writes = [], []
+    def attempt(*_args):
+        attempts.append("launch")
+        supervisor._update(item, cleanup_identity=(321, "windows-creation:10", "a" * 32),
+            cleanup_drained=True, last_exit=0, cleanup_result=(0, 0.0, None))
+        raise OSError("receipt write failed")
+    monkeypatch.setattr(supervisor, "_attempt", attempt)
+    def record(*_args):
+        writes.append("receipt")
+        if len(writes) == 1:
+            raise OSError("receipt write failed")
+    monkeypatch.setattr(supervisor, "_record_service_cleanup", record)
+    monkeypatch.setattr(supervisor._stop, "wait", lambda _delay: False)
+
+    with RotatingLog(tmp_path / "logs/service-pack-host.log") as log:
+        supervisor._run(item)
+
+    assert attempts == ["launch"]
+    assert len(writes) == 2
+    assert supervisor.snapshot()[0]["reason"] == "exited"
+
+
+def test_cleanup_retry_preserves_readiness_failure_outcome(tmp_path, monkeypatch):
+    supervisor = _supervisor(tmp_path, [ServiceSpec("pack-host", (sys.executable,), "on-failure")])
+    item = supervisor._services[0]
+    monkeypatch.setattr(services_module, "sys", SimpleNamespace(platform="win32"))
+    attempts, writes = [], []
+    def attempt(*_args):
+        attempts.append("launch")
+        supervisor._update(item, cleanup_identity=(321, "windows-creation:10", "a" * 32),
+            cleanup_drained=True, last_exit=0, cleanup_result=(0, 0.0, "readiness_timeout"))
+        if len(attempts) == 1:
+            raise OSError("receipt write failed")
+        supervisor._stop.set()
+        return 0, 0.0, "stopped"
+    monkeypatch.setattr(supervisor, "_attempt", attempt)
+    def record(*_args):
+        writes.append("receipt")
+        if len(writes) == 1:
+            raise OSError("receipt write failed")
+    monkeypatch.setattr(supervisor, "_record_service_cleanup", record)
+    monkeypatch.setattr(supervisor._stop, "wait", lambda _delay: False)
+
+    with RotatingLog(tmp_path / "logs/service-pack-host.log") as log:
+        supervisor._run(item)
+
+    assert attempts == ["launch", "launch"]
+    assert len(writes) == 2
+
+
 def test_source_profile_selects_one_file_and_preserves_old_profile_digest(tmp_path):
     mapping = {"profile": "astrid", "runtime_checkout": str(ROOT), "source_checkout": str(tmp_path)}
     old = SourceProfile.from_mapping(mapping)
@@ -226,6 +337,28 @@ def test_service_environment_and_argv_keep_spaces_and_literal_shell_syntax(tmp_p
     assert not {"PYTHONPATH", "ASTRID_RUNTIME_JOB_HANDLE", "ASTRID_RUNTIME_CUSTODY_OWNER"} & options["env"].keys()
     assert code == 9 and supervisor.snapshot()[0]["last_exit"] == 9
     assert (tmp_path / "logs/service-example.log").read_text() == "first\nsecond\n"
+
+
+def test_service_child_receives_node_environment_without_import_or_custody_overrides(tmp_path, monkeypatch):
+    node = str(tmp_path / "node tools" / "node")
+    node_path = str(Path(node).parent)
+    monkeypatch.setenv("PATH", node_path)
+    monkeypatch.setenv("ASTRID_NODE_EXECUTABLE", node)
+    monkeypatch.setenv("PYTHONPATH", "/unexpected")
+    monkeypatch.setenv("PYTHONHOME", "/unexpected")
+    monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_OWNER", "secret")
+    code = ("import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+        "('PATH', 'ASTRID_NODE_EXECUTABLE', 'PYTHONPATH', 'PYTHONHOME', "
+        "'ASTRID_RUNTIME_CUSTODY_OWNER')}))")
+    spec = ServiceSpec("example", ("{python}", "-c", code), "on-failure")
+    supervisor = _supervisor(tmp_path, [spec])
+    with RotatingLog(tmp_path / "logs/service-example.log") as log:
+        exit_code, _, _ = supervisor._attempt(supervisor._services[0], log)
+    child = json.loads((tmp_path / "logs/service-example.log").read_text())
+    assert exit_code == 0
+    assert child["PATH"].split(os.pathsep) == [str(Path(sys.executable).parent), node_path]
+    assert child["ASTRID_NODE_EXECUTABLE"] == node
+    assert child["PYTHONPATH"] is child["PYTHONHOME"] is child["ASTRID_RUNTIME_CUSTODY_OWNER"] is None
 
 
 def test_windows_service_environment_uses_userprofile_when_home_is_absent(tmp_path, monkeypatch):
