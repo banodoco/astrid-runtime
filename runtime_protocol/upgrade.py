@@ -2326,6 +2326,21 @@ def _generation_tag_evidence(connection, generation, *, version: int,
     return updated
 
 
+def _generation_tag_admission_realm_id(root: Path) -> str:
+    """Read the admitted identity before an apply confirmation touches SQLite."""
+    path = root / "admission-state.json"
+    _regular(path, "realm admission identity")
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            state = json.load(source)
+    except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+        raise ValidationError("realm admission identity is unreadable") from exc
+    realm_id = state.get("realm_id") if isinstance(state, dict) else None
+    if not isinstance(realm_id, str) or not realm_id:
+        raise ValidationError("realm admission identity is invalid")
+    return realm_id
+
+
 def migrate_generation_tags(
     root: str | Path,
     *,
@@ -2346,6 +2361,15 @@ def migrate_generation_tags(
     root = _safe_realm_root(root)
     if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
         raise ValidationError("timeout_seconds must be positive")
+    admission_realm_id = None
+    if not dry_run:
+        # Refuse before schema inspection. Inspecting a stopped WAL realm is
+        # isolated on a copy, but it is needless work for an invalid operator
+        # confirmation and can prompt deferred SQLite cleanup on older Python.
+        admission_realm_id = _generation_tag_admission_realm_id(root)
+        expected_confirmation = f"{GENERATION_TAG_MIGRATION_CONFIRMATION} {admission_realm_id}"
+        if confirmation != expected_confirmation:
+            raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
     started = time.monotonic()
     deadline = started + float(timeout_seconds)
     template_models = _generation_tag_template_models(template_model_map)
@@ -2361,9 +2385,8 @@ def migrate_generation_tags(
     identity = inspect_canonical_schema(root)
     realm_id = str(identity["realm_id"])
     version = int(identity["version"])
-    expected_confirmation = f"{GENERATION_TAG_MIGRATION_CONFIRMATION} {realm_id}"
-    if not dry_run and confirmation != expected_confirmation:
-        raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
+    if not dry_run and realm_id != admission_realm_id:
+        raise ConflictError("realm identity changed before generation tag migration")
     with _owner_fence(root):
         connection = (_open_readonly(root / "realm.sqlite3") if dry_run else
                       sqlite3.connect(root / "realm.sqlite3", timeout=float(timeout_seconds)))

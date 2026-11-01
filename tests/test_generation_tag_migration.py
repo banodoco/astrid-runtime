@@ -63,6 +63,15 @@ def _generation(connection, identity, metadata, *, task_id=None, intent=None, ef
     )
 
 
+def _tree_snapshot(root):
+    """Capture realm bytes and topology, including optional SQLite sidecars."""
+    paths = sorted(root.rglob("*"), key=lambda path: str(path.relative_to(root)))
+    return (
+        tuple(str(path.relative_to(root)) for path in paths if path.is_dir()),
+        {str(path.relative_to(root)): path.read_bytes() for path in paths if path.is_file()},
+    )
+
+
 def test_v31_upgrade_adds_guarded_index_and_preserves_generation_metadata(tmp_path):
     root = tmp_path / "old"
     database = _realm(root, old=True)
@@ -178,13 +187,20 @@ def test_backfill_requires_stopped_runtime(tmp_path, dry_run):
         owner.close()
 
 
-def test_apply_requires_exact_confirmation_before_mutation(tmp_path):
+def test_apply_requires_exact_confirmation_before_mutation(tmp_path, monkeypatch):
     root = tmp_path / "realm"
     database = _realm(root)
     before = database.read_bytes()
+    before_tree = _tree_snapshot(root)
+
+    def unexpected_schema_inspection(*args, **kwargs):
+        pytest.fail("invalid confirmation must be refused before SQLite inspection")
+
+    monkeypatch.setattr(upgrade, "inspect_canonical_schema", unexpected_schema_inspection)
     with pytest.raises(ValidationError, match="confirmation exactly"):
         migrate_generation_tags(root, dry_run=False, confirmation="MIGRATE GENERATION TAGS wrong-realm")
     assert database.read_bytes() == before
+    assert _tree_snapshot(root) == before_tree
 
 
 def test_runtime_admin_cli_exposes_dry_run_and_skip_ledger(tmp_path, capsys):
