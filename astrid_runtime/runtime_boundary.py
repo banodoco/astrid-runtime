@@ -365,7 +365,10 @@ class LocalRuntimeBoundary:
         try:
             created = json.loads(output)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise BootstrapError("Runtime realm creation returned invalid metadata.") from exc
+            diagnostic = output if len(output) <= 4096 else output[:4096] + "... [truncated]"
+            raise BootstrapError(
+                "Runtime realm creation returned invalid metadata: " + repr(diagnostic)
+            ) from exc
         if not isinstance(created, Mapping):
             raise BootstrapError("Runtime realm creation returned invalid metadata.")
         return created

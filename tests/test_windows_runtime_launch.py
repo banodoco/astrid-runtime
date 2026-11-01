@@ -10,7 +10,7 @@ import venv
 
 import pytest
 
-from astrid_runtime.bootstrap import SourceProfile
+from astrid_runtime.bootstrap import BootstrapError, SourceProfile
 from astrid_runtime import runtime_boundary
 from runtime_protocol import windows_handoff
 from tests.lanes import requires_windows_runtime_venv
@@ -94,6 +94,30 @@ def test_windows_realm_creation_preserves_selected_python(tmp_path, monkeypatch,
     assert argv[:5] == [str(expected), "-X", "utf8", "-m", "runtime_protocol"]
     assert options["env"].get("__PYVENV_LAUNCHER__") == (str(selected) if selected_venv else None)
     assert os.environ["__PYVENV_LAUNCHER__"] == "stale-python"
+
+
+def test_windows_realm_creation_preserves_non_json_child_diagnostic(tmp_path, monkeypatch):
+    environment = tmp_path / "selected"
+    (environment / "Scripts").mkdir(parents=True)
+    selected = environment / "Scripts" / "python.exe"
+    selected.touch()
+    selected.chmod(0o755)
+    monkeypatch.setattr(runtime_boundary, "sys", SimpleNamespace(platform="win32", executable="other-python"))
+    monkeypatch.setattr(windows_handoff, "sys", SimpleNamespace(executable="other-python"))
+    monkeypatch.setattr(runtime_boundary.platform, "venv_python", lambda root: root / "Scripts" / "python.exe")
+    monkeypatch.setattr(
+        runtime_boundary.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="child startup diagnostic", returncode=0),
+    )
+    profile = SourceProfile(profile="astrid", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path),
+                            runtime_environment=str(environment))
+
+    with pytest.raises(BootstrapError, match="'child startup diagnostic'"):
+        runtime_boundary.LocalRuntimeBoundary().create(
+            realm_id="realm", realm_root=tmp_path / "new-realm",
+            display_name="Astrid Workspace", source_profile=profile,
+        )
 
 
 @pytest.mark.integration
