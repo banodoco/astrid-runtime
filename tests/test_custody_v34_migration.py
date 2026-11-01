@@ -268,3 +268,50 @@ def test_rollback_preserves_potentially_live_supervisor_and_post_backup_writes(w
     restart(w);restart(w);retained(w)
     assert supervisor.invoked==1
     assert w['service'].store.conn.execute('SELECT content FROM user_preferences').fetchone()[0]=='must survive'
+
+
+@pytest.mark.parametrize('boundary',[None,'plan_persisted','backfill_committed'])
+def test_populated_v31_to_round1b_v33_and_interrupted_backfill_remain_separate(tmp_path,monkeypatch,boundary):
+    from test_v33_manifest import database
+    from test_v33_upgrade_dispatch import write_realm
+    from runtime_protocol.upgrade import migrate_canonical_to_v33
+    root=tmp_path/'realm';db=database('C31')
+    db.execute("INSERT INTO projects VALUES ('project','r','project','Retained project','{}',1,'t','t',NULL)")
+    write_realm(root,db)
+    if boundary:
+        original=life.old.phase
+        def fail(archive,record,state,**facts):
+            original(archive,record,state,**facts)
+            if state==boundary:raise OSError('interrupted round1b backfill')
+        with monkeypatch.context() as patch:
+            patch.setattr(life.old,'phase',fail)
+            with pytest.raises(OSError):migrate_canonical_to_v33(root,confirmation='MIGRATE CANONICAL r')
+    for _ in range(2):
+        result=migrate_canonical_to_v33(root,confirmation='MIGRATE CANONICAL r')
+        assert result['target_schema_version']==33
+        with sqlite3.connect(root/'realm.sqlite3') as db:
+            assert canonical_manifest(db)['kind']=='U33'
+            assert db.execute('SELECT name FROM projects').fetchone()[0]=='Retained project'
+        assert life.old.activation(root)[1]['state']=='backfill_complete'
+        assert not (root/life.MARKER).exists()
+    # No reinterpretation of an unfinished round-1b activation as custody-ready.
+    with pytest.raises(ConflictError):migrate_canonical_to_current(root,confirmation='MIGRATE CANONICAL r')
+
+
+def test_authentic_archived_v31_to_v33_preserves_cas_and_publication_lineage(tmp_path):
+    from precut_realm_fixture import FIXTURE_BACKUP_KEY,_extract_archive,readonly_tree_digest
+    from runtime_protocol.backup import restore_backup
+    from runtime_protocol.upgrade import migrate_canonical_to_v33
+    archive=_extract_archive(tmp_path/'archive')
+    root=tmp_path/'realm';restore_backup(archive,root,key=FIXTURE_BACKUP_KEY,older_schema=True)
+    cas=readonly_tree_digest(root/'cas')
+    with sqlite3.connect(root/'realm.sqlite3') as db:
+        realm=db.execute('SELECT id FROM realm').fetchone()[0]
+        before=list(db.execute('SELECT publication_id,revision_id FROM timeline_commit_history'))
+    result=migrate_canonical_to_v33(root,confirmation=f'MIGRATE CANONICAL {realm}')
+    assert result['target_schema_version']==33
+    with sqlite3.connect(root/'realm.sqlite3') as db:
+        assert canonical_manifest(db)['kind']=='U33'
+        assert list(db.execute('SELECT publication_id,revision_id FROM timeline_commit_history'))==before
+    assert readonly_tree_digest(root/'cas')==cas
+    assert life.old.activation(root)[1]['state']=='backfill_complete'

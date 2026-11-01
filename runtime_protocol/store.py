@@ -6475,6 +6475,9 @@ class RealmStore:
                 selected = sorted(selected_task_ids)
             else:
                 selected = None
+            for child in self.conn.execute("SELECT id FROM tasks WHERE run_id=?", (run_id,)):
+                if selected is None or child["id"] in selected:
+                    self.custody.assert_task_installation_clear(child["id"])
             request_hash = hashlib.sha256(canonical_json({"selected_task_ids": selected}).encode()).hexdigest()
             if idempotency_key:
                 prior = self.conn.execute("SELECT * FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?", ("run.retry", run_id, idempotency_key)).fetchone()

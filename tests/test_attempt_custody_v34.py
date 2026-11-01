@@ -237,12 +237,14 @@ def test_duplicate_conflicting_creates_and_callback_cas(world):
     retained(w)
 
 
-@pytest.mark.parametrize('path',['claim','task_retry','run_retry','reset','reservation_release','new_task','reconcile_attempt','bare_stop','resume'])
+@pytest.mark.parametrize('path',['claim','claim_replay','task_retry','run_retry','reset','reservation_release','new_task','reconcile_attempt','bare_stop','resume'])
 def test_every_b1_bypass_path(world,path):
     w=world;r=arm(w);s=w['service'];db=s.store.conn
     if path=='claim':
         db.execute("UPDATE tasks SET status='queued' WHERE id=?",(r['task_id'],))
         call=lambda:s.store._claim_task(r['task_id'],'installer-worker','new-lease',runtime_epoch=r['runtime_epoch'],allow_provider_recovery=True)
+    elif path=='claim_replay':
+        call=lambda:s.claim_next({'executor_id':'installer-worker','capability_ids':['custody.test'],'runtime_epoch':r['runtime_epoch']},idempotency_key='claim')
     elif path=='task_retry':
         db.execute("UPDATE tasks SET status='failed' WHERE id=?",(r['task_id'],))
         call=lambda:s.retry_task(r['task_id'],idempotency_key='retry')
@@ -493,3 +495,22 @@ def test_conflicting_concurrent_recovery_only_one_commits(world):
     assert results.count('conflict')==1
     assert w['service'].store.custody.row(w['custody_id'])['recovery_generation']==1
     assert w['service'].store.conn.execute("SELECT COUNT(*) FROM events WHERE kind='task.custody_released'").fetchone()[0]==1
+
+
+def test_reconcile_http_owner_admin_auth_idempotency_and_real_proof(world,tmp_path):
+    from runtime_protocol.daemon import RuntimeDaemon
+    from tests.http_helpers import Api
+    w=world;arm(w);w['service'].close()
+    daemon=RuntimeDaemon(w['root'],support_root=tmp_path/'http-support').start()
+    try:
+        w['service']=daemon.service
+        b=body(w);path=f"/v1/control/tasks/{w['request']['task_id']}/reconcile"
+        for api in (Api(daemon.endpoint,None),Api(daemon.endpoint,daemon.worker_token)):
+            with pytest.raises(RuntimeError):api.request('POST',path,b,headers={'Idempotency-Key':'http-recovery'})
+        retained(w)
+        api=Api(daemon.endpoint,daemon.token)
+        with pytest.raises(RuntimeError):api.request('POST',path,b)
+        result=api.request('POST',path,b,headers={'Idempotency-Key':'http-recovery'})
+        assert result['custody_state']=='released' and result['stop_confirmed'] is True
+        assert api.request('POST',path,b,headers={'Idempotency-Key':'http-recovery'})==result
+    finally:daemon.stop()

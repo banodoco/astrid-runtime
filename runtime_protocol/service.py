@@ -7969,6 +7969,7 @@ class RuntimeService:
         self._require_object_body(body)
         with self.store._mutex:
             current = self.store.get_task(task_id)
+            self.store.custody.assert_task_installation_clear(task_id)
             project_id = current["run"].get("project_id") or "unscoped"
             request_hash = hashlib.sha256(canonical_json({"task_id": task_id, "body": body}).encode()).hexdigest()
             replay = self._command_replay("task.retry", task_id, idempotency_key, request_hash, project_id=project_id)
@@ -7976,7 +7977,6 @@ class RuntimeService:
                 return replay
             if self._task_drain(task_id) is not None:
                 raise ConflictError("remote drain blocks fresh task retries")
-            self.store.custody.assert_task_installation_clear(task_id)
             status = current["task"]["status"]
             if current["task"].get("waiting_reason") == "provider_state_unknown":
                 raise ConflictError(
@@ -8198,6 +8198,7 @@ class RuntimeService:
             if isinstance(replay, dict):
                 self.store.assert_attempt_not_abandoned(replay.get("attempt_id"))
             if isinstance(replay, dict) and replay.get("task_id"):
+                self.store.custody.assert_task_installation_clear(replay["task_id"])
                 replay_capability = self.store.conn.execute(
                     "SELECT capability FROM tasks WHERE id=?", (replay["task_id"],)
                 ).fetchone()
@@ -8416,6 +8417,7 @@ class RuntimeService:
         child = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (str(task_id),)).fetchone()
         if child is None:
             raise NotFoundError("delegated child not found")
+        self.store.custody.assert_task_installation_clear(task_id)
         lineage = self.store._spec(child).get("delegated_parent")
         expected_lineage = {
             "parent_task_id": parent["id"], "parent_attempt_id": parent_attempt["id"],
