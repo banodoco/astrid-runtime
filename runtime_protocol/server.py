@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import socket
 import sys
@@ -9,11 +10,60 @@ import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
-from urllib.parse import unquote, urlsplit, parse_qs
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .errors import RuntimeErrorBase, AuthorizationError, BodyTooLargeError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError, RetiredRouteError
 from .service import validate_idempotency_key
 from .cas import IO_CHUNK_BYTES
+
+
+class _DuplicateJSONKey(ValueError):
+    pass
+
+
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJSONKey(key)
+        result[key] = value
+    return result
+
+
+def _reject_non_finite_json(value):
+    raise ValueError(f"non-finite JSON value {value!r}")
+
+
+def _validate_finite_json(value):
+    """Reject overflowed JSON numbers after the decoder has produced them."""
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite JSON value {value!r}")
+        return
+    if isinstance(value, list):
+        for child in value:
+            _validate_finite_json(child)
+        return
+    if isinstance(value, dict):
+        for child in value.values():
+            _validate_finite_json(child)
+
+
+DOCUMENT_PIN = ("document_id", "version", "content_digest")
+# Verified reads under /v1/projects/{project_id}/: path tail -> (exact query
+# field sets, Runtime method, error message for any other query shape).
+VERIFIED_READS = {
+    ("media-selection",): (
+        ({"asset", "generation_id", "variant_id"}, {"association_id", "object_id", "version"}),
+        "get_project_media_selection", "exactly one complete media selection selector form is required"),
+    ("media-selection", "verified"): (
+        ({"asset", "generation_id", "variant_id", "object_id", "catalog_digest"},),
+        "get_project_verified_media", "all five exact media selection fields are required"),
+    ("document-inputs", "verified"): (
+        ({*DOCUMENT_PIN},), "get_project_verified_document", "all three exact document pin fields are required"),
+    ("document-objects", "verified"): (
+        ({*DOCUMENT_PIN, "object_id"},), "get_project_verified_document_object", "all four exact document object fields are required"),
+}
 
 
 class RuntimeHTTPServer(ThreadingHTTPServer):
@@ -94,10 +144,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     # Bound abandoned request bodies and clients that stop consuming responses.
     timeout = 30
     MAX_BODY_BYTES = 64 * 1024 * 1024
+    TIMELINE_BODY_BYTES = 1024 * 1024
     REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
 
     def log_message(self, *_):
         return
+
+    def handle_one_request(self):
+        # BaseHTTPRequestHandler reuses this instance for keep-alive requests;
+        # the public id is stable only for the request currently being parsed.
+        self._runtime_request_id = None
+        return super().handle_one_request()
 
     def _request_id(self):
         current = getattr(self, "_runtime_request_id", None)
@@ -189,16 +246,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
                 yield chunk
 
-    def _read_raw_body(self):
+    def _read_raw_body(self, limit=None):
         if self._header_values("Transfer-Encoding"):
             raise ProtocolError("JSON requests require Content-Length without Transfer-Encoding")
-        length = self._content_length()
+        length = self._content_length(limit)
         raw = self.rfile.read(length)
         if len(raw) != length:
             raise ProtocolError("request body is shorter than Content-Length")
         return raw
 
-    def _prefetch_body(self):
+    def _prefetch_body(self, limit=None):
         """Read a declared request body before the store mutex is taken.
 
         A client that is still sending its body must not hold the lock every
@@ -208,17 +265,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if not hasattr(self, "headers") or not (self._header_values("Content-Length") or self._header_values("Transfer-Encoding")):
             return
         try:
-            self._prefetched_body = self._read_raw_body()
+            self._prefetched_body = self._read_raw_body(limit)
         except RuntimeErrorBase as exc:
             self._prefetched_body = exc
 
-    def _raw_body(self):
+    def _raw_body(self, limit=None):
         prefetched = getattr(self, "_prefetched_body", None)
         if isinstance(prefetched, RuntimeErrorBase):
             raise prefetched
         if prefetched is not None:
             return prefetched
-        return self._read_raw_body()
+        return self._read_raw_body(limit)
 
     def _body(self):
         raw = self._raw_body()
@@ -226,6 +283,28 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8")) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ProtocolError("request body must be valid JSON") from exc
+
+    def _strict_json_body(self, label):
+        """Parse an authoring request without normalizing its original body."""
+        raw = self._raw_body(self.TIMELINE_BODY_BYTES)
+        try:
+            body = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_json_keys,
+                parse_constant=_reject_non_finite_json,
+            ) if raw else {}
+            _validate_finite_json(body)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ProtocolError(f"{label} must be finite JSON without duplicate fields") from exc
+        if not isinstance(body, dict):
+            raise InvalidRequestError(f"{label} must be a JSON object")
+        return body
+
+    def _commit_body(self):
+        return self._strict_json_body("commit request")
+
+    def _restore_body(self):
+        return self._strict_json_body("restore request")
 
     def _project_mutation_body(self):
         body = self._body()
@@ -247,6 +326,76 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return validate_idempotency_key(key)
         except InvalidRequestError as exc:
             raise ProtocolError(str(exc)) from exc
+
+    def _commit_idempotency_key(self):
+        values = self._header_values("Idempotency-Key")
+        if len(values) != 1:
+            raise ProtocolError("one Idempotency-Key header is required")
+        try:
+            return validate_idempotency_key(values[0])
+        except InvalidRequestError as exc:
+            raise ProtocolError(str(exc)) from exc
+
+    def _authorize_timeline_commit(self, publisher):
+        identity = self._identity("projects:write")
+        if identity.get("actor") != publisher:
+            raise AuthorizationError("authenticated publisher changed during commit")
+        return identity
+
+    def _authorize_timeline_read(self, publisher):
+        identity = self._identity("projects:read")
+        if identity.get("actor") != publisher:
+            raise AuthorizationError("authenticated publisher changed during timeline read")
+        return identity
+
+    @staticmethod
+    def _timeline_path(project_id, timeline_id, suffix):
+        return (
+            f"/v1/projects/{quote(project_id, safe='')}/timelines/"
+            f"{quote(timeline_id, safe='')}/{suffix}"
+        )
+
+    def _timeline_commit(self, project_id, timeline_id, path):
+        if urlsplit(self.path).query:
+            raise ProtocolError("timeline commit does not accept a query string")
+        identity = self._identity("projects:write")
+        body = self._commit_body()
+        if body.get("project_id") != project_id or body.get("timeline_id") != timeline_id:
+            raise ConflictError("commit project/timeline identity does not match the route")
+        key = self._commit_idempotency_key()
+        commit = getattr(self.runtime, "commit_timeline", None)
+        if not callable(commit):
+            from .timeline_commit_execution import (
+                _emit_redacted_diagnostic,
+                _new_request_id,
+            )
+            from .timeline_commit_provider import TimelineCommitUnavailable
+            public_request_id = self._request_id()
+            _emit_redacted_diagnostic(
+                _new_request_id(), reason="timeline_commit_unavailable",
+                public_request_id=public_request_id,
+                idempotency_key=key,
+            )
+            raise TimelineCommitUnavailable()
+        publisher = identity["actor"]
+
+        def authorize():
+            return self._authorize_timeline_commit(publisher)
+
+        from .timeline_commit_execution import (
+            idempotency_key_scope,
+            public_request_id_scope,
+        )
+        with public_request_id_scope(self._request_id()), idempotency_key_scope(key):
+            return self._send(200, commit(
+                project_id,
+                timeline_id,
+                body,
+                idempotency_key=key,
+                publisher=publisher,
+                invocation_path=self._timeline_path(project_id, timeline_id, "commit"),
+                authorize=authorize,
+            ))
 
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):
         if getattr(self, "_defer_response", False):
@@ -310,7 +459,21 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         return (self.command == "POST" and len(path) == 4 and path[:2] == ["v1", "projects"]
                 and path[3] in ("objects", "media-imports"))
 
+    def _is_timeline_commit(self):
+        path = [unquote(x) for x in urlsplit(getattr(self, "path", "")).path.split("/") if x]
+        if getattr(self, "command", None) != "POST" or path[:2] != ["v1", "projects"]:
+            return False
+        commit = len(path) == 6 and path[3] == "timelines" and path[5] == "commit"
+        restore = (
+            len(path) == 8 and path[3] == "timelines"
+            and path[5] == "composition-revisions" and path[7] == "restore"
+        )
+        return commit or restore
+
     def _error(self, exc):
+        commits = getattr(self.runtime, "_timeline_commit_store", None)
+        if commits is not None:
+            commits.clear_replay_memo()
         if isinstance(exc, RuntimeErrorBase):
             payload = exc.as_dict()
             payload["request_id"] = self._request_id()
@@ -493,10 +656,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             project_id = value["project"]["project_id"]
             aggregate_id = f"{identity['actor']}:{value['scope']}"
             return self._send(200, {"data": value, "receipt": self.runtime.committed_receipt("project.select", aggregate_id, key, project_id=project_id)})
+        if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "commit" and method == "POST":
+            return self._timeline_commit(path[2], path[4], path)
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timelines":
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "POST":
                 body = self._project_mutation_body()
+                if set(body) - {"timeline_id", "name"}:
+                    raise InvalidRequestError("timeline creation accepts only timeline_id and name")
                 if "name" in body and not isinstance(body["name"], str):
                     raise InvalidRequestError("timeline name must be a string")
                 key = self.headers.get("Idempotency-Key")
@@ -515,15 +682,53 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.get_project_timeline(path[2], path[4]))
             if method == "PATCH":
                 return self._send(200, self.runtime.rename_timeline(path[2], path[4], self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+        if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "commits" and method == "GET":
+            identity = self._identity("projects:read")
+            publisher = identity["actor"]
+            def authorize():
+                return self._authorize_timeline_read(publisher)
+
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            return self._send(200, self.runtime.list_timeline_commits(
+                path[2], path[4], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0],
+                authorize=authorize,
+            ))
+        route = VERIFIED_READS.get(tuple(path[3:]))
+        if path[:2] == ["v1", "projects"] and route is not None and method == "GET":
+            forms, read, message = route
+            document = path[3] in ("document-inputs", "document-objects")
+            identity = self._identity("projects:read")
+            publisher = identity["actor"]
+            def authorize():
+                return self._authorize_timeline_read(publisher)
+
+            raw_query = urlsplit(self.path).query
+            try:
+                if re.search(r"%(?![0-9a-fA-F]{2})", raw_query):
+                    raise ValueError("invalid percent encoding")
+                query = parse_qs(raw_query, keep_blank_values=True, strict_parsing=True, errors="strict")
+            except (ValueError, UnicodeError) as exc:
+                raise ProtocolError("invalid media selection query encoding") from exc
+            if set(query) not in forms or any(len(values) != 1 or not values[0].strip() for values in query.values()):
+                raise ProtocolError(message)
+            if "version" in query:
+                if not re.fullmatch(r"[1-9][0-9]*", query["version"][0]):
+                    raise ProtocolError("document version must be a positive integer" if document
+                                        else "output version must be a positive integer")
+                query["version"] = [int(query["version"][0])]
+            selector = {key: values[0] for key, values in query.items()}
+            if document:
+                pin = {key: selector[key] for key in DOCUMENT_PIN}
+                args = (pin, selector["object_id"]) if path[3] == "document-objects" else (pin,)
+            else:
+                args = (selector,)
+            return self._send(200, getattr(self.runtime, read)(path[2], *args, authorize=authorize))
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timeline-documents" and method == "POST":
             self._identity("projects:write")
-            raise RetiredRouteError(
-                "timeline-document creation is retired; publish a canonical parent composition",
-                details={"replacement": "POST /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions"},
-            )
+            self.runtime._require_timeline_command()
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "POST":
             self._identity("projects:write")
-            return self._send(200, self.runtime.publish_parent_composition(path[2], path[4], self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+            self.runtime._require_timeline_command()
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "GET":
             self._identity("projects:read")
             query = parse_qs(urlsplit(self.path).query)
@@ -534,19 +739,37 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("projects:read")
             return self._send(200, self.runtime.inspect_timeline(path[2], path[4], self._timeline_options()))
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "views" and method == "POST":
-            self._identity("projects:read")
-            return self._send(200, self.runtime.create_timeline_view(path[2], path[4], self._timeline_options()))
+            self._identity("projects:write")
+            return self._send(200, self.runtime.create_timeline_view(path[2], path[4], self._timeline_options(), idempotency_key=self._idempotency_key()))
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "replace-parent-media" and method == "POST":
             self._identity("projects:write")
-            return self._send(200, self.runtime.replace_parent_composition_media(path[2], path[4], self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+            self.runtime._require_timeline_command()
         if len(path) == 7 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "GET":
             self._identity("projects:read")
             return self._send(200, self.runtime.get_project_parent_composition_revision(path[2], path[4], path[6]))
         if len(path) == 8 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and path[7] == "restore" and method == "POST":
-            self._identity("projects:write")
-            return self._send(200, self.runtime.restore_project_parent_composition_revision(
-                path[2], path[4], path[6], self._project_mutation_body(), idempotency_key=self._idempotency_key(),
-            ))
+            identity = self._identity("projects:write")
+            body = self._restore_body()
+            restore = self.runtime.restore_project_parent_composition_revision
+
+            def authorize():
+                current = self._identity("projects:write")
+                if current.get("actor") != identity.get("actor"):
+                    raise AuthorizationError("authenticated publisher changed during restore")
+                return current
+
+            from .timeline_commit_execution import public_request_id_scope
+            with public_request_id_scope(self._request_id()):
+                return self._send(200, restore(
+                    path[2], path[4], path[6], body,
+                    idempotency_key=self._commit_idempotency_key(),
+                    publisher=identity["actor"],
+                    invocation_path=self._timeline_path(
+                        path[2], path[4],
+                        f"composition-revisions/{quote(path[6], safe='')}/restore",
+                    ),
+                    authorize=authorize,
+                ))
         if len(path) == 7 and path[:2] == ["v1", "projects"] and path[5] == "revisions" and method == "GET":
             self._identity("projects:read")
             if path[3] == "shots":
@@ -561,10 +784,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 raise ProtocolError("Idempotency-Key header is required")
             return self._send(201, self.runtime.create_shot(path[2], body, idempotency_key=key) if path[3] == "shots" else self.runtime.create_reference(path[2], body, idempotency_key=key))
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "PATCH":
-            self._identity("projects:write"); return self._send(200, self.runtime.update_timeline(path[2], self._body(), idempotency_key=self._idempotency_key()))
+            self._identity("projects:write"); self.runtime._require_timeline_command()
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] == "replace-clip" and method == "POST":
             self._identity("projects:write")
-            return self._send(200, self.runtime.replace_timeline_clip(path[2], self._body(), idempotency_key=self._idempotency_key()))
+            self.runtime._require_timeline_command()
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("history", "diff") and method == "GET":
             self._identity("projects:read")
             query = parse_qs(urlsplit(self.path).query)
@@ -632,13 +855,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if method == "POST":
                     body = self._body()
                     if isinstance(body, dict) and (
-                        str(body.get("document_id", "")).startswith("timeline:")
+                        "timeline_id" in body
+                        or str(body.get("document_id", "")).startswith("timeline:")
                         or body.get("kind") == "timeline.composition"
                     ):
-                        raise RetiredRouteError(
-                            "timeline documents are retired; publish a canonical parent composition",
-                            details={"replacement": "POST /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions"},
-                        )
+                        self.runtime._require_timeline_command()
                     return self._send(201, self.runtime.create_document(selector, body, idempotency_key=self._idempotency_key()))
             if len(path) == 5 and path[3] == "documents" and method in ("GET", "PATCH"):
                 self._identity("projects:read" if method == "GET" else "projects:write")
@@ -648,7 +869,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         details={"replacement": "POST /v1/projects/{project_id}/timelines/{timeline_id}/inspect"},
                     )
                 if method == "GET": return self._send(200, self.runtime.get_document(selector, path[4]))
-                return self._send(200, self.runtime.update_document(selector, path[4], self._body(), idempotency_key=self._idempotency_key()))
+                body = self._body()
+                if isinstance(body, dict) and "timeline_id" in body:
+                    self.runtime._require_timeline_command()
+                return self._send(200, self.runtime.update_document(selector, path[4], body, idempotency_key=self._idempotency_key()))
             if len(path) == 4 and path[3] == "media-imports" and method == "POST":
                 identity = self._identity("projects:write")
                 key = self._idempotency_key()
@@ -984,8 +1208,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.prepare_reboot(body, identity=identity))
             if action == "checkpoint": return self._send(201, self.runtime.checkpoint_attempt(path[2], self._body(), identity=identity))
             if action == "publish-timeline-render":
-                key = self._idempotency_key()
-                return self._send(200, self.runtime.publish_timeline_render(path[2], self._body(), idempotency_key=key, identity=identity))
+                self.runtime._require_timeline_command()
             if action == "settle":
                 key = self._idempotency_key()
                 value = self.runtime.settle_attempt(path[2], self._body(), idempotency_key=key, identity=identity)
@@ -1127,6 +1350,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         writes happen afterwards: an unread client must not hold the database
         lock and stall every other request, including health checks.
         """
+        timing = token = None
+        wire_started = False
+        if self._is_timeline_commit():
+            from .timeline_commit_execution import start_commit_timing
+            timing, token = start_commit_timing()
+            timing.begin("handler")
         try:
             self._pending_response = None
             self._pending_file_response = None
@@ -1152,9 +1381,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     # Support diagnostics performs independent owner-boundary
                     # probes; it must not hold the serialized SQLite section.
                     self._route()
-                elif self._is_remote_credential_control() or self._is_binary_io():
+                elif self._is_remote_credential_control() or self._is_binary_io() or self._is_timeline_commit():
                     # Both routes own short store sections. Transfer, hashing,
                     # and daemon actor ownership must stay outside this lock.
+                    if self._is_timeline_commit():
+                        self._prefetch_body(self.TIMELINE_BODY_BYTES)
                     self._route()
                 else:
                     self._prefetch_body()
@@ -1165,23 +1396,50 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if self._pending_response is not None:
                 status, payload, kwargs = self._pending_response
                 self._pending_response = None
-                self._send(status, payload, **kwargs)
+                if timing is not None:
+                    timing.begin("wire_response")
+                    wire_started = True
+                try:
+                    self._send(status, payload, **kwargs)
+                finally:
+                    if timing is not None:
+                        timing.end("wire_response")
+                        wire_started = False
             if self._pending_file_response is not None:
                 pending = self._pending_file_response
                 self._pending_file_response = None
                 self._send_file(*pending)
         except (ConnectionError, TimeoutError):
+            if timing is not None:
+                timing.outcome = "failure"
+                if wire_started:
+                    timing.end("wire_response")
             self.close_connection = True
         except Exception as exc:
+            if timing is not None:
+                timing.outcome = "failure"
+                timing.begin("wire_response")
+                wire_started = True
             if getattr(self, "_response_started", False):
                 self.close_connection = True
             else:
-                self._error(exc)
+                try:
+                    self._error(exc)
+                finally:
+                    if timing is not None:
+                        timing.end("wire_response")
+                        wire_started = False
         finally:
             pending = getattr(self, "_pending_file_response", None)
             if pending is not None:
                 pending[1].close()
                 self._pending_file_response = None
+            if timing is not None:
+                if wire_started:
+                    timing.end("wire_response")
+                timing.end("handler")
+                from .timeline_commit_execution import finish_commit_timing
+                finish_commit_timing(timing, token)
 
     def do_GET(self):
         self._dispatch()

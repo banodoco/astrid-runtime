@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrid.haus/workspace/v1/schemas/media-selection.json",
+  "$ref": "timeline-commit.json#/$defs/MediaSelection"
+}

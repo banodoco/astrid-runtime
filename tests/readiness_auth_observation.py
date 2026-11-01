@@ -1,0 +1,224 @@
+"""Explicit-only diagnostic: pytest tests/readiness_auth_observation.py.
+
+Measures frozen genuine seed fixtures without authentication wrappers or stack sampling.
+No browser journey runs. Captures retain timings and credential-scanned history
+replies. The filename keeps this machine-specific probe out of
+ordinary test discovery while permitting the central service's relative --files.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import signal
+import socket
+import sqlite3
+import subprocess
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+import pytest
+
+WORKTREE = Path('/home/user/work/wt/rt-R-readiness-auth-cost-sol-0155')
+SOURCE = Path(__file__).resolve().parents[1]
+BASE = '28bb65668'
+APP_FAILED = '804134d74782d40855146aa568ff289200b79142'
+AGENT_FAILED = '079580ca46af77e0292d49dc34386b25c8391f99'
+APP_P1 = 'f8b15af0a66ed14e7711a4bb7f1ed5b62b4988b5'
+AGENT_P1 = '78738040d72ce74c42ddf7731221aecb06f9246d'
+NODE = '/home/user/work/toolchain/node-v20.19.4-linux-x64/bin/node'
+NODE_MODULES = Path('/home/user/work/app/node_modules').resolve()
+APP_FILES = [
+    'tests/e2e/local/support/harness.ts',
+    'tests/e2e/local/support/astrid.ts',
+    'tests/e2e/local/support/quick-descriptor.ts',
+    'src/shared/lib/editorTourVersion.ts',
+    'tests/e2e/local/three-products.p1-chain.spec.ts',
+]
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, separators=(',', ':')) + '\n')
+
+
+def retain_state(scratch, capture):
+    database, = (scratch / 'fixture').rglob('realm.sqlite3')
+    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        tables = ['parent_composition_heads', 'parent_composition_revisions',
+                  'shot_revisions', 'internal_timeline_revisions', 'timeline_commit_history',
+                  'timeline_events', 'project_sequences', 'timeline_document_input_contents',
+                  'timeline_document_input_bindings', 'timeline_document_input_links']
+        state = {table: [dict(row) for row in conn.execute(f'SELECT * FROM {table}')] for table in tables}
+        state['command_idempotency'] = [dict(row) for row in conn.execute(
+            "SELECT * FROM command_idempotency WHERE command_kind='timeline.commit'")]
+    write_json(capture / 'authenticated-state.json', state)
+
+
+def archive(repo, revision, destination, files=()):
+    destination.mkdir()
+    result = subprocess.run(['git', '-C', repo, 'archive', revision, *files],
+                            check=True, capture_output=True)
+    subprocess.run(['tar', '-x', '-C', str(destination)], input=result.stdout, check=True)
+
+
+def until_state(root, stages, process, seconds=150):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        state = read_json(root / 'state.json')
+        if state and state['stage'] in stages:
+            return state
+        assert process.poll() is None, f'fixture exited {process.returncode}; private log: {root}'
+        time.sleep(.025)
+    raise AssertionError(f'fixture stage deadline; private log: {root}')
+
+
+def get(state, suffix, *, door=False, preflight=False):
+    start = time.monotonic()
+    headers = {'Origin': state['origin']} if door else {
+        'Authorization': 'Bearer ' + read_json(Path(state['credential']))['token'],
+    }
+    if preflight:
+        headers.update({'Access-Control-Request-Method': 'GET',
+                        'Access-Control-Request-Headers': 'content-type',
+                        'Access-Control-Request-Private-Network': 'true'})
+    req = urllib.request.Request((state['door'] if door else state['endpoint']) + suffix,
+                                 headers=headers, method='OPTIONS' if preflight else 'GET')
+    result = {'path': suffix.split('&cursor=')[0], 'door': door, 'preflight': preflight,
+              'started': start}
+    cursor = None
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            raw = response.read()
+            value = json.loads(raw) if raw else None
+            result.update(status=response.status, bytes=len(raw),
+                          cors=response.headers.get('Access-Control-Allow-Origin'))
+            if isinstance(value, dict) and 'items' in value:
+                cursor = value.get('next_cursor')
+                result.update(items=len(value['items']), has_cursor=bool(cursor), head=value['head'],
+                              publications=[item['publication_id'] for item in value['items']], reply=value)
+    except urllib.error.HTTPError as exc:
+        # Do not export the response body, which can contain request details.
+        result.update(status=exc.code, error='HTTPError')
+    except (OSError, ValueError) as exc:
+        result.update(status=None, error=type(exc).__name__)
+    result.update(finished=time.monotonic(), seconds=time.monotonic() - start)
+    return result, cursor
+
+
+@pytest.mark.parametrize('mode', ['native21', 'p1'])
+def test_history_conditions(mode):
+    # Fixtures/archives stay in harness-cleaned TMPDIR; only safe captures are durable.
+    scratch = Path(os.environ.get('TMPDIR', '/tmp/w-a28b87584c')) / f'readiness-{mode}-{uuid.uuid4().hex[:8]}'
+    scratch.mkdir()
+    capture = WORKTREE / 'diagnostics' / 'readiness-auth' / scratch.name
+    capture.mkdir(parents=True)
+    app_sha, agent_sha = (APP_P1, AGENT_P1) if mode == 'p1' else (APP_FAILED, AGENT_FAILED)
+    app, agent = scratch / 'app', scratch / 'agent'
+    archive('/home/user/work/app', app_sha, app, APP_FILES)
+    archive('/home/user/work/agent', agent_sha, agent)
+    # Links point outwards to an existing read-only install. Nothing writes inside it.
+    (app / 'node_modules').symlink_to(NODE_MODULES, target_is_directory=True)
+    local = app / 'tests/e2e/local'
+    spec = (local / 'three-products.p1-chain.spec.ts').read_text()
+    seed = spec[spec.index('async function seedOneClip('):spec.index('\nasync function history(')]
+    seed = seed.replace('async function seedOneClip(', 'export async function seedOneClip(', 1)
+    (local / 'p1-seed.ts').write_text(
+        "import { randomUUID } from 'node:crypto';\n"
+        f"import {{ expect }} from '{NODE_MODULES}/@playwright/test/index.mjs';\n"
+        "import { ASTRID_PYTHON } from './support/astrid.ts';\n"
+        "import type { AstridCli } from './support/astrid.ts';\n"
+        "import type { DirectHarness } from './support/harness.ts';\n"
+        "type ChainSeed = { projectSlug: string; timelineId: string; sourceId: string };\n"
+        "const SOURCE_ID = 'p1-chain-source';\n" + seed)
+    (local / 'probe.mts').write_bytes((SOURCE / 'tests/readiness_auth_observation.mts').read_bytes())
+    manifest = {'mode': mode, 'runtime_base': BASE, 'runtime_source': str(SOURCE),
+                'app': app_sha, 'agent': agent_sha, 'new_observation': True,
+                'instrumentation': False,
+                'runtime_files': {name: hashlib.sha256((SOURCE / 'runtime_protocol' / name).read_bytes()).hexdigest()
+                                  for name in ['service.py', 'timeline_commit_store.py']},
+                'fixture_files': {file: hashlib.sha256((app / file).read_bytes()).hexdigest()
+                                  for file in APP_FILES},
+                'probe_files': {file: hashlib.sha256((SOURCE / file).read_bytes()).hexdigest()
+                                for file in ['tests/readiness_auth_observation.py',
+                                             'tests/readiness_auth_observation.mts']}}
+    write_json(capture / 'manifest.json', manifest)
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    env = dict(os.environ, ASTRID_RUNTIME_CHECKOUT=str(SOURCE),
+               ASTRID_RUNTIME_PYTHON='/home/user/work/venv-runtime/bin/python',
+               ASTRID_CHECKOUT=str(agent), ASTRID_PYTHON='/home/user/work/venv-agent/bin/python',
+               READINESS_DOOR_PORT=str(port), TMPDIR=str(scratch),
+               PYTHONDONTWRITEBYTECODE='1', TSX_DISABLE_CACHE='1')
+    results = []
+    failure = None
+    with (scratch / 'node.log').open('w') as output:
+        process = subprocess.Popen([NODE, str(NODE_MODULES / 'tsx/dist/cli.mjs'),
+                                    str(local / 'probe.mts'), str(scratch), str(capture), mode],
+                                   env=env, stdout=output, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        try:
+            state = until_state(scratch, {'baseline', 'error'}, process)
+            assert state['stage'] == 'baseline', f'fixture setup failed; private log: {scratch}'
+            route = f"/v1/projects/{state['project']}/timelines/{state['timeline']}/commits?limit=50"
+            (scratch / 'GO').touch()
+            state = until_state(scratch, {'idle', 'error'}, process)
+            assert state['stage'] == 'idle', f'fixture seed failed; private log: {scratch}'
+            route = f"/v1/projects/{state['project']}/timelines/{state['timeline']}/commits?limit=50"
+            for door in (False, True):
+                result, _ = get(state, route, door=door)
+                results.append(dict(condition='completed-seed-no-writer', **result))
+                assert result['items'] == 2
+            assert results[0]['reply'] == results[1]['reply']
+            assert all(r['status'] in (200, 204) for r in results), results
+        except BaseException as exc:
+            failure = type(exc).__name__
+            raise
+        finally:
+            (scratch / 'STOP').touch()
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=15)
+            write_json(capture / 'responses.json', results)
+            retain_state(scratch, capture)
+            manifest.update(failure=failure, node_exit=process.returncode,
+                            captured_files=sorted(p.name for p in capture.iterdir()))
+            write_json(capture / 'manifest.json', manifest)
+            # Negative credential control against every minted credential in this fixture.
+            secrets = []
+            for file in (scratch / 'fixture').rglob('*.json'):
+                value = read_json(file)
+                if isinstance(value, dict) and isinstance(value.get('token'), str):
+                    secrets.append(value['token'].encode())
+            secrets.extend(file.read_bytes().strip() for file in (scratch / 'fixture').rglob('*.token'))
+            for file in capture.iterdir():
+                raw = file.read_bytes()
+                assert not any(secret in raw for secret in secrets), f'credential in {file.name}'
+            print(f'CAPTURE {capture} observations={len(results)} fixture_exit={process.returncode}')
+
+
+def test_exact_acceptance():
+    command = ['/home/user/work/venv-runtime/bin/python', '-m', 'pytest', '-q', '-o', 'addopts=',
+               '-p', 'no:cacheprovider', 'tests/test_timeline_history_boundaries.py',
+               'tests/test_timeline_commit_authentication.py', 'tests/test_timeline_commit_read_basis.py',
+               'tests/test_timeline_history_authenticated_read.py']
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', PYTHONPATH='.:packages/python',
+               ASTRID_CHECKOUT='/home/user/work/agent')
+    result = subprocess.run(command, cwd=SOURCE, env=env, text=True, capture_output=True, check=False)
+    (WORKTREE / 'diagnostics/readiness-auth/acceptance.txt').write_text(
+        'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:packages/python ASTRID_CHECKOUT=/home/user/work/agent '
+        + ' '.join(command) + '\n' + result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr

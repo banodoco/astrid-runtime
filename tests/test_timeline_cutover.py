@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from baseline_fixture import load_baseline_fixture
 from runtime_protocol.daemon import RuntimeDaemon
-from runtime_protocol.store import RealmStore
 from runtime_protocol.timeline_cutover import audit_active_timeline_heads
 from tests.http_helpers import Api
 
@@ -42,23 +42,7 @@ def _publication(project: str) -> dict:
 
 
 def _service(tmp_path):
-    from runtime_protocol.service import RuntimeService
-
-    root = tmp_path / "realm"
-    RealmStore.initialize(root).close()
-    service = RuntimeService(root)
-    project = service.create_project({"slug": "cutover", "name": "Cutover"}, idempotency_key="project")
-    service.create_timeline_document(
-        project["id"],
-        {
-            "timeline_id": "main", "slug": "main", "name": "Main",
-            "config": {"clips": [{"id": "legacy-shell", "clipType": "shot", "at": 0, "hold": 1, "params": {"shot_id": "shot-1", "timeline_document_id": "child-1"}}], "pinnedShotGroups": [{"id": "legacy-group", "clipIds": ["legacy-shell"]}]},
-            "registry": {},
-        },
-        idempotency_key="timeline",
-    )
-    service.publish_parent_composition(project["id"], "main", _publication(project["id"]), idempotency_key="publish")
-    return service, project["id"], root
+    return load_baseline_fixture(tmp_path, "cutover")
 
 
 def test_active_head_audit_reports_canonical_closure_and_legacy_shell(tmp_path):
@@ -80,7 +64,7 @@ def test_active_head_audit_reports_canonical_closure_and_legacy_shell(tmp_path):
 
 
 def test_active_head_audit_accepts_canonical_cutover_tombstone(tmp_path):
-    service, project_id, _ = _service(tmp_path)
+    service, project_id, _ = load_baseline_fixture(tmp_path, "legacy-document")
     try:
         service.store.conn.execute(
             "UPDATE project_documents SET content_json=?, version=? WHERE id=? AND project_id=?",
@@ -99,7 +83,9 @@ def test_active_head_audit_accepts_canonical_cutover_tombstone(tmp_path):
 
 
 def test_public_timeline_document_routes_are_retired(tmp_path):
-    service, project_id, root = _service(tmp_path)
+    service, project_id, _ = load_baseline_fixture(tmp_path)
+    root = service.store.root
+    service.rename_timeline(project_id, "main", {"name": "Main"}, idempotency_key="timeline-name")
     service.close()
     daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start()
     try:

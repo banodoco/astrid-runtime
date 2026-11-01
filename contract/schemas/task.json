@@ -23,7 +23,7 @@
     "execution_request": { "$ref": "#/definitions/ExecutionRequest" },
     "execution_binding": { "$ref": "#/definitions/ExecutionBinding" },
     "required_facts": { "$ref": "#/definitions/RequiredFacts" },
-    "spec": { "type": "object", "additionalProperties": true },
+    "spec": { "type": "object", "additionalProperties": true, "properties": { "spec": { "$ref": "#/definitions/RenderAdmissionSpec" } } },
     "generation_intent": { "type": "object", "additionalProperties": true },
     "expected_effect": { "type": "object", "additionalProperties": true },
     "storage_estimate": {
@@ -40,6 +40,44 @@
     ,"result": { "type": "object", "additionalProperties": true }
   },
   "definitions": {
+    "CanonicalRenderRevision": {
+      "description": "Immutable accepted revision selector. Requesting clients require rendering.render.historical_revision.v1 and verify the returned revision, digest and publication authority.",
+      "type": "object", "additionalProperties": false,
+      "required": ["project_id", "timeline_id", "revision_id", "publication_id", "content_digest"],
+      "properties": {
+        "project_id": { "type": "string", "minLength": 1 },
+        "timeline_id": { "type": "string", "minLength": 1 },
+        "revision_id": { "type": "string", "minLength": 1 },
+        "publication_id": { "type": "string", "minLength": 1, "description": "Accepted publication receipt_id." },
+        "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "RenderTimelineAuthority": {
+      "type": "object", "additionalProperties": true,
+      "properties": {
+        "project_id": { "type": "string", "minLength": 1 },
+        "timeline_id": { "type": "string", "minLength": 1 },
+        "parent_revision_id": { "type": "string", "minLength": 1 },
+        "parent_content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "publication_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "RenderAdmissionSpec": {
+      "type": "object", "additionalProperties": true,
+      "if": { "required": ["family"], "properties": { "family": { "const": "render" } } },
+      "then": {
+        "properties": {
+          "params": {
+            "type": "object", "additionalProperties": true,
+            "properties": { "canonical_revision": { "$ref": "#/definitions/CanonicalRenderRevision" } }
+          },
+          "inputs": {
+            "type": "object", "additionalProperties": true,
+            "properties": { "timeline_authority": { "$ref": "#/definitions/RenderTimelineAuthority" } }
+          }
+        }
+      }
+    },
     "ExecutionTarget": {
       "type": "object", "additionalProperties": true,
       "required": ["kind"],

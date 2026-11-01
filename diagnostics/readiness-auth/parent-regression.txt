@@ -1,0 +1,41 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+__ test_production_history_authenticates_bound_once_and_preserves_exact_reply __
+
+service = <runtime_protocol.service.RuntimeService object at 0x7efe94b86120>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7efe938f29e0>
+
+    def test_production_history_authenticates_bound_once_and_preserves_exact_reply(service, monkeypatch):
+        provider(service)
+        accepted = commit(service, body(service))
+        commits, _ = service._timeline_commits()
+        head = commits.head(service.test_project, "main")
+        publications = service.store.conn.execute(
+            "SELECT publication_id FROM timeline_commit_history ORDER BY project_seq").fetchall()
+        expected = {"head": head, "next_cursor": None, "items": [
+            commits.history_entry(service.test_project, "main", row[0]) for row in publications]}
+        calls = Counter()
+        original = commits._verify_accepted
+
+        def verify(row, edge, **kwargs):
+            assert service.store._mutex._is_owned()
+            calls[edge["publication_id"]] += 1
+            return original(row, edge, **kwargs)
+
+        monkeypatch.setattr(commits, "_verify_accepted", verify)
+        before = rows(service)
+        actual = listed(service, limit=50)
+        assert canonical_json(actual) == canonical_json(expected)
+        assert actual["items"][-1]["receipt"] == accepted["receipt"]
+        assert actual["items"][-1]["receipt"]["result"]["canonical_document"] == accepted["data"]["canonical_document"]
+>       assert calls == {accepted["receipt"]["receipt_id"]: 1}
+E       AssertionError: assert Counter({'txn...5ddd483e': 3}) == {'txn-9478dbd...65ddd483e': 1}
+E
+E         Differing items:
+E         {'txn-9478dbd9ab454698828b09365ddd483e': 3} != {'txn-9478dbd9ab454698828b09365ddd483e': 1}
+E         Use -v to get more diff
+
+/tmp/w-a28b87584c/parent-runtime/tests/test_timeline_history_authenticated_read.py:47: AssertionError
+=========================== short test summary info ============================
+FAILED ../../../../../tmp/w-a28b87584c/parent-runtime/tests/test_timeline_history_authenticated_read.py::test_production_history_authenticates_bound_once_and_preserves_exact_reply
+1 failed in 1.13s

@@ -34,6 +34,7 @@ def test_installed_runtime_wheel_contains_selected_source(stage1_runtime_environ
     probe = subprocess.run(
         [
             str(python),
+            "-I",
             "-c",
             (
                 "import importlib, inspect, pathlib; "
@@ -57,6 +58,22 @@ def test_build_replaces_stale_generated_package_files(tmp_path):
     root = Path(__file__).resolve().parents[1]
     source = tmp_path / "source"
     source.mkdir()
+    builders = [sys.executable, "python3.11", "python3.12", "python3.13", "python3", "python"]
+    builder = None
+    for candidate in builders:
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", "import setuptools.build_meta"],
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            continue
+        if probe.returncode == 0:
+            builder = candidate
+            break
+    if builder is None:
+        raise RuntimeError("the stale-build regression needs a setuptools builder")
     for filename in ("pyproject.toml", "setup.py", "LICENSE"):
         shutil.copy2(root / filename, source / filename)
     for package in ("astrid_runtime", "runtime_protocol"):
@@ -68,9 +85,14 @@ def test_build_replaces_stale_generated_package_files(tmp_path):
 
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
+    build_env = os.environ.copy()
+    if builder == sys.executable:
+        build_env.pop("SETUPTOOLS_USE_DISTUTILS", None)
+    else:
+        build_env["SETUPTOOLS_USE_DISTUTILS"] = "stdlib"
     subprocess.run(
         [
-            sys.executable,
+            builder,
             "-m",
             "pip",
             "wheel",
@@ -82,6 +104,7 @@ def test_build_replaces_stale_generated_package_files(tmp_path):
             str(wheelhouse),
             str(source),
         ],
+        env=build_env,
         check=True,
     )
     wheels = list(wheelhouse.glob("astrid_runtime-*.whl"))

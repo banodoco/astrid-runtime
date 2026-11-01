@@ -172,8 +172,9 @@ def test_posix_durable_replace_fsyncs_both_parent_directories(monkeypatch, tmp_p
 
 def test_windows_directory_durability_helper_is_best_effort_noop(monkeypatch, tmp_path):
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="win32"))
-    monkeypatch.setattr(platform.os, "open", lambda *_a, **_k: pytest.fail("Windows must not open directory for fsync"))
-    platform.fsync_directory(tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(platform.os, "open", lambda *_a, **_k: pytest.fail("Windows must not open directory for fsync"))
+        platform.fsync_directory(tmp_path)
 
 
 @pytest.mark.parametrize("os_name", ["darwin", "linux", "win32"])
@@ -262,6 +263,8 @@ def test_linux_proc_identity_parser_uses_stat_and_brackets_start_tick(monkeypatc
             if self.value.endswith("boot_id"):
                 return "test-boot"
             reads.append(self.value)
+            if self.value == "/proc/sys/kernel/random/boot_id":
+                return "b38142f7-84c5-487d-95a4-8180cbff3972\n"
             tick = start_ticks[min(len(reads) - 1, 1)]
             fields = ["S", "23", "24", "25"] + ["0"] * 15 + [tick, "0"]
             return "77 (worker ) with parens) " + " ".join(fields)
@@ -296,6 +299,47 @@ def test_linux_proc_identity_rejects_pid_reuse_during_observation(monkeypatch):
     monkeypatch.setattr(platform, "Path", FakePath)
     with pytest.raises(OSError, match="changed"):
         platform.process_identity(77)
+
+
+@pytest.mark.parametrize("boot_id,tick", [
+    (None, "4242"), ("", "4242"), ("corrupt", "4242"),
+    ("b38142f7-84c5-487d-95a4-8180cbff3972", "corrupt"),
+])
+def test_linux_proc_identity_refuses_unknown_boot_or_start_tick(tmp_path, monkeypatch, boot_id, tick):
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
+    proc = tmp_path / "proc"
+    (proc / "77").mkdir(parents=True)
+    fields = ["S", "23", "24", "25"] + ["0"] * 15 + [tick, "0"]
+    (proc / "77" / "stat").write_text("77 (worker) " + " ".join(fields))
+    boot = tmp_path / "boot_id"
+    if boot_id is not None:
+        boot.write_text(boot_id)
+    monkeypatch.setattr(platform, "Path", lambda path: boot if str(path).endswith("boot_id") else proc)
+    if tick == "corrupt":
+        with pytest.raises(OSError):
+            platform.process_identity(77)
+    else:
+        identity = platform.process_identity(77)
+        assert platform.process_birth_matches(identity["birth_id"], identity["birth_id"]) is None
+
+
+@pytest.mark.parametrize("birth_id", [
+    "e1a239c5-fbdb-4c06-b924-6f0479e69568:4242",  # Same PID/tick, prior boot.
+    "b38142f7-84c5-487d-95a4-8180cbff3972:4243",  # Reused PID.
+    "proc-start-ticks:4242", "corrupt",
+])
+def test_linux_signal_refuses_mismatched_birth_before_kernel_signal(monkeypatch, birth_id):
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
+    observed = {"pid": 77, "uid": 501, "birth_id": "b38142f7-84c5-487d-95a4-8180cbff3972:4242"}
+    opened, closed = [], []
+    monkeypatch.setattr(platform.os, "pidfd_open", lambda pid: opened.append(pid) or 99, raising=False)
+    monkeypatch.setattr(platform.os, "close", closed.append)
+    monkeypatch.setattr(platform.signal, "pidfd_send_signal", lambda *_: pytest.fail("mismatched birth signaled"), raising=False)
+    monkeypatch.setattr(platform, "process_identity", lambda pid: observed)
+    with pytest.raises(OSError, match="incarnation changed"):
+        platform.signal_process({**observed, "birth_id": birth_id}, platform.TERM)
+    assert opened == [77]
+    assert closed == [99]
 
 
 def test_darwin_identity_keeps_legacy_birth_marker_and_brackets_native_observation(monkeypatch):
@@ -569,14 +613,17 @@ def test_windows_tree_drained_preserves_query_errors(monkeypatch):
 
 
 @pytest.mark.parametrize("expected,actual,result", [
-    ("proc-start-ticks:1", "proc-start-ticks:1;boot:a;pidns:2", True),
-    ("proc-start-ticks:1", "proc-start-ticks:2;boot:a;pidns:2", False),
+    ("b38142f7-84c5-487d-95a4-8180cbff3972:42", "b38142f7-84c5-487d-95a4-8180cbff3972:42", None),
+    ("b38142f7-84c5-487d-95a4-8180cbff3972:42", "de2e05aa-6956-451e-9dd9-521955212d27:42", None),
+    ("proc-start-ticks:42;boot:a", "proc-start-ticks:43;boot:a", None),
+    ("proc-start-ticks:1", "proc-start-ticks:1;boot:a;pidns:2", None),
+    ("proc-start-ticks:1", "proc-start-ticks:2;boot:a;pidns:2", None),
     ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;boot:b;pidns:2", False),
-    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;boot:a;pidns:3", False),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;boot:a;pidns:3", None),
     ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1", None),
     ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;pidns:2", None),
-    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;pidns:3", False),
-    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:2", False),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;pidns:3", None),
+    ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:2", None),
     ("proc-start-ticks:1;boot:a;pidns:2", "proc-start-ticks:1;boot:a;pidns:2", True),
 ])
 def test_process_birth_comparison_handles_reboot_namespace_and_legacy(expected, actual, result):
@@ -614,3 +661,15 @@ def test_linux_identity_keeps_working_when_optional_scope_is_denied(monkeypatch,
     assert identity is not None
     assert (";boot:" in identity["birth_id"]) is (unavailable == "namespace")
     assert (";pidns:" in identity["birth_id"]) is (unavailable == "boot")
+
+
+@pytest.mark.parametrize("expected,actual,result", [
+    ("b38142f7-84c5-487d-95a4-8180cbff3972:42", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:7", None),
+    ("b38142f7-84c5-487d-95a4-8180cbff3972:42", "proc-start-ticks:43;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:7", None),
+    ("b38142f7-84c5-487d-95a4-8180cbff3972:42", "proc-start-ticks:42;pidns:7", None),
+    ("proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:7", "b38142f7-84c5-487d-95a4-8180cbff3972:42", None),
+    ("proc-start-ticks:42;boot:a;pidns:7", "proc-start-ticks:42;boot:a;pidns:8", None),
+    ("proc-start-ticks:bad", "proc-start-ticks:bad", None),
+])
+def test_cross_format_birth_comparison_is_conservative(expected, actual, result):
+    assert platform.process_birth_matches(expected, actual) is result

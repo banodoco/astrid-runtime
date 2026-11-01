@@ -103,7 +103,7 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
             connection.commit()
         finally:
             connection.close()
-    assert inspect_canonical_schema(realm_root, expected_realm_id="realm-1")["kind"] == f"v{version}"
+    assert inspect_canonical_schema(realm_root, expected_realm_id="realm-1")["kind"] == ("U33" if version == 33 else f"v{version}")
     checkout = runtime_checkout or tmp_path
     profile = SourceProfile(profile="astrid", runtime_checkout=str(checkout), source_checkout=str(checkout))
     catalog = {

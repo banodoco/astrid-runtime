@@ -1,6 +1,9 @@
 """Record Runtime responses from a real daemon into conformance/responses/ (testing plan C2.1, R-4).
 
-    python scripts/record_responses.py [OUT_DIR]   # default: conformance/responses
+    PYTHONPATH=.:/path/to/astrid python scripts/record_responses.py [OUT_DIR]
+
+The real Astrid authoring provider must be importable. OUT_DIR defaults to
+conformance/responses; obsolete fixture removal requires a reviewed diff.
 
 Consumers (the App's zod parsers and conflict classifier, Astrid's fake) are trusted
 only for responses they reproduce from these files. Each file is
@@ -114,38 +117,6 @@ class Recorder:
         })
 
 
-def _publication(project_id: str, revision: str, config: dict) -> dict:
-    """A complete one-level parent composition, as a client publishes it."""
-    clip = {"id": "picture", "clipType": "media", "at": 0, "hold": 1, "track": "video-1"}
-    return {
-        "project_id": project_id,
-        "timeline_id": "main",
-        "expected_head": None,
-        "parent_revision_id": revision,
-        "internal_timeline_revisions": [{
-            "timeline_id": "main",
-            "revision_id": f"{revision}-timeline",
-            "payload": {"tracks": [], "clips": [clip], "effects": [], "audio": [], "layout": {}, "registry": {}, "assets": []},
-        }],
-        "shot_revisions": [{
-            "shot_id": "shot-1",
-            "revision_id": f"{revision}-shot",
-            "internal_timeline_revision_id": f"{revision}-timeline",
-            "payload": {"metadata": {"title": "opening"}, "items": [], "pools": [], "selected_variants": {}, "provenance": {}, "generation_inputs": {}, "audio_bindings": [], "text_bindings": []},
-        }],
-        "parent_composition": {
-            "config": config,
-            "registry": {},
-            "clips": [],
-            "occurrences": [{
-                "occurrence_id": "occurrence-1", "shot_id": "shot-1", "shot_revision_id": f"{revision}-shot",
-                "placement": {"start_ms": 0}, "source_offset": 0, "duration_ms": 1000, "speed": 1,
-                "track": "video-1", "transform": {}, "gain": 1, "mute": False, "provenance": {},
-            }],
-        },
-    }
-
-
 def drive(recorder: Recorder) -> None:
     """Exactly what a client does; the order is part of the contract (event ids are positional)."""
     call, norm = recorder.call, recorder.normalizer
@@ -153,10 +124,10 @@ def drive(recorder: Recorder) -> None:
     project_id = norm.learn(project["data"]["project_id"], "project_id")
     call("POST", f"/v1/projects/{project_id}/timelines", {"timeline_id": "main"}, key="timeline")
 
-    # (a) two publishes against the same empty head: the second one conflicts.
+    # (a) the compatibility publication route is unconditionally retired.
     publish = f"/v1/projects/{project_id}/timelines/main/composition-revisions"
-    call("POST", publish, _publication(project_id, "parent-1", {}), key="publish-1")
-    call("POST", publish, _publication(project_id, "parent-2", {"changed": True}), key="publish-2", case="publish_conflict_409")
+    status, retired = call("POST", publish, {}, key="publish", case="retired_route_410")
+    assert status == 410 and retired["code"] == "retired_route"
     recorder.keep()
 
     call("POST", "/v1/capabilities", {"capability_id": CAPABILITY, "definition_digest": CAPABILITY_DIGEST, "status": "ready", "required_resource_keys": [], "estimated_scratch_bytes": 0, "estimated_output_bytes": 0}, key="capability")
@@ -201,6 +172,31 @@ def drive(recorder: Recorder) -> None:
     call("GET", "/v1/events?cursor=not-a-cursor", case="invalid_cursor_400")
     recorder.keep()
 
+    # A real canonical edit advances the head; restoring from the earlier pair conflicts.
+    _, timeline = call("GET", f"/v1/projects/{project_id}/timelines/main")
+    revision = norm.learn(timeline["head_revision_id"], "base_revision_id")
+    publication = norm.learn(timeline["head_publication_id"], "base_publication_id")
+    _, source = call("GET", f"{publish}/{revision}")
+    commit = f"/v1/projects/{project_id}/timelines/main/commit"
+    request = {
+        "api_version": 1, "project_id": project_id, "timeline_id": "main",
+        "base_revision_id": revision, "base_publication_id": publication,
+        "commands": [{"schema_version": 1, "op": "doc.patch", "version": "1", "select": None,
+                      "args": {"changes": [{"op": "set", "ref": "parent", "path": ["config", "title"],
+                                            "before": {"state": "absent"}, "value": "Recorded"}]}}],
+        "label": "Recorded title", "merge": "fields",
+    }
+    status, accepted = call("POST", commit, request, key="commit-title")
+    assert status == 200, accepted
+    norm.learn(accepted["data"]["accepted_revision_id"], "current_revision_id")
+    norm.learn(accepted["receipt"]["receipt_id"], "current_publication_id")
+    request["commands"] = [{"schema_version": 1, "op": "timeline.restore", "version": "1", "select": None,
+                            "args": {"revision_id": revision, "content_digest": source["content_digest"]}}]
+    status, conflict = call("POST", commit, request, key="stale-restore", case="commit_conflict_409")
+    assert status == 409 and conflict["code"] == "conflict"
+    assert conflict["details"]["reason"] == "stale_head"
+    recorder.keep()
+
 
 def record(out_dir: Path = DEFAULT_OUT) -> dict[str, dict]:
     """Run the journey against a fresh daemon and write one file per case.
@@ -211,14 +207,12 @@ def record(out_dir: Path = DEFAULT_OUT) -> dict[str, dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="record-responses-") as tmp:
         RealmStore.initialize(Path(tmp) / "realm").close()
-        daemon = RuntimeDaemon(Path(tmp) / "realm", support_root=Path(tmp) / "support").start()
+        daemon = RuntimeDaemon(Path(tmp) / "realm", support_root=Path(tmp) / "support", authoring_profile="astrid").start()
         try:
             recorder = Recorder(daemon.endpoint, daemon.token)
             drive(recorder)
         finally:
             daemon.stop()
-    for stale in out_dir.glob("*.json"):
-        stale.unlink()
     for entry in recorder.cases:
         (out_dir / f"{entry['case']}.json").write_text(json.dumps(entry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return recorder.raw

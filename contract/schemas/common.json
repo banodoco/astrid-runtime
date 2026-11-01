@@ -31,7 +31,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["code", "message", "request_id"],
       "properties": {
-        "code": { "type": "string", "enum": ["invalid_request", "validation_error", "unauthorized", "forbidden", "not_found", "conflict", "version_conflict", "idempotency_conflict", "unsupported_version", "range_not_satisfiable", "lease_fenced", "invalid_settlement", "not_ready", "internal"] },
+        "code": { "type": "string", "enum": ["invalid_request", "validation_error", "unauthorized", "forbidden", "not_found", "conflict", "version_conflict", "idempotency_conflict", "unsupported_version", "range_not_satisfiable", "retired_route", "lease_fenced", "invalid_settlement", "not_ready", "internal"] },
         "message": { "type": "string" },
         "request_id": { "$ref": "#/\u0024defs/Id" },
         "details": { "type": "object", "additionalProperties": true }

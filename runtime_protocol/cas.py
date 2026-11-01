@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from .dirfd import filesystem as os
 import stat
 import uuid
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -111,16 +113,44 @@ class ContentAddressedStore:
         """Verify potential deduplication outside the database critical section."""
         try:
             with self.open(digest) as stream:
-                initial = os.fstat(stream.fileno())
-                hasher = hashlib.sha256()
-                while chunk := stream.read(IO_CHUNK_BYTES):
-                    hasher.update(chunk)
+                self._verify_open_stream(stream, digest, size)
                 final = os.fstat(stream.fileno())
-                if initial.st_size != size or file_identity(initial) != file_identity(final) or hasher.hexdigest() != digest:
-                    raise ConflictError("CAS collision or corrupt existing object")
                 return file_identity(final)
         except NotFoundError:
             return None
+
+    @staticmethod
+    def _verify_open_stream(stream, digest, expected_size):
+        initial = os.fstat(stream.fileno())
+        if not stat.S_ISREG(initial.st_mode) or initial.st_size != expected_size:
+            raise ConflictError("CAS collision or corrupt existing object")
+        stream.seek(0)
+        hasher = hashlib.sha256()
+        while chunk := stream.read(IO_CHUNK_BYTES):
+            hasher.update(chunk)
+        final = os.fstat(stream.fileno())
+        if file_identity(initial) != file_identity(final) or hasher.hexdigest() != digest:
+            raise ConflictError("CAS collision or corrupt existing object")
+        return initial
+
+    def wav_duration(self, digest, size):
+        """Read a verified WAV header without buffering the CAS object."""
+        with self.open(digest) as stream:
+            initial = self._verify_open_stream(stream, digest, size)
+            try:
+                stream.seek(0)
+                with wave.open(stream, "rb") as reader:
+                    frames = reader.getnframes()
+                    rate = reader.getframerate()
+                duration = None if rate <= 0 else frames / rate
+            except (EOFError, OSError, ValueError, ZeroDivisionError, wave.Error):
+                duration = None
+            final = os.fstat(stream.fileno())
+            if file_identity(initial) != file_identity(final):
+                raise ConflictError("CAS object changed during WAV inspection")
+            if duration is None or not math.isfinite(duration) or duration <= 0:
+                return None
+            return duration
 
     def publish(self, staged, *, existing_identity=None):
         """No-replace, same-filesystem publication. Caller owns publication journal."""

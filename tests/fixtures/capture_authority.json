@@ -1,0 +1,354 @@
+{
+  "source": "Agent 321cef4b8c89a4a938cb9ede41ba6a5444cf1b62 CaptureRuntime.snapshot; Runtime 4bb1d0f public managed ingest/publication/exact immutable reads; no renderer; duplicate canonical_timeline and expansion.graph omitted here, restored from capture_authority and actual Runtime immutable reads in fixture",
+  "media_bytes": "source video",
+  "publication": {
+    "project_id": "PROJECT_ID",
+    "timeline_id": "main",
+    "expected_head": null,
+    "parent_revision_id": "parent-1",
+    "parent_composition": {
+      "config": {
+        "tracks": [
+          {
+            "id": "picture",
+            "kind": "visual"
+          }
+        ],
+        "opaque_parent_config": {
+          "keep": true
+        }
+      },
+      "registry": {
+        "assets": {}
+      },
+      "clips": [],
+      "occurrences": [
+        {
+          "occurrence_id": "occ-1",
+          "shot_id": "shot-shared",
+          "shot_revision_id": "shot-rev-1",
+          "placement": {
+            "start_ms": 0
+          },
+          "source_offset": 0,
+          "duration_ms": 1000,
+          "speed": 1,
+          "track": "picture",
+          "transform": {},
+          "gain": 1,
+          "muted": false,
+          "provenance": {}
+        }
+      ]
+    },
+    "shot_revisions": [
+      {
+        "shot_id": "shot-shared",
+        "revision_id": "shot-rev-1",
+        "internal_timeline_revision_id": "internal-1",
+        "payload": {
+          "name": "Opening",
+          "metadata": {},
+          "items": [
+            {
+              "item_id": "item-1",
+              "media_id": "sha256:34edefb5a55a8cf230cf951322f466a6b19ee29f7147caeaddd69cc85b026141",
+              "source_frame": null,
+              "metadata": {}
+            }
+          ],
+          "pools": [],
+          "selected_variants": {},
+          "provenance": {},
+          "generation_inputs": {},
+          "audio_bindings": [],
+          "text_bindings": [],
+          "internal_timeline_revision_id": "internal-1"
+        }
+      }
+    ],
+    "internal_timeline_revisions": [
+      {
+        "timeline_id": "main",
+        "revision_id": "internal-1",
+        "payload": {
+          "tracks": [
+            {
+              "id": "picture",
+              "kind": "visual"
+            }
+          ],
+          "clips": [
+            {
+              "id": "picture-1",
+              "track": "picture",
+              "clipType": "media",
+              "asset": "picture",
+              "at": 0,
+              "hold": 1
+            }
+          ],
+          "effects": [],
+          "audio": [],
+          "layout": {},
+          "registry": {
+            "assets": {
+              "picture": {
+                "media_id": "sha256:34edefb5a55a8cf230cf951322f466a6b19ee29f7147caeaddd69cc85b026141",
+                "type": "video",
+                "opaque_asset": "keep"
+              }
+            }
+          },
+          "assets": []
+        }
+      }
+    ]
+  },
+  "saved": {
+    "project_slug": "source-probe",
+    "timeline_id": "main",
+    "timeline_name": "main",
+    "render_run_id": "composed-capture:main:parent-1",
+    "video_digest": "sha256:1170fcface458eaa0a8270948b304d9558fcaa2a6ea71b5e8f6f606726b84ff3",
+    "fps_rational": [
+      30,
+      1
+    ],
+    "duration_frames": 30,
+    "clips": [
+      {
+        "asset": "occ-1:picture",
+        "at": 0.0,
+        "clipType": "media",
+        "hold": 1.0,
+        "id": "occ-1:picture-1",
+        "track": "picture",
+        "shot_occurrence_id": "occ-1",
+        "app": {
+          "astrid_shot_composition": {
+            "project_id": "PROJECT_ID",
+            "timeline_id": "main",
+            "shot_id": "shot-shared",
+            "shot_revision_id": "shot-rev-1",
+            "internal_timeline_revision_id": "internal-1",
+            "occurrence_id": "occ-1",
+            "output_identity": "parent-1:occ-1",
+            "stable_deep_link": "astrid://projects/PROJECT_ID/timelines/main/occurrences/occ-1",
+            "source_offset": 0,
+            "speed": 1.0,
+            "gain": 1,
+            "muted": false,
+            "source_clip_id": "picture-1"
+          }
+        },
+        "kind": "visual",
+        "duration": 1.0,
+        "start_frame": 0,
+        "end_frame": 30,
+        "occurrence_ids": [
+          "occ-1"
+        ],
+        "shot_id": "shot-shared",
+        "shot_name": "Opening",
+        "occurrence_id": "occ-1"
+      }
+    ],
+    "scripts": [],
+    "occurrences": [
+      {
+        "occurrence_id": "occ-1",
+        "shot_id": "shot-shared",
+        "shot_name": "Opening",
+        "start": 0.0,
+        "end": 1.0,
+        "start_frame": 0,
+        "end_frame": 30
+      }
+    ],
+    "tracks": [
+      {
+        "id": "picture",
+        "kind": "visual"
+      }
+    ],
+    "registry": {
+      "assets": {
+        "occ-1:picture": {
+          "media_id": "sha256:34edefb5a55a8cf230cf951322f466a6b19ee29f7147caeaddd69cc85b026141",
+          "opaque_asset": "keep",
+          "type": "video",
+          "content_sha256": "34edefb5a55a8cf230cf951322f466a6b19ee29f7147caeaddd69cc85b026141"
+        }
+      }
+    },
+    "metadata": {
+      "authored_duration_frames": 30,
+      "rendered_duration_frames": 30,
+      "script_timing": "shot_script",
+      "script_mapping_available": true,
+      "script_mapping_note": "Frozen shot script; no word alignment.",
+      "selection": "composed_frame_capture",
+      "capture_authority": {
+        "project_id": "PROJECT_ID",
+        "timeline_id": "main",
+        "parent_revision_id": "parent-1",
+        "parent_content_digest": "sha256:9e3c93e1cce58dddb37c775b2e1a0ee6c90548edbf3d8485d065472121052369",
+        "expansion": {
+          "canonical": true,
+          "parent_revision_id": "parent-1",
+          "children": [
+            {
+              "timeline_id": "main",
+              "revision_id": "internal-1",
+              "config_version": 1,
+              "config_hash": "sha256:1916ab9ac6df998f7d81b1575df507070bc1a03551badaca0279b56b49a379ce"
+            }
+          ],
+          "shots": [
+            {
+              "shot_id": "shot-shared",
+              "revision_id": "shot-rev-1",
+              "content_digest": "sha256:583bab39d29808729c9c9d988b8ac90b89182949a788fd8bc4b9fa2e5c668138",
+              "name": "Opening",
+              "text_bindings": []
+            }
+          ],
+          "occurrences": [
+            {
+              "duration_ms": 1000,
+              "gain": 1,
+              "muted": false,
+              "occurrence_id": "occ-1",
+              "placement": {
+                "start_ms": 0
+              },
+              "provenance": {},
+              "shot_id": "shot-shared",
+              "shot_revision_id": "shot-rev-1",
+              "source_offset": 0,
+              "speed": 1,
+              "track": "picture",
+              "transform": {},
+              "revision_id": "shot-rev-1",
+              "project_id": "PROJECT_ID",
+              "timeline_id": "main",
+              "ordinal": 0,
+              "output_identity": "parent-1:occ-1",
+              "stable_deep_link": "astrid://projects/PROJECT_ID/timelines/main/occurrences/occ-1",
+              "at": 0.0,
+              "hold": 1.0,
+              "duration_seconds": 1.0,
+              "blank": false
+            }
+          ],
+          "outputs": [
+            {
+              "occurrence_id": "occ-1",
+              "output_identity": "parent-1:occ-1",
+              "stable_deep_link": "astrid://projects/PROJECT_ID/timelines/main/occurrences/occ-1",
+              "shot_id": "shot-shared",
+              "revision_id": "shot-rev-1",
+              "internal_timeline_revision_id": "internal-1",
+              "at_ms": 0,
+              "duration_ms": 1000,
+              "blank": false
+            }
+          ],
+          "parent_content_digest": "sha256:9e3c93e1cce58dddb37c775b2e1a0ee6c90548edbf3d8485d065472121052369"
+        }
+      },
+      "capture_identity": "sha256:1170fcface458eaa0a8270948b304d9558fcaa2a6ea71b5e8f6f606726b84ff3",
+      "requested_revision_id": "parent-1"
+    },
+    "config": {
+      "opaque_parent_config": {
+        "keep": true
+      },
+      "tracks": [
+        {
+          "id": "picture",
+          "kind": "visual"
+        }
+      ],
+      "clips": [
+        {
+          "asset": "occ-1:picture",
+          "at": 0.0,
+          "clipType": "media",
+          "hold": 1.0,
+          "id": "occ-1:picture-1",
+          "track": "picture",
+          "shot_id": "shot-shared",
+          "shot_occurrence_id": "occ-1",
+          "app": {
+            "astrid_shot_composition": {
+              "project_id": "PROJECT_ID",
+              "timeline_id": "main",
+              "shot_id": "shot-shared",
+              "shot_revision_id": "shot-rev-1",
+              "internal_timeline_revision_id": "internal-1",
+              "occurrence_id": "occ-1",
+              "output_identity": "parent-1:occ-1",
+              "stable_deep_link": "astrid://projects/PROJECT_ID/timelines/main/occurrences/occ-1",
+              "source_offset": 0,
+              "speed": 1.0,
+              "gain": 1,
+              "muted": false,
+              "source_clip_id": "picture-1"
+            }
+          }
+        }
+      ],
+      "app": {
+        "astrid_shot_composition": {
+          "schema_version": 1,
+          "project_id": "PROJECT_ID",
+          "timeline_id": "main",
+          "parent_revision_id": "parent-1",
+          "occurrences": [
+            {
+              "duration_ms": 1000,
+              "gain": 1,
+              "muted": false,
+              "occurrence_id": "occ-1",
+              "placement": {
+                "start_ms": 0
+              },
+              "provenance": {},
+              "shot_id": "shot-shared",
+              "shot_revision_id": "shot-rev-1",
+              "source_offset": 0,
+              "speed": 1,
+              "track": "picture",
+              "transform": {},
+              "revision_id": "shot-rev-1",
+              "project_id": "PROJECT_ID",
+              "timeline_id": "main",
+              "ordinal": 0,
+              "output_identity": "parent-1:occ-1",
+              "stable_deep_link": "astrid://projects/PROJECT_ID/timelines/main/occurrences/occ-1",
+              "at": 0.0,
+              "hold": 1.0,
+              "duration_seconds": 1.0,
+              "blank": false
+            }
+          ],
+          "outputs": [
+            {
+              "occurrence_id": "occ-1",
+              "output_identity": "parent-1:occ-1",
+              "stable_deep_link": "astrid://projects/PROJECT_ID/timelines/main/occurrences/occ-1",
+              "shot_id": "shot-shared",
+              "revision_id": "shot-rev-1",
+              "internal_timeline_revision_id": "internal-1",
+              "at_ms": 0,
+              "duration_ms": 1000,
+              "blank": false
+            }
+          ]
+        }
+      }
+    }
+  }
+}

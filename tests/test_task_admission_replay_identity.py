@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from astrid_runtime_client import ApiError, WorkspaceClient
+from runtime_protocol.cas import ContentAddressedStore
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError
 from runtime_protocol.store import (
@@ -31,10 +32,16 @@ def store(tmp_path):
         store.close()
 
 
-def _admit(store, *, spec=None, effect=None, digest=DIGEST, request=None):
+def _admit(store, *, spec=None, effect=None, digest=DIGEST, request=None, project=None):
     return store.create_task(CAPABILITY, spec if spec is not None else {"message": "hello"},
         idempotency_key="same-admission", expected_effect=effect, capability_digest=digest,
-        execution_request=request)
+        execution_request=request, project=project)
+
+
+def _effect(store, metadata):
+    project = store.create_project("replay-effect", "Replay effect")
+    return {"effect_type": "project.update", "target_id": project["id"],
+            "expected_version": project["version"], "payload": {"metadata": metadata}}
 
 
 def _receipt_state(store, mode):
@@ -48,28 +55,32 @@ def _receipt_state(store, mode):
 
 
 def _snapshot(store):
+    tables = [row[0] for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     return {
-        table: [dict(row) for row in store.conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
-        for table in ("tasks", "runs", "events", "command_idempotency", "project_sequences")
+        **{table: [dict(row) for row in store.conn.execute(f'SELECT * FROM "{table}" ORDER BY rowid')]
+           for table in tables},
+        "files": {str(path.relative_to(store.root)): path.read_bytes()
+                  for root in (store.cas_root, store.staging_root)
+                  for path in root.rglob("*") if path.is_file()},
     }
 
 
 @pytest.mark.parametrize("receipt", ["current", "stale", "absent", "partial_current", "partial_stale"])
 @pytest.mark.parametrize("changed", ["effect", "digest", "removed_effect", "effect_scalar_type"])
 def test_changed_effect_or_digest_conflicts_without_mutating_any_admission_evidence(store, receipt, changed):
-    effect = {"effect_type": "fixture.effect", "value": True}
+    effect = _effect(store, {"value": True})
     _admit(store, effect=effect)
     _receipt_state(store, receipt)
     before = _snapshot(store)
     requested_effect, requested_digest = copy.deepcopy(effect), DIGEST
     if changed == "effect":
-        requested_effect["value"] = False
+        requested_effect["payload"]["metadata"]["value"] = False
     elif changed == "digest":
         requested_digest = OTHER_DIGEST
     elif changed == "removed_effect":
         requested_effect = None
     else:
-        requested_effect["value"] = 1  # JSON true and 1 are distinct identity.
+        requested_effect["payload"]["metadata"]["value"] = 1  # JSON true and 1 are distinct identity.
     with pytest.raises(ConflictError, match="different input"):
         _admit(store, effect=requested_effect, digest=requested_digest)
     assert _snapshot(store) == before
@@ -131,11 +142,12 @@ def test_no_effect_and_omitted_digest_remain_compatible_with_persisted_evidence(
 
 @pytest.mark.parametrize("receipt", ["stale", "absent", "partial_current", "partial_stale"])
 def test_equivalent_effect_mapping_order_refreshes_without_rewriting_task(store, receipt):
-    effect = {"effect_type": "fixture.effect", "nested": {"first": 1, "second": 2}}
+    effect = _effect(store, {"nested": {"first": 1, "second": 2}})
     admitted = _admit(store, effect=effect)
     _receipt_state(store, receipt)
     before = _snapshot(store)
-    reordered = {"nested": {"second": 2, "first": 1}, "effect_type": "fixture.effect"}
+    reordered = {**dict(reversed(list(effect.items()))),
+                 "payload": {"metadata": {"nested": {"second": 2, "first": 1}}}}
     replay = _admit(store, effect=reordered)
     assert replay["task"]["id"] == admitted["task"]["id"]
     assert _snapshot(store)["tasks"] == before["tasks"]
@@ -217,7 +229,7 @@ def test_generated_http_concurrent_exact_requests_converge_and_changed_effect_co
     try:
         daemon.service.register_capability({"capability_id": CAPABILITY, "definition_digest": DIGEST})
         arguments = dict(capability_id=CAPABILITY, capability_digest=DIGEST, input_object_ids=[],
-                        idempotency_key="concurrent-admission", settlement_effect={"effect_type": "fixture.effect"})
+                        idempotency_key="concurrent-admission", settlement_effect=_effect(daemon.service.store, {}))
         def admit(_):
             return WorkspaceClient(daemon.endpoint, daemon.token).admit_task(**arguments)
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -297,3 +309,83 @@ def test_unkeyed_store_admission_still_creates_fresh_tasks(store):
     first = store.create_task(CAPABILITY, {"message": "hello"})
     second = store.create_task(CAPABILITY, {"message": "hello"})
     assert first["task"]["id"] != second["task"]["id"]
+
+
+@pytest.mark.parametrize("receipt", ["current", "stale", "absent"])
+@pytest.mark.parametrize("changed", ["effect", "digest", "execution_request", "spec"])
+def test_changed_snapshot_and_identity_refuse_before_any_store_publication(store, receipt, changed):
+    project = store.create_project("snapshot-replay", "Snapshot replay")["id"]
+    snapshot = {"config": {"clips": [], "metadata": {"value": True}}, "registry": {}}
+    spec = {"timeline_snapshot": snapshot}
+    request = {"schema_version": 1, "target": {"kind": "machine", "id": "chosen-machine"}}
+    _admit(store, spec=spec, request=request, project=project)
+    _receipt_state(store, receipt)
+    before = _snapshot(store)
+    changed_spec = copy.deepcopy(spec)
+    changed_spec["timeline_snapshot"]["config"]["metadata"]["value"] = False
+    arguments = {"spec": changed_spec, "request": request, "project": project}
+    if changed == "effect":
+        arguments["effect"] = {"effect_type": "timeline.update", "target_id": "unused"}
+    elif changed == "digest":
+        arguments["digest"] = OTHER_DIGEST
+    elif changed == "execution_request":
+        arguments["request"] = {**request, "creative_options": {"changed": True}}
+    with pytest.raises(ConflictError, match="different input"):
+        _admit(store, **arguments)
+    assert _snapshot(store) == before
+
+
+@pytest.mark.parametrize("receipt", ["current", "stale", "absent"])
+@pytest.mark.parametrize("location", ["timeline", "inputs", "filmstrip", "input", "capture"])
+def test_exact_inline_snapshot_keeps_published_spec_and_admission_hash(store, receipt, location):
+    project = store.create_project("snapshot-replay", "Snapshot replay")["id"]
+    snapshot = {"config": {"clips": [], "metadata": {"keep": True}}, "registry": {}}
+    # The existing publisher is the independent identity oracle. Preparation
+    # must produce exactly its ref, including revision provenance and source kind.
+    ref = store._publish_spec_snapshot(snapshot, {}, project)
+    if location == "timeline":
+        spec, expected = {"timeline_snapshot": snapshot}, {"timeline_snapshot_ref": ref}
+    elif location == "inputs":
+        spec = {"inputs": {"timeline_snapshot": snapshot}}
+        expected = {"inputs": {"timeline_snapshot_ref": ref}}
+    else:
+        key = location + "_snapshot"
+        spec = {"authority_context": {key: snapshot}}
+        expected = {"authority_context": {key + "_ref": ref}}
+    expected["input_object_ids"] = [ref["digest"]]
+    first = _admit(store, spec=spec, project=project)
+    assert first["task"]["spec"] == expected
+    original_hash = store.conn.execute("SELECT request_hash FROM command_idempotency WHERE command_kind='task.create'").fetchone()[0]
+    _receipt_state(store, receipt)
+    before = _snapshot(store)
+    replay = _admit(store, spec=spec, project=project)
+    assert replay["task"]["id"] == first["task"]["id"]
+    assert replay["task"]["spec"] == expected
+    after = _snapshot(store)
+    assert {key: value for key, value in after.items() if key not in {"command_idempotency", "project_sequences"}} == {
+        key: value for key, value in before.items() if key not in {"command_idempotency", "project_sequences"}}
+    assert after["command_idempotency"][0]["request_hash"] == original_hash
+    assert _admit(store, spec=spec, project=project) == replay
+    assert _snapshot(store) == after
+
+
+@pytest.mark.parametrize("receipt", ["current", "stale", "absent"])
+def test_proven_exact_replay_retains_inline_snapshot_republication(store, receipt):
+    project = store.create_project("snapshot-repair", "Snapshot repair")["id"]
+    spec = {"timeline_snapshot": {"config": {"clips": []}, "registry": {}}}
+    first = _admit(store, spec=spec, project=project)
+    digest = first["task"]["spec"]["timeline_snapshot_ref"]["digest"].removeprefix("sha256:")
+    cas = ContentAddressedStore(store.cas_root)
+    payload = cas.read(digest)
+    # Controlled storage damage: equivalent inline retries have always been
+    # able to republish missing snapshot bytes and associations.
+    store.conn.execute("DELETE FROM project_objects WHERE digest=?", (digest,))
+    store.conn.execute("DELETE FROM objects WHERE digest=?", (digest,))
+    cas.path_for(digest).unlink()
+    _receipt_state(store, receipt)
+    task_before = _snapshot(store)["tasks"]
+    assert _admit(store, spec=spec, project=project)["task"]["id"] == first["task"]["id"]
+    assert cas.read(digest) == payload
+    assert store.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()[0] == len(payload)
+    assert store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=? AND relation='managed'", (project, digest)).fetchone()
+    assert _snapshot(store)["tasks"] == task_before

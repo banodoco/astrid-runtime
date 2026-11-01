@@ -1,0 +1,44 @@
+{
+  "runtime-0.2.2.json": {
+    "repository": "runtime",
+    "commit": "6be970633cc82ab412428151e6bf42f3e7fc3081",
+    "path": "contract/schemas/edit-command.json",
+    "version": "0.2.2",
+    "sha256": "460e61c70702f1f6bfa5cd033c8da859c913c3c8839f2a5b928df7691e08a388"
+  },
+  "runtime-0.2.3.json": {
+    "repository": "runtime",
+    "commit": "d691ddadb4ef3f5881a25fa893b4fb812211f102",
+    "path": "contract/schemas/edit-command.json",
+    "version": "0.2.3",
+    "sha256": "472622c45fa6b5c7a425c949516a64a52d83192d3749e78a0f000decd088aee9"
+  },
+  "withdrawn-10c.json": {
+    "repository": "agent",
+    "commit": "b3c0dbd7c69a369dee303640c2bd608f1d3b71c9",
+    "path": "astrid/core/timeline/schema/edit-command.schema.json",
+    "version": "withdrawn; never a release floor",
+    "sha256": "10c1610b61ad151259149c97061493d9e36ae0a9220ba4983b45f22e8ac7e3b1"
+  },
+  "runtime-0.2.10.json": {
+    "repository": "runtime",
+    "commit": "6023cfb10307b4c0004642b5fa1995d72ba4f6d1",
+    "path": "contract/schemas/edit-command.json",
+    "version": "0.2.10",
+    "sha256": "472622c45fa6b5c7a425c949516a64a52d83192d3749e78a0f000decd088aee9"
+  },
+  "agent-0a0ac7ba.json": {
+    "repository": "agent",
+    "commit": "0a0ac7baaa74e15485b10bcbaa80eda1afe48c00",
+    "path": "astrid/core/timeline/schema/edit-command.schema.json",
+    "version": "manager freeze 2026-10-20 09:47 UTC",
+    "sha256": "30da4fde84c328e7cb44035b50eb53fd2cd9637a14a0c948f4412f6469ce34bd"
+  },
+  "agent-26ef2bbb.json": {
+    "repository": "agent",
+    "commit": "26ef2bbb31b4892fdd7c15ee5b20700bd40cb933",
+    "path": "astrid/core/timeline/schema/edit-command.schema.json",
+    "version": "frozen additive S2; unpublished Runtime staging floor",
+    "sha256": "a6f1aaa9dfcc31828bd04c908158fd7fd9a825df6c9f88f79b81779273a190ef"
+  }
+}
