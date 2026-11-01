@@ -447,6 +447,55 @@ class HostLaunchVerifier:
                 raise
 
 
+INVENTORY_MEMBER_LIMIT = 2 * 1024 * 1024 * 1024
+
+
+def _stream_member_digest(path, expected):
+    """Verify one inventory member by streaming sha256; never accumulates bytes.
+
+    Same no-follow and stable-inode checks as read_source, but the bound is the
+    inventory sanity bound, not the 64 MiB import-source bound.
+    """
+    path = _absolute(str(path)); _no_alias(path)
+    if not _raw(expected):
+        raise HostLaunchError("installed inventory pin is invalid")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > INVENTORY_MEMBER_LIMIT:
+            raise HostLaunchError("installed inventory member is not a bounded regular file")
+        digest = hashlib.sha256(); total = 0
+        while True:
+            part = os.read(descriptor, 1024 * 1024)
+            if not part: break
+            total += len(part)
+            if total > INVENTORY_MEMBER_LIMIT:
+                raise HostLaunchError("installed inventory member exceeds its bound")
+            digest.update(part)
+        after = os.fstat(descriptor); current = path.stat(follow_symlinks=False)
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        if identity(before) != identity(after) or identity(after) != identity(current):
+            raise HostLaunchError("installed inventory member changed while being read")
+        if digest.hexdigest() != expected:
+            raise HostLaunchError("installed inventory member differs from its reviewed pin")
+    finally:
+        os.close(descriptor)
+
+
+def _sha256_file(path):
+    """Chunked sha256 for the installed-inventory measurement (no whole-file read)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for part in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(part)
+    return digest.hexdigest()
+
+
+def _local_member_digest(path, expected):
+    """Inventory member check: same path resolution as _local_read, streamed digest."""
+    return _stream_member_digest(_absolute(str(Path(path).resolve(strict=True))), expected)
+
+
 def _local_read(path, expected):
     """Observe the selected installation, allowing its recorded Python aliases.
 
@@ -473,7 +522,7 @@ def installed_inventory(root):
             aliases[path.relative_to(root).as_posix()] = {"target": os.readlink(path),
                 "kind": "file" if path.is_file() else "directory" if path.is_dir() else "broken"}
         if path.is_file():
-            files[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+            files[path.relative_to(root).as_posix()] = _sha256_file(path)
     # rglob does not traverse directory aliases. Record their literal targets,
     # but never silently make their contents an import root. -S omits the
     # stdlib's ordinary aliased site directory in favor of the explicit roots.
@@ -497,7 +546,7 @@ def _local_inventory(value):
                 or path.as_posix() != relative or "__pycache__" in path.parts
                 or path.suffix in {".pyc", ".pyo"} or not _raw(pin)):
             raise HostLaunchError("installed inventory has an unsupported file representation")
-        _local_read(root / relative, pin)
+        _local_member_digest(root / relative, pin)
     if installed_inventory(root) != value:
         raise HostLaunchError("installed inventory has missing, changed or unexpected files")
     return json.loads(canonical(value))
