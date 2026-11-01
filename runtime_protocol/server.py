@@ -13,7 +13,7 @@ from socketserver import TCPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .errors import RuntimeErrorBase, AuthorizationError, BodyTooLargeError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError, RetiredRouteError
-from .service import validate_idempotency_key
+from .service import reject_retired_timeline_writer, validate_idempotency_key
 from .cas import IO_CHUNK_BYTES
 
 
@@ -728,7 +728,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self.runtime._require_timeline_command()
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "POST":
             self._identity("projects:write")
-            self.runtime._require_timeline_command()
+            # Retire at the HTTP boundary so no compatibility dispatch can
+            # reach a Runtime publication implementation.
+            reject_retired_timeline_writer()
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "GET":
             self._identity("projects:read")
             query = parse_qs(urlsplit(self.path).query)

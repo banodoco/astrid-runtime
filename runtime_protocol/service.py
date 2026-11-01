@@ -441,6 +441,17 @@ def _page_args(cursor, limit):
     return limit, value
 
 
+def reject_retired_timeline_writer():
+    """Reject a legacy timeline writer before it can reach publication code."""
+    raise RetiredRouteError(
+        "legacy timeline writes are retired; submit EditCommands through commitTimeline",
+        details={"status": "refused", "reason": "timeline_commit_required",
+                 "hint": "Submit a timeline commit instead of the retired save route.",
+                 "suggested_command": "timeline commit",
+                 "replacement": "POST /v1/projects/{project_id}/timelines/{timeline_id}/commit"},
+    )
+
+
 def _page_cursor(scope, key, *, numeric=False):
     value = {"v": 1, "s": scope, "k": list(key)}
     if numeric:
@@ -1787,13 +1798,7 @@ class RuntimeService:
 
     @staticmethod
     def _require_timeline_command():
-        raise RetiredRouteError(
-            "legacy timeline writes are retired; submit EditCommands through commitTimeline",
-            details={"status": "refused", "reason": "timeline_commit_required",
-                     "hint": "Submit a timeline commit instead of the retired save route.",
-                     "suggested_command": "timeline commit",
-                     "replacement": "POST /v1/projects/{project_id}/timelines/{timeline_id}/commit"},
-        )
+        reject_retired_timeline_writer()
 
     def update_timeline(self, timeline_id, body, *, idempotency_key=None):
         self._require_timeline_command()
@@ -3619,7 +3624,7 @@ class RuntimeService:
         return found
 
     def publish_parent_composition(self, project_id, timeline_id, body, *, idempotency_key=None):
-        self._require_timeline_command()
+        RuntimeService._require_timeline_command()
 
     def _project_shot_resource(self, row):
         value = dict(row)
