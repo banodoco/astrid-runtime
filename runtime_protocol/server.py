@@ -564,7 +564,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     "kind": "update-recovery-refusal",
                     "operation_id": operation_id,
                     "blocker": "held",
-                    "remediation": remediation,
+                    "remediation": [remediation],
                 },
             )
         raise refusal
@@ -590,6 +590,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._update_refusal(refusal)
         if isinstance(result, dict) and result.get("accepted") is False:
             self._update_reconciliation_response(result)
+        if (not isinstance(result, dict) or result.get("accepted") is not True
+                or result.get("state") not in {"accepted", "launching", "active"}
+                or self._update_operation_id(result.get("operation_id")) is None
+                or not isinstance(result.get("message"), str) or not result["message"]):
+            self._update_uncertain()
         # This is the frozen accepted/continued response. In particular, it
         # remains 202 and its body is relayed without a route-added field.
         return self._send(202, result)

@@ -137,23 +137,37 @@ class UpdateAdmission:
                   "from astrid.installer.update_job import main; main()")
         env = {key: value for key, value in os.environ.items()
                if key not in {"ASTRID_INSTALL_MANIFEST_URL", "PYTHONPATH", "PYTHONHOME"}}
-        result = subprocess.run([str(python), "-I", "-B", "-c", script, str(agent), str(runtime)],
-                                input=json.dumps(payload), text=True, capture_output=True,
-                                timeout=300, env=env)
+        reconciliation = payload.get("action") == "reconcile"
+        try:
+            result = subprocess.run([str(python), "-I", "-B", "-c", script, str(agent), str(runtime)],
+                                    input=json.dumps(payload), text=True, capture_output=True,
+                                    timeout=300, env=env)
+        except (OSError, subprocess.SubprocessError):
+            if reconciliation:
+                raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.") from None
+            raise
         failure_reason = "update-record-failed" if payload.get("action") == "accept" else "inputs-unavailable"
         failure_message = ("The update request could not be saved safely." if failure_reason == "update-record-failed"
                            else "Update inputs are unavailable or invalid.")
         try:
             value = json.loads(result.stdout)
         except (TypeError, json.JSONDecodeError):
+            if reconciliation:
+                raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.") from None
             raise UpdateRefusal(failure_reason, failure_message) from None
         if result.returncode:
             helper_reason = value.get("reason") if isinstance(value, dict) else None
             helper_message = value.get("message") if isinstance(value, dict) else None
+            if reconciliation:
+                if helper_reason in {"busy", "unsupported-service-manager"}:
+                    raise UpdateRefusal("busy", helper_message or failure_message, remediation="M4")
+                raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.")
             if helper_reason in _STATUS_REASONS:
                 raise UpdateRefusal(helper_reason, helper_message or failure_message)
             raise UpdateRefusal(failure_reason, failure_message)
         if not isinstance(value, dict):
+            if reconciliation:
+                raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.")
             raise UpdateRefusal(failure_reason, failure_message)
         return value
 
@@ -264,7 +278,7 @@ class UpdateAdmission:
                 "old_identity": self.daemon.startup_identity, "old_version": old_version,
             })
             if not isinstance(p1, dict):
-                raise UpdateRefusal("busy", "The update reconciliation result is incomplete; no job was launched.")
+                raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.")
             disposition, prior = p1.get("disposition"), p1.get("job")
             if disposition == "continued-existing":
                 operation_id = prior.get("operation_id") if isinstance(prior, dict) else None
@@ -279,9 +293,21 @@ class UpdateAdmission:
             if disposition in {"recovered-this-request", "confirmed-prior"}:
                 operation_id = prior.get("operation_id") if isinstance(prior, dict) else None
                 state = prior.get("state") if isinstance(prior, dict) else None
+                route = prior.get("route_disposition") if isinstance(prior, dict) else None
+                route = route if isinstance(route, dict) else {}
+                confirmation = route.get("confirmation")
                 if (not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
-                        or state not in {"updated", "rolled_back", "failed"}):
-                    raise UpdateRefusal("busy", "The reconciled update result is incomplete; no job was launched.")
+                        or state not in {"updated", "rolled_back", "failed"}
+                        or route.get("format") != "astrid-update-route-disposition/v1"
+                        or route.get("disposition") != disposition or route.get("blocker") != "cleared"
+                        or not isinstance(confirmation, dict) or confirmation.get("confirmed") is not True
+                        or confirmation.get("operation_id") != operation_id or confirmation.get("outcome") != state
+                        or not isinstance(confirmation.get("transaction_id"), str)
+                        or not re.fullmatch(r"[0-9a-f]{32}", confirmation["transaction_id"])
+                        or confirmation["transaction_id"] != prior.get("transaction_id")
+                        or not isinstance(confirmation.get("message"), str) or not confirmation["message"]
+                        or confirmation["message"] != prior.get("message")):
+                    raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.")
                 # The HTTP boundary consumes this private discriminator to
                 # create H3.  It never crosses the frozen accepted POST wire
                 # contract because this path is a 409 reconciliation result.
@@ -289,6 +315,8 @@ class UpdateAdmission:
                         "message": prior.get("message") or prior.get("result") or state,
                         "disposition": disposition}
             if disposition != "prepare-new":
+                if disposition != "refused":
+                    raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.")
                 remediation = p1.get("remediation") if isinstance(p1, dict) else None
                 raise UpdateRefusal("busy", "The update reconciliation did not grant preparation; no job was launched.",
                                     remediation=remediation or "M1")

@@ -670,6 +670,18 @@ def _admission_fixture(tmp_path, monkeypatch, launcher):
     return admission, accepted, prepared
 
 
+def _confirmed_job(operation_id, disposition, outcome, message):
+    transaction_id = "e" * 32
+    return {"operation_id": operation_id, "state": outcome, "message": message,
+            "transaction_id": transaction_id, "route_disposition": {
+                "format": "astrid-update-route-disposition/v1", "blocker": "cleared",
+                "disposition": disposition, "confirmation": {
+                    "operation_id": operation_id, "outcome": outcome, "confirmed": True,
+                    "transaction_id": transaction_id, "message": message,
+                },
+            }}
+
+
 def test_reconcile_before_manifest_and_newer_target_checks(tmp_path, monkeypatch):
     launches = []
     admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: launches.append(job))
@@ -694,6 +706,65 @@ def test_reconcile_before_manifest_and_newer_target_checks(tmp_path, monkeypatch
     assert launches == []
 
 
+@pytest.mark.parametrize("reply", [None, {}, {"disposition": "unexpected"},
+                                  {"disposition": "acknowledgement-unknown"}])
+def test_unknown_reconciliation_never_prepares_or_launches(tmp_path, monkeypatch, reply):
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("launch"))
+    admission._helper = lambda *_args, **_kwargs: reply
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
+    assert error.value.details["reason"] == "acknowledgement-unknown"
+    assert prepared == []
+
+
+@pytest.mark.parametrize("defect", ["missing", "held", "wrong-operation", "wrong-transaction", "wrong-outcome"])
+def test_unconfirmed_terminal_reconciliation_is_observe_only(tmp_path, monkeypatch, defect):
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("launch"))
+    job = _confirmed_job("d" * 32, "recovered-this-request", "rolled_back",
+                         "Recovered your previous version — run Update again")
+    route = job["route_disposition"]
+    if defect == "missing":
+        del job["route_disposition"]
+    elif defect == "held":
+        route["blocker"] = "held"
+    elif defect == "wrong-operation":
+        route["confirmation"]["operation_id"] = "f" * 32
+    elif defect == "wrong-transaction":
+        route["confirmation"]["transaction_id"] = "f" * 32
+    else:
+        route["confirmation"]["outcome"] = "updated"
+    admission._helper = lambda *_args, **_kwargs: {"disposition": "recovered-this-request", "job": job}
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
+    assert error.value.details["reason"] == "acknowledgement-unknown"
+    assert prepared == []
+
+
+@pytest.mark.parametrize("result", ["timeout", "invalid-json", "non-object", "unknown-error", "busy"])
+def test_reconcile_helper_failure_preserves_uncertainty(tmp_path, monkeypatch, result):
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("launch"))
+    admission._helper = update.UpdateAdmission._helper.__get__(admission)
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(json.loads(kwargs["input"]))
+        if result == "timeout":
+            raise subprocess.TimeoutExpired("helper", 300)
+        stdout, returncode = {
+            "invalid-json": ("{", 0), "non-object": ("[]", 0),
+            "unknown-error": ('{"reason":"unexpected"}', 1),
+            "busy": ('{"reason":"busy"}', 1),
+        }[result]
+        return SimpleNamespace(stdout=stdout, returncode=returncode)
+
+    monkeypatch.setattr(update.subprocess, "run", run)
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
+    assert error.value.details["reason"] == ("busy" if result == "busy" else "acknowledgement-unknown")
+    assert [call["action"] for call in calls] == ["reconcile"]
+    assert prepared == []
+
+
 @pytest.mark.parametrize("launch_status", [None, "unknown", "launching", "failed"])
 def test_unacknowledged_continuation_reply_is_observe_only(tmp_path, monkeypatch, launch_status):
     launches = []
@@ -716,10 +787,9 @@ def test_reconcile_terminal_result_prevents_preparation_and_new_launch(tmp_path,
     operation_id = "d" * 32
 
     admission._helper = lambda _python, _agent, _runtime, payload, **_kwargs: {
-        "disposition": "recovered-this-request", "job": {
-            "operation_id": operation_id, "state": "rolled_back",
-            "message": "Recovered your previous version — run Update again",
-        },
+        "disposition": "recovered-this-request", "job": _confirmed_job(
+            operation_id, "recovered-this-request", "rolled_back",
+            "Recovered your previous version — run Update again"),
     } if payload["action"] == "reconcile" else pytest.fail("P1 must finish before preparation")
 
     assert admission.request() == {
@@ -820,11 +890,7 @@ def test_update_route_h3_returns_confirmed_reconciliation_conflict(
         admission.daemon = world.daemon
         admission._helper = lambda _python, _agent, _runtime, payload, **_kwargs: {
             "disposition": disposition,
-            "job": {
-                "operation_id": operation_id,
-                "state": outcome,
-                "message": message,
-            },
+            "job": _confirmed_job(operation_id, disposition, outcome, message),
         } if payload["action"] == "reconcile" else pytest.fail("H3 must not prepare or launch")
         world.daemon.update_admission = admission
 
@@ -873,7 +939,7 @@ def test_update_route_h4_returns_recovery_refusal(tmp_path, monkeypatch):
             "kind": "update-recovery-refusal",
             "operation_id": None,
             "blocker": "held",
-            "remediation": "M4",
+            "remediation": ["M4"],
         }
         assert prepared == []
     finally:
@@ -925,6 +991,48 @@ def test_update_route_preserves_frozen_accepted_response(tmp_path):
 
         assert response.status == 202
         assert response.json() == accepted
+    finally:
+        world.stop()
+
+
+def test_authenticated_continuation_keeps_operation_and_journal(tmp_path, monkeypatch):
+    world = start_door_world(tmp_path)
+    try:
+        admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("second launch"))
+        admission.daemon = world.daemon
+        operation_id, transaction_id = "c" * 32, "e" * 32
+        root = tmp_path / "program with spaces"
+        journal = _write(root / "update-transaction.json", {"operation_id": transaction_id,
+                                                           "update_job": {"operation_id": operation_id}})
+        before = journal.read_bytes()
+        calls = []
+
+        def reconcile(_python, _agent, _runtime, payload):
+            calls.append(payload["action"])
+            assert payload["action"] == "reconcile"
+            return {"disposition": "continued-existing", "job": {
+                "operation_id": operation_id, "state": "launching", "launch_status": "acknowledged"}}
+
+        admission._helper = reconcile
+        world.daemon.update_admission = admission
+        response = world.call("/api/runtime/v1/update", "POST", body=b"")
+        assert response.status == 202
+        assert response.json() == {"accepted": True, "state": "accepted", "operation_id": operation_id,
+                                   "message": "Update continued."}
+        assert journal.read_bytes() == before
+        assert calls == ["reconcile"] and prepared == []
+    finally:
+        world.stop()
+
+
+@pytest.mark.parametrize("result", [None, {}, {"accepted": True, "operation_id": "bad", "state": "accepted"}])
+def test_update_route_malformed_acceptance_is_uncertain(tmp_path, result):
+    world = start_door_world(tmp_path)
+    try:
+        world.daemon.update_admission.request = lambda: result
+        response = world.call("/api/runtime/v1/update", "POST", body=b"")
+        assert response.status == 409
+        assert response.json()["details"]["reason"] == "acknowledgement-unknown"
     finally:
         world.stop()
 
