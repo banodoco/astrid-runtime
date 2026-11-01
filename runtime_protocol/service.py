@@ -8768,6 +8768,9 @@ class RuntimeService:
         Runtime validates portable identity, never producer scratch paths. Generic
         manifests remain opaque; the existing managed profile has a closed envelope.
         """
+        manifest_digest = self.store._validated_manifest_digest(result, project_id=project_id)
+        if manifest_digest is not None and not any(item["digest"] == manifest_digest for item in staged["items"]):
+            self._verify_child_object_bytes(manifest_digest, result["manifest_ref"]["size"], label="result manifest CAS object")
         candidates = [item for item in staged["items"] if item["output_port"] == "result_manifest"]
         if not candidates:
             return

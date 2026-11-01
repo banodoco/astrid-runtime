@@ -5491,6 +5491,8 @@ class RealmStore:
         object_id = reference.get("object_id", reference.get("digest"))
         if not isinstance(object_id, str) or not OBJECT_ID_RE.fullmatch(object_id) or not object_id.startswith("sha256:"):
             raise ValidationError("manifest_ref requires a canonical sha256 object_id")
+        if "object_id" in reference and "digest" in reference and reference["object_id"] != reference["digest"]:
+            raise ConflictError("manifest_ref object_id and digest differ")
         digest = object_id.removeprefix("sha256:")
         size = reference.get("size")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
@@ -5501,6 +5503,8 @@ class RealmStore:
             None,
         )
         if matching_output is not None:
+            if matching_output.get("kind") != "object" or matching_output.get("durability", "durable") != "durable":
+                raise ValidationError("manifest_ref must identify a durable object")
             if int(matching_output["size"]) != size:
                 raise ConflictError("manifest_ref size does not match settled output")
         else:
