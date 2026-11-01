@@ -676,7 +676,12 @@ def test_workspace_inspection_forwards_selected_admission_budget_without_changin
 
     def fake_run(argv, **kwargs):
         observed["argv"] = argv
-        return SimpleNamespace(returncode=0 if healthy else 1, stdout=json.dumps(report))
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0 if healthy else 1,
+            stdout=json.dumps(report),
+            stderr="timeline history memo disabled; full verification for this request",
+        )
 
     monkeypatch.setattr("astrid_runtime.runtime_boundary.subprocess.run", fake_run)
     assert LocalRuntimeBoundary().inspect(realm_root=root) == report
@@ -684,6 +689,7 @@ def test_workspace_inspection_forwards_selected_admission_budget_without_changin
         __import__("sys").executable, "-X", "utf8", "-m", "runtime_protocol", "doctor",
         "--root", str(root), "--json", "--admission-timeout", expected,
     ]
+    assert observed["kwargs"]["stderr"] is subprocess.PIPE
     assert list(root.iterdir()) == []
 
 
