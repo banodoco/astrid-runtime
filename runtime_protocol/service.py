@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 from .errors import RuntimeErrorBase, AuthorizationError, ForbiddenError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError, RetiredRouteError
+from .errors import VerificationReceiptMissingError, CandidateNotVerifiedError, VerificationDigestMismatchError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .timeline_commit_store import timeline_scope_is_empty
@@ -6739,6 +6740,68 @@ class RuntimeService:
         if actual != source["raw_publication"]:
             raise ConflictError("actual raw publication changed after final admission")
 
+    def _require_candidate_verification_receipt(self, source, manifest_digest):
+        verification = source.get("verification", source)
+        task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (verification["producer_task_id"],)).fetchone()
+        receipt = self.store._spec(task).get("candidate_verification_receipt")
+        if not isinstance(receipt, dict):
+            raise VerificationReceiptMissingError("Runtime verification receipt is missing")
+        if receipt.get("candidate_verified") is not True:
+            raise CandidateNotVerifiedError("candidate was not verified")
+        if manifest_digest is None or receipt.get("candidate_sha256") != manifest_digest:
+            raise VerificationDigestMismatchError("verification receipt does not match the manifest")
+
+    def _verification_receipt_writer(self, policy, spec, staged, result, project_id):
+        """Build a receipt only for the declared verifier and its stored evidence."""
+        final = (policy.get("publications") or {}).get("final") or policy.get("final_publication")
+        if not final or spec.get("delegated_stage") != final["verify_stage"]:
+            return None
+        manifest_digest = self.store._validated_manifest_digest(result, project_id=project_id)
+        outputs = [item for item in staged["items"]
+                   if item["output_port"] == final["verify_output_port"]
+                   and item["output"]["kind"] == "object" and item["durability"] == "durable"]
+        if manifest_digest is None or len(outputs) != 1 or outputs[0]["size"] > 16 * 1024 * 1024:
+            return None
+
+        def read_verified(digest, size, *, collect=False):
+            root_fd, prefix_fd = self._cas_prefix_fds(digest, create=False)
+            try:
+                fd = os.open(digest[2:], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=prefix_fd)
+                try:
+                    self._verify_open_file(fd, digest, size, label="verification evidence CAS object")
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    hasher, chunks = hashlib.sha256(), []
+                    while True:
+                        chunk = os.read(fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+                        if collect:
+                            chunks.append(chunk)
+                    if hasher.hexdigest() != digest:
+                        raise ConflictError("verification evidence CAS object changed while reading")
+                    return hasher.hexdigest(), b"".join(chunks)
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(prefix_fd)
+                os.close(root_fd)
+
+        def write(timestamp):
+            _, data = read_verified(outputs[0]["digest"], outputs[0]["size"], collect=True)
+            try:
+                decision = json.loads(data)
+            except (ValueError, UnicodeError):
+                return None
+            if not isinstance(decision, dict) or type(decision.get("candidate_verified")) is not bool:
+                return None
+            actual_digest, _ = read_verified(manifest_digest, result["manifest_ref"]["size"])
+            return {"candidate_verified": decision["candidate_verified"],
+                    "candidate_sha256": actual_digest, "verifier": final["verify_stage"],
+                    "verified_at": timestamp}
+
+        return write
+
     def _live_child_authority(self, authority, *, identity):
         payload = self._decode_child_authority(authority)
         if payload.get("identity_digest") != self._child_identity_digest(identity):
@@ -8511,6 +8574,7 @@ class RuntimeService:
             if admitted_spec.get("delegation_closed_attempt_id") == attempt_id:
                 raise AuthorizationError("parent attempt child authority has ended")
             lineage = admitted_spec.get("delegated_parent")
+            policy = None
             if lineage is not None:
                 _, parent, _, policy = self._live_delegating_parent(lineage["parent_attempt_id"], {
                     "lease_id": lineage["parent_lease_id"], "fence": lineage["parent_fence"],
@@ -8659,6 +8723,11 @@ class RuntimeService:
                 result = dict(body.get("result") or {})
                 result["outputs"] = staged["outputs"]
                 self._validate_terminal_manifest(staged, result, task, attempt_id, project_id)
+                receipt_writer = (self._verification_receipt_writer(policy, admitted_spec, staged, result, project_id)
+                                  if policy is not None else None)
+                if verified_source is not None and verified_source.get("publication_name", "final") == "final":
+                    manifest_digest = self.store._validated_manifest_digest(result, project_id=project_id)
+                    self._require_candidate_verification_receipt(verified_source, manifest_digest)
                 recorded = None
                 def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, created_at=None):
                     nonlocal recorded
@@ -8675,6 +8744,7 @@ class RuntimeService:
                     duration_seconds_presence=staged["duration_seconds_presence"],
                     publish=lambda: self._publish_staged_outputs(staged, project_id=project_id),
                     record=record,
+                    verification_receipt=receipt_writer,
                 )
                 staged["committed"] = True
                 return recorded
@@ -8768,6 +8838,9 @@ class RuntimeService:
         Runtime validates portable identity, never producer scratch paths. Generic
         manifests remain opaque; the existing managed profile has a closed envelope.
         """
+        manifest_digest = self.store._validated_manifest_digest(result, project_id=project_id)
+        if manifest_digest is not None and not any(item["digest"] == manifest_digest for item in staged["items"]):
+            self._verify_child_object_bytes(manifest_digest, result["manifest_ref"]["size"], label="result manifest CAS object")
         candidates = [item for item in staged["items"] if item["output_port"] == "result_manifest"]
         if not candidates:
             return

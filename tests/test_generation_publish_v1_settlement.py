@@ -511,6 +511,74 @@ def test_publish_v1_replay_conflict_and_stale_fence_are_atomic(tmp_path):
         service.close()
 
 
+def test_publish_with_existing_manifest_survives_restart_and_replay(tmp_path):
+    service, project, task, attempt, effect = _fixture(
+        tmp_path, effect_factory=lambda project_id: _effect(project_id, policy="allow"), slug="manifest-readback",
+    )
+    manifest = b'{"source":"stored"}'
+    output = _output(b"published", output_port="video", group_key="main", variant_key="first", ordinal=0)
+    try:
+        stored = service.ingest(project["id"], manifest, media_type="application/json", idempotency_key="store-manifest")
+        reference = {"object_id": stored["data"]["digest"], "size": len(manifest)}
+        body = {**{key: attempt[key] for key in ("lease_id", "fence", "runtime_epoch")},
+                "outputs": [output], "result": {"manifest_ref": reference}, "effect": effect}
+        first = service.settle_attempt(attempt["attempt_id"], body, idempotency_key="publish-manifest")
+        service.close()
+        service = RuntimeService(tmp_path / "manifest-readback")
+        stored_task = service.task(task["task"]["id"])["task"]
+        assert stored_task["result"]["manifest_ref"] == reference
+        assert service.object(reference["object_id"])[1] == manifest
+        assert service.object(output["digest"])[1] == b"published"
+        associations = service.managed_outputs(task["task"]["id"])
+        assert len(associations) == 1 and associations[0]["manifest_ref"] == reference["object_id"]
+        assert service.get_generation(associations[0]["generation_id"])["source_task_id"] == task["task"]["id"]
+        assert service.settle_attempt(attempt["attempt_id"], body, idempotency_key="publish-manifest") == first
+        changed = {**body, "result": {"manifest_ref": reference, "changed": True}}
+        with pytest.raises(ConflictError):
+            service.settle_attempt(attempt["attempt_id"], changed, idempotency_key="publish-manifest")
+        assert len(service.managed_outputs(task["task"]["id"])) == 1
+        assert service.store.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0] == 1
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("corruption", ["bytes", "missing", "conflicting-digest", "non-object", "temporary"])
+def test_publish_rejects_unverified_manifest_reference_atomically(tmp_path, corruption):
+    service, project, task, attempt, effect = _fixture(
+        tmp_path, effect_factory=lambda project_id: _effect(project_id, policy="allow"), slug="manifest-" + corruption,
+    )
+    manifest = b'{"source":"stored"}'
+    output = _output(b"published", output_port="video", group_key="main", variant_key="first", ordinal=0)
+    try:
+        stored = service.ingest(project["id"], manifest, media_type="application/json", idempotency_key="store-manifest")
+        object_id = stored["data"]["digest"]
+        reference = {"object_id": object_id, "size": len(manifest)}
+        outputs = [output]
+        if corruption == "bytes":
+            service.cas.path_for(object_id.removeprefix("sha256:")).write_bytes(b"x" * len(manifest))
+        elif corruption == "missing":
+            service.cas.path_for(object_id.removeprefix("sha256:")).unlink()
+        elif corruption == "conflicting-digest":
+            reference["digest"] = _digest(b"another manifest")
+        else:
+            reference = {"object_id": _digest(manifest), "size": len(manifest)}
+            fields = {"kind": "value"} if corruption == "non-object" else {"durability": "temporary"}
+            outputs.append(_output(manifest, output_port="other", group_key="other", variant_key="other", ordinal=0, **fields))
+        body = {**{key: attempt[key] for key in ("lease_id", "fence", "runtime_epoch")},
+                "outputs": outputs, "result": {"manifest_ref": reference}, "effect": effect}
+        message = {"bytes": "hash or size", "missing": "unavailable", "conflicting-digest": "object_id and digest differ",
+                   "non-object": "durable object", "temporary": "durable object"}[corruption]
+        with pytest.raises((ValidationError, ConflictError), match=message):
+            service.settle_attempt(attempt["attempt_id"], body, idempotency_key="reject-manifest")
+        assert service.task(task["task"]["id"])["task"]["status"] == "running"
+        assert not service.managed_outputs(task["task"]["id"])
+        assert service.store.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0] == 0
+        assert service.store.conn.execute("SELECT COUNT(*) FROM generation_variants").fetchone()[0] == 0
+        assert not service.cas.path_for(output["digest"].removeprefix("sha256:")).exists()
+    finally:
+        service.close()
+
+
 def test_generic_output_generation_id_remains_managed_only(tmp_path):
     service, project, task, attempt, _effect_value = _fixture(
         tmp_path,
