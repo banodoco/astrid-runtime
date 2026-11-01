@@ -762,7 +762,7 @@ def test_explicit_update_returns_agent_recovery_without_a_second_launch(tmp_path
     admission._helper = helper
     result = admission.request()
 
-    assert selection_calls == [{"allow_pending": True}]
+    assert selection_calls == [{"allow_pending": True, "require_autostart": False}]
     assert helper_actions == [None, "accept"]
     assert launches == []
     assert result == {
