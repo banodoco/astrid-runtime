@@ -91,6 +91,12 @@ def token(pid: int) -> dict[str, object]:
 
 
 def details(words: Sequence[int]) -> dict[str, object]:
+    """Public token details, with the same keys as the Darwin audit token."""
+    decoded = _decode(words)
+    return {key: decoded[key] for key in ("pid", "uid", "pidversion", "sha256")}
+
+
+def _decode(words: Sequence[int]) -> dict[str, object]:
     """Decode and validate a Linux token; never trusts a frame's own pid."""
     if len(words) != 8 or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > _WORD_LIMIT for v in words):
         raise LinuxBindingError("linux process token is invalid")
@@ -108,7 +114,7 @@ def details(words: Sequence[int]) -> dict[str, object]:
 
 
 def _matches(words: Sequence[int]) -> dict[str, object]:
-    decoded = details(words)
+    decoded = _decode(words)
     observed = _observe(int(decoded["pid"]))
     if (observed["uid"] != decoded["uid"] or observed["ticks"] != decoded["pidversion"]
             or observed["namespace"] != decoded["namespace"]):
@@ -134,7 +140,7 @@ def peer_token(connection) -> dict[str, object]:
 
 def signal(words: Sequence[int], signum: int) -> None:
     """Signal the exact process named by the token, or refuse without signalling."""
-    decoded = details(words)
+    decoded = _decode(words)
     pid = int(decoded["pid"])
     if signum not in (platform.TERM, platform.KILL) and signum != platform.USER1:
         raise LinuxBindingError("linux process signal is not admitted")

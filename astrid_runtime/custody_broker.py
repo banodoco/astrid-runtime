@@ -19,6 +19,8 @@ import math
 from runtime_protocol.dirfd import filesystem as os
 from runtime_protocol import platform
 from runtime_protocol import process_control
+from runtime_protocol import process_binding
+from runtime_protocol import linux_process_binding
 from pathlib import Path
 import shutil
 import socket
@@ -140,6 +142,8 @@ def _token_from_words(words: Sequence[int]) -> _AuditToken:
 
 
 def audit_token_details(words: Sequence[int]) -> dict[str, object]:
+    if process_binding.LINUX:
+        return linux_process_binding.details(words)
     if sys.platform == "win32":
         return platform.handoff_token_details(list(words))
     if sys.platform != "darwin":
@@ -160,6 +164,8 @@ def audit_token_details(words: Sequence[int]) -> dict[str, object]:
 
 
 def _peer_token(connection: socket.socket) -> dict[str, object]:
+    if process_binding.LINUX:
+        return linux_process_binding.peer_token(connection)
     if sys.platform == "win32":
         return platform.handoff_peer_token(connection)
     if sys.platform != "darwin":
@@ -174,6 +180,8 @@ def _peer_token(connection: socket.socket) -> dict[str, object]:
 
 def current_process_audit_token(pid: int) -> dict[str, object]:
     """Read a live Darwin audit token or native Windows creation identity."""
+    if process_binding.LINUX:
+        return linux_process_binding.token(pid)
 
     if sys.platform == "win32":
         return platform.handoff_token(pid)
@@ -229,6 +237,8 @@ def current_process_audit_token(pid: int) -> dict[str, object]:
 
 
 def signal_audit_token(words: Sequence[int], signum: int) -> None:
+    if process_binding.LINUX:
+        return linux_process_binding.signal(words, signum)
     if int(signum) not in _admitted_signals():
         raise CustodyError("custody signal is outside the admitted set")
     if sys.platform == "win32":
@@ -905,7 +915,7 @@ class RoleBoundCustodyBroker:
     ) -> None:
         if not role or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in role):
             raise CustodyError("custody role is invalid")
-        if sys.platform not in ("darwin", "win32"):
+        if not process_binding.supported():
             raise CustodyError("Darwin audit-token custody is unavailable")
         self.role = role
         self.identity_provider = identity_provider
@@ -1294,7 +1304,7 @@ class RoleBoundCustodyBroker:
             post: dict[str, object] | None = None
             while time.monotonic() < deadline:
                 candidate = _peer_token(connection)
-                if candidate["pidversion"] != pre["pidversion"] or sys.platform == "win32":
+                if candidate["pidversion"] != pre["pidversion"] or sys.platform == "win32" or not process_binding.ROTATES_ON_EXEC:
                     post = candidate
                     break
                 time.sleep(0.005)
@@ -1328,7 +1338,7 @@ class RoleBoundCustodyBroker:
                         "state": "post-exec-authority-validated",
                         "registration_before_exec": True,
                         "pre_post_exec_incarnation_bound": True,
-                        "signal_primitive": "proc_signal_with_audittoken",
+                        "signal_primitive": process_binding.PRIMITIVE,
                     },
                 })
                 _append_owner_jsonl(self.authority_journal, {
@@ -1610,7 +1620,7 @@ def signal_sealed_capability(
     ):
         raise CustodyError("Runtime custody capability changed during signal")
     return {
-        "ok": True, "kind": "proc_signal_with_audittoken", "signal": int(signum),
+        "ok": True, "kind": process_binding.PRIMITIVE, "signal": int(signum),
         "role": loaded["reference"]["role"], "pid": expected_identity["pid"],
         "birth_id": expected_identity["birth_id"],
         "audit_token_sha256": loaded["registration"]["audit_token_sha256"],

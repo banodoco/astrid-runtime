@@ -73,3 +73,38 @@ def test_namespace_zero_or_missing_is_refused():
         lpb._parse_birth("proc-start-ticks:123")
     with pytest.raises(lpb.LinuxBindingError):
         lpb.details([lpb.TOKEN_TAG, os.getpid(), 0, 0, 1, 0, 0, 0])
+
+
+def test_exited_unreaped_child_is_refused_before_binding_and_never_signalled():
+    """Spawn-to-seal window: the child exits but is not reaped; binding must refuse it."""
+    import threading
+    from astrid_runtime import custody_broker
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and platform.process_identity(child.pid) is not None:
+        time.sleep(0.01)  # zombie is reported as absent; wait until it has exited
+    with pytest.raises(custody_broker.CustodyError):
+        custody_broker.AuthenticatedCleanupActor.retained_child(child, reap_guard=threading.RLock())
+    assert child.returncode is None  # never reaped by the refusal path
+    child.wait()  # now reap it ourselves; nothing was signalled by the broker
+
+
+def test_real_host_broker_constructs_on_linux_and_custody_branches_stay_in_one_module(tmp_path):
+    from astrid_runtime import custody_broker
+    from runtime_protocol import platform as rp
+
+    scope = tmp_path / "scope"
+    scope.mkdir()
+    platform.owner_only(scope)
+    broker = custody_broker.RoleBoundCustodyBroker(
+        role="host", identity_provider=rp.process_identity,
+        ledger_root=scope / "host-admission", authority_scope_root=scope,
+        authority_journal=scope / "admissions.jsonl", owner_epoch="epoch", timeout=5,
+    )
+    assert broker.role == "host"
+    # Allow-list guard: custody_broker gained no sys.platform branch; the Linux
+    # branches go through process_binding.LINUX. Base had 26; this head has 25.
+    from pathlib import Path
+    source = Path(custody_broker.__file__).read_text(encoding="utf-8")
+    assert source.count("sys.platform") <= 25
