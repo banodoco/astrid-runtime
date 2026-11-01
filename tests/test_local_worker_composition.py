@@ -1006,3 +1006,48 @@ def test_host_only_custody_scope_wrong_owner_never_grants_authority(tmp_path,mon
         _create_host_custody_scope(scope)
     assert scope.stat().st_uid==original_uid
     assert not list(scope.iterdir())
+
+
+def test_host_only_owner_projection_is_exactly_five_fields_and_strict_validator_rejects_extras(tmp_path, monkeypatch):
+    """Linux native observation carries process_group and session_id; only the five contract fields may reach the owner record."""
+    from dataclasses import replace
+    from test_local_worker import host_only_profile_case
+    from runtime_protocol import local_worker_composition as module
+    from runtime_protocol import local_execution_supervisor
+    from runtime_protocol.local_execution_supervisor import host_prepare_request, RUNTIME_OWNER_FIELDS
+    from runtime_protocol.local_execution_supervisor import RelayError
+    import astrid_runtime.custody_broker as custody
+
+    native = {'pid': os.getpid(), 'uid': runtime_platform.current_user(), 'birth_id': 'owner',
+              'parent_pid': 1, 'process_group': 4321, 'session_id': 8765}
+    monkeypatch.setattr(custody, 'default_process_identity', lambda pid: dict(native))
+    captured = {}
+
+    class Stop(Exception):
+        pass
+
+    def capture_request(**kwargs):
+        captured.update(kwargs)
+        raise Stop()
+
+    monkeypatch.setattr(local_execution_supervisor, 'host_prepare_request', capture_request)
+    selected = host_only_profile_case()
+    profile = replace(selected, support_root=tmp_path)
+    config = {**profile.host_launch, 'runtime_endpoint': 'http://127.0.0.1:1', 'runtime_instance_id': 'epoch',
+              'credential_file': str(tmp_path / 'credential'), 'ready_file': str(tmp_path / 'ready')}
+    preparer = module.CrossProcessWorkerPreparer(profile=profile, config=config, environment={})
+    with pytest.raises(Stop):
+        preparer._prepare_host_only(profile, operation_id='op', channel_id='channel')
+
+    owner = captured['runtime_owner']
+    assert set(owner) == set(RUNTIME_OWNER_FIELDS) == {'pid', 'uid', 'birth_id', 'runtime_instance_id', 'coordinator_epoch'}
+    assert owner == {'pid': native['pid'], 'uid': native['uid'], 'birth_id': 'owner',
+                     'runtime_instance_id': 'epoch', 'coordinator_epoch': 'epoch'}
+
+    # The strict validator still accepts the projected record and rejects any extra field.
+    base = dict(operation_id='op', channel_id='channel', owner_epoch='epoch', profile=captured['profile'],
+                custody_scope=captured['custody_scope'])
+    host_prepare_request(runtime_owner=owner, **base)
+    for extra in ('process_group', 'session_id', 'parent_pid'):
+        with pytest.raises(RelayError):
+            host_prepare_request(runtime_owner={**owner, extra: 1}, **base)
