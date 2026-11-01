@@ -335,22 +335,29 @@ class P2CommitPhaseCapture:
         daemon sampler, and each safe frame identity is counted at most once
         per sample.  It never changes the request or Runtime execution path.
         """
-        previous = time.perf_counter()
+        previous = self._start_ns
+        interval_ns = self.sampling_interval * 1_000_000_000
         try:
-            while not self._sampler_stop.is_set():
+            # Sampling is periodic in the capture's clock, including its first
+            # tick. Thread startup ordering must not create an extra sample or
+            # sample a capture whose injected clock has never advanced.
+            while not self._sampler_stop.wait(self.sampling_interval):
                 started_cpu = time.thread_time_ns()
-                now = time.perf_counter()
-                elapsed = now - previous
-                previous = now
-                if elapsed > self.sampling_interval * 1.5:
-                    lost = max(0, int(elapsed / self.sampling_interval) - 1)
-                    with self._lock:
+                with self._lock:
+                    if not self.active or self._sampler_stop.is_set():
+                        break
+                    now = self._clock_ns()
+                    elapsed = now - previous
+                    if elapsed < interval_ns:
+                        continue
+                    previous = now
+                    if elapsed > interval_ns * 1.5:
+                        lost = max(0, int(elapsed / interval_ns) - 1)
                         self._lost_samples += lost
                         for request in self._requests.values():
                             if not request["dispatch_finished"]:
                                 request["lost_samples"] += lost
-                self._sample_once()
-                self._sampler_stop.wait(self.sampling_interval)
+                    self._sample_once()
                 self._sampler_cpu_ns += time.thread_time_ns() - started_cpu
         except Exception as exc:  # noqa: BLE001 - observer failure cannot affect operation
             self._sampler_errors.append(type(exc).__name__)

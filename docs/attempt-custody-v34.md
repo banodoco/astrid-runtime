@@ -74,6 +74,15 @@ Finish the old v33 classifier/backfill/provider activation with its owning
 coordinator before custody migration. Historical migration functions still produce
 that gated U33 intermediate; the new binary cannot serve it as v34. The current
 upgrade coordinator refuses inputs older than U33 before journal or owner changes.
+Journaled adoption is the exception for an unadmitted copy: it places that copy
+at its final directory before creating either activation archive, finishes the
+round-1b SQL/backfill gate, and migrates U33 to V34 within the same adoption.
+The adoption marker binds the directory identity to its journal. Ordinary startup
+stays closed until the adoption startup registers and verifies its real Timeline
+provider and baselines. Both recovery archives are preserved at their original
+bindings. An interrupted U33 stage retries against the verified full recovery set;
+committed V34 resumes verification while closed; a hybrid refuses before writes.
+This path does not relocate an activated realm. V34 relocation remains refused.
 For a stopped,
 ready U33 realm, use `migrate-canonical --confirm 'MIGRATE CANONICAL <realm-id>'`,
 then the explicit `activate-custody` command after verification. Interrupted

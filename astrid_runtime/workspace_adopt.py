@@ -211,6 +211,43 @@ def _inspect_source_snapshot(root: Path, realm_id: str) -> dict[str, object]:
         return inspect_canonical_schema(snapshot, expected_realm_id=realm_id)
 
 
+def _finish_adoption_migration(root: Path, journal_path: Path, realm_id: str) -> dict:
+    """Resume at the real schema boundary, with both activation archives retained."""
+    from runtime_protocol import adoption_lifecycle, v33_lifecycle, v34_lifecycle
+    from runtime_protocol.upgrade import migrate_canonical_to_v33
+
+    # Hybrid refusal precedes owner/SQLite/journal writes, including on retries.
+    identity = inspect_canonical_schema(root, expected_realm_id=realm_id)
+    adoption_lifecycle.activation(root)
+    pending = v34_lifecycle.activation(root)
+    if pending:
+        v34_lifecycle.verify_recovery(*pending)
+    with _owner_fence(root):
+        identity = inspect_canonical_schema(root, expected_realm_id=realm_id)
+        prior = json.loads(journal_path.read_text())
+        historical = prior.get('historical_migration') or {}
+        _journal(journal_path, state='activating')
+        if identity['version'] < 33 or (identity['version'] == 33 and
+                (old := v33_lifecycle.activation(root)) and old[1]['state'] not in {'backfill_complete', 'ready'}):
+            historical = migrate_canonical_to_v33(root, confirmation=f'MIGRATE CANONICAL {realm_id}',
+                                                  expected_realm_id=realm_id)
+            _journal(journal_path, state='backfill_complete', historical_migration=historical)
+        result = migrate_canonical_to_current(root, confirmation=f'MIGRATE CANONICAL {realm_id}',
+                                               expected_realm_id=realm_id)
+        pending = v34_lifecycle.activation(root)
+        if pending and pending[1]['state'] != 'ready':
+            v34_lifecycle.activate(root, admit=False)
+        custody_steps = result.get('steps', [])
+        if not custody_steps and pending and pending[1]['source']['version'] == 33:
+            custody_steps = [{'source_schema_version': 33, 'target_schema_version': 34}]
+        result = {**result, 'source_schema_version': prior['source_version'],
+                  'changed': prior['source_version'] != SCHEMA_VERSION,
+                  'steps': [*historical.get('steps', []), *custody_steps],
+                  'historical_recovery_set': historical.get('recovery_set')}
+        _journal(journal_path, state='migrated', migration=result)
+        return result
+
+
 def _adopt_workspace(
     paths: RuntimePaths,
     boundary: RuntimeBoundary,
@@ -243,10 +280,18 @@ def _adopt_workspace(
     if (selected or catalog.get("selected_realm_id")) and not (already_attached and prior.get("source") == str(root) and prior.get("destination") == str(destination)):
         raise WorkspaceAdoptError("destination already has a workspace selection")
     resume = destination.exists()
-    if resume and (prior.get("source") != str(root) or prior.get("destination") != str(destination) or prior.get("realm_id") != realm_id or prior.get("state") not in {"published", "attached", "started", "complete", "failed"}):
+    if resume and (prior.get("source") != str(root) or prior.get("destination") != str(destination) or prior.get("realm_id") != realm_id or prior.get("state") not in {"materializing", "materialized", "activating", "backfill_complete", "migrated", "published", "attached", "started", "complete", "failed"}):
         raise WorkspaceAdoptError("destination realm already exists and is not a resumable adoption")
     if destination.is_symlink():
         raise WorkspaceAdoptError("destination realm must not be a symlink")
+    from runtime_protocol import adoption_lifecycle
+    adopted = None
+    if resume:
+        # Inspect the actual schema before any support journal or owner write.
+        inspect_canonical_schema(destination, expected_realm_id=realm_id)
+        adopted = adoption_lifecycle.activation(destination)
+        if prior.get('state') in {'materializing', 'materialized', 'activating', 'backfill_complete', 'migrated'} and not adopted:
+            raise WorkspaceAdoptError('incomplete adoption has no matching admission fence')
     try:
         with contextlib.nullcontext() if backup else _owner_fence(root):
             if backup:
@@ -290,6 +335,14 @@ def _adopt_workspace(
                     inspect_canonical_schema(destination, expected_realm_id=realm_id)
                     counts = dict(prior.get("counts") or {})
                     migration = prior.get("migration")
+                    if adopted and prior.get('state') in {'materializing', 'materialized', 'activating', 'backfill_complete', 'migrated'}:
+                        migration = migration or _finish_adoption_migration(destination, journal_path, realm_id)
+                        if inspect_canonical_schema(destination, expected_realm_id=realm_id)['version'] != SCHEMA_VERSION:
+                            raise WorkspaceAdoptError('adoption recovery did not reach the current schema')
+                        report = RealmStore.inspect_realm(destination, deep=True, timeout_seconds=BACKUP_INTEGRITY_TIMEOUT_SECONDS)
+                        if not report.get('ok'):
+                            raise WorkspaceAdoptError(f'adopted realm failed final integrity checks: {report}')
+                        _journal(journal_path, state='published')
                 else:
                     temporary = paths.realms_dir / f".{realm_id}.adopt-{operation_id}"
                     if destination.exists():
@@ -306,16 +359,31 @@ def _adopt_workspace(
                         else:
                             counts = _materialize(root, temporary, files)
                         _journal(journal_path, state="copied", counts=counts)
-                        migration = migrate_canonical_to_current(temporary, confirmation=f"MIGRATE CANONICAL {realm_id}", expected_realm_id=realm_id)
-                        final = inspect_canonical_schema(temporary, expected_realm_id=realm_id)
+                        candidate = temporary
+                        if int(identity['version']) < SCHEMA_VERSION:
+                            # This is publication of an unadmitted copy, before
+                            # either migration archive is created. No activation
+                            # record is relocated or rebound across a rename.
+                            adoption_lifecycle.begin(temporary, destination, journal_path, operation_id, realm_id)
+                            _journal(journal_path, state='materializing')
+                            os.rename(temporary, destination)
+                            platform.fsync_directory(destination.parent)
+                            candidate = destination
+                            adopted = adoption_lifecycle.activation(destination)
+                            _journal(journal_path, state='materialized')
+                            migration = _finish_adoption_migration(destination, journal_path, realm_id)
+                        else:
+                            migration = migrate_canonical_to_current(temporary, confirmation=f"MIGRATE CANONICAL {realm_id}", expected_realm_id=realm_id)
+                        final = inspect_canonical_schema(candidate, expected_realm_id=realm_id)
                         if int(final["version"]) != SCHEMA_VERSION:
                             raise WorkspaceAdoptError(f"adopted realm did not reach canonical v{SCHEMA_VERSION} (got v{final['version']})")
-                        report = RealmStore.inspect_realm(temporary, deep=True, timeout_seconds=BACKUP_INTEGRITY_TIMEOUT_SECONDS)
+                        report = RealmStore.inspect_realm(candidate, deep=True, timeout_seconds=BACKUP_INTEGRITY_TIMEOUT_SECONDS)
                         if not report.get("ok"):
                             raise WorkspaceAdoptError(f"adopted realm failed final integrity checks: {report}")
                         _journal(journal_path, state="migrated", migration=migration)
-                        os.rename(temporary, destination)
-                        platform.fsync_directory(destination.parent)
+                        if candidate == temporary:
+                            os.rename(temporary, destination)
+                            platform.fsync_directory(destination.parent)
                         _journal(journal_path, state="published")
                     except Exception:
                         if temporary.is_dir() and not temporary.is_symlink():
@@ -327,7 +395,10 @@ def _adopt_workspace(
             raise WorkspaceAdoptError(_LIVE_SOURCE) from exc
 
     # Attach owns catalog writes; bootstrap owns runtime launch and verification.
+    previous_token = os.environ.get(adoption_lifecycle.TOKEN)
     try:
+        if adopted:
+            os.environ[adoption_lifecycle.TOKEN] = adopted['operation_id']
         configure_workspace(paths, boundary, config, mode="attach", realm_root=destination, realm_id=realm_id)
         _journal(journal_path, state="attached")
         launch = bootstrap(paths, boundary, config)
@@ -336,6 +407,11 @@ def _adopt_workspace(
     except Exception as exc:
         _journal(journal_path, state="failed", error=str(exc))
         raise WorkspaceAdoptError(f"realm materialized at {destination}; finish with astrid-runtime up after resolving: {exc}") from exc
+    finally:
+        if previous_token is None:
+            os.environ.pop(adoption_lifecycle.TOKEN, None)
+        else:
+            os.environ[adoption_lifecycle.TOKEN] = previous_token
     return {"ok": True, "source": str(root), "source_kind": "backup" if backup else "realm", "destination": str(destination), "realm_id": realm_id,
             "source_version": int(identity["version"]), "target_version": SCHEMA_VERSION, **counts,
             "elapsed_seconds": round(time.monotonic() - started, 3), "migration": migration, "verification": verification}

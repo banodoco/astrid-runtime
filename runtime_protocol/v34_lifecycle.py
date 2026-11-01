@@ -74,6 +74,10 @@ def begin(root, identity, observation):
               'inventory': inventory, 'recovery_digest': old.digest(inventory),
               'state': 'backup_verified', 'created_at': now(),
               'retention': 'indefinite while unresolved; at least 30 days and operator acknowledgement'}
+    from .adoption_lifecycle import activation as adoption_activation
+    adopted = adoption_activation(root)
+    if adopted:
+        record['adoption_operation'] = adopted['operation_id']
     verify_recovery(archive, record)
     phase(root, archive, record, 'backup_verified')
     return archive, record
@@ -122,8 +126,12 @@ def migrate(root, *, confirmation, expected_realm_id=None, timeout_seconds=120):
     if confirmation != f"MIGRATE CANONICAL {identity['realm_id']}":
         raise ValidationError('custody migration confirmation differs')
     previous = old.activation(root)
+    from . import adoption_lifecycle as adoption
+    adopted = adoption.activation(root)
     if previous and previous[1]['state'] != 'ready':
-        raise ConflictError('finish or explicitly recover the round-1b v33 activation first')
+        if adopted is None:
+            raise ConflictError('finish or explicitly recover the round-1b v33 activation first')
+        adoption.verify_historical_gate(root)
     pending = activation(root)
     if identity['kind'] == 'V34':
         if pending:
@@ -210,6 +218,13 @@ def activate(root, *, admit=True):
 
 def check_startup(root):
     pending = activation(root)
+    if pending and pending[1]['state'] == 'activation_verified' and pending[1].get('adoption_operation'):
+        from . import adoption_lifecycle as adoption
+        record = adoption.activation(root)
+        import os
+        if (record and record['operation_id'] == pending[1]['adoption_operation']
+                and os.environ.get(adoption.TOKEN) == record['operation_id']):
+            return
     if pending and pending[1]['state'] == 'activation_verified' and pending[1].get('operator_owned'):
         import os
         if os.environ.get('ASTRID_V33_ACTIVATION') == pending[1]['operation_id']:
@@ -301,4 +316,12 @@ def provider_ready(root, inventory):
         archive, record = pending
         record['provider_verified'] = True
         record['baseline_inventory'] = inventory
-        phase(Path(root), archive, record, 'activation_verified')
+        if record.get('adoption_operation'):
+            from . import adoption_lifecycle as adoption
+            adopted = adoption.activation(root)
+            if adopted is None or adopted['operation_id'] != record['adoption_operation']:
+                raise ConflictError('provider activation differs from its adoption journal')
+            # Only fresh real provider registration reaches this callback.
+            phase(Path(root), archive, record, 'ready')
+        else:
+            phase(Path(root), archive, record, 'activation_verified')

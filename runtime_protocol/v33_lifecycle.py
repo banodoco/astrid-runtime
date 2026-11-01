@@ -205,6 +205,12 @@ def begin(root, identity, *, recovery_root=None, sqlite_image=None):
               "source": identity, "root_identity": identity["source_root_identity"], "inventory": inventory, "state": "backup_verified", "created_at": now(),
               "retention": "at least 30 days after activation AND operator acknowledgement after a verified replacement backup; indefinite while recovery is unresolved",
               "scope": "realm DB/sidecars, all CAS and realm files; offline input, no disconnected App state"}
+    from .adoption_lifecycle import activation as adoption_activation
+    adopted = adoption_activation(root)
+    if adopted:
+        # The older binary also honors operator_owned, so it cannot serve the
+        # U33 crash boundary while this adoption owns the remaining activation.
+        record.update(operator_owned=True, adoption_operation=adopted['operation_id'])
     write_record(archive / "activation.json", record)
     write_record(root / MARKER, {"archive": str(archive), "operation_id": operation_id, "realm_id": identity["realm_id"], "state": "backup_verified"})
     return archive, record
@@ -274,7 +280,11 @@ def check_startup(root):
     if record["state"] not in {"backfill_complete", "provider_verified", "ready"}:
         raise ConflictError("v33 activation incomplete; run offline upgrade recovery before startup")
     if record.get("operator_owned") and record["state"] != "ready" and os.environ.get("ASTRID_V33_ACTIVATION") != record["operation_id"]:
-        raise ConflictError("v33 activation is exclusively owned by the upgrade coordinator")
+        from . import adoption_lifecycle as adoption
+        adopted = adoption.activation(root)
+        if (not adopted or record.get('adoption_operation') != adopted['operation_id']
+                or os.environ.get(adoption.TOKEN) != adopted['operation_id']):
+            raise ConflictError("v33 activation is exclusively owned by the upgrade coordinator")
     completion = read_record(archive / "backfill-complete.json")
     if completion["plan_digest"] != record.get("plan_digest") or completion["backup_id"] != record["backup_id"]:
         raise ConflictError("v33 completion does not match activation")
@@ -301,7 +311,8 @@ def provider_ready(root, inventory):
     if state:
         archive, record = state
         check_startup(root)
-        phase(archive, record, "provider_verified" if record.get("operator_owned") and record["state"] != "ready" else "ready",
+        adopted = record.get('adoption_operation')
+        phase(archive, record, "provider_verified" if record.get("operator_owned") and not adopted and record["state"] != "ready" else "ready",
               baseline_inventory=inventory, ready_at=record.get("ready_at", now()))
 
 

@@ -846,6 +846,8 @@ class RealmStore:
             # copied. A malformed or unsupported root with no marker is still
             # inspected first, preserving the no-side-effect admission
             # contract; the directory lock serializes competing fresh opens.
+            from .adoption_lifecycle import check_startup as adoption_startup
+            adoption_startup(self.root)
             from .v33_lifecycle import check_startup
             check_startup(self.root)
             from .v34_lifecycle import check_startup as custody_startup
