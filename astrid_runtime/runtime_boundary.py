@@ -350,7 +350,7 @@ class LocalRuntimeBoundary:
             result = subprocess.run(
                 argv,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 text=True,
                 check=False,
                 env=environment,
@@ -358,14 +358,17 @@ class LocalRuntimeBoundary:
         except OSError as exc:
             raise BootstrapError("Runtime realm creation could not start.") from exc
         output = result.stdout.strip()
+        errors = (getattr(result, "stderr", "") or "").strip()
         if result.returncode != 0:
+            diagnostic = "\n".join(value for value in (output, errors) if value)
             raise BootstrapError(
-                "Runtime realm creation failed: " + (output or "no diagnostic")
+                "Runtime realm creation failed: " + (diagnostic or "no diagnostic")
             )
         try:
             created = json.loads(output)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            diagnostic = output if len(output) <= 4096 else output[:4096] + "... [truncated]"
+            diagnostic = "\n".join(value for value in (output, errors) if value)
+            diagnostic = diagnostic if len(diagnostic) <= 4096 else diagnostic[:4096] + "... [truncated]"
             raise BootstrapError(
                 "Runtime realm creation returned invalid metadata: " + repr(diagnostic)
             ) from exc

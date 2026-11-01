@@ -78,7 +78,7 @@ def test_windows_realm_creation_preserves_selected_python(tmp_path, monkeypatch,
     monkeypatch.setenv("__PYVENV_LAUNCHER__", "stale-python")
     calls = []
     monkeypatch.setattr(runtime_boundary.subprocess, "run", lambda argv, **kwargs: (
-        calls.append((argv, kwargs)) or SimpleNamespace(stdout='{"realm_id":"realm"}', returncode=0)
+        calls.append((argv, kwargs)) or SimpleNamespace(stdout='{"realm_id":"realm"}', stderr="", returncode=0)
     ))
 
     profile = SourceProfile(profile="astrid", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path),
@@ -108,7 +108,7 @@ def test_windows_realm_creation_preserves_non_json_child_diagnostic(tmp_path, mo
     monkeypatch.setattr(
         runtime_boundary.subprocess,
         "run",
-        lambda *args, **kwargs: SimpleNamespace(stdout="child startup diagnostic", returncode=0),
+        lambda *args, **kwargs: SimpleNamespace(stdout="child startup diagnostic", stderr="", returncode=0),
     )
     profile = SourceProfile(profile="astrid", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path),
                             runtime_environment=str(environment))
@@ -118,6 +118,35 @@ def test_windows_realm_creation_preserves_non_json_child_diagnostic(tmp_path, mo
             realm_id="realm", realm_root=tmp_path / "new-realm",
             display_name="Astrid Workspace", source_profile=profile,
         )
+
+
+def test_windows_realm_creation_keeps_stderr_out_of_its_json_metadata(tmp_path, monkeypatch):
+    environment = tmp_path / "selected"
+    (environment / "Scripts").mkdir(parents=True)
+    selected = environment / "Scripts" / "python.exe"
+    selected.touch()
+    selected.chmod(0o755)
+    monkeypatch.setattr(runtime_boundary, "sys", SimpleNamespace(platform="win32", executable="other-python"))
+    monkeypatch.setattr(windows_handoff, "sys", SimpleNamespace(executable="other-python"))
+    monkeypatch.setattr(runtime_boundary.platform, "venv_python", lambda root: root / "Scripts" / "python.exe")
+    monkeypatch.setattr(
+        runtime_boundary.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout='{"realm_id":"realm"}',
+            stderr="timeline history memo disabled; full verification for this request",
+            returncode=0,
+        ),
+    )
+    profile = SourceProfile(profile="astrid", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path),
+                            runtime_environment=str(environment))
+
+    created = runtime_boundary.LocalRuntimeBoundary().create(
+        realm_id="realm", realm_root=tmp_path / "new-realm",
+        display_name="Astrid Workspace", source_profile=profile,
+    )
+
+    assert created == {"realm_id": "realm"}
 
 
 @pytest.mark.integration
