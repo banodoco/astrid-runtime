@@ -217,3 +217,47 @@ def test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child(tmp_path
         else:
             if process is None:
                 broker.abort_before_spawn()
+
+
+def test_non_child_same_user_connection_is_never_bound_and_holds_the_single_accept_slot():
+    """(c) non-child: an unrelated same-user connection is never registered or bound.
+
+    Finding (not fixed here): the Linux listener is listen(1). An unrelated connection that
+    connects first occupies the single accept slot, so a real child registering behind it times
+    out. That is a liveness issue, not a binding bypass; the rogue is never bound.
+    """
+    import os
+    import socket
+    from astrid_runtime import custody_broker as custody
+
+    import shutil
+    import tempfile
+    from pathlib import Path
+    scope_root = Path(tempfile.mkdtemp(prefix="nc-", dir="/tmp"))
+    scope = scope_root / "scope"
+    platform.private_directory(scope)
+    broker = custody.RoleBoundCustodyBroker(role="host", identity_provider=custody.default_process_identity,
+        ledger_root=scope / "admission", authority_scope_root=scope,
+        authority_journal=scope / "admissions.jsonl", owner_epoch="owner", timeout=3)
+    target = [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
+    environment = {**os.environ, **broker.child_environment(target, start_new_session=True)}
+    process = rogue = None
+    try:
+        rogue = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        rogue.settimeout(10)
+        rogue.connect(str(broker.socket_path))
+        process = platform.spawn_tree(custody.custody_wrapper_argv(sys.executable), env=environment,
+                                      start_new_session=False, close_fds=True)
+        with pytest.raises(custody.CustodyError):
+            broker.wait_until_sealed()
+        assert broker.registration is None  # nothing was bound to the rogue or to the child
+    finally:
+        if rogue is not None:
+            rogue.close()
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+        else:
+            broker.abort_before_spawn()
+        shutil.rmtree(scope_root, ignore_errors=True)
