@@ -126,6 +126,25 @@ def test_actual_owner_installed_env_overrides_archive_source_paths(tmp_path, mon
         daemon.stop()
 
 
+def test_unstamped_installed_roots_and_mixed_roots(tmp_path):
+    from runtime_protocol.startup_identity import capture_startup_identity
+    from runtime_protocol.source_identity import SourceIdentityError
+
+    runtime, agent = tmp_path / "runtime", tmp_path / "agent"
+    runtime.mkdir()
+    agent.mkdir()
+    assert capture_startup_identity(runtime_checkout=runtime, agent_checkout=agent, environ={}) == {
+        "release": 0, "managed_by": None,
+    }
+    assert capture_startup_identity(runtime_checkout=runtime, agent_checkout=agent,
+                                    environ={"ASTRID_INSTALL_RELEASE": "7", "ASTRID_INSTALL_MANAGED_BY": "pinokio"}) == {
+        "release": 7, "managed_by": "pinokio",
+    }
+    (runtime / ".git").mkdir()
+    with pytest.raises(SourceIdentityError):
+        capture_startup_identity(runtime_checkout=runtime, agent_checkout=agent, environ={})
+
+
 def test_local_boundary_argv_carries_exact_profile_checkouts(tmp_path):
     from astrid_runtime.bootstrap import SourceProfile
     from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
