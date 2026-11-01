@@ -179,8 +179,11 @@ class P2CommitPhaseCapture:
         self._profile_selection_closed = False
         self.pid = os.getpid()
         self.birth_ticks = _process_birth_ticks()
+        # Keep byte accounting stable across counter digit boundaries. The
+        # namespace is redacted from comparisons, but its encoded width still
+        # contributes to the retained snapshot's byte totals.
         self.namespace = (f"pid-{self.pid}-birth-{self.birth_ticks or 'unknown'}-"
-                          f"capture-{_CAPTURE_NAMESPACE}")
+                          f"capture-{_CAPTURE_NAMESPACE:020d}")
         self.sink = Path(sink).absolute() if sink is not None else None
         self.watchdog_sink = (self.sink.with_name(f"{self.sink.stem}.stacks.txt")
                               if self.sink is not None else None)

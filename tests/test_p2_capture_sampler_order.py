@@ -1,4 +1,7 @@
 """The first periodic sample is clock-driven, and shutdown wins a late tick."""
+import pytest
+
+from tests.helpers import p2_commit_phase_capture as helper
 from tests.helpers.p2_commit_phase_capture import P2CommitPhaseCapture
 
 
@@ -46,3 +49,13 @@ def test_sampler_stop_wins_over_a_late_tick():
     capture._sample_stack()
     assert samples == []
     assert capture._sampler_errors == []
+
+
+@pytest.mark.parametrize('counter', [8, 98, 998])
+def test_pending_snapshot_is_deterministic_across_namespace_digit_boundaries(monkeypatch, counter):
+    from test_p2_commit_phase_capture import (
+        test_pending_request_is_the_final_correlated_request_and_shutdown_is_deterministic as assert_snapshot,
+    )
+    monkeypatch.setattr(helper, '_CAPTURE_NAMESPACE', counter)
+    # Run the original assertions unchanged at 9/10, 99/100 and 999/1000.
+    assert_snapshot()
