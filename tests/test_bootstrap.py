@@ -3072,3 +3072,54 @@ class StaleOwnerTests(unittest.TestCase):
             down(self.paths, self.boundary)
         self.assertTrue(self.paths.discovery_path.exists())
         self.assertEqual(json.loads(self.paths.instance_lock_path.read_text()), replacement)
+
+
+def test_up_repairs_only_the_verified_healthy_owner_discovery():
+    case = BootstrapTests()
+    case.setUp()
+    try:
+        case._configure()
+        first = bootstrap(case.paths, case.boundary, case.config)
+        before = case.paths.discovery_path.read_bytes()
+        case.paths.discovery_path.unlink()
+        with pytest.raises(BootstrapError, match="no matching discovery"):
+            down(case.paths, case.boundary)
+        recovered = bootstrap(case.paths, case.boundary, case.config)
+        assert recovered.status == "reconnected"
+        assert recovered.runtime_instance_id == first.runtime_instance_id
+        assert len(case.boundary.starts) == 1
+        assert case.paths.discovery_path.read_bytes() == before
+    finally:
+        case.tearDown()
+        case.doCleanups()
+
+
+@pytest.mark.parametrize("changed", ["health", "instance", "realm", "snapshot"])
+def test_discovery_recovery_refuses_changed_owner_without_publication(changed):
+    case = BootstrapTests()
+    case.setUp()
+    try:
+        case._configure()
+        bootstrap(case.paths, case.boundary, case.config)
+        case.paths.discovery_path.unlink()
+        if changed == "health":
+            case.boundary.healthy = False
+        elif changed == "instance":
+            case.boundary.live_instance_id = "replacement"
+        elif changed == "realm":
+            case.boundary.endpoint_metadata = lambda **_: {"runtime_instance_id": case.boundary.live_instance_id,
+                                                          "realm_id": "foreign"}
+        else:
+            marker = json.loads(case.paths.instance_lock_path.read_text())
+            marker["discovery"]["runtime_instance_id"] = "replacement"
+            case.paths.instance_lock_path.write_text(json.dumps(marker))
+        before = case.paths.instance_lock_path.read_bytes()
+        with pytest.raises(BootstrapError):
+            bootstrap(case.paths, case.boundary, case.config)
+        assert not case.paths.discovery_path.exists()
+        assert case.paths.instance_lock_path.read_bytes() == before
+        assert len(case.boundary.starts) == 1
+        assert case.boundary.restart_calls == 0
+    finally:
+        case.tearDown()
+        case.doCleanups()
