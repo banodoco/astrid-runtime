@@ -10,6 +10,7 @@ import venv
 
 import pytest
 
+from astrid_runtime.bootstrap import SourceProfile
 from astrid_runtime import runtime_boundary
 from runtime_protocol import windows_handoff
 from tests.lanes import requires_windows_runtime_venv
@@ -51,6 +52,48 @@ def test_windows_daemon_launch_preserves_selected_python(tmp_path, monkeypatch, 
     assert os.environ["__PYVENV_LAUNCHER__"] == "stale-python"
     assert options["detached"] is True and options["close_fds"] is True
     assert process is child and boundary._process is child and broker is None
+
+
+@pytest.mark.parametrize("selected_venv", [True, False])
+def test_windows_realm_creation_preserves_selected_python(tmp_path, monkeypatch, selected_venv):
+    base = tmp_path / "base"
+    base.mkdir()
+    executable = base / "python.exe"
+    executable.touch()
+    environment = tmp_path / "direct"
+    (environment / "Scripts").mkdir(parents=True)
+    selected = environment / "Scripts" / "python.exe"
+    selected.touch()
+    selected.chmod(0o755)
+    if selected_venv:
+        environment = tmp_path / "selected"
+        (environment / "Scripts").mkdir(parents=True)
+        selected = environment / "Scripts" / "python.exe"
+        selected.touch()
+        selected.chmod(0o755)
+        (environment / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_boundary, "sys", SimpleNamespace(platform="win32", executable="other-python"))
+    monkeypatch.setattr(windows_handoff, "sys", SimpleNamespace(executable="other-python"))
+    monkeypatch.setattr(runtime_boundary.platform, "venv_python", lambda root: root / "Scripts" / "python.exe")
+    monkeypatch.setenv("__PYVENV_LAUNCHER__", "stale-python")
+    calls = []
+    monkeypatch.setattr(runtime_boundary.subprocess, "run", lambda argv, **kwargs: (
+        calls.append((argv, kwargs)) or SimpleNamespace(stdout='{"realm_id":"realm"}', returncode=0)
+    ))
+
+    profile = SourceProfile(profile="astrid", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path),
+                            runtime_environment=str(environment))
+    created = runtime_boundary.LocalRuntimeBoundary().create(
+        realm_id="realm", realm_root=tmp_path / "new-realm",
+        display_name="Astrid Workspace", source_profile=profile,
+    )
+
+    argv, options = calls[0]
+    assert created == {"realm_id": "realm"}
+    expected = executable if selected_venv else selected
+    assert argv[:5] == [str(expected), "-X", "utf8", "-m", "runtime_protocol"]
+    assert options["env"].get("__PYVENV_LAUNCHER__") == (str(selected) if selected_venv else None)
+    assert os.environ["__PYVENV_LAUNCHER__"] == "stale-python"
 
 
 @pytest.mark.integration

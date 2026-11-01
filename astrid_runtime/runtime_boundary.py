@@ -327,6 +327,19 @@ class LocalRuntimeBoundary:
                     f"{candidate}"
                 )
             python = str(candidate)
+        environment = None
+        if sys.platform == "win32":
+            from runtime_protocol.windows_handoff import python_executable
+
+            # The Windows venv redirector starts a second process.  Invoke the
+            # actual interpreter directly so the creation command has the same
+            # selected-venv identity and custody boundary as daemon startup.
+            executable = python_executable(python)
+            environment = dict(os.environ)
+            environment.pop("__PYVENV_LAUNCHER__", None)
+            if executable != python:
+                environment["__PYVENV_LAUNCHER__"] = str(python)
+            python = executable
         argv = [
             python, "-X", "utf8", "-m", "runtime_protocol", "create",
             "--root", str(realm_root),
@@ -340,6 +353,7 @@ class LocalRuntimeBoundary:
                 stderr=subprocess.STDOUT,
                 text=True,
                 check=False,
+                env=environment,
             )
         except OSError as exc:
             raise BootstrapError("Runtime realm creation could not start.") from exc
