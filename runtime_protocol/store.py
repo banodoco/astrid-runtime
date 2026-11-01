@@ -6221,18 +6221,61 @@ class RealmStore:
         continuation_events = self._refresh_continuations_for_predecessor(task_id)
         return disposition, [event_id, *continuation_events]
 
-    def cancel_task(self, task_id, *, record=None):
+    def cancel_task(self, task_id, *, record=None, attempt_id=None, lease_id=None,
+                    fence=None, runtime_epoch=None, result=None, publish=None, stop_observed=False):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise NotFoundError("task not found")
-            if (task["status"] in ("completed", "cancel_requested", "cancelled")
-                    or (task["status"] == "failed" and json.loads(task["result_json"] or "{}").get("disposition") == "lost")):
+            if attempt_id is not None:
+                if (task["status"] not in {"running", "cancel_requested"}
+                        or task["attempt_id"] != attempt_id or task["lease_token"] != lease_id
+                        or task["lease_fence"] != fence or task["runtime_epoch"] != runtime_epoch
+                        or runtime_epoch != self._current_runtime_epoch()):
+                    raise LeaseError("cancellation attempt lease is stale or already settled")
+                if task["lease_expires_at"] and datetime.fromisoformat(task["lease_expires_at"]) <= datetime.now(timezone.utc):
+                    raise LeaseError("attempt lease has expired")
+            if (task["status"] in ("completed", "failed", "cancelled")
+                    or (task["status"] == "cancel_requested" and attempt_id is None)):
                 value = self.get_task(task_id)
                 if record is not None:
                     record(value)
                 return value
             with self._transaction():
+                timestamp = now()
+                terminal_result = dict(json.loads(task["result_json"] or "{}"))
+                if result is not None:
+                    previous_manifest = terminal_result.get("manifest_ref")
+                    if (previous_manifest is not None and result.get("manifest_ref", previous_manifest) != previous_manifest):
+                        raise ConflictError("cancellation cannot replace published manifest evidence")
+                    def output_key(output):
+                        ordinal = output.get("ordinal", 0)
+                        return (output.get("output_port", output.get("name", "output")),
+                                output.get("group_key", "default"),
+                                output.get("variant_key", str(ordinal)), ordinal)
+                    outputs = {output_key(output): output for output in terminal_result.get("outputs", [])}
+                    for output in result.get("outputs", []):
+                        key = output_key(output)
+                        if key in outputs and outputs[key] != output:
+                            raise ConflictError("cancellation cannot replace published output evidence")
+                        outputs[key] = output
+                    terminal_result.update(result)
+                    terminal_result["outputs"] = list(outputs.values())
+                terminal_result.update({"attempt_id": task["attempt_id"],
+                                        "attempted": task["attempt_id"] is not None})
+                terminal_result["input_object_ids"] = self._spec(task).get("input_object_ids", [])
+                terminal_result["cancel"] = {"requested": True, "stop_observed": bool(stop_observed)}
+                if publish is not None:
+                    publish()
+                project = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()
+                if result is not None:
+                    self._associate_managed_outputs(terminal_result, task_id=task_id,
+                        attempt_id=attempt_id, project_id=project[0], created_at=timestamp)
+                if attempt_id is not None:
+                    if self._task_lifetime_failure(task, datetime.now(timezone.utc)):
+                        raise LeaseError("task absolute deadline has expired")
+                    if task["lease_expires_at"] and datetime.fromisoformat(task["lease_expires_at"]) <= datetime.now(timezone.utc):
+                        raise LeaseError("attempt lease has expired")
                 self.contain_delegated_children(task_id, reason="parent_cancelled")
                 binding = self.execution_binding(task_id)
                 unresolved_external = bool(
@@ -6241,11 +6284,16 @@ class RealmStore:
                     and binding.get("actual_target")
                     and (binding.get("verification") or {}).get("verified") is True
                 )
-                if unresolved_external:
+                outstanding = task["attempt_id"] and self.conn.execute(
+                    "SELECT 1 FROM attempts WHERE id=? AND settled=0", (task["attempt_id"],)).fetchone()
+                # Legacy unbound owner cancellation retains its Runtime-only
+                # terminal semantics. A worker's fenced report explicitly
+                # distinguishes an unknown producer stop, even without a binding.
+                if (unresolved_external or (outstanding and attempt_id is not None)) and not stop_observed:
                     timestamp = now()
                     self.conn.execute(
-                        "UPDATE tasks SET status='cancel_requested', waiting_reason='provider_state_unknown', updated_at=? WHERE id=?",
-                        (timestamp, task_id),
+                        "UPDATE tasks SET status='cancel_requested', result_json=?, waiting_reason='provider_state_unknown', updated_at=? WHERE id=?",
+                        (canonical_json(terminal_result), timestamp, task_id),
                     )
                     self.release_execution_attempt(task_id, status="stale")
                     event_id = self._append_event(
@@ -6269,12 +6317,12 @@ class RealmStore:
                         )
                     return value
                 self._reconcile_runtime_attempt(task_id, task["attempt_id"])
-                self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (now(), task_id))
+                self.conn.execute("UPDATE tasks SET status='cancelled', result_json=?, lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(terminal_result), now(), task_id))
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (now(), task["run_id"]))
                 self._release_reservations(task_id, task["lease_token"])
                 if binding is not None:
                     self.release_execution_attempt(task_id)
-                event_id = self._append_event(task["run_id"], task_id, "task.cancelled", {})
+                event_id = self._append_event(task["run_id"], task_id, "task.cancelled", {"result": terminal_result})
                 self._refresh_continuations_for_predecessor(task_id)
                 value = self.get_task(task_id)
                 if record is not None:
@@ -6410,26 +6458,37 @@ class RealmStore:
                     self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.retry", run_id, idempotency_key, request_hash, canonical_json(result), now()))
             return result
 
-    def _fail_task_in_transaction(self, task, failure, *, attempt_id=None, record=None):
+    def _fail_task_in_transaction(self, task, failure, *, attempt_id=None, record=None, result=None, publish=None):
         """Single terminal failure path; caller owns the settlement transaction."""
         task_id, lease_token = task["id"], task["lease_token"]
         self.contain_delegated_children(task_id, attempt_id=attempt_id, reason="parent_failed")
         timestamp = now()
-        result = {"error": failure}
+        result = dict(result or {})
+        result["error"] = failure
+        if publish is not None:
+            publish()
+        project = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()
+        self._associate_managed_outputs(result, task_id=task_id, attempt_id=attempt_id,
+                                        project_id=project[0], created_at=timestamp)
+        if publish is not None:
+            if self._task_lifetime_failure(task, datetime.now(timezone.utc)):
+                raise LeaseError("task absolute deadline has expired")
+            if task["lease_expires_at"] and datetime.fromisoformat(task["lease_expires_at"]) <= datetime.now(timezone.utc):
+                raise LeaseError("attempt lease has expired")
         self.conn.execute("UPDATE tasks SET status='failed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
         self.conn.execute("UPDATE runs SET status='failed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
         if attempt_id is not None:
             self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND task_id=? AND settled=0", (attempt_id, task_id))
         self._release_reservations(task_id, lease_token)
         self.release_execution_attempt(task_id)
-        event_id = self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
+        event_id = self._append_event(task["run_id"], task_id, "task.failed", {"error": failure, "result": result})
         self._refresh_continuations_for_predecessor(task_id)
         value = self.get_task(task_id)
         if record is not None:
             record(value, event_ids=[event_id], primary_stream_id=task["run_id"], resulting_stream_seq=None)
         return value
 
-    def fail_task(self, task_id, lease_token, failure, *, fence=None, attempt_id=None, record=None):
+    def fail_task(self, task_id, lease_token, failure, *, fence=None, attempt_id=None, record=None, result=None, publish=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
@@ -6445,7 +6504,14 @@ class RealmStore:
             # rejected by the current lease, fence and attempt checks above.
             failure = self._task_lifetime_failure(task, datetime.now(timezone.utc)) or failure
             with self._transaction():
-                return self._fail_task_in_transaction(task, failure, attempt_id=attempt_id, record=record)
+                if publish is not None:
+                    deadline = task["lease_expires_at"]
+                    if deadline and datetime.fromisoformat(deadline) <= datetime.now(timezone.utc):
+                        raise LeaseError("attempt lease has expired")
+                    if self._task_lifetime_failure(task, datetime.now(timezone.utc)):
+                        raise LeaseError("task absolute deadline has expired")
+                return self._fail_task_in_transaction(task, failure, attempt_id=attempt_id, record=record,
+                                                      result=result, publish=publish)
 
     def doctor(self, *, catalog_path=None, deep=False):
         """Return a read-only, actionable integrity report.

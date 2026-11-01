@@ -741,7 +741,8 @@ paths:
     post:
       operationId: cancelTask
       parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
-      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      description: Request cancellation or publish fenced attempt evidence. Evidence requires the complete current attempt fence. stop_observed=true acknowledges an observed stop; false retains cancel_requested and fenced custody. Exact committed replay survives restart without touching producer spool bytes.
+      requestBody: { required: false, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/TaskCancellation' } } } }
       responses: { '200': { description: Cancellation requested with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/tasks/{task_id}/retry:
     post:
@@ -946,6 +947,7 @@ paths:
   /v1/attempts/{attempt_id}/fail:
     post:
       operationId: failAttempt
+      description: Atomically publish hash-verified result_manifest and partial evidence with failure, without applying a generation publication effect. Evidence requires a live attempt fence; legacy failure without evidence may cede an expired retained attempt. Exact committed replay survives restart.
       parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AttemptFailure' } } } }
       responses: { '200': { description: Failed with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
@@ -1343,10 +1345,7 @@ components:
       required: [variant_id]
       properties: { variant_id: { type: string }, object_id: { type: string }, variant_type: { type: string }, metadata: { type: object } }
     AttemptFailure:
-      type: object
-      additionalProperties: false
-      required: [lease_id, fence, runtime_epoch, error]
-      properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, runtime_epoch: { type: integer, minimum: 1 }, error: {} }
+      $ref: './schemas/worker.json#/definitions/AttemptFailure'
     Shot:
       type: object
       additionalProperties: false

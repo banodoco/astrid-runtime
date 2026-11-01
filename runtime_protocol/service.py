@@ -7794,11 +7794,23 @@ class RuntimeService:
     def cancel(self, task_id):
         return self.store.cancel_task(task_id)
 
-    @_verified_mutation
-    def cancel_task_canonical(self, task_id, body=None, *, idempotency_key=None):
+    @_durable_mutation
+    def cancel_task_canonical(self, task_id, body=None, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = {} if body is None else body
-        self._require_object_body(body)
+        body = _wire_object(body, allowed=("expected_version", "attempt_id", "lease_id", "fence",
+                                            "runtime_epoch", "outputs", "result", "stop_observed"))
+        if "expected_version" in body:
+            _wire_integer(body, "expected_version", positive=True)
+        fenced = bool(set(body) & {"attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "result", "stop_observed"})
+        if fenced:
+            _wire_string(body, "attempt_id")
+            _wire_string(body, "lease_id")
+            _wire_integer(body, "fence")
+            _wire_integer(body, "runtime_epoch", positive=True)
+            if "stop_observed" in body and not isinstance(body["stop_observed"], bool):
+                raise ValidationError("stop_observed must be a boolean")
+            self._validate_terminal_result_body(body)
         with self.store._mutex:
             current = self.store.get_task(task_id)
             project_id = current["run"].get("project_id") or "unscoped"
@@ -7809,13 +7821,38 @@ class RuntimeService:
             expected = body.get("expected_version")
             if expected is not None and int(expected) != int(current["task"].get("attempt", 0)) + 1:
                 raise ConflictError("stale task version", details={"expected": expected, "actual": int(current["task"].get("attempt", 0)) + 1})
-            with self.store._transaction():
+            staged = None
+            try:
+                options = {}
+                if fenced:
+                    attempt_id = body["attempt_id"]
+                    row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+                    self._assert_attempt_identity(row, identity)
+                    self._validate_attempt_lease(row, body, self.store._current_runtime_epoch())
+                    task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+                    if row["task_id"] != task_id:
+                        raise LeaseError("cancellation attempt does not match task")
+                    options = {key: body[key] for key in ("attempt_id", "lease_id", "fence", "runtime_epoch")}
+                    options["stop_observed"] = body.get("stop_observed", False)
+                    if "outputs" in body or "result" in body:
+                        staged = self._stage_outputs(attempt_id, body.get("outputs", []), project_id=current["run"].get("project_id"),
+                            attempt_row=row, task_row=task, lease_body=body)
+                        result = dict(body.get("result") or {})
+                        result["outputs"] = staged["outputs"]
+                        self._validate_terminal_manifest(staged, result, task, attempt_id, current["run"].get("project_id"))
+                        options.update(result=result,
+                            publish=lambda: self._publish_staged_outputs(staged, project_id=current["run"].get("project_id")))
                 recorded = None
                 def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
                     nonlocal recorded
                     recorded = self._command_record("task.cancel", task_id, idempotency_key, request_hash, self._task_resource(value), project_id=project_id, event_ids=event_ids, primary_stream_id=primary_stream_id, resulting_stream_seq=resulting_stream_seq)
-                self.store.cancel_task(task_id, record=record)
+                self.store.cancel_task(task_id, record=record, **options)
+                if staged is not None:
+                    staged["committed"] = True
                 return recorded
+            finally:
+                if staged is not None:
+                    self._discard_staged_outputs(staged)
 
     @_durable_mutation
     def abandon_task(self, task_id, body, *, idempotency_key=None, identity=None):
@@ -8448,7 +8485,6 @@ class RuntimeService:
             if not row:
                 raise LeaseError("attempt lease is stale or already settled")
             current_epoch = self.store._current_runtime_epoch()
-            self.store._validate_runtime_epoch(body["runtime_epoch"], identity="executor", identity_id=row["executor_id"], required=True)
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
             project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0] if task else "unscoped"
             request_hash = hashlib.sha256(canonical_json({"attempt_id": attempt_id, "body": body}).encode()).hexdigest()
@@ -8619,6 +8655,7 @@ class RuntimeService:
                 # reserved field and are added atomically with user fields.
                 result = dict(body.get("result") or {})
                 result["outputs"] = staged["outputs"]
+                self._validate_terminal_manifest(staged, result, task, attempt_id, project_id)
                 recorded = None
                 def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, created_at=None):
                     nonlocal recorded
@@ -8712,6 +8749,138 @@ class RuntimeService:
             and recorded_size == int(size)
             and result.get("media_type") == media_type
         )
+
+    @staticmethod
+    def _validate_terminal_result_body(body):
+        if "outputs" in body and not isinstance(body["outputs"], list):
+            raise ValidationError("outputs must be a list")
+        if "result" in body and not isinstance(body["result"], dict):
+            raise ValidationError("result must be an object")
+        if "outputs" in body.get("result", {}):
+            raise ValidationError("result.outputs is reserved; send outputs at the top level")
+
+    def _validate_terminal_manifest(self, staged, result, task, attempt_id, project_id):
+        """Check managed producer correlation and refs against verified CAS bytes.
+
+        Runtime validates portable identity, never producer scratch paths. Generic
+        manifests remain opaque; the existing managed profile has a closed envelope.
+        """
+        candidates = [item for item in staged["items"] if item["output_port"] == "result_manifest"]
+        if not candidates:
+            return
+        if len(candidates) != 1:
+            raise ValidationError("one result_manifest is required")
+        manifest = candidates[0]
+        if manifest["output"]["kind"] != "object" or manifest["durability"] != "durable":
+            raise ValidationError("result_manifest must be a durable CAS object")
+        if manifest["size"] > 16 * 1024 * 1024:
+            raise ValidationError("result_manifest exceeds 16 MiB")
+        path = manifest["path"] or self.cas.path_for(manifest["digest"])
+        parent_fd = _open_directory_chain(path.parent)
+        try:
+            fd = os.open(path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+            try:
+                self._verify_open_file(fd, manifest["digest"], manifest["size"], label="result manifest")
+                os.lseek(fd, 0, os.SEEK_SET)
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    payload = json.load(stream)
+            finally:
+                os.close(fd)
+        except (ValueError, UnicodeError) as exc:
+            raise ValidationError("result_manifest must contain JSON") from exc
+        finally:
+            os.close(parent_fd)
+        if not isinstance(payload, dict) or payload.get("kind") != "managed-generation-result.v1":
+            return
+        fields = {"schema_version", "kind", "inputs", "outputs", "created", "warnings", "task_id",
+                  "attempt_id", "producer_run_id", "outcomes", "evidence"}
+        if set(payload) != fields or type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+            raise ValidationError("managed result has an invalid outer envelope")
+        if payload["task_id"] != task["id"] or payload["attempt_id"] != attempt_id:
+            raise ConflictError("managed result task/attempt identity does not match publication")
+        if not isinstance(payload["producer_run_id"], str) or not payload["producer_run_id"].strip():
+            raise ValidationError("managed result requires producer_run_id")
+        try:
+            created = datetime.fromisoformat(payload["created"].replace("Z", "+00:00"))
+            if created.utcoffset() != timedelta(0):
+                raise ValueError("UTC required")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValidationError("managed result created must be UTC") from exc
+        if not isinstance(payload["warnings"], list) or any(not isinstance(w, str) for w in payload["warnings"]):
+            raise ValidationError("managed result warnings must be strings")
+        evidence = payload["evidence"]
+        if (not isinstance(evidence, dict) or set(evidence) != {"producer", "transport"}
+                or any(not isinstance(value, dict) for value in evidence.values())):
+            raise ValidationError("managed result evidence namespaces are invalid")
+        phases = {"execution", "retrieval", "verification", "publication"}
+        outcomes = payload["outcomes"]
+        if not isinstance(outcomes, dict) or set(outcomes) != phases:
+            raise ValidationError("managed result outcomes are invalid")
+        for outcome in outcomes.values():
+            if (not isinstance(outcome, dict) or set(outcome) - {"status", "code", "message"}
+                    or outcome.get("status") not in {"not_started", "pending", "succeeded", "failed", "cancelled", "interrupted"}
+                    or any(not isinstance(value, str) for value in outcome.values())):
+                raise ValidationError("managed result outcome is invalid")
+        by_digest = {item["digest"]: item for item in staged["items"]}
+
+        def verify_ref(reference):
+            if not isinstance(reference, dict):
+                raise ValidationError("managed result object ref must be an object")
+            digest = reference.get("object_id", reference.get("digest", reference.get("sha256")))
+            digest = digest.removeprefix("sha256:") if isinstance(digest, str) else ""
+            size = reference.get("bytes", reference.get("size"))
+            if not re.fullmatch("[0-9a-f]{64}", digest) or type(size) is not int or size < 0:
+                raise ValidationError("managed result object ref requires sha256 and bytes")
+            for key in ("sha256", "digest", "object_id"):
+                if key in reference and reference[key] not in (digest, "sha256:" + digest):
+                    raise ConflictError("managed result object ref hashes differ")
+            if "bytes" in reference and "size" in reference and reference["bytes"] != reference["size"]:
+                raise ConflictError("managed result object ref sizes differ")
+            if digest in by_digest:
+                if by_digest[digest]["size"] != size:
+                    raise ConflictError("managed result ref size differs from output")
+            else:
+                obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+                if not obj or obj["size"] != size or (project_id and not self.store.conn.execute(
+                        "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone()):
+                    raise ConflictError("managed result ref is outside the task project")
+                self._verify_child_object_bytes(digest, size, label="managed result evidence CAS object")
+            return digest
+
+        inputs = payload["inputs"]
+        if not isinstance(inputs, dict):
+            raise ValidationError("managed result inputs must be an object")
+        for key in ("source", "effective_settings"):
+            if key in inputs:
+                verify_ref(inputs[key])
+        outputs = payload["outputs"]
+        if not isinstance(outputs, list):
+            raise ValidationError("managed result outputs must be a list")
+        seen = set()
+        for output in outputs:
+            required = {"producer_output_id", "output_port", "ordinal", "path", "media_type", "bytes", "sha256"}
+            if (not isinstance(output, dict) or set(output) != required
+                    or not isinstance(output["producer_output_id"], str) or not output["producer_output_id"]
+                    or output["producer_output_id"] in seen or type(output["ordinal"]) is not int or output["ordinal"] < 0
+                    or not isinstance(output["output_port"], str) or not output["output_port"]
+                    or not isinstance(output["path"], str) or not output["path"]
+                    or Path(output["path"]).is_absolute() or ".." in Path(output["path"]).parts
+                    or not isinstance(output["media_type"], str)
+                    or not isinstance(output["sha256"], str) or not re.fullmatch("[0-9a-f]{64}", output["sha256"])):
+                raise ValidationError("managed result output identity is invalid")
+            seen.add(output["producer_output_id"])
+            digest = verify_ref(output)
+            matched = [item for item in staged["items"] if item["digest"] == digest
+                       and item["output"]["kind"] == "object"
+                       and item["output_port"] == output["output_port"]
+                       and item["output"].get("ordinal", 0) == output["ordinal"]
+                       and item["media_type"] == output["media_type"]]
+            if len(matched) != 1:
+                raise ConflictError("managed result output differs from published output")
+        expected_ref = {"object_id": "sha256:" + manifest["digest"], "size": manifest["size"]}
+        if result.get("manifest_ref", expected_ref) != expected_ref:
+            raise ConflictError("managed result manifest_ref differs from published manifest")
+        result["manifest_ref"] = expected_ref
 
     def _stage_outputs(self, attempt_id, outputs, *, project_id=None, attempt_row=None, task_row=None, lease_body=None, verified_objects=None):
         """Validate and stage every output without making it globally reachable."""
@@ -9745,26 +9914,27 @@ class RuntimeService:
         body = _wire_object(
             body,
             required=("lease_id", "fence", "runtime_epoch"),
-            allowed=("lease_id", "fence", "runtime_epoch", "error", "reason"),
+            allowed=("lease_id", "fence", "runtime_epoch", "error", "reason", "outputs", "result"),
         )
         _wire_string(body, "lease_id")
         # A typed fence of zero is stale lease state, not malformed wire.
         _wire_integer(body, "fence")
         _wire_integer(body, "runtime_epoch", positive=True)
+        self._validate_terminal_result_body(body)
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
             if not row:
                 raise LeaseError("attempt lease is stale or already settled")
             current = self.store._current_runtime_epoch()
-            self.store._validate_runtime_epoch(body["runtime_epoch"], identity="executor", identity_id=row["executor_id"], required=True)
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone() if row else None
             project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0] if task else "unscoped"
             request_hash = hashlib.sha256(canonical_json({"attempt_id": attempt_id, "body": body}).encode()).hexdigest()
             replay = self._command_replay("attempt.fail", attempt_id, idempotency_key, request_hash, project_id=project_id or "unscoped")
             if replay is not None:
                 return replay
-            self._validate_attempt_lease(row, body, current, allow_expired=True)
+            publishing = "outputs" in body or "result" in body
+            self._validate_attempt_lease(row, body, current, allow_expired=not publishing)
             if "reason" in body:
                 raise ValidationError("reason is not supported; use error")
             failure = body.get("error") or {"code": "executor_failed"}
@@ -9778,8 +9948,24 @@ class RuntimeService:
             def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
                 nonlocal recorded
                 recorded = self._command_record("attempt.fail", attempt_id, idempotency_key, request_hash, self._task_resource(value), project_id=project_id or "unscoped", event_ids=event_ids, primary_stream_id=primary_stream_id, resulting_stream_seq=resulting_stream_seq)
-            self.store.fail_task(row["task_id"], row["lease_id"], failure, fence=row["fence"], attempt_id=attempt_id, record=record)
-            return recorded
+            staged = None
+            try:
+                result = None
+                if publishing:
+                    staged = self._stage_outputs(attempt_id, body.get("outputs", []), project_id=project_id,
+                        attempt_row=row, task_row=task, lease_body=body)
+                    result = dict(body.get("result") or {})
+                    result["outputs"] = staged["outputs"]
+                    self._validate_terminal_manifest(staged, result, task, attempt_id, project_id)
+                self.store.fail_task(row["task_id"], row["lease_id"], failure, fence=row["fence"], attempt_id=attempt_id,
+                    record=record, result=result,
+                    publish=(lambda: self._publish_staged_outputs(staged, project_id=project_id)) if staged is not None else None)
+                if staged is not None:
+                    staged["committed"] = True
+                return recorded
+            finally:
+                if staged is not None:
+                    self._discard_staged_outputs(staged)
 
     def events_page(self, aggregate_id=None, *, cursor=None, limit=50, from_=None):
         scope = f"events:{aggregate_id or '*'}"
