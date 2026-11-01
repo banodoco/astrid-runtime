@@ -969,6 +969,97 @@ def created_child_public(tmp_path, astrid_importable, request):
         runtime.close()
 
 
+def _same_command_created_child(monkeypatch):
+    from astrid.sdk.timeline import commands
+
+    roots = [
+        {"ref": "shot:new-shot", "kind": "shot", "owner": None, "value": {
+            "payload": {"name": "New shot", "items": [], "metadata": {}, "unknown": {
+                "pinnedShotGroups": None, "clipType": "shot", "empty": {}, "ordered": [None, False, 0]}},
+            "internal_timeline": {"tracks": [{"id": "picture", "kind": "visual", "unknown": None}],
+                                  "clips": [{"id": "title", "track": "picture", "at": 0,
+                                             "hold": 2, "text": "Hello", "unknown": [None]}],
+                                  "output": {"fps": {"numerator": 30000, "denominator": 1001}},
+                                  "unknown": {"null": None, "empty": []}},
+        }},
+        {"ref": "occurrence:new-occ", "kind": "occurrence", "owner": "parent", "value": {
+            "occurrence_id": "new-occ", "shot_id": "new-shot", "track": "picture",
+            "placement": {"start_ms": 20000, "track": "picture"}, "duration_ms": 3000,
+            "source_offset": 0, "speed": 1, "gain": 1,
+            "provenance": {"group_migration": {"opaque": [None, {"clipType": "shot"}]}},
+        }},
+    ]
+
+    def create(ctx, _command):
+        for root in roots:
+            ctx.create_entity(**root)
+        ref = "occurrence:new-occ/clip:title"
+        ctx.select("collection.clips", "occurrence:new-occ")
+        ctx.read(ref, ["hold"])
+        ctx.bind("created-child", ref)
+        ctx.write(ref, ["hold"], 3)
+        ctx.read(ref, ["hold"])
+
+    registered = commands.operations()
+    registered["test.runtime-created-child"] = commands.Operation({
+        "type": "object", "required": ["roots"], "additionalProperties": False,
+        "properties": {"roots": {"type": "array"}},
+    }, create, {})
+    monkeypatch.setattr(commands, "operations", lambda: registered)
+    return {"schema_version": 1, "op": "test.runtime-created-child", "version": "1",
+            "select": "parent", "args": {"roots": roots},
+            "created": [root["ref"] for root in roots]}
+
+
+@pytest.mark.integration
+def test_same_command_created_occurrence_child_aliases_use_staged_closure(created_child_public, monkeypatch):
+    _runtime, _project, _source, submitted, _held, document, publish = created_child_public
+    submitted = copy.deepcopy(submitted)
+    submitted["commands"] = [_same_command_created_child(monkeypatch)]
+    submitted["steps"][0]["command_ordinals"] = [0]
+
+    result = publish(submitted, "same-command-created-child")
+
+    assert result["data"]["status"] == "accepted"
+    canonical = document()
+    assert canonical == result["data"]["canonical_document"]
+    occurrence = next(row for row in canonical["parent_revision"]["payload"]["occurrences"]
+                      if row["occurrence_id"] == "new-occ")
+    shot = next(row for row in canonical["shot_revisions"]
+                if row["revision_id"] == occurrence["shot_revision_id"])
+    internal = next(row for row in canonical["internal_timeline_revisions"]
+                    if row["revision_id"] == shot["internal_timeline_revision_id"])
+    assert internal["payload"]["clips"][0]["hold"] == 3
+
+
+@pytest.mark.integration
+def test_absent_non_created_occurrence_child_alias_still_refuses(created_child_public, monkeypatch):
+    from runtime_protocol.timeline_commit_port import RequestCommitPort
+
+    runtime, _project, source, submitted, _held, document, publish = created_child_public
+    submitted = copy.deepcopy(submitted)
+    submitted["commands"] = [_same_command_created_child(monkeypatch)]
+    submitted["steps"][0]["command_ordinals"] = [0]
+    before_db = tuple(runtime.store.conn.iterdump())
+    before_history = runtime.list_timeline_commits(source["project_id"], "film", authorize=lambda: None)
+    accept = RequestCommitPort.accept
+
+    def forged_absent_child(port, prepared):
+        value = copy.deepcopy(prepared)
+        read = next(read for read in value["records"]["commands"][0]["reads"]
+                    if read["ref"] == "occurrence:new-occ/collection:clip")
+        read["ref"] = "occurrence:absent/collection:clip"
+        return accept(port, value)
+
+    monkeypatch.setattr(RequestCommitPort, "accept", forged_absent_child)
+    with pytest.raises(RuntimeErrorBase) as error:
+        publish(submitted, "absent-non-created-child")
+    assert error.value.details is not None and error.value.details["reason"] == "invalid_records"
+    assert tuple(runtime.store.conn.iterdump()) == before_db
+    assert runtime.list_timeline_commits(source["project_id"], "film", authorize=lambda: None) == before_history
+    assert document() == source
+
+
 def _forge_created_child_promotion(value, source, target):
     # Keep the exact 1204 equal-byte forgery: only intermediate input claims,
     # their parent pins and dependency union change; canonical effects stay intact.
