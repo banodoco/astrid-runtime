@@ -929,7 +929,9 @@ class RetainedProcess:
         return self.actor
 
     def poll(self):
-        with self.guard, getattr(self.child, "_waitpid_lock", self.guard):
+        # Popen.poll() manages its own waitpid lock; holding it here prevents
+        # the non-reentrant lock from being acquired and the child from reaping.
+        with self.guard:
             if self.exit_code is not None:
                 return self.exit_code
             if self.child.returncode is not None:

@@ -219,6 +219,41 @@ def test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child(tmp_path
                 broker.abort_before_spawn()
 
 
+def test_real_broker_term_is_reaped_by_retained_process(tmp_path):
+    import signal
+    from astrid_runtime import custody_broker as custody
+    from runtime_protocol.local_execution_supervisor import RetainedProcess
+
+    scope = tmp_path / "scope"
+    platform.private_directory(scope)
+    broker = custody.RoleBoundCustodyBroker(role="host", identity_provider=custody.default_process_identity,
+        ledger_root=scope / "admission", authority_scope_root=scope,
+        authority_journal=scope / "admissions.jsonl", owner_epoch="owner", timeout=15)
+    target = [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
+    environment = {**os.environ, **broker.child_environment(target, start_new_session=True)}
+    retained = None
+    try:
+        process = platform.spawn_tree(custody.custody_wrapper_argv(sys.executable),
+                                      env=environment, start_new_session=False, close_fds=True)
+        retained = RetainedProcess(process)
+        broker.wait_until_sealed()
+        actor = retained.bind_actor()
+        assert broker.role_authority.reference()["target"] == actor.verify()
+        broker.signal(int(signal.SIGTERM), expected_pid=process.pid)
+        assert retained.wait(timeout=3) == -int(signal.SIGTERM)
+        assert process.returncode == -int(signal.SIGTERM)
+        assert retained.poll() == -int(signal.SIGTERM)
+    finally:
+        if retained is None:
+            broker.abort_before_spawn()
+        elif retained.child.returncode is None:
+            try:
+                os.kill(retained.child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            retained.wait(timeout=3)
+
+
 def test_non_child_same_user_connection_does_not_starve_the_real_child():
     """(c) non-child / N-tier: a silent same-user stray connection is dropped; the real child seals in time.
 
