@@ -26,6 +26,9 @@ def _realm(root, *, old=False):
             (STAMP, STAMP),
         )
         if old:
+            # DESIGN rev 3 §8 (migration): build authentic C31 from pinned U33.
+            from custody_schema_fixtures import to_u33
+            to_u33(connection)
             # A C31 source has app state but neither the Timeline v32 bundle
             # nor M's generation index.  Merely relabeling a U33 database as
             # v31 would create a forbidden v33-manifest hybrid.
@@ -93,7 +96,8 @@ def test_v32_index_inspection_rejects_missing_or_alternate_index(tmp_path, repla
             connection.execute(replacement)
     before = database.read_bytes()
     contents = sorted(path.name for path in root.iterdir())
-    with pytest.raises(ValidationError, match="unsupported canonical v33 manifest"):
+    # DESIGN rev 3 §8 (migration): damaged current schemas retain the V34 identity.
+    with pytest.raises(ValidationError, match="unsupported canonical v34 manifest"):
         inspect_canonical_schema(root)
     assert database.read_bytes() == before
     assert sorted(path.name for path in root.iterdir()) == contents

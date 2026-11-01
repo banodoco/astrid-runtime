@@ -275,6 +275,7 @@ class Custody:
         if execution and execution.get('executor_incarnation') and execution['executor_incarnation'] != row['executor_incarnation']:
             raise ConflictError('Runtime execution incarnation differs from custody')
         if live:
+            self.assert_execution_admitted()
             executor = self.db.execute('SELECT * FROM executors WHERE id=?', (row['executor_id'],)).fetchone()
             if not executor or str(executor['source_digest']).removeprefix('sha256:') != row['source_digest']:
                 raise ConflictError('live custody source identity changed')
@@ -320,6 +321,7 @@ class Custody:
                 return self.public(self.row(prior['custody_id']))
             if self.db.execute('SELECT id FROM realm').fetchone()[0] != request['realm_id']:
                 raise ConflictError('custody realm differs')
+            self.assert_execution_admitted()
             self.assert_clear(installation_id=request['installation_id'])
             self.assert_clear(task_id=request['task_id'])
             if not self.db.execute("SELECT 1 FROM custody_keys WHERE installation_id=? AND role='supervisor' AND revoked_at IS NULL", (request['installation_id'],)).fetchone():

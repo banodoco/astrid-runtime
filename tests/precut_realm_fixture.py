@@ -42,6 +42,7 @@ class PrecutRealmFixture:
     copy_roots: tuple[Path, Path]
     manifest: dict
     pins: dict
+    restored_digests: tuple[str, str]
 
 
 def _extract_archive(destination: Path, archive_path: Path = ARCHIVE) -> Path:
@@ -169,16 +170,26 @@ def load_precut_realm_fixture(tmp_path: Path, *, variant: str | None = None) -> 
     copy_a = tmp_path / f"{stem}-copy-a"
     copy_b = tmp_path / f"{stem}-copy-b"
     restore_backup(backup_root, copy_a, key=FIXTURE_BACKUP_KEY, older_schema=True)
+    # DESIGN rev 3 §8 (migration): pin exact restore bytes before either migration.
+    restored_a = readonly_tree_digest(copy_a)
     identity = inspect_realm_schema(copy_a)
     migrate_canonical_to_current(copy_a, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
+    # DESIGN rev 3 §8 (migration): retain the v31/U33 path, then activate V34 offline.
+    from custody_schema_fixtures import activate_fixture_to_current
+    activate_fixture_to_current(copy_a)
     restore_backup(backup_root, copy_b, key=FIXTURE_BACKUP_KEY, older_schema=True)
+    # DESIGN rev 3 §8 (migration): migration legitimately changes the SQLite image.
+    restored_b = readonly_tree_digest(copy_b)
     identity = inspect_realm_schema(copy_b)
     migrate_canonical_to_current(copy_b, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
+    # DESIGN rev 3 §8 (migration): both restored current destinations must be V34.
+    activate_fixture_to_current(copy_b)
     return PrecutRealmFixture(
         backup_root=backup_root,
         copy_roots=(copy_a, copy_b),
         manifest=manifest,
         pins=_read_pins(backup_root),
+        restored_digests=(restored_a, restored_b),
     )
 
 

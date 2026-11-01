@@ -39,8 +39,9 @@ def test_sigkill_keeps_upgrade_transaction_identity_at_every_journal_step(tmp_pa
     assert journal["source_support_root"] == str(support)
     realm = support / "runtime" / "realms" / "realm-1"
     assert journal["realm_root"] == str(realm)
-    assert journal["schema_before"] == "v29"
-    expected = 29 if state in {"planned", "stopping", "stopped"} else SCHEMA_VERSION
+    # DESIGN rev 3 §8 (migration): current activation faults span the explicit U33/V34 boundary.
+    assert journal["schema_before"] == "U33"
+    expected = 33 if state in {"planned", "stopping", "stopped"} else SCHEMA_VERSION
     assert inspect_canonical_schema(realm)["version"] == expected
 
 
@@ -97,11 +98,9 @@ if __name__ == "__main__":
     base, kill_state = Path(sys.argv[1]), sys.argv[2]
     paths, profile, realm = _fixture(base, version=SCHEMA_VERSION)
     with sqlite3.connect(realm / "realm.sqlite3") as connection:
-        walk_back_to_v30(connection)
-        connection.execute("ALTER TABLE timelines DROP COLUMN name")
-        connection.execute("DROP TABLE user_app_state")
-        connection.execute("DROP INDEX idx_generations_gen")
-        connection.execute("UPDATE runtime_schema SET version=29 WHERE id=1")
+        # DESIGN rev 3 §8 (migration): older backfill faults remain in the separate U33 journeys.
+        from custody_schema_fixtures import to_u33
+        to_u33(connection)
     boundary = _Boundary(paths)
     original_journal = operator_upgrade._journal
     original_migrate = operator_upgrade.migrate_canonical_to_current

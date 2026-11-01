@@ -434,6 +434,11 @@ def upgrade_workspace(
         identity = inspect_realm_schema(realm_root, expected_realm_id=realm_id)
     except Exception as exc:
         raise OperatorUpgradeError(str(exc)) from exc
+    if int(identity['version']) < 33:
+        raise OperatorUpgradeError(
+            'finish the separate round-1b U33 activation with its owning Runtime before custody upgrade',
+            details={'reason': 'round1b_activation_required',
+                     'next_action': 'finish_v33_activation_then_migrate_v34'})
     kind = _schema_kind(realm_root, expected_realm_id=realm_id)
     custody_upgrade = int(identity["version"]) >= 33
     idle = _assert_idle(realm_root)

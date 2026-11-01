@@ -76,6 +76,9 @@ def load_baseline_fixture(tmp_path, variant="single"):
     restore_backup(backup, root, key=FIXTURE_BACKUP_KEY, older_schema=True)
     identity = inspect_realm_schema(root)
     migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
+    # DESIGN rev 3 §8 (migration): complete the owning U33 gate offline before V34.
+    from custody_schema_fixtures import activate_fixture_to_current
+    activate_fixture_to_current(root)
     publications = json.loads((extracted / f"{name}-publications.json").read_text())
     service = RuntimeService(root)
     project_selector = "cutover" if variant == "cutover" else "composition"

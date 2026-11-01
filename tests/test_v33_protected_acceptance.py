@@ -25,7 +25,7 @@ import pytest
 from runtime_protocol import v33_lifecycle as life, upgrade
 from runtime_protocol.errors import ConflictError, ValidationError, RuntimeErrorBase
 from runtime_protocol.service import RuntimeService
-from runtime_protocol.store import RealmStore
+from runtime_protocol.store import RealmStore, SCHEMA_VERSION
 from runtime_protocol.util import canonical_json
 from test_v33_manifest import database, legacy_database, _REVISION_TABLES
 from test_timeline_commit_port import PreparedProvider, commit, request
@@ -162,12 +162,23 @@ def family_realm(captures, root, family, *, components=(), populated_revisions=T
     return facts
 
 
+def current_service(root):
+    # DESIGN rev 3 §8 (migration): U33 provider activation is offline; current service requires V34.
+    from custody_schema_fixtures import activate_fixture_to_current
+    if upgrade.inspect_realm_schema(root)['kind'] == 'U33':
+        life.check_startup(root)
+        activate_fixture_to_current(root)
+    return RuntimeService(root)
+
+
 def migrate(root):
     identity = upgrade.inspect_realm_schema(root)
     if identity["version"] == 23:
         return upgrade.upgrade_realm(root, retain_backup=True, archive_root=root.parent / "archives",
                                      confirmation=f"UPGRADE {identity['realm_id']}")
-    return upgrade.migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
+    # DESIGN rev 3 §8 (migration): the historical backfill remains explicitly U33.
+    migrate_stage = upgrade.migrate_canonical_to_current if identity['kind'] == 'V34' else upgrade.migrate_canonical_to_v33
+    return migrate_stage(root, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
 
 
 def witness(connection, tables):
@@ -175,9 +186,10 @@ def witness(connection, tables):
 
 
 def assert_registration_restart(root, project):
-    service = RuntimeService(root)
+    service = current_service(root)
     try:
-        with pytest.raises(ConflictError, match="fresh pins are fenced"):
+        # DESIGN rev 3 §8 (migration): the U33 offline gate is complete; this V34 process must register anew.
+        with pytest.raises(ConflictError, match="v33 provider registration is required for this process before requests and fresh pins"):
             service.get_project_media_selection(project, {}, authorize=lambda: None)
         service.register_timeline_commit_provider(PreparedProvider())
         before = witness(service.store.conn, ("timeline_commit_history", "command_idempotency", "timeline_events"))
@@ -187,7 +199,7 @@ def assert_registration_restart(root, project):
         assert witness(service.store.conn, before) == before
     finally:
         service.close()
-    service = RuntimeService(root)
+    service = current_service(root)
     service.register_timeline_commit_provider(PreparedProvider())
     assert witness(service.store.conn, before) == before
     return service
@@ -270,7 +282,7 @@ def test_V33_POPULATED_H31_TL32(captures, tmp_path, family):
     migrate(root)
     with sqlite3.connect(root / "realm.sqlite3") as connection:
         assert witness(connection, before) == before
-    service = RuntimeService(root)
+    service = current_service(root)
     service.register_timeline_commit_provider(PreparedProvider())
     assert service.store.integrity_report()["ok"]
     service.close()
@@ -363,8 +375,11 @@ service=RuntimeService(root)
 service.register_timeline_commit_provider(PreparedProvider())
 if boundary=='after_provider': os.kill(os.getpid(),signal.SIGKILL)
 '''
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(REPO), str(REPO / "tests")))}
-    result = subprocess.run([sys.executable, "-c", script, str(root), boundary], cwd=REPO, env=env, capture_output=True, text=True, timeout=30)
+    # DESIGN rev 3 §8 (migration): exercise the frozen U33 provider gate with its owning binary.
+    from custody_schema_fixtures import v33_executable
+    owning = v33_executable(root)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(owning), str(REPO / "tests")))}
+    result = subprocess.run([sys.executable, "-c", script, str(root), boundary], cwd=owning, env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == -signal.SIGKILL, result.stderr
     archive, record = life.activation(root)
     if record["state"] not in {"backfill_complete", "ready"}:
@@ -374,7 +389,7 @@ if boundary=='after_provider': os.kill(os.getpid(),signal.SIGKILL)
     migrate(root)
     if frozen:
         assert life.read_record(archive / "backfill-plan.json") == frozen
-    service = RuntimeService(root)
+    service = current_service(root)
     service.register_timeline_commit_provider(PreparedProvider())
     expected = life.read_record(archive / "backfill-plan.json")
     for entry in expected["entries"]:
@@ -446,7 +461,7 @@ def test_V33_IDEMPOTENT_U33_AFTER_AUTHORIZED_WRITES(captures, tmp_path):
     assert migrate(root)["changed"] is False
     assert migrate(root)["changed"] is False
     assert tree(root) == before
-    service = RuntimeService(root)
+    service = current_service(root)
     service.register_timeline_commit_provider(PreparedProvider())
     assert service.store.conn.execute("SELECT min(updated_at) FROM generations").fetchone()[0] == "authorized-later-write"
     service.close()
@@ -553,6 +568,10 @@ def test_V33_L23_ARCHIVAL_BYTES_AND_WORKERS(captures, tmp_path, archive_profile,
 
 @pytest.mark.parametrize("recovery_mode", ["automatic", "explicit_interruption", "interrupted_restore"])
 def test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH(captures, tmp_path, monkeypatch, recovery_mode):
+    # DESIGN rev 3 §8 (migration): retain the U33-only rollback journey on its owning binary.
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(tmp_path, 'test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH[' + recovery_mode + ']')
     from astrid_runtime import operator_upgrade as operator
     from astrid_runtime.bootstrap import BootstrapConfig, SourceProfile
     from astrid_runtime.paths import RuntimePaths
@@ -583,7 +602,7 @@ def test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH(captures, tmp_
     def start(selected_paths, boundary, config):
         selected = Path(config.source_profile.runtime_checkout)
         if selected == REPO:
-            service = RuntimeService(root)
+            service = current_service(root)
             service.register_timeline_commit_provider(PreparedProvider())
             assert upgrade.inspect_realm_schema(root)["version"] == 33
             assert life.activation(root)[1]["state"] == "provider_verified"
@@ -679,7 +698,7 @@ def test_V33_V28_V29_SNAPSHOT_ORDER_AND_REPLAY(captures, tmp_path, family):
                 connection.execute(f"UPDATE {table} SET spec_json=?",(body,))
     result = migrate(root)
     if family == "L23":
-        service = RuntimeService(root)
+        service = current_service(root)
         try:
             retained = service.store.conn.execute("SELECT s.body_json FROM tasks t JOIN task_specs s ON s.digest=t.spec_digest").fetchone()[0]
             assert retained == body
@@ -693,7 +712,7 @@ def test_V33_V28_V29_SNAPSHOT_ORDER_AND_REPLAY(captures, tmp_path, family):
         assert versions.index((27,28)) < versions.index((28,29))
     step = next(s for s in result["steps"] if s["source_schema_version"] == 28)
     assert step["referenced_pairs"] == 1
-    service = RuntimeService(root)
+    service = current_service(root)
     try:
         raw = json.loads(service.store.conn.execute("SELECT s.body_json FROM tasks t JOIN task_specs s ON s.digest=t.spec_digest").fetchone()[0])
         ref = raw["spec"]["timeline_snapshot_ref"]
@@ -745,9 +764,10 @@ accepted=service.publish_parent_composition(project,'main',body,idempotency_key=
 service.close();print(json.dumps(accepted))
 """,root,facts["project"],canonical_json(original["affected"]))
     migrate(root)
-    service=RuntimeService(root)
+    service=current_service(root)
     try:
-        with pytest.raises(ConflictError,match="fresh pins are fenced"):
+        # DESIGN rev 3 §8 (migration): a fresh V34 process still requires provider registration.
+        with pytest.raises(ConflictError,match="v33 provider registration is required for this process before requests and fresh pins"):
             service.get_project_media_selection(facts["project"],{"asset":"affected","generation_id":"affected","variant_id":"affected-variant"},authorize=lambda:None)
         provider = PreparedProvider()
         service.register_timeline_commit_provider(provider)
@@ -834,7 +854,7 @@ def test_V33_REFUSE_DAMAGED_POPULATED_ZERO_EFFECTS(captures,tmp_path,monkeypatch
 def test_V33_RESTART_REQUIRES_FRESH_PROVIDER_BEFORE_PINS(captures,tmp_path):
     root=tmp_path/'realm';facts=family_realm(captures,root,'C31');migrate(root)
     service=assert_registration_restart(root,facts['project']);service.close()
-    service=RuntimeService(root)
+    service=current_service(root)
     try:
         with pytest.raises(ConflictError,match='registration is required for this process'):
             service.get_project_media_selection(facts['project'],{},authorize=lambda:None)
@@ -906,6 +926,10 @@ def test_V33_BACKUP_FAILURE_PRECEDES_SCHEMA_AND_BACKFILL(captures,tmp_path,monke
 
 
 def test_V33_RELOCATION_REBINDS_ONLY_COMPLETED_ACTIVATION(captures,tmp_path):
+    # DESIGN rev 3 §8 (migration): U33 relocation stays covered; V34 relocation has a separate refusal regression.
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(tmp_path, 'test_V33_RELOCATION_REBINDS_ONLY_COMPLETED_ACTIVATION')
     root=tmp_path/'realm';facts=family_realm(captures,root,'C31');migrate(root)
     service=assert_registration_restart(root,facts['project']);service.close()
     archive,_=life.activation(root);archived=tree(archive/'realm')

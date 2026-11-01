@@ -92,6 +92,8 @@ def test_loader_reads_and_baseline_install_reopen_preserve_two_publications(tmp_
         changes = service.store.conn.total_changes
         facts = verify_baseline(service.store.conn, fixture.project_id, "main", read_object=service.cas.read)
         assert service.store.conn.total_changes == changes
+        # DESIGN rev 3 §8 (migration): offline U33 activation already verified this exact manifest.
+        assert before['parent'].pop('dependency_manifest') == facts['canonical_document']['dependency_manifest']
         assert facts["entries"][0]["receipt"] == fixture.first["receipt"]
         assert [entry["revision_id"] for entry in facts["entries"]] == ["parent-1", "parent-2"]
         with service.store._transaction():

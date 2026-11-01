@@ -119,9 +119,9 @@ def migrate(root, *, confirmation, expected_realm_id=None, timeout_seconds=120):
         if pending:
             verify_recovery(*pending)
             if pending[1]['state'] != 'ready':
-                return {'ok': True, 'changed': False, 'source_schema_version': 34, 'target_schema_version': 34,
+                return {'ok': True, 'realm_id': identity['realm_id'], 'steps': [], 'changed': False, 'source_schema_version': 34, 'target_schema_version': 34,
                         'admission_closed': True, 'recovery_set': str(pending[0]), 'next_action': 'activate_v34'}
-        return {'ok': True, 'changed': False, 'source_schema_version': 34, 'target_schema_version': 34, 'admission_closed': False}
+        return {'ok': True, 'realm_id': identity['realm_id'], 'steps': [], 'changed': False, 'source_schema_version': 34, 'target_schema_version': 34, 'admission_closed': False}
     if pending:
         if pending[1]['state'] != 'backup_verified' or pending[1]['source']['fingerprint'] != identity['fingerprint']:
             raise ConflictError('v34 activation journal conflicts with intact U33')
@@ -168,7 +168,7 @@ def migrate(root, *, confirmation, expected_realm_id=None, timeout_seconds=120):
             raise
         finally:
             connection.close()
-    return {'ok': True, 'changed': True, 'source_schema_version': 33, 'target_schema_version': 34,
+    return {'ok': True, 'realm_id': identity['realm_id'], 'steps': [{'source_schema_version': 33, 'target_schema_version': 34}], 'changed': True, 'source_schema_version': 33, 'target_schema_version': 34,
             'admission_closed': True, 'recovery_set': str(archive), 'next_action': 'activate_v34'}
 
 
@@ -243,6 +243,10 @@ def assert_replacement_preserves_custody(active, candidate):
             db.row_factory = sqlite3.Row
             try:
                 tables = _tables(db)
+                if 'runtime_schema' not in tables:
+                    from .v33_manifest import legacy_manifest
+                    legacy_manifest(db)
+                    return {}
                 schema = db.execute('SELECT version FROM runtime_schema WHERE id=1').fetchone()
                 if not schema:
                     raise ConflictError('replacement cannot establish the active custody schema')

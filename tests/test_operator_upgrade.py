@@ -62,12 +62,18 @@ class _Boundary:
         return SimpleNamespace(doctor=lambda: {"ok": True, "state": "healthy"})
 
 
-def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
+def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=33):
+    # DESIGN rev 3 §8 (migration): the current coordinator starts from completed U33.
     support = tmp_path / "support"
     paths = RuntimePaths.current(data_root=support)
     paths.ensure_support_dirs()
     realm_root = paths.realms_dir / "realm-1"
     RealmStore.initialize(realm_root, realm_id="realm-1").close()
+    if version <= 33:
+        # DESIGN rev 3 §8 (migration): old fixtures have the authentic U33 inventory.
+        from custody_schema_fixtures import to_u33
+        with sqlite3.connect(realm_root / "realm.sqlite3") as connection:
+            to_u33(connection)
     if version < 32:
         from test_runtime_upgrade import _remove_timeline_commit_schema
         with sqlite3.connect(realm_root / "realm.sqlite3") as connection:
@@ -106,7 +112,8 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
             connection.commit()
         finally:
             connection.close()
-    assert inspect_canonical_schema(realm_root, expected_realm_id="realm-1")["kind"] == ("U33" if version == 33 else f"C{version}" + ("-nullable" if version < 28 else ""))
+    # DESIGN rev 3 §8 (migration): distinguish V34 current from historical U33.
+    assert inspect_canonical_schema(realm_root, expected_realm_id="realm-1")["kind"] == ("V34" if version == 34 else "U33" if version == 33 else f"C{version}" + ("-nullable" if version < 28 else ""))
     checkout = runtime_checkout or tmp_path / "prior-executable"
     if runtime_checkout is None:
         (checkout / "runtime_protocol").mkdir(parents=True)
@@ -169,7 +176,8 @@ def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, 
     result = upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
     assert result["ok"] is True
     assert boundary.connection_options["timeout_seconds"] == 120.0
-    assert result["schema_before"] == "v25"
+    # DESIGN rev 3 §8 (migration): the immediate predecessor is the pinned U33 union.
+    assert result["schema_before"] == "U33"
     assert migration_calls == [
         ((realm_root,), {"timeout_seconds": 120.0, "confirmation": "MIGRATE CANONICAL realm-1", "expected_realm_id": "realm-1"})
     ]
@@ -310,7 +318,8 @@ def test_operator_upgrade_current_schema_uses_read_only_schema_noop(tmp_path, mo
 
     monkeypatch.setattr("astrid_runtime.operator_upgrade._bootstrap_locked", fake_start)
     result = upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
-    assert result["schema_before"] == "U33"
+    # DESIGN rev 3 §8 (migration): current-schema no-op is V34.
+    assert result["schema_before"] == "V34"
     assert result["migration"]["changed"] is False
     assert result["migration"]["steps"] == []
 
@@ -324,7 +333,8 @@ def test_operator_upgrade_rejects_newer_schema_before_journal_or_signal(tmp_path
     tracked = [realm_root / "realm.sqlite3", paths.catalog_path, paths.discovery_path, paths.instance_lock_path]
     before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in tracked}
     boundary = _Boundary(paths)
-    with pytest.raises(OperatorUpgradeError, match="unsupported canonical v34"):
+    # DESIGN rev 3 §8 (migration): the unsupported successor of V34 is v35.
+    with pytest.raises(OperatorUpgradeError, match="unsupported canonical v35"):
         upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
     after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in tracked}
     assert after == before

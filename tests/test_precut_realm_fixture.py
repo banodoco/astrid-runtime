@@ -93,7 +93,8 @@ def test_restored_copies_preserve_publication_closure_media_and_legacy_reference
 
 def test_two_restored_copies_have_independent_owner_locks_and_readonly_stable_bytes(tmp_path):
     fixture = load_precut_realm_fixture(tmp_path)
-    before = [readonly_tree_digest(root) for root in fixture.copy_roots]
+    # DESIGN rev 3 §8 (migration): exact byte parity belongs to the historical restore stage.
+    before = fixture.restored_digests
     assert before[0] == before[1] == readonly_tree_digest(fixture.backup_root)
     first = RuntimeService(fixture.copy_roots[0])
     second = RuntimeService(fixture.copy_roots[1])
@@ -103,6 +104,8 @@ def test_two_restored_copies_have_independent_owner_locks_and_readonly_stable_by
         assert first.get_project(fixture.pins["project_id"])["id"] == fixture.pins["project_id"]
         assert second.get_project(fixture.pins["project_id"])["id"] == fixture.pins["project_id"]
         for service in (first, second):
+            # DESIGN rev 3 §8 (migration): the opened destination is the migrated V34 schema.
+            assert service.store.conn.execute('SELECT version FROM runtime_schema').fetchone()[0] == 34
             changes = service.store.conn.total_changes
             verify_baseline(
                 service.store.conn,

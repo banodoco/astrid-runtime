@@ -24,7 +24,18 @@ from runtime_protocol.upgrade import (
 )
 
 
+def _open_current_fixture(root):
+    # DESIGN rev 3 §8 (migration): serve historical fixtures only after both offline gates.
+    if inspect_canonical_schema(root)['kind'] == 'U33':
+        from custody_schema_fixtures import activate_fixture_to_current
+        activate_fixture_to_current(root)
+    return RealmStore(root)
+
+
 def _remove_timeline_commit_schema(connection):
+    # DESIGN rev 3 §8 (migration): historical schemas exclude v34 custody DDL.
+    from custody_schema_fixtures import to_u33
+    to_u33(connection)
     # C24-C31 predate the complete Timeline v32 bundle.
     for table in ("timeline_document_input_links", "timeline_document_input_bindings",
                   "timeline_document_input_contents", "timeline_commit_history"):
@@ -145,7 +156,8 @@ def test_upgrade_preserves_canonical_rows_and_retains_backup_only_when_requested
     archive = Path(result["archive"])
     manifest = json.loads((archive / "manifest.json").read_text())
     assert manifest["source_schema_version"] == 23
-    assert manifest["target_schema_version"] == SCHEMA_VERSION
+    # DESIGN rev 3 §8 (migration): this preserved archive describes the historical U33 rebuild.
+    assert manifest["target_schema_version"] == 33
     assert manifest["historical_managed_outputs"]["migrated"] == 1
     assert set(manifest["legacy_tables"]) >= {"schema_migrations", "lost_and_found"}
     assert (archive / "realm.sqlite3").is_file()
@@ -155,7 +167,7 @@ def test_upgrade_preserves_canonical_rows_and_retains_backup_only_when_requested
     finally:
         archived.close()
 
-    reopened = RealmStore(root)
+    reopened = _open_current_fixture(root)
     try:
         row = reopened.conn.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
         assert tuple(row) == ("astrid-runtime-sqlite-v1", SCHEMA_VERSION)
@@ -292,6 +304,10 @@ def _canonical_fixture(root, version):
     store.close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
+        if version <= 33:
+            # DESIGN rev 3 §8 (migration): rewind before changing any historical DDL.
+            from custody_schema_fixtures import to_u33
+            to_u33(connection)
         if version < 32:
             connection.execute("DROP INDEX IF EXISTS idx_generations_gen")
         if version < 28:
@@ -315,7 +331,8 @@ def _canonical_fixture(root, version):
         connection.commit()
     finally:
         connection.close()
-    family = "U33" if version == 33 else f"C{version}" + ("-nullable" if version < 28 else "")
+    # DESIGN rev 3 §8 (migration): the current union is V34, not C34.
+    family = "V34" if version == 34 else "U33" if version == 33 else f"C{version}" + ("-nullable" if version < 28 else "")
     assert inspect_canonical_schema(root, expected_realm_id=f"realm-v{version}")["kind"] == family
     return f"realm-v{version}"
 
@@ -334,8 +351,14 @@ def test_complete_canonical_migration_chain_reaches_current_schema(tmp_path, sou
         expected_realm_id=realm_id,
     )
     assert result["source_schema_version"] == source_version
-    assert result["target_schema_version"] == SCHEMA_VERSION
+    # DESIGN rev 3 §8 (migration): retain exact assertions for the historical U33 stage.
+    assert result["target_schema_version"] == 33 and result['admission_closed']
     assert len(result["steps"]) == expected_steps
+    from custody_schema_fixtures import activate_fixture_to_current
+    result = activate_fixture_to_current(root)
+    # DESIGN rev 3 §8 (migration): the explicit final step reaches V34.
+    assert result['steps'] == [{'source_schema_version': 33, 'target_schema_version': 34}]
+    assert result['target_schema_version'] == SCHEMA_VERSION == 34
     assert inspect_canonical_schema(root, expected_realm_id=realm_id)["version"] == SCHEMA_VERSION
 
     with sqlite3.connect(root / "realm.sqlite3") as connection:
@@ -343,7 +366,7 @@ def test_complete_canonical_migration_chain_reaches_current_schema(tmp_path, sou
         assert connection.execute("SELECT * FROM project_documents ORDER BY id").fetchall() == documents_before
         assert connection.execute("SELECT COUNT(*) FROM user_preferences").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM user_app_state").fetchone()[0] == 0
-    reopened = RealmStore(root)
+    reopened = _open_current_fixture(root)
     try:
         assert reopened.integrity_report()["ok"] is True
     finally:
@@ -376,7 +399,8 @@ def test_current_canonical_migration_is_read_only_idempotent(tmp_path):
     assert not (root / ".runtime-owner.lock").exists()
 
 
-@pytest.mark.parametrize("mutation, message", [("newer", "unsupported canonical v34 manifest"), ("alternate", "unsupported canonical v33 manifest")])
+# DESIGN rev 3 §8 (migration): V34 is current; its unsupported successor is v35.
+@pytest.mark.parametrize("mutation, message", [("newer", "unsupported canonical v35 manifest"), ("alternate", "unsupported canonical v34 manifest")])
 def test_unknown_canonical_layout_is_rejected_without_mutation(tmp_path, mutation, message):
     root = tmp_path / mutation
     realm_id = _canonical_fixture(root, SCHEMA_VERSION)
@@ -517,7 +541,7 @@ def test_upgrade_repairs_missing_historical_object_indexes(tmp_path):
     realm_id = _legacy_realm(root, register_indexes=False)
     result = upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     assert result["historical_managed_outputs"]["migrated"] == 1
-    reopened = RealmStore(root)
+    reopened = _open_current_fixture(root)
     try:
         digest = reopened.conn.execute("SELECT object_digest FROM managed_output_associations").fetchone()[0]
         assert reopened.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()[0] == len(b"legacy-video")
@@ -678,7 +702,7 @@ os._exit(0)
         assert (archive / name).read_bytes() == payload
         assert manifest["components"][name]["sha256"] == hashlib.sha256(payload).hexdigest()
     assert not any((root / f"realm.sqlite3{suffix}").exists() for suffix in ("-wal", "-shm", "-journal"))
-    reopened = RealmStore(root)
+    reopened = _open_current_fixture(root)
     try:
         assert reopened.realm["display_name"] == "WAL realm"
     finally:

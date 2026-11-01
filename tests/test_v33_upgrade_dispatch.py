@@ -11,6 +11,9 @@ from test_v33_manifest import database, legacy_database
 
 
 def write_realm(root, connection):
+    # DESIGN rev 3 §8 (migration): offline activation requires a complete historical realm fixture.
+    if not connection.execute('SELECT 1 FROM realm_lifecycle').fetchone():
+        connection.execute("INSERT INTO realm_lifecycle(realm_id,state,version) SELECT id,'active',1 FROM realm")
     root.mkdir()
     target = sqlite3.connect(root / "realm.sqlite3")
     connection.commit()
@@ -25,10 +28,19 @@ def test_empty_canonical_dispatch(tmp_path, family):
     write_realm(root, database(family))
     assert inspect_realm_schema(root)["kind"] == family
     result = migrate_canonical_to_current(root, confirmation="MIGRATE CANONICAL r")
-    assert result["target_schema_version"] == SCHEMA_VERSION == 33
+    # DESIGN rev 3 §8 (migration): assert the historical stage and its offline gate.
+    if family != "U33":
+        assert result["target_schema_version"] == 33 and result["admission_closed"]
+        assert inspect_realm_schema(root)["kind"] == "U33"
+        from custody_schema_fixtures import finish_v33_offline
+        finish_v33_offline(root)
+        result = migrate_canonical_to_current(root, confirmation="MIGRATE CANONICAL r")
+    # DESIGN rev 3 §8 (migration): the current destination is the explicit V34 union.
+    assert result["target_schema_version"] == SCHEMA_VERSION == 34
     with sqlite3.connect(root / "realm.sqlite3") as connection:
-        assert canonical_manifest(connection)["kind"] == "U33"
-    assert result["changed"] == (family != "U33")
+        assert canonical_manifest(connection)["kind"] == "V34"
+    # DESIGN rev 3 §8 (migration): every listed source predates V34.
+    assert result["changed"] is True
 
 
 @pytest.mark.parametrize("mutation", ["DROP INDEX idx_generations_gen", "CREATE INDEX unexpected ON generations(id)", "DROP TABLE timeline_document_input_links"])
