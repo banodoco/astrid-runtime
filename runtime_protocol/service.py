@@ -6460,8 +6460,8 @@ class RuntimeService:
                 or provenance.get("runtime_epoch") != int(attempt["runtime_epoch"])):
             raise AuthorizationError("derived input managed association no longer matches its receipt")
         digest = ref["object_id"].removeprefix("sha256:")
-        obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
-        if (obj is None or int(obj["size"]) != ref["size"] or obj["media_type"] != ref["media_type"]
+        obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+        if (obj is None or int(obj["size"]) != ref["size"]
                 or not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project, digest)).fetchone()):
             raise ConflictError("derived input object metadata or project association changed")
         self._verify_child_object_bytes(digest, ref["size"], label="derived input CAS object")
@@ -6522,8 +6522,8 @@ class RuntimeService:
                     raise ConflictError("derived input was already registered with another descriptor")
                 ref = previous
             else:
-                obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
-                if obj is None or int(obj["size"]) != item["size"] or obj["media_type"] != item["media_type"]:
+                obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+                if obj is None or int(obj["size"]) != item["size"]:
                     raise ConflictError("derived input object metadata does not match upload")
                 self._verify_child_object_bytes(digest, item["size"], label="derived input CAS object")
                 self.store.conn.execute("INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)", (project, digest, now()))
@@ -6646,10 +6646,10 @@ class RuntimeService:
         association = self.store.get_managed_output(source["association_id"])
         producer = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (source["producer_task_id"],)).fetchone()
         attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (source["producer_attempt_id"],)).fetchone()
-        obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (source["object_id"].removeprefix("sha256:"),)).fetchone()
+        obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (source["object_id"].removeprefix("sha256:"),)).fetchone()
         if (producer is None or producer["status"] != "completed" or producer["attempt_id"] != source["producer_attempt_id"]
                 or attempt is None or not attempt["settled"] or int(attempt["runtime_epoch"]) != self.store._current_runtime_epoch()
-                or obj is None or int(obj["size"]) != association["size"] or obj["media_type"] != association["media_type"]
+                or obj is None or int(obj["size"]) != association["size"]
                 or (project is not None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project, source["object_id"].removeprefix("sha256:"))).fetchone())
                 or association["task_id"] != source["producer_task_id"]
                 or association["attempt_id"] != source["producer_attempt_id"]
@@ -7084,8 +7084,8 @@ class RuntimeService:
                 output_port=item["output_port"], filename=item["filename"], recorded_filename=item["filename"],
                 attempt_row=attempt, task_row=task, project_id=project, lease_body=body):
             raise AuthorizationError("snapshot requires the producing child's authenticated upload receipt")
-        obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
-        if obj is None or int(obj["size"]) != item["size"] or obj["media_type"] != item["media_type"]:
+        obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+        if obj is None or int(obj["size"]) != item["size"]:
             raise ConflictError("snapshot object metadata does not match upload")
         self._verify_child_object_bytes(digest, item["size"], label="snapshot CAS object")
         self.store.conn.execute("INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)", (project, digest, now()))
@@ -7160,7 +7160,7 @@ class RuntimeService:
             raise ConflictError("managed output digest is not canonical")
         raw_digest = digest.removeprefix("sha256:")
         object_row = self.store.conn.execute(
-            "SELECT size, media_type, original_name FROM objects WHERE digest=?",
+            "SELECT size FROM objects WHERE digest=?",
             (raw_digest,),
         ).fetchone()
         if not object_row:
@@ -7168,8 +7168,6 @@ class RuntimeService:
         data = self.cas.read(raw_digest)
         if len(data) != int(association["size"]) or len(data) != int(object_row["size"]):
             raise ConflictError("managed output CAS size does not match its association")
-        if str(object_row["media_type"]) != str(association["media_type"]):
-            raise ConflictError("managed output media type does not match its CAS object")
         try:
             export_filename = _canonical_managed_output_filename(str(association["filename"]))
         except ValidationError as exc:
@@ -8539,8 +8537,8 @@ class RuntimeService:
                     if association["role"] == "recoverable_snapshot":
                         continue
                     digest = association["object_id"].removeprefix("sha256:")
-                    obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
-                    if (obj is None or int(obj["size"]) != association["size"] or obj["media_type"] != association["media_type"]
+                    obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+                    if (obj is None or int(obj["size"]) != association["size"]
                             or association["project_id"] != project_id
                             or (project_id is not None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone())):
                         raise ConflictError("accepted child managed output metadata changed")
@@ -8899,7 +8897,7 @@ class RuntimeService:
         staged = []
         duration_seconds_presence = {}
         seen = set()
-        content_metadata = {}
+        seen_digests = set()
         non_object_digests = set()
         try:
             for index, output in enumerate(outputs):
@@ -8925,7 +8923,7 @@ class RuntimeService:
                 kind = output.get("kind", "object")
                 if not isinstance(kind, str) or kind not in {"object", "document", "value"}:
                     raise ValidationError("output kind is invalid")
-                if digest in non_object_digests or (kind != "object" and digest in content_metadata):
+                if digest in non_object_digests or (kind != "object" and digest in seen_digests):
                     raise ValidationError("outputs must not contain duplicate digests")
                 if kind != "object":
                     non_object_digests.add(digest)
@@ -8999,10 +8997,11 @@ class RuntimeService:
                             os.close(root_fd)
                     if declared_size is not None and declared_size != size:
                         raise ValidationError("output size does not match CAS bytes")
-                metadata = (size, media_type)
-                if digest in content_metadata and content_metadata[digest] != metadata:
-                    raise ConflictError("output metadata does not match existing object", details={"digest": digest_value})
-                content_metadata[digest] = metadata
+                # A digest identifies verified bytes, not an output descriptor.
+                # Object outputs may share bytes while retaining their own
+                # association filename and media type. Non-object outputs keep
+                # their established uniqueness rule above.
+                seen_digests.add(digest)
                 ordinal = output.get("ordinal")
                 if ordinal is not None and (isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0):
                     raise ValidationError("output ordinal must be a non-negative integer")
@@ -9064,10 +9063,10 @@ class RuntimeService:
                 coverage = output.get("coverage")
                 if coverage is not None:
                     coverage = _validate_coverage(coverage)
-                existing = self.store.conn.execute("SELECT size, media_type, original_name FROM objects WHERE digest=?", (digest,)).fetchone()
+                existing = self.store.conn.execute("SELECT size, original_name FROM objects WHERE digest=?", (digest,)).fetchone()
                 if existing:
-                    if int(existing["size"]) != size or existing["media_type"] != media_type:
-                        raise ConflictError("output metadata does not match existing object", details={"digest": digest_value})
+                    if int(existing["size"]) != size:
+                        raise ConflictError("output size does not match existing object", details={"digest": digest_value})
                     if project_id and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
                         has_project_owner = self.store.conn.execute(
                             "SELECT 1 FROM project_objects WHERE digest=? LIMIT 1", (digest,)
