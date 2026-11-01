@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
-from types import SimpleNamespace
 
 import pytest
 
@@ -15,20 +15,46 @@ from astrid_runtime import custody_broker as custody
 from runtime_protocol import platform
 
 
-def _identities(monkeypatch):
-    owner = {"pid": os.getpid(), "uid": platform.current_user(), "birth_id": "controller-birth"}
-    target = {"pid": 44121, "uid": platform.current_user(), "birth_id": "target-birth"}
-    monkeypatch.setattr(custody, "default_process_identity", lambda _pid: dict(owner))
-    # Exercise the native pidfd/OpenProcess branch without entering Darwin's
-    # audit-token lane. The signal itself remains a mocked platform call.
-    monkeypatch.setattr(custody, "sys", SimpleNamespace(platform="linux"))
-    return owner, target
+@pytest.fixture
+def processes():
+    children = []
+
+    def spawn(*, catch_term=False):
+        code = (
+            "import signal, sys\n"
+            + ("signal.signal(signal.SIGTERM, lambda *_: print('TERM', flush=True))\n" if catch_term else "")
+            + "print('READY', flush=True)\nwhile True: signal.pause()\n"
+        )
+        child = subprocess.Popen([sys.executable, "-u", "-c", code], stdout=subprocess.PIPE, text=True)
+        children.append(child)
+        assert child.stdout.readline().strip() == "READY"
+        identity = custody.default_process_identity(child.pid)
+        assert identity is not None
+        return child, {key: identity[key] for key in ("pid", "uid", "birth_id")}
+
+    yield spawn
+    for child in children:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        child.stdout.close()
 
 
-def test_native_custody_publish_release_and_adopted_signal_use_guard(tmp_path, monkeypatch):
-    owner_identity, target = _identities(monkeypatch)
-    delivered = []
-    monkeypatch.setattr(platform, "signal_process", lambda identity, signum: delivered.append((dict(identity), signum)))
+def _assert_running(child):
+    # Give a mistakenly delivered terminating signal time to take effect.
+    with pytest.raises(subprocess.TimeoutExpired):
+        child.wait(timeout=0.1)
+
+
+def _identities(processes, *, catch_term=False):
+    owner = custody.default_process_identity(os.getpid())
+    assert owner is not None
+    child, target = processes(catch_term=catch_term)
+    return owner, child, target
+
+
+def test_native_custody_publish_release_and_adopted_signal_use_guard(tmp_path, processes):
+    owner_identity, child, target = _identities(processes, catch_term=True)
     original = custody.NativeProcessCustody(tmp_path, target)
     original.publish()
     stored = json.loads(original.path.read_text())
@@ -44,7 +70,9 @@ def test_native_custody_publish_release_and_adopted_signal_use_guard(tmp_path, m
         guarded.append(True)
     original.signal(platform.TERM, validate=validate_inside_lock)
     assert guarded == [True]
-    assert delivered == [(target, platform.TERM)]
+    assert select.select([child.stdout], [], [], 5)[0], "child did not receive TERM"
+    assert child.stdout.readline().strip() == "TERM"
+    assert child.poll() is None
 
     assert original.release() == {"state": "released"}
     assert json.loads(original.path.read_text())["state"] == "released"
@@ -52,15 +80,15 @@ def test_native_custody_publish_release_and_adopted_signal_use_guard(tmp_path, m
     # the identity-pinning platform boundary.
     adopted = custody.NativeProcessCustody(tmp_path, target)
     adopted.signal(platform.KILL)
-    assert delivered == [(target, platform.TERM), (target, platform.KILL)]
+    assert child.wait(timeout=5) == -platform.KILL
 
 
 @pytest.mark.parametrize("mutation,match", [
     ("target", "differs from the selected owner"),
     ("version", "differs from the selected owner"),
 ])
-def test_native_custody_rejects_wrong_target_or_version(tmp_path, monkeypatch, mutation, match):
-    _owner, target = _identities(monkeypatch)
+def test_native_custody_rejects_wrong_target_or_version(tmp_path, monkeypatch, processes, mutation, match):
+    _owner, child, target = _identities(processes)
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
     value = json.loads(instance.path.read_text())
@@ -73,13 +101,9 @@ def test_native_custody_rejects_wrong_target_or_version(tmp_path, monkeypatch, m
         instance._read()
 
 
-def test_native_custody_rejects_another_live_controller_while_owned(tmp_path, monkeypatch):
-    old = {"pid": 41001, "uid": platform.current_user(), "birth_id": "old-controller"}
-    other = {"pid": 41002, "uid": platform.current_user(), "birth_id": "other-controller"}
-    target = {"pid": 44121, "uid": platform.current_user(), "birth_id": "target-birth"}
-    identities = {old["pid"]: old, other["pid"]: other}
-    monkeypatch.setattr(custody, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(custody, "default_process_identity", lambda pid: identities.get(pid))
+def test_native_custody_rejects_another_live_controller_while_owned(tmp_path, monkeypatch, processes):
+    old_child, old = processes()
+    _owner, child, target = _identities(processes)
     class OsProxy:
         current_pid = old["pid"]
         def __getattr__(self, name): return getattr(os, name)
@@ -88,20 +112,18 @@ def test_native_custody_rejects_another_live_controller_while_owned(tmp_path, mo
     monkeypatch.setattr(custody, "os", os_proxy)
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
-    os_proxy.current_pid = other["pid"]
+    os_proxy.current_pid = os.getpid()
     with pytest.raises(custody.CustodyError, match="another controller"):
         instance.release()
     with pytest.raises(custody.CustodyError, match="another live controller"):
         instance.signal(platform.TERM)
+    _assert_running(old_child)
+    _assert_running(child)
 
 
-def test_native_custody_recovers_when_prior_controller_is_proven_absent(tmp_path, monkeypatch):
-    old = {"pid": 41011, "uid": platform.current_user(), "birth_id": "dead-controller"}
-    current = {"pid": 41012, "uid": platform.current_user(), "birth_id": "current-controller"}
-    target = {"pid": 44122, "uid": platform.current_user(), "birth_id": "target-birth"}
-    identities = {old["pid"]: old, current["pid"]: current}
-    monkeypatch.setattr(custody, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(custody, "default_process_identity", lambda pid: identities.get(pid))
+def test_native_custody_recovers_when_prior_controller_is_proven_absent(tmp_path, monkeypatch, processes):
+    old_child, old = processes()
+    current, child, target = _identities(processes)
     class OsProxy:
         current_pid = old["pid"]
         def __getattr__(self, name): return getattr(os, name)
@@ -110,22 +132,21 @@ def test_native_custody_recovers_when_prior_controller_is_proven_absent(tmp_path
     monkeypatch.setattr(custody, "os", os_proxy)
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
-    os_proxy.current_pid = current["pid"]
+    os_proxy.current_pid = os.getpid()
+    old_child.terminate()
+    assert old_child.wait(timeout=5) == -platform.TERM
     # The old controller PID is absent; the signal operation durably adopts
     # the active record before delivering through the platform boundary.
-    identities.pop(old["pid"])
-    delivered = []
-    monkeypatch.setattr(platform, "signal_process", lambda identity, signum: delivered.append((dict(identity), signum)))
     instance.signal(platform.TERM)
     record = json.loads(instance.path.read_text())
     assert record["state"] == "owned"
     assert record["controller"] == current
-    assert delivered == [(target, platform.TERM)]
+    assert child.wait(timeout=5) == -platform.TERM
 
 
 @requires_posix_file_modes_native_custody
-def test_native_custody_rejects_unsafe_owner_file(tmp_path, monkeypatch):
-    _owner, target = _identities(monkeypatch)
+def test_native_custody_rejects_unsafe_owner_file(tmp_path, monkeypatch, processes):
+    _owner, child, target = _identities(processes)
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
     instance.path.chmod(0o644)
@@ -133,47 +154,48 @@ def test_native_custody_rejects_unsafe_owner_file(tmp_path, monkeypatch):
         instance._read()
 
 
-def test_native_custody_wraps_platform_identity_drift_without_signaling(tmp_path, monkeypatch):
-    _owner, target = _identities(monkeypatch)
+def test_native_custody_wraps_platform_identity_drift_without_signaling(tmp_path, monkeypatch, processes):
+    _owner, child, target = _identities(processes)
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
     failures = []
-    def reject_drift(identity, signum):
-        failures.append((identity, signum))
+    def reject_drift(words, signum):
+        failures.append((words, signum))
         raise OSError("process incarnation changed")
-    monkeypatch.setattr(platform, "signal_process", reject_drift)
+    expected_words = custody.linux_process_binding.token(target["pid"])["words"]
+    monkeypatch.setattr(custody, "signal_audit_token", reject_drift)
     with pytest.raises(custody.CustodyError, match="process incarnation changed"):
         instance.signal(platform.TERM)
-    assert failures == [(target, platform.TERM)]
+    assert failures == [(expected_words, platform.TERM)]
+    _assert_running(child)
 
 
 @pytest.mark.parametrize("operation", ["release", "signal"])
 @pytest.mark.parametrize("field", ["parent_pid", "process_group", "session_id"])
-def test_native_custody_preserves_controller_after_metadata_changes(tmp_path, monkeypatch, operation, field):
-    owner, target = _identities(monkeypatch)
+def test_native_custody_preserves_controller_after_metadata_changes(tmp_path, monkeypatch, processes, operation, field):
+    owner, child, target = _identities(processes)
     owner.update(parent_pid=100, process_group=200, session_id=300)
+    real_identity = custody.default_process_identity
+    monkeypatch.setattr(custody, "default_process_identity", lambda pid: dict(owner) if pid == os.getpid() else real_identity(pid))
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
     pinned = json.loads(instance.path.read_text())["controller"]
     owner[field] += 1
-    delivered = []
-    monkeypatch.setattr(platform, "signal_process", lambda *args: delivered.append(args))
     if operation == "release":
         assert instance.release() == {"state": "released"}
-        assert delivered == []
+        _assert_running(child)
     else:
         instance.signal(platform.TERM)
-        assert delivered == [(target, platform.TERM)]
+        assert child.wait(timeout=5) == -platform.TERM
     assert {key: owner[key] for key in target} == {key: pinned[key] for key in target}
 
 
 @pytest.mark.parametrize("field", ["pid", "uid", "birth_id"])
-def test_native_custody_rejects_each_different_live_controller_incarnation(tmp_path, monkeypatch, field):
-    owner, target = _identities(monkeypatch)
+def test_native_custody_rejects_each_different_live_controller_incarnation(tmp_path, monkeypatch, processes, field):
+    owner, child, target = _identities(processes)
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
     other = {**owner, field: "other-birth" if field == "birth_id" else owner[field] + 1}
-    monkeypatch.setattr(platform, "signal_process", lambda *args: pytest.fail("delivered without controller custody"))
     monkeypatch.setattr(custody, "default_process_identity", lambda _pid: other)
     with pytest.raises(custody.CustodyError, match="another controller"):
         instance.release()
@@ -184,6 +206,7 @@ def test_native_custody_rejects_each_different_live_controller_incarnation(tmp_p
     with pytest.raises(custody.CustodyError, match="another live controller"):
         instance.signal(platform.TERM, validate=lambda: pytest.fail("validated without controller custody"))
     assert instance.path.read_bytes() == before
+    _assert_running(child)
 
 
 @pytest.mark.parametrize("actor", [
@@ -195,37 +218,37 @@ def test_native_custody_rejects_each_different_live_controller_incarnation(tmp_p
     {"pid": 1, "uid": 0, "birth_id": ""},
     {"pid": 1, "uid": 0, "birth_id": None},
 ])
-def test_native_custody_rejects_unavailable_or_malformed_actor(tmp_path, monkeypatch, actor):
-    _owner, target = _identities(monkeypatch)
+def test_native_custody_rejects_unavailable_or_malformed_actor(tmp_path, monkeypatch, processes, actor):
+    _owner, child, target = _identities(processes)
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
     before = instance.path.read_bytes()
     monkeypatch.setattr(custody, "default_process_identity", lambda _pid: actor)
-    monkeypatch.setattr(platform, "signal_process", lambda *args: pytest.fail("delivered for an unknown actor"))
     for operation in (instance.release, lambda: instance.signal(platform.TERM), instance.publish):
         with pytest.raises(custody.CustodyError, match="actor.*unavailable|actor.*malformed"):
             operation()
         assert instance.path.read_bytes() == before
+        _assert_running(child)
 
 
 @pytest.mark.parametrize("controller", [None, {}, [], {"pid": "unknown"}])
-def test_native_custody_rejects_missing_or_malformed_persisted_controller(tmp_path, monkeypatch, controller):
-    _owner, target = _identities(monkeypatch)
+def test_native_custody_rejects_missing_or_malformed_persisted_controller(tmp_path, monkeypatch, processes, controller):
+    _owner, child, target = _identities(processes)
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
     record = json.loads(instance.path.read_text())
     record["controller"] = controller
     custody._atomic_owner_json(instance.path, record)
     before = instance.path.read_bytes()
-    monkeypatch.setattr(platform, "signal_process", lambda *args: pytest.fail("delivered without known controller"))
     for operation in (instance.release, lambda: instance.signal(platform.TERM)):
         with pytest.raises(custody.CustodyError):
             operation()
         assert instance.path.read_bytes() == before
+        _assert_running(child)
 
 
-def test_native_custody_unknown_prior_controller_observation_does_not_adopt(tmp_path, monkeypatch):
-    owner, target = _identities(monkeypatch)
+def test_native_custody_unknown_prior_controller_observation_does_not_adopt(tmp_path, monkeypatch, processes):
+    owner, child, target = _identities(processes)
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
     actor = {**owner, "pid": owner["pid"] + 1}
@@ -233,10 +256,10 @@ def test_native_custody_unknown_prior_controller_observation_does_not_adopt(tmp_
         observations = iter([actor, observation])
         monkeypatch.setattr(custody, "default_process_identity", lambda _pid: next(observations))
         before = instance.path.read_bytes()
-        monkeypatch.setattr(platform, "signal_process", lambda *args: pytest.fail("delivered for unknown prior controller"))
         with pytest.raises(custody.CustodyError):
             instance.signal(platform.TERM)
         assert instance.path.read_bytes() == before
+        _assert_running(child)
 
 
 @requires_linux_tree_custody
