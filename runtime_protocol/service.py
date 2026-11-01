@@ -860,6 +860,8 @@ class RuntimeService:
         if not getattr(self, "_registering_v33_provider", False):
             from .v33_lifecycle import require_ready, MARKER
             require_ready(self.store.root)
+            from .v34_lifecycle import require_ready as custody_ready
+            custody_ready(self.store.root)
             if (self.store.root / MARKER).exists() and not self._v33_provider_registered:
                 raise ConflictError("v33 provider registration is required for this process before requests and fresh pins")
         if not self._verified:
@@ -7450,6 +7452,8 @@ class RuntimeService:
             resource["required_facts"] = dict(spec["required_facts"])
         if "storage_estimate" in spec:
             resource["storage_estimate"] = dict(spec["storage_estimate"])
+        if task.get("custody"):
+            resource["custody"] = task["custody"]
         if task.get("waiting_reason"):
             resource["waiting_reason"] = task["waiting_reason"]
         if task.get("lease_fence"):
@@ -7891,6 +7895,11 @@ class RuntimeService:
             project_id=project_id, event_ids=event_ids, primary_stream_id=current["run"]["id"])
 
     @_verified_mutation
+    def reconcile_task_custody(self, task_id, body, *, idempotency_key, identity):
+        # Separate recovery authority; no reuse of ordinary lease credentials.
+        self._assert_mutation_admitted()
+        return self.store.custody.reconcile(task_id, body, identity=identity, idempotency_key=idempotency_key)
+
     def retry_task(self, task_id, body=None, *, idempotency_key=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = {} if body is None else body
@@ -7904,6 +7913,7 @@ class RuntimeService:
                 return replay
             if self._task_drain(task_id) is not None:
                 raise ConflictError("remote drain blocks fresh task retries")
+            self.store.custody.assert_task_installation_clear(task_id)
             status = current["task"]["status"]
             if current["task"].get("waiting_reason") == "provider_state_unknown":
                 raise ConflictError(
@@ -9762,6 +9772,7 @@ class RuntimeService:
         with self.store._mutex:
             current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
             row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
+            self.store.custody.assert_task_installation_clear(row["task_id"])
             self._assert_attempt_identity(row, identity)
             attempt_owner = self.store.conn.execute("SELECT executor_id FROM attempts WHERE id=?", (row["attempt_id"],)).fetchone()
             if attempt_owner is None:

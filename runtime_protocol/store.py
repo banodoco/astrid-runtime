@@ -25,7 +25,7 @@ from urllib.parse import unquote
 from . import platform
 from . import cancellation
 from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
-from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
+from .canonical_schema import CANONICAL_FORMAT_ID, CURRENT_SCHEMA_SQL as CANONICAL_SCHEMA_SQL
 from .cas import ContentAddressedStore
 from .dirfd import remove_tree_at
 from .snapshot_refs import check_working_copy_base, parent_revision_row, prepare_snapshot, publish_snapshot, rewrite_spec_snapshots, source_kind_of, validate_capture_scope, working_copy_binding
@@ -42,7 +42,7 @@ from .visual_seam import (
 from .visual_boundary import finite as _visual_finite, js_round as _visual_js_round
 from .idempotency import command_result, compact_result, expired_result, EXPIRED, RESULT_WINDOW_SECONDS, IdempotencyWindowExpired
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 IDEMPOTENCY_RESULT_WINDOW_SECONDS = 24 * 60 * 60
 IDEMPOTENCY_RESULT_MARKER = "__runtime_idempotency_result_expired_v1"
 IDEMPOTENCY_RESULT_MARKER_PREFIX = '{"' + IDEMPOTENCY_RESULT_MARKER + '":'
@@ -259,6 +259,13 @@ REQUIRED_SCHEMA_COLUMNS = {
     "timelines": frozenset("id project_id version name created_at archived_at".split()),
     "runtime_schema": frozenset("id format_id version created_at".split()),
 }
+from .custody_schema import CUSTODY_SCHEMA_SQL
+_custody_shape = sqlite3.connect(":memory:")
+_custody_shape.executescript(CUSTODY_SCHEMA_SQL)
+for _table, in _custody_shape.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+    REQUIRED_SCHEMA_COLUMNS[_table] = frozenset(row[1] for row in _custody_shape.execute(f'PRAGMA table_info({_table})'))
+_custody_shape.close()
+del _custody_shape, _table
 REQUIRED_SCHEMA_TABLES = frozenset(REQUIRED_SCHEMA_COLUMNS)
 _REALM_METADATA_TABLES = frozenset({"runtime_schema", "realm_lifecycle", "runtime_lifecycle"})
 
@@ -834,6 +841,8 @@ class RealmStore:
             # contract; the directory lock serializes competing fresh opens.
             from .v33_lifecycle import check_startup
             check_startup(self.root)
+            from .v34_lifecycle import check_startup as custody_startup
+            custody_startup(self.root)
             owner_marker_present = self.lock_path.exists() or self.lock_path.is_symlink()
             if acquire_owner and owner_marker_present:
                 self._acquire_owner()
@@ -849,6 +858,11 @@ class RealmStore:
         except Exception:
             self.close(orderly=False)
             raise
+
+    @property
+    def custody(self):
+        from .custody import Custody
+        return Custody(self)
 
     def _acquire_admission_lock(self):
         """Serialize startup admission without mutating the realm tree.
@@ -1308,6 +1322,8 @@ class RealmStore:
                     if latest["status"] not in {"running", "cancel_requested"}:
                         continue
                     self.contain_delegated_children(task["id"], attempt_id=task["attempt_id"], reason="parent_runtime_epoch_ended")
+                    if self.custody.hold(task["id"], "runtime_restart"):
+                        continue
                     binding = self.execution_binding(task["id"])
                     unresolved_external = bool(
                         binding
@@ -3301,6 +3317,7 @@ class RealmStore:
         return self.execution_binding(task_id)
 
     def reset_execution_attempt(self, task_id, *, runtime_epoch=None, status="prepared"):
+        self.custody.assert_task_installation_clear(task_id)
         if runtime_epoch is None:
             runtime_epoch = self._current_runtime_epoch()
         selected = self.effective_execution_target(task_id)
@@ -3387,6 +3404,9 @@ class RealmStore:
             result["result"] = json.loads(result["result_json"])
         if result.get("waiting_reason"):
             result["blocked_reason"] = result["waiting_reason"]
+        custody = self.custody.blocking(result["id"])
+        if custody:
+            result["custody"] = self.custody.public(custody)
         value = {"run": dict(run), "task": result}
         if not binding_loaded:
             binding = self.execution_binding(result["id"])
@@ -3599,6 +3619,7 @@ class RealmStore:
         self.conn.execute("UPDATE tasks SET waiting_reason=?, updated_at=? WHERE id=? AND status='queued'", (reason, now(), task_id))
 
     def _release_reservations(self, task_id, lease_token=None, *, released_at=None):
+        self.custody.assert_clear(task_id=task_id)
         timestamp = released_at or now()
         if lease_token is None:
             self.conn.execute("UPDATE reservations SET released_at=? WHERE task_id=? AND released_at IS NULL", (timestamp, task_id))
@@ -3819,6 +3840,8 @@ class RealmStore:
         for row in self._overdue_lease_rows():
             latest = self.conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
             if latest["status"] not in {"queued", "running", "cancel_requested"}:
+                continue
+            if self.custody.hold(row["id"], "lease_or_deadline_expired"):
                 continue
             failure = self._task_lifetime_failure(latest, datetime.now(timezone.utc))
             if failure is None and int(latest["attempt"] or 0) >= MAX_TASK_ATTEMPTS:
@@ -4068,6 +4091,9 @@ class RealmStore:
                 task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
                 if not task:
                     raise NotFoundError("task not found")
+                self.custody.assert_task_installation_clear(task_id)
+                if task["waiting_reason"] == "legacy_install_custody_unknown":
+                    raise ConflictError("legacy in-flight work requires explicit recovery")
                 provider_recovery_claim = (
                     allow_provider_recovery
                     and task["waiting_reason"] == "provider_state_unknown"
@@ -5816,6 +5842,13 @@ class RealmStore:
                         raise LeaseError("attempt lease has expired")
                 except ValueError as exc:
                     raise LeaseError("attempt lease deadline is invalid") from exc
+            if self.custody.blocking(task_id):
+                with self._transaction():
+                    self.custody.hold(task_id, "terminal_publication_pending", pending={"kind": "completion", "attempt_id": attempt_id, "fence": fence, "result": result, "effect": effect})
+                    value = self.get_task(task_id)
+                    if record is not None:
+                        record(value)
+                    return value
             declared = json.loads(task["expected_effect_json"]) if task["expected_effect_json"] else None
             task_spec = self._spec(task)
             input_object_ids = task_spec.get("input_object_ids", [])
@@ -6227,6 +6260,8 @@ class RealmStore:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise NotFoundError("task not found")
+            if self.custody.blocking(task_id) and stop_observed:
+                raise ConflictError("bare stop_observed is not custody release authority")
             if attempt_id is not None:
                 if (task["status"] not in {"running", "cancel_requested"}
                         or task["attempt_id"] != attempt_id or task["lease_token"] != lease_id
@@ -6243,6 +6278,12 @@ class RealmStore:
                 return value
             with self._transaction():
                 timestamp = now()
+                if self.custody.hold(task_id, "cancel_requested", pending={"kind": "cancel", "result": result}):
+                    self.conn.execute("UPDATE tasks SET status='cancel_requested' WHERE id=?", (task_id,))
+                    value = self.get_task(task_id)
+                    if record is not None:
+                        record(value)
+                    return value
                 terminal_result = dict(json.loads(task["result_json"] or "{}"))
                 if result is not None:
                     previous_manifest = terminal_result.get("manifest_ref")
@@ -6351,6 +6392,10 @@ class RealmStore:
                 cancel_requested = []
                 for task in children:
                     if task["status"] in {"completed", "failed", "cancelled"}:
+                        continue
+                    if self.custody.hold(task["id"], "run_cancel_requested"):
+                        self.conn.execute("UPDATE tasks SET status='cancel_requested' WHERE id=?", (task["id"],))
+                        cancel_requested.append(task["id"])
                         continue
                     self.contain_delegated_children(task["id"], reason="parent_run_cancelled")
                     binding = self.execution_binding(task["id"])
@@ -6461,6 +6506,13 @@ class RealmStore:
     def _fail_task_in_transaction(self, task, failure, *, attempt_id=None, record=None, result=None, publish=None):
         """Single terminal failure path; caller owns the settlement transaction."""
         task_id, lease_token = task["id"], task["lease_token"]
+        if self.custody.hold(task_id, "attempt_failed", pending={"kind": "failure", "failure": failure, "result": result}):
+            self.conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
+            self.conn.execute("UPDATE runs SET status='failed' WHERE id=?", (task["run_id"],))
+            value = self.get_task(task_id)
+            if record is not None:
+                record(value)
+            return value
         self.contain_delegated_children(task_id, attempt_id=attempt_id, reason="parent_failed")
         timestamp = now()
         result = dict(result or {})
@@ -6606,7 +6658,7 @@ class RealmStore:
         if schema_ok:
             from .v33_manifest import canonical_manifest
             try:
-                schema_ok = canonical_manifest(self.conn)["kind"] == "U33"
+                schema_ok = canonical_manifest(self.conn)["kind"] == "V34"
             except ValidationError:
                 schema_ok = False
         realm_identity = {"ok": False, "realm_id": None, "row_count": None, "reason": "realm_table_missing"}

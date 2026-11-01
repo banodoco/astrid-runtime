@@ -1148,6 +1148,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if action == "lifecycle" and method == "POST":
                 self._identity("tasks:write")
                 return self._send(200, self.runtime.update_managed_output_lifecycle(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+        if len(path) == 5 and path[:3] == ["v1", "control", "tasks"] and path[4] == "reconcile" and method == "POST":
+            identity = self._identity("admin")
+            return self._send(200, self.runtime.reconcile_task_custody(
+                path[3], self._body(), idempotency_key=self._idempotency_key(), identity=identity))
         if len(path) == 4 and path[:2] == ["v1", "tasks"]:
             task_id, action = path[2:]
             if method == "POST" and action == "remote-credential":

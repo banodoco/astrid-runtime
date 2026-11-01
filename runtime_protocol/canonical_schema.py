@@ -470,3 +470,8 @@ CREATE INDEX idx_managed_output_manifest ON managed_output_associations(manifest
 """ + TIMELINE_COMMIT_SCHEMA_SQL + DOCUMENT_INPUT_SCHEMA_SQL
 
 CANONICAL_SCHEMA_SQL += GENERATION_TAG_INDEX_SQL + ";\n"
+
+# Historical consumers retain the frozen v33 SQL above. All fresh Runtime
+# databases use this explicitly numbered successor.
+from .custody_schema import CUSTODY_SCHEMA_SQL
+CURRENT_SCHEMA_SQL = CANONICAL_SCHEMA_SQL + CUSTODY_SCHEMA_SQL
