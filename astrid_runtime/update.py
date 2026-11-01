@@ -34,7 +34,7 @@ _STATUS_REASONS = frozenset({"busy", "autostart-off", "unsupported-service-manag
 class UpdateRefusal(ConflictError):
     def __init__(self, reason, message, *, remediation=None):
         details = {"reason": reason}
-        if remediation in {"M1", "M2", "M3", "M4", "M5", "M6", "wait"}:
+        if isinstance(remediation, str) and remediation in {"M1", "M2", "M3", "M4", "M5", "M6", "wait"}:
             details["remediation"] = remediation
         super().__init__(message, details=details)
 
@@ -280,10 +280,12 @@ class UpdateAdmission:
             if not isinstance(p1, dict):
                 raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.")
             disposition, prior = p1.get("disposition"), p1.get("job")
+            if not isinstance(disposition, str):
+                raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.")
             if disposition == "continued-existing":
                 operation_id = prior.get("operation_id") if isinstance(prior, dict) else None
                 if (not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
-                        or prior.get("state") not in {"launching", "active"}
+                        or prior.get("state") not in ("launching", "active")
                         or prior.get("launch_status") != "acknowledged"):
                     raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.")
                 # The locked reconciler already performed the sole native
@@ -297,7 +299,7 @@ class UpdateAdmission:
                 route = route if isinstance(route, dict) else {}
                 confirmation = route.get("confirmation")
                 if (not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
-                        or state not in {"updated", "rolled_back", "failed"}
+                        or state not in ("updated", "rolled_back", "failed")
                         or route.get("format") != "astrid-update-route-disposition/v1"
                         or route.get("disposition") != disposition or route.get("blocker") != "cleared"
                         or not isinstance(confirmation, dict) or confirmation.get("confirmed") is not True

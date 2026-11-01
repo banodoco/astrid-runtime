@@ -706,7 +706,7 @@ def test_reconcile_before_manifest_and_newer_target_checks(tmp_path, monkeypatch
     assert launches == []
 
 
-@pytest.mark.parametrize("reply", [None, {}, {"disposition": "unexpected"},
+@pytest.mark.parametrize("reply", [None, {}, {"disposition": []}, {"disposition": "unexpected"},
                                   {"disposition": "acknowledgement-unknown"}])
 def test_unknown_reconciliation_never_prepares_or_launches(tmp_path, monkeypatch, reply):
     admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("launch"))
@@ -1025,7 +1025,8 @@ def test_authenticated_continuation_keeps_operation_and_journal(tmp_path, monkey
         world.stop()
 
 
-@pytest.mark.parametrize("result", [None, {}, {"accepted": True, "operation_id": "bad", "state": "accepted"}])
+@pytest.mark.parametrize("result", [None, {}, {"accepted": True, "operation_id": "bad", "state": "accepted"},
+                                    {"accepted": True, "operation_id": "c" * 32, "state": []}])
 def test_update_route_malformed_acceptance_is_uncertain(tmp_path, result):
     world = start_door_world(tmp_path)
     try:

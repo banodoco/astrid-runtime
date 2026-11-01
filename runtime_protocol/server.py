@@ -591,7 +591,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if isinstance(result, dict) and result.get("accepted") is False:
             self._update_reconciliation_response(result)
         if (not isinstance(result, dict) or result.get("accepted") is not True
-                or result.get("state") not in {"accepted", "launching", "active"}
+                or result.get("state") not in ("accepted", "launching", "active")
                 or self._update_operation_id(result.get("operation_id")) is None
                 or not isinstance(result.get("message"), str) or not result["message"]):
             self._update_uncertain()
