@@ -6,6 +6,7 @@ import re
 import socket
 import sys
 import threading
+import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -81,13 +82,33 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
         self._maintenance_lock = threading.Lock()
         self._maintenance_thread = None
         self._maintenance_error = None
+        self._maintenance_loop_thread = None
+        self._maintenance_interval = 0.5
+        self._maintenance_due = 0.0
         super().__init__(*args, **kwargs)
+
+    def serve_forever(self, poll_interval=0.5):
+        self._maintenance_interval = 0.0 if poll_interval is None else poll_interval
+        self._maintenance_due = time.monotonic() + self._maintenance_interval
+        self._maintenance_loop_thread = threading.get_ident()
+        try:
+            return super().serve_forever(poll_interval=poll_interval)
+        finally:
+            self._maintenance_loop_thread = None
 
     def service_actions(self):
         # serve_forever already polls every 0.5s, including when no clients or
         # workers are connected. Reuse the same fenced reaper as reads/claims.
         # SQLite may wait on an external writer or the shared store mutex;
         # neither wait may occupy the accept loop. Admit only one reaper.
+        # socketserver also calls this after every accepted connection. Keep
+        # those automatic turns on the idle poll cadence, rather than racing
+        # each control request with a new reaper. Explicit maintenance pumps
+        # outside the serving thread retain their immediate behavior.
+        if (self._maintenance_loop_thread == threading.get_ident()
+                and self._maintenance_error is None
+                and time.monotonic() < self._maintenance_due):
+            return
         runtime = getattr(self, "runtime", None)
         if (runtime is None or not self.accepting_authenticated_requests
                 or not self._maintenance_lock.acquire(blocking=False)):
@@ -101,6 +122,8 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
                 name="astrid-runtime-lifetime-reaper", daemon=True,
             )
             self._maintenance_thread.start()
+            if self._maintenance_loop_thread is not None:
+                self._maintenance_due = time.monotonic() + self._maintenance_interval
         except BaseException:
             self._maintenance_thread = None
             self._maintenance_lock.release()
