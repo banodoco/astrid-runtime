@@ -54,10 +54,11 @@ evidence. Released rows preserve terminal publication linkage without inventing
 success, manifests, operation IDs or journal history. Final release and its audit,
 reservations, attempt settlement, binding and replay receipts commit together.
 
-The realm holds one maximum-sized object plus two bounded proof envelopes of
-recovery budget per new row before dispatch. Ordinary evidence cannot consume
-the envelope allowance. At least one of the 32 reference slots is reserved for a
-proof. Exhaustion refuses work. Detail compaction affects only released rows older
+The realm holds two maximum-sized fencing objects plus two bounded proof
+envelopes of recovery budget per new row before dispatch. Ordinary evidence
+cannot consume that allowance. Four of the 32 reference slots cover initial
+fencing, lost proof, updated fencing and repair proof. Spending a fencing slot
+requires owner/admin authority. Exhaustion refuses work. Detail compaction affects only released rows older
 than 30 days; nonces, replay receipts, create identities and tombstones remain for
 the realm lifetime. Unresolved rows and evidence are never compacted or evicted.
 

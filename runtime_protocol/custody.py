@@ -29,10 +29,10 @@ MAX_REFS = 32
 MAX_ROWS = 1024
 MAX_EVIDENCE = 1024 ** 3
 MAX_OBJECT = 8 * 1024 ** 2
-# Hold one maximum-sized recovery object and two bounded signed envelopes
-# (lost then repair) before dispatch. Ordinary evidence cannot spend proof space.
+# Hold independent fencing evidence and a signed envelope for both lost and
+# repair before dispatch. Ordinary evidence cannot spend recovery capacity.
 PROOF_BUDGET = 2 * MAX_METADATA
-RECOVERY_BUDGET = MAX_OBJECT + PROOF_BUDGET
+RECOVERY_BUDGET = 2 * MAX_OBJECT + PROOF_BUDGET
 INVOCATION_SECONDS = 30
 AUTOMATIC_RETRIES = 5
 PROOF_DOMAIN = b'astrid-runtime/attempt-custody/stop/v1\x00'
@@ -385,7 +385,7 @@ class Custody:
                 raise ConflictError('stale custody CAS or sequence')
             if row['install_binding_digest'] != binding_digest:
                 raise ConflictError('custody install binding differs')
-            self._validate_binding(row, live=state in {'dispatching','active'})
+            self._validate_binding(row, live=True)
             allowed = {'armed': {'dispatching','unresolved'}, 'dispatching': {'active','unresolved'},
                        'active': {'active','unresolved'}, 'unresolved': {'unresolved'}}
             if state not in allowed.get(row['custody_state'], set()):
@@ -404,8 +404,10 @@ class Custody:
             self._event(row, 'task.custody_updated')
             return self._record(row, 'update', custody_seq, rd)
 
-    def stage_evidence(self, custody_id, data, *, expected_version, custody_seq, ref):
+    def stage_evidence(self, custody_id, data, *, expected_version, custody_seq, ref, recovery=False, identity=None):
         opaque(ref); integer(expected_version, 'expected_version', 1); integer(custody_seq, 'custody_seq', 2)
+        if recovery:
+            owner(identity)
         if not isinstance(data, bytes) or len(data) > MAX_OBJECT:
             raise ValidationError('custody evidence object exceeds 8 MiB')
         object_digest = hashlib.sha256(data).hexdigest()
@@ -415,15 +417,21 @@ class Custody:
             replay = self._receipt(row, 'evidence', custody_seq, rd)
             if replay is not None:
                 return replay
-            if row['custody_state'] in {'released','lost_fenced'} or row['custody_version'] != expected_version or custody_seq <= row['custody_seq']:
+            if row['custody_state'] == 'released' or (row['custody_state'] == 'lost_fenced' and not recovery) or row['custody_version'] != expected_version or custody_seq <= row['custody_seq']:
                 raise ConflictError('stale evidence CAS')
-            self._validate_binding(row)
+            self._validate_binding(row, live=not recovery)
             refs = json.loads(row['evidence_refs_json'])
-            if len(refs) >= MAX_REFS - 1 or any(e['ref'] == ref for e in refs):
+            lost = row['disposition'] == 'lost_fenced'
+            # Four slots: initial fence, lost proof, replacement fence, repair
+            # proof. An owner can spend each reserved fencing slot in order.
+            limit = MAX_REFS - (1 if lost else 3) if recovery else MAX_REFS - 4
+            if len(refs) >= max(1, limit) or any(e['ref'] == ref for e in refs):
                 raise ConflictError('custody evidence reference bound exhausted or reused')
             existing = self.db.execute('SELECT size FROM custody_evidence WHERE digest=?', (object_digest,)).fetchone()
             needed = 0 if existing else len(data)
-            budget = max(min(PROOF_BUDGET, row['evidence_budget']), row['evidence_budget'] - needed)
+            floor = MAX_METADATA if lost else MAX_OBJECT + PROOF_BUDGET
+            budget = (max(min(floor, row['evidence_budget']), row['evidence_budget'] - needed)
+                      if recovery else row['evidence_budget'])
             if self._capacity() + needed - (row['evidence_budget'] - budget) > MAX_EVIDENCE:
                 raise ConflictError('custody evidence quota full')
             # Durable immutable bytes precede any database reference.

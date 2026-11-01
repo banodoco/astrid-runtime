@@ -70,7 +70,7 @@ def body(w, *, mode='reconcile', key=None, fencing='external_absence'):
     repair = mode != 'reconcile'
     fence_bytes = b'independent owner controller fencing confirmation'
     if repair and not any(x['digest'] == hashlib.sha256(fence_bytes).hexdigest() for x in json.loads(r['evidence_refs_json'])):
-        c.stage_evidence(r['custody_id'],fence_bytes,expected_version=r['custody_version'],custody_seq=r['custody_seq']+1,ref='independent-fence')
+        c.stage_evidence(r['custody_id'],fence_bytes,expected_version=r['custody_version'],custody_seq=r['custody_seq']+1,ref='independent-fence',recovery=True,identity=OWNER)
         r = c.row(w['custody_id'])
     e = {k: r[k] for k in IDENTITY}
     e.update({'repair_version' if repair else 'proof_version': 1,
@@ -300,7 +300,7 @@ def test_quota_full_recovery_uses_reserved_budget(world,monkeypatch):
     monkeypatch.setattr(module,'MAX_EVIDENCE',module.RECOVERY_BUDGET)
     monkeypatch.setattr(module,'MAX_ROWS',1)
     with pytest.raises(ConflictError): c.create(w['request'],idempotency_key='quota-other')
-    c.stage_evidence(w['custody_id'],b'pending journal bytes',expected_version=1,custody_seq=2,ref='journal')
+    c.stage_evidence(w['custody_id'],b'pending journal bytes',expected_version=1,custody_seq=2,ref='journal',recovery=True,identity=OWNER)
     retained(w)
     assert reconcile(w)['custody_state']=='released'
 
@@ -519,3 +519,24 @@ def test_reconcile_http_owner_admin_auth_idempotency_and_real_proof(world,tmp_pa
         assert result['custody_state']=='released' and result['stop_confirmed'] is True
         assert api.request('POST',path,b,headers={'Idempotency-Key':'http-recovery'})==result
     finally:daemon.stop()
+
+
+def test_full_reference_and_byte_budget_can_complete_lost_then_repair(world,monkeypatch):
+    w=world;r=arm(w);c=w['service'].store.custody
+    for index in range(module.MAX_REFS-4):
+        r=c.row(r['custody_id'])
+        c.stage_evidence(r['custody_id'],f'ordinary evidence {index}'.encode(),expected_version=r['custody_version'],custody_seq=r['custody_seq']+1,ref=f'ordinary-{index}')
+    r=c.row(r['custody_id'])
+    with pytest.raises(ConflictError):c.stage_evidence(r['custody_id'],b'overflow',expected_version=r['custody_version'],custody_seq=r['custody_seq']+1,ref='overflow')
+    monkeypatch.setattr(module,'MAX_EVIDENCE',c._capacity())
+    assert reconcile(w,body(w,mode='lost'))['custody_state']=='lost_fenced'
+    r=retained(w);new_fence=b'fresh independent confirmation for final repair'
+    c.stage_evidence(r['custody_id'],new_fence,expected_version=r['custody_version'],custody_seq=r['custody_seq']+1,ref='fresh-fence',recovery=True,identity=OWNER)
+    b=body(w,mode='repair');e=b['proof']['envelope']
+    e['fencing_evidence']['evidence_digest']=hashlib.sha256(new_fence).hexdigest()
+    b['proof']['signature']=base64.b64encode(w['controller'].sign(signed_bytes(e,repair=True))).decode()
+    result=reconcile(w,b,replay='final-repair')
+    assert result['custody_state']=='released' and result['stop_confirmed'] is False
+    row=c.row(r['custody_id'])
+    assert len(json.loads(row['evidence_refs_json']))==module.MAX_REFS
+    assert c.db.execute('SELECT COUNT(*) FROM reservations WHERE released_at IS NULL').fetchone()[0]==0
