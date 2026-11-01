@@ -2108,7 +2108,7 @@ class TimelineCommitStore:
         if changed != 1:
             reject("stale_head")
 
-    def install_verified_baseline(self, project_id, timeline_id, *, authorize):
+    def install_verified_baseline(self, project_id, timeline_id, *, authorize, verify_inputs=None):
         from .cas import ContentAddressedStore
         from .timeline_commit_baseline import baseline_install_plan, verify_baseline
 
@@ -2123,6 +2123,8 @@ class TimelineCommitStore:
             facts = verify_baseline(self.conn, project_id, timeline_id, read_object=read_object)
             plan = baseline_install_plan(self.conn, facts, read_object=read_object)
             document = facts["canonical_document"]
+            if verify_inputs is not None:
+                verify_inputs(document)
             self._validate_closure(document)
             for entry in plan["entries"]:
                 event = self.conn.execute("SELECT payload_json FROM timeline_events WHERE id=? AND timeline_id=?",

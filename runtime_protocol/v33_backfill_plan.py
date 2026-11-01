@@ -1,4 +1,4 @@
-"""Frozen SQL-only generation backfill primitives for a future coordinator.
+"""Frozen SQL-only generation backfill primitives used by v33_lifecycle.
 
 Callers must hold the realm fence, durably persist the returned plan before
 application, and bind it to a verified recovery set. These functions alone do
@@ -82,7 +82,7 @@ def freeze_generation_plan(connection, *, realm_id, backup_id, schema_fingerprin
     return {**plan, "digest": _digest(plan)}
 
 
-def reconcile_generation_plan(connection, plan):
+def reconcile_generation_plan(connection, plan, *, verify_only=False):
     """Apply the exact frozen plan or recognize its committed post-state.
 
     The caller must already have persisted the plan and obtained exclusive realm
@@ -114,6 +114,8 @@ def reconcile_generation_plan(connection, plan):
         if rows == post:
             state = "already_applied"
         elif rows == pre:
+            if verify_only:
+                raise ConflictError("completed backfill does not match its post-state")
             for entry in entries:
                 before, after = entry["before"], entry["after"]
                 if before == after:

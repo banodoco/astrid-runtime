@@ -14,7 +14,7 @@ from astrid_runtime.paths import RuntimePaths
 from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
 from astrid_runtime.refusal import refusal_from
 from runtime_protocol.store import SCHEMA_VERSION, RealmStore
-from runtime_protocol.upgrade import inspect_canonical_schema
+from runtime_protocol.upgrade import inspect_canonical_schema, migrate_canonical_to_current
 
 
 def test_refusal_from_prefers_structured_message_and_preserves_details():
@@ -69,6 +69,9 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
     realm_root = paths.realms_dir / "realm-1"
     RealmStore.initialize(realm_root, realm_id="realm-1").close()
     if version < 32:
+        from test_runtime_upgrade import _remove_timeline_commit_schema
+        with sqlite3.connect(realm_root / "realm.sqlite3") as connection:
+            _remove_timeline_commit_schema(connection)
         with sqlite3.connect(realm_root / "realm.sqlite3") as connection:
             connection.execute("DROP INDEX idx_generations_gen")
     if version < 30:
@@ -103,8 +106,11 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
             connection.commit()
         finally:
             connection.close()
-    assert inspect_canonical_schema(realm_root, expected_realm_id="realm-1")["kind"] == ("U33" if version == 33 else f"v{version}")
-    checkout = runtime_checkout or tmp_path
+    assert inspect_canonical_schema(realm_root, expected_realm_id="realm-1")["kind"] == ("U33" if version == 33 else f"C{version}" + ("-nullable" if version < 28 else ""))
+    checkout = runtime_checkout or tmp_path / "prior-executable"
+    if runtime_checkout is None:
+        (checkout / "runtime_protocol").mkdir(parents=True)
+        (checkout / "runtime_protocol" / "__init__.py").write_text("# Test service boundary executable\n")
     profile = SourceProfile(profile="astrid", runtime_checkout=str(checkout), source_checkout=str(checkout))
     catalog = {
         "version": 1,
@@ -134,6 +140,11 @@ def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, 
 
     def fake_start(target_paths, _boundary, _config):
         started.append(target_paths.app_support)
+        from runtime_protocol.service import RuntimeService
+        from test_timeline_commit_provider import Provider
+        service = RuntimeService(realm_root)
+        service.register_timeline_commit_provider(Provider())
+        service.close()
         discovery = {
             "pid": 1235, "active_realm": "realm-1", "endpoint": "http://127.0.0.1:1235",
             "runtime_instance_id": "instance-2", "process_birth_id": "birth-2", "realm_root": str(realm_root.resolve()),
@@ -147,7 +158,7 @@ def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, 
         "astrid_runtime.operator_upgrade.migrate_canonical_to_current",
         lambda *args, **kwargs: (
             migration_calls.append((args, kwargs))
-            or {"ok": True, "source_schema_version": 25, "target_schema_version": SCHEMA_VERSION}
+            or migrate_canonical_to_current(*args, **kwargs)
         ),
     )
     monkeypatch.setattr(
@@ -167,7 +178,7 @@ def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, 
     assert started == [paths.app_support]
     journal = json.loads((paths.runtime_support / "upgrade-journal.json").read_text())
     assert journal["state"] == "complete"
-    assert [event["state"] for event in journal["history"]] == ["planned", "stopping", "stopped", "activated", "restarted", "complete"]
+    assert [event["state"] for event in journal["history"]] == ["planned", "stopping", "stopped", "backup_verified", "activated", "restarted", "complete"]
 
 
 @pytest.mark.parametrize("healthy", [True, False])
@@ -247,7 +258,7 @@ def test_operator_upgrade_failure_before_activation_restarts_original_and_journa
 
     def fake_start(target_paths, _boundary, _config):
         started.append(True)
-        return SimpleNamespace(endpoint="http://127.0.0.1:1235", runtime_instance_id="instance-2")
+        return SimpleNamespace(endpoint="http://127.0.0.1:1235", pid=1235, runtime_instance_id="instance-2")
 
     def fail_migration(*_args, **_kwargs):
         raise RuntimeError("validation failed")
@@ -259,8 +270,9 @@ def test_operator_upgrade_failure_before_activation_restarts_original_and_journa
     assert started == [True]
     assert (realm_root / "realm.sqlite3").is_file()
     journal = json.loads((paths.runtime_support / "upgrade-journal.json").read_text())
-    assert journal["state"] == "failed"
-    assert journal["activated"] is False
+    assert journal["state"] == "rolled_back"
+    assert inspect_canonical_schema(realm_root)["version"] == 25
+    assert Path(journal["recovery_set"]).is_dir()
 
 
 @pytest.mark.darwin_native
@@ -283,6 +295,11 @@ def test_operator_upgrade_current_schema_uses_read_only_schema_noop(tmp_path, mo
     boundary = _Boundary(paths)
 
     def fake_start(target_paths, _boundary, _config):
+        from runtime_protocol.service import RuntimeService
+        from test_timeline_commit_provider import Provider
+        service = RuntimeService(_realm_root)
+        service.register_timeline_commit_provider(Provider())
+        service.close()
         discovery = {
             "pid": 1235, "active_realm": "realm-1", "endpoint": "http://127.0.0.1:1235",
             "runtime_instance_id": "instance-2", "process_birth_id": "birth-2", "realm_root": str(_realm_root.resolve()),
@@ -293,7 +310,7 @@ def test_operator_upgrade_current_schema_uses_read_only_schema_noop(tmp_path, mo
 
     monkeypatch.setattr("astrid_runtime.operator_upgrade._bootstrap_locked", fake_start)
     result = upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
-    assert result["schema_before"] == f"v{SCHEMA_VERSION}"
+    assert result["schema_before"] == "U33"
     assert result["migration"]["changed"] is False
     assert result["migration"]["steps"] == []
 
@@ -307,7 +324,7 @@ def test_operator_upgrade_rejects_newer_schema_before_journal_or_signal(tmp_path
     tracked = [realm_root / "realm.sqlite3", paths.catalog_path, paths.discovery_path, paths.instance_lock_path]
     before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in tracked}
     boundary = _Boundary(paths)
-    with pytest.raises(OperatorUpgradeError, match="newer than supported"):
+    with pytest.raises(OperatorUpgradeError, match="unsupported canonical v34"):
         upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
     after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in tracked}
     assert after == before

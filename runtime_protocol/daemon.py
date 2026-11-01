@@ -300,6 +300,11 @@ class RuntimeDaemon:
                 self.service.close()
                 self.service = None
                 raise
+        from .v33_lifecycle import activation
+        if activation(self.root) and provider is None:
+            self.service.close()
+            self.service = None
+            raise ConflictError("migrated realm requires fresh Timeline provider registration before readiness")
         cancellation.check()
         self.service.set_readiness_callback(self._revoke_readiness)
         self.service.set_local_claim_generation_verifier(self._verify_local_claim_generation, actor=WORKER_ACTOR)

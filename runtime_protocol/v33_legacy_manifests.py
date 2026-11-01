@@ -147,3 +147,7 @@ COMPONENTS = {'canonical_receipt_backfills-fixture': {'canonical_receipt_backfil
  'task_specs': {'task_specs': '0965114793c3dfd66973f1645b7a0761ff805981f01efd82464a6eaebdfaac50'},
  'user_app_state': {'user_app_state': 'da7874a7614abfbe03ed9420bfe18b3a197e13a53b8c657d34e1fe5ba09c25b7'},
  'user_preferences': {'user_preferences': '3f5eb769b95384ed7d30b1b34b019f3ae5087a8d945681d4e1f9809cbf2c4d2f'}}
+
+# Bounded archival workers profile approved by orchestrator 2026-10-31T23:36:50Z.
+# Pinned retired migrations 001..018, before 019 removes workers.
+COMPONENTS["workers-production"] = {'workers': 'b9044aac0074c2f4d775a843aab3508797aed522e15eb206c27f43c5a6e0136c'}

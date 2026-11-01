@@ -4,7 +4,8 @@ Opening a realm never upgrades it. This module is an operator-only boundary:
 it acquires the same owner fence as the daemon, stages a temporary copy of the
 source SQLite state for rollback, builds a fresh canonical database, and
 replaces the database only after lossless row and integrity checks pass. A
-persistent source archive is opt-in.
+persistent source archive is required for v23; the v33 coordinator retains a
+verified full recovery image before migration.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -400,6 +402,7 @@ def inspect_realm_schema(root: str | Path, *, expected_realm_id: str | None = No
     root = _safe_realm_root(root)
     if not root.is_dir() or root.is_symlink():
         raise RealmAdmissionError("realm root is missing or invalid")
+    root_stat = root.stat()
     db = root / "realm.sqlite3"
     _regular(db, "realm database")
     paths = [db, *(Path(str(db) + suffix) for suffix in ("-wal", "-shm", "-journal"))]
@@ -433,6 +436,9 @@ def inspect_realm_schema(root: str | Path, *, expected_realm_id: str | None = No
                     for table in discarded
                 }
             result["source_file_identity"] = before[db]
+            result["source_root_identity"] = [root_stat.st_dev, root_stat.st_ino]
+            if [root.stat().st_dev, root.stat().st_ino] != result["source_root_identity"]:
+                raise ConflictError("realm directory changed during preflight")
             return result
         finally:
             connection.close()
@@ -483,8 +489,14 @@ def _foreign_key_errors(connection: sqlite3.Connection, timeout: float) -> list:
         raise
 
 
+_HELD_UPGRADE_FENCE = ContextVar("held_upgrade_fence", default=None)
+
+
 @contextmanager
 def _owner_fence(root: Path):
+    if _HELD_UPGRADE_FENCE.get() == str(root):
+        yield
+        return
     lock_path = root / "owner.lock"
     if lock_path.is_symlink():
         raise ValidationError("owner lock must not be a symlink")
@@ -502,9 +514,11 @@ def _owner_fence(root: Path):
             if handle is not None:
                 handle.close()
             raise OwnerBusyError("another runtime daemon owns this realm") from exc
+        token = _HELD_UPGRADE_FENCE.set(str(root))
         try:
             yield
         finally:
+            _HELD_UPGRADE_FENCE.reset(token)
             try:
                 platform.unlock_file(handle.fileno())
             except OSError:
@@ -972,7 +986,7 @@ def migrate_canonical_to_current(
     confirmation: str | None = None,
     expected_realm_id: str | None = None,
 ) -> dict:
-    """Atomically run supported empty-generation canonical steps through v33.
+    """Run supported canonical steps and the durable SQL-only backfill through v33.
 
     Current v33 is a read-only idempotent result.  Unknown, alternate, and
     newer layouts are rejected by the read-only preflight before an owner-lock
@@ -987,7 +1001,22 @@ def migrate_canonical_to_current(
     if confirmation != expected_confirmation:
         raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
     source_version = int(identity["version"])
+    from . import v33_lifecycle as lifecycle
+    pending = lifecycle.activation(root)
+    if pending and pending[1]["state"] in {"restoring", "restored"}:
+        raise ConflictError("full-set restoration is incomplete; use explicit operator recovery")
+    if source_version == SCHEMA_VERSION and pending and pending[1]["state"] != "ready":
+        with _owner_fence(root):
+            connection = sqlite3.connect(root / "realm.sqlite3", timeout=float(timeout_seconds))
+            connection.row_factory = sqlite3.Row
+            try:
+                completion = lifecycle.complete_backfill(root, connection, *pending)
+            finally:
+                connection.close()
+        return {"ok": True, "realm_id": realm_id, "source_schema_version": 33, "target_schema_version": 33,
+                "changed": False, "steps": [], "backfill": completion, "recovery_set": str(pending[0])}
     if source_version == SCHEMA_VERSION:
+        lifecycle.check_startup(root)
         return {
             "ok": True,
             "realm_id": realm_id,
@@ -996,13 +1025,12 @@ def migrate_canonical_to_current(
             "steps": [],
             "changed": False,
         }
-    if identity["generation_count"]:
-        raise ValidationError("generation-tag backfill requires the durable coordinator; preserve this realm and retry after the coordinator is available")
     started = time.monotonic()
-    with _owner_fence(root):
+    with _owner_fence(root), lifecycle.sqlite_observation(root) as original_sqlite:
         connection = sqlite3.connect(root / "realm.sqlite3", timeout=float(timeout_seconds))
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        archive = None
         try:
             connection.execute("BEGIN IMMEDIATE")
             current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
@@ -1010,8 +1038,9 @@ def migrate_canonical_to_current(
             if (any(current[key] != identity[key] for key in ("version", "kind", "fingerprint", "realm_id"))
                     or (source_stat.st_dev, source_stat.st_ino) != identity["source_file_identity"][:2]):
                 raise ConflictError("realm schema or database identity changed before canonical migration")
-            if connection.execute("SELECT COUNT(*) FROM generations").fetchone()[0]:
-                raise ConflictError("generations changed before migration; durable backfill is required")
+            if connection.execute("SELECT COUNT(*) FROM generations").fetchone()[0] != identity["generation_count"]:
+                raise ConflictError("generation scope changed after preflight")
+            archive, activation_record = pending or lifecycle.begin(root, identity, sqlite_image=original_sqlite)
             steps: list[dict[str, object]] = []
             if source_version == CANONICAL_PREVIOUS_SCHEMA_VERSION:
                 steps.append(_apply_v24_to_v25(connection))
@@ -1052,8 +1081,12 @@ def migrate_canonical_to_current(
             if foreign_keys:
                 raise ValidationError("migrated database failed foreign-key validation")
             connection.commit()
+            lifecycle.phase(archive, activation_record, "schema_committed")
+            completion = lifecycle.complete_backfill(root, connection, archive, activation_record)
             return {
                 "ok": True,
+                "backfill": completion,
+                "recovery_set": str(archive),
                 "realm_id": realm_id,
                 "source_schema_version": source_version,
                 "target_schema_version": SCHEMA_VERSION,
@@ -1064,6 +1097,11 @@ def migrate_canonical_to_current(
             }
         except Exception:
             connection.rollback()
+            connection.close()
+            if archive is not None:
+                lifecycle.restore(root, archive)
+            else:
+                lifecycle.restore_observation(root, original_sqlite)
             raise
         finally:
             connection.close()
@@ -1107,11 +1145,11 @@ def _source_shape(connection: sqlite3.Connection) -> tuple[set[str], dict[str, l
     if missing:
         raise ValidationError("upgrade source is missing shared canonical tables: " + ", ".join(sorted(missing)))
     columns: dict[str, list[str]] = {}
-    shared_tables = (REQUIRED_SCHEMA_TABLES - NEW_TABLES) | (tables & {"user_preferences"})
+    shared_tables = (REQUIRED_SCHEMA_TABLES - NEW_TABLES) | (tables & ({"user_preferences", "user_app_state", "task_specs"} | REVISION_TABLES))
     _, legacy_columns = _canonical_shape_for(USER_PREFERENCES_TARGET_SCHEMA_VERSION)
     for table in sorted(shared_tables):
         actual = _table_columns(connection, table)
-        expected = list(legacy_columns[table])
+        expected = list(legacy_columns.get(table, REQUIRED_SCHEMA_COLUMNS[table]))
         if set(actual) != set(expected) or len(actual) != len(expected):
             raise ValidationError(f"upgrade source shape differs for table {table}")
         columns[table] = actual
@@ -1137,13 +1175,13 @@ def _archive_source(root: Path, archive: Path) -> dict:
 
 def _assert_snapshot_unchanged(root: Path, metadata: dict) -> None:
     """Refuse to activate if anything changed after the archive was taken."""
-    for name, expected in metadata.get("components", {}).items():
+    for name, expected in metadata.get("locked_components", metadata.get("components", {})).items():
         current = root / name
         _regular(current, name)
         size, digest = _file_digest(current)
         if size != expected["size"] or digest != expected["sha256"]:
             raise ConflictError(f"realm changed while preparing upgrade: {name}")
-    archived = set(metadata.get("components", {}))
+    archived = set(metadata.get("locked_components", metadata.get("components", {})))
     current = {f"realm.sqlite3{suffix}" for suffix in ("", "-wal", "-shm", "-journal") if (root / f"realm.sqlite3{suffix}").exists()}
     if current != archived:
         raise ConflictError("realm SQLite sidecars changed while preparing upgrade")
@@ -1180,7 +1218,7 @@ def _copy_shared(source: sqlite3.Connection, target: sqlite3.Connection, columns
         target.execute("PRAGMA foreign_keys=OFF")
         fingerprints = {}
         try:
-            for table in sorted(columns):
+            for table in sorted(columns, key=lambda name: (name != "task_specs", name)):
                 names = columns[table]
                 source_count, source_digest = _row_digest(source, table, names, deadline=deadline)
                 quoted = ", ".join(_quote(name) for name in names)
@@ -1195,6 +1233,11 @@ def _copy_shared(source: sqlite3.Connection, target: sqlite3.Connection, columns
                     for row in rows:
                         values = list(row)
                         body = values[spec_index]
+                        try:
+                            if not isinstance(json.loads(body), dict):
+                                raise ValueError("spec is not an object")
+                        except (ValueError, TypeError) as exc:
+                            raise ValidationError("legacy spec cannot be losslessly converted") from exc
                         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
                         target.execute(
                             "INSERT OR IGNORE INTO task_specs(digest, body_json, created_at) VALUES (?, ?, ?)",
@@ -1213,6 +1256,7 @@ def _copy_shared(source: sqlite3.Connection, target: sqlite3.Connection, columns
                     if (source_count, source_digest) != (count, digest):
                         raise ValidationError(f"source and staged rows differ for table {table}")
                     fingerprints[table] = {"rows": count, "sha256": digest}
+            _validate_spec_records(target)
             target.execute(
                 "INSERT INTO runtime_schema(id, format_id, version, created_at) VALUES (1, ?, ?, ?)",
                 (CANONICAL_FORMAT_ID, SCHEMA_VERSION, now()),
@@ -1298,12 +1342,8 @@ def upgrade_realm(
         raise ValidationError("upgrade requires a supported legacy v23 manifest")
     if confirmation != f"UPGRADE {identity['realm_id']}":
         raise ValidationError(f"upgrade requires confirmation exactly 'UPGRADE {identity['realm_id']}'")
-    if identity["generation_count"]:
-        raise ValidationError("generation-tag backfill requires the durable coordinator; preserve this realm and retry after the coordinator is available")
-    unsupported = {table for table, count in identity["additive_row_counts"].items() if count or table == "task_specs"}
-    if unsupported:
-        raise ValidationError("v23 additive tables are not supported by the existing rebuild; preserve the source and use a supported export or recovery route: " + ", ".join(sorted(unsupported)))
-    with _owner_fence(root):
+    from . import v33_lifecycle as lifecycle
+    with _owner_fence(root), lifecycle.sqlite_observation(root) as original_sqlite:
         source_db = root / "realm.sqlite3"
         source = None
         locked_source = None
@@ -1313,6 +1353,8 @@ def upgrade_realm(
         archive = None
         temporary_archive_parent = None
         preserve_temporary_archive = False
+        lifecycle_archive = None
+        from . import v33_lifecycle as lifecycle
         try:
             # Recheck the actual source while holding the SQLite writer fence,
             # before creating an archive or staging directory.
@@ -1324,11 +1366,8 @@ def upgrade_realm(
             if (locked["fingerprint"] != identity["fingerprint"] or
                     (stat_now.st_dev, stat_now.st_ino) != identity["source_file_identity"][:2]):
                 raise ConflictError("legacy realm changed before upgrade")
-            if locked_source.execute("SELECT COUNT(*) FROM generations").fetchone()[0]:
-                raise ConflictError("generations changed before upgrade; durable backfill is required")
-            if any(locked_source.execute(f"SELECT COUNT(*) FROM {_quote(table)}").fetchone()[0]
-                   for table in identity["additive_row_counts"]):
-                raise ConflictError("legacy additive tables changed before upgrade; the rebuild cannot preserve them")
+            if locked_source.execute("SELECT COUNT(*) FROM generations").fetchone()[0] != identity["generation_count"]:
+                raise ConflictError("generation scope changed after preflight")
             operation_id = uuid.uuid4().hex
             if archive_parent is None:
                 temporary_archive_parent = Path(
@@ -1341,7 +1380,9 @@ def upgrade_realm(
             # Archive before opening SQLite.  Even a read-only SQLite
             # connection may create/update a WAL shared-memory sidecar; the
             # source tree must remain byte-identical on every rejected plan.
-            archive_meta = _archive_source(root, archive)
+            archive_meta = _archive_source(original_sqlite, archive)
+            archive_meta["locked_components"] = {p.name: {"size": p.stat().st_size, "sha256": _file_digest(p)[1]}
+                for p in root.glob("realm.sqlite3*") if p.name in {"realm.sqlite3" + suffix for suffix in ("", "-wal", "-shm", "-journal")}}
             # Read from a disposable copy as SQLite may modify its SHM even
             # in read-only mode. The recovery image and its hashes stay exact.
             stage_dir = Path(tempfile.mkdtemp(prefix=".realm-upgrade-", dir=root.parent))
@@ -1354,11 +1395,6 @@ def upgrade_realm(
             stat_now = source_db.stat()
             if current["fingerprint"] != identity["fingerprint"] or (stat_now.st_dev, stat_now.st_ino) != identity["source_file_identity"][:2]:
                 raise ConflictError("legacy realm changed before upgrade")
-            if source.execute("SELECT COUNT(*) FROM generations").fetchone()[0]:
-                raise ConflictError("generations changed before upgrade; durable backfill is required")
-            if any(source.execute(f"SELECT COUNT(*) FROM {_quote(table)}").fetchone()[0]
-                   for table in identity["additive_row_counts"]):
-                raise ConflictError("legacy additive tables changed before upgrade; the rebuild cannot preserve them")
             tables, columns, source_version = _source_shape(source)
             source_check = _quick_check(source, timeout_seconds)
             if source_check != "ok":
@@ -1377,6 +1413,7 @@ def upgrade_realm(
                 count, digest = _row_digest(source, table, table_columns, deadline=time.monotonic() + timeout_seconds)
                 legacy[table] = {"columns": table_columns, "rows": count, "sha256": digest}
             archive_meta["legacy_tables"] = legacy
+            lifecycle_archive, activation_record = lifecycle.activation(root) or lifecycle.begin(root, identity, recovery_root=archive / "recovery", sqlite_image=original_sqlite)
             stage_db = stage_dir / "realm.sqlite3"
             target = sqlite3.connect(stage_db)
             target.executescript(CANONICAL_SCHEMA_SQL)
@@ -1392,12 +1429,12 @@ def upgrade_realm(
             source.close()
             source = None
             _assert_snapshot_unchanged(root, archive_meta)
-            locked_source.rollback()
-            locked_source.close()
-            locked_source = None
             # The source WAL is part of the archived evidence.  Checkpoint it
             # before replacing the DB so a crash cannot make SQLite apply an
             # old WAL to the newly activated canonical file.
+            locked_source.rollback()
+            locked_source.close()
+            locked_source = None
             restore_required = True
             _checkpoint_source_wal(source_db)
             archive_meta.update({
@@ -1424,12 +1461,21 @@ def upgrade_realm(
             # The completed publication is now covered by restore_required;
             # a failed directory flush must take the rollback path too.
             platform.flush_replace(stage_db, source_db)
+            lifecycle.phase(lifecycle_archive, activation_record, "schema_committed")
+            backfill_connection = sqlite3.connect(source_db)
+            try:
+                backfill_connection.row_factory = sqlite3.Row
+                completion = lifecycle.complete_backfill(root, backfill_connection, lifecycle_archive, activation_record)
+            finally:
+                backfill_connection.close()
             archive_meta.update({"state": "activated", "activated_at": now()})
             _write_manifest(archive, archive_meta)
             return {
                 "ok": True,
                 "realm_id": realm_id,
                 "archive": str(archive) if retain_backup else None,
+                "recovery_set": str(lifecycle_archive),
+                "backfill": completion,
                 "backup_retained": bool(retain_backup),
                 "root": str(root),
                 "source_schema_version": int(source_version),
@@ -1444,6 +1490,14 @@ def upgrade_realm(
         except Exception:
             if target is not None:
                 target.close()
+            if source is not None:
+                source.close(); source = None
+            if locked_source is not None:
+                locked_source.close(); locked_source = None
+            if not restore_required and lifecycle_archive is not None:
+                lifecycle.restore(root, lifecycle_archive)
+            elif not restore_required:
+                lifecycle.restore_observation(root, original_sqlite)
             if restore_required and archive is not None:
                 # A post-swap sidecar or manifest failure must not strand a
                 # half-activated realm. Restore the archived byte snapshot;
@@ -1466,6 +1520,8 @@ def upgrade_realm(
                         elif restored_sidecar.exists() or restored_sidecar.is_symlink():
                             restored_sidecar.unlink()
                     _fsync_directory(root)
+                    if lifecycle_archive is not None:
+                        lifecycle.restore(root, lifecycle_archive)
                 except Exception as rollback_error:
                     # Keep the only rollback image if restoration itself
                     # fails. Its path is deterministic from this exception's
@@ -1832,7 +1888,7 @@ def _collect_historical_candidates(
         params.append(task_id)
     spec_join = (
         "LEFT JOIN task_specs s ON s.digest=t.spec_digest "
-        if "task_specs" in _tables(connection) else ""
+        if "spec_digest" in _table_columns(connection, "tasks") else ""
     )
     spec_select = "s.body_json AS spec_json" if spec_join else "t.spec_json"
     tasks = connection.execute(
@@ -2216,6 +2272,8 @@ def _generation_tag_evidence(connection, generation, *, version: int,
             if effect.get("effect_type") in {"generation.publish_v1", "generation.create_with_variant"}:
                 payload = _generation_tag_object(effect.get("payload", {}), reason="malformed_source_effect")
                 merge_metadata(payload.get("metadata", {}))
+                if payload.get("modality") in {"image", "video", "audio"}:
+                    merge({"kind": payload["modality"]})
         for row in (task, run):
             spec = stored_spec(row)
             if spec is not None:

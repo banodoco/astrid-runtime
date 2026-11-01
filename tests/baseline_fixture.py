@@ -24,6 +24,7 @@ from pathlib import Path
 from precut_realm_fixture import FIXTURE_BACKUP_KEY
 from restore_history_fixture import load_restore_history_fixture
 from runtime_protocol.backup import restore_backup, verify_backup
+from runtime_protocol.upgrade import inspect_realm_schema, migrate_canonical_to_current
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.timeline_commit_baseline import verify_baseline
 
@@ -68,11 +69,13 @@ def load_baseline_fixture(tmp_path, variant="single"):
             archive.extractall(extracted, members=members, filter="data")
     name = "backup" if variant == "single" else variant
     backup = extracted / name
-    verified = verify_backup(backup, key=FIXTURE_BACKUP_KEY)
+    verified = verify_backup(backup, key=FIXTURE_BACKUP_KEY, older_schema=True)
     if verified["manifest"]["schema"]["version"] != 31:
         raise AssertionError("baseline fixture is not schema 31")
     root = tmp_path / f"baseline-{variant}"
-    restore_backup(backup, root, key=FIXTURE_BACKUP_KEY)
+    restore_backup(backup, root, key=FIXTURE_BACKUP_KEY, older_schema=True)
+    identity = inspect_realm_schema(root)
+    migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
     publications = json.loads((extracted / f"{name}-publications.json").read_text())
     service = RuntimeService(root)
     project_selector = "cutover" if variant == "cutover" else "composition"

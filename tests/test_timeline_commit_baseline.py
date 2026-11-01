@@ -180,6 +180,8 @@ def test_later_document_write_without_parent_event_invalidates_head(tmp_path, mo
 
 def test_later_display_rename_is_not_an_authored_write(published):
     service, project_id, accepted = published
+    from test_timeline_commit_provider import Provider
+    service.register_timeline_commit_provider(Provider())
     service.rename_timeline(project_id, "main", {"name": "Renamed"}, idempotency_key="rename")
     assert _verify(service, project_id)["head"]["publication_id"] == accepted["receipt"]["receipt_id"]
 
@@ -241,6 +243,8 @@ def test_install_plan_refuses_replacement_same_revision_publication(tmp_path):
 
 def test_foreign_scope_and_foreign_child_are_refused(published):
     service, project_id, _ = published
+    from test_timeline_commit_provider import Provider
+    service.register_timeline_commit_provider(Provider())
     other = service.create_project({"slug": "other", "name": "Other"}, idempotency_key="other")
     _refused(lambda: _verify(service, other["id"]))
     service.store.conn.execute("UPDATE internal_timeline_revisions SET project_id=? WHERE id='timeline-rev-1'", (other["id"],))
@@ -447,6 +451,8 @@ def test_corrupt_old_head_is_not_guessed_from_equal_content(tmp_path, monkeypatc
 
 def test_unrelated_project_and_timeline_writes_do_not_invalidate_baseline(published):
     service, project_id, accepted = published
+    from test_timeline_commit_provider import Provider
+    service.register_timeline_commit_provider(Provider())
     other = service.create_project({"slug": "unrelated", "name": "Unrelated"}, idempotency_key="unrelated")
     service.create_timeline(other["id"], "elsewhere", idempotency_key="elsewhere")
     service.create_document(other["id"], {"document_id": "notes", "kind": "notes", "content": {}}, idempotency_key="notes")

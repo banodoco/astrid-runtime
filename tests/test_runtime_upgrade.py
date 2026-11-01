@@ -132,26 +132,28 @@ def test_upgrade_preserves_canonical_rows_and_retains_backup_only_when_requested
     root = tmp_path / "realm"
     realm_id = _legacy_realm(root)
 
-    result = upgrade_realm(root, retain_backup=retain_backup, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    if not retain_backup:
+        before = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        with pytest.raises(ValidationError, match="retained archive"):
+            upgrade_realm(root, retain_backup=False, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+        assert {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+        assert not (tmp_path / "archives").exists()
+    result = upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     assert result["ok"] is True
-    assert result["backup_retained"] is retain_backup
+    assert result["backup_retained"] is True
     assert not list(tmp_path.glob(".realm-upgrade-transaction-*"))
-    if retain_backup:
-        archive = tmp_path / "realm" / "realm-upgrade-backups" / result["archive"].split("/")[-1]
-        manifest = json.loads((archive / "manifest.json").read_text())
-        assert manifest["source_schema_version"] == 23
-        assert manifest["target_schema_version"] == SCHEMA_VERSION
-        assert manifest["historical_managed_outputs"]["migrated"] == 1
-        assert set(manifest["legacy_tables"]) >= {"schema_migrations", "lost_and_found"}
-        assert (archive / "realm.sqlite3").is_file()
-        archived = sqlite3.connect(archive / "realm.sqlite3")
-        try:
-            assert archived.execute("SELECT payload FROM lost_and_found WHERE id=1").fetchone()[0] == b"legacy-bytes"
-        finally:
-            archived.close()
-    else:
-        assert result["archive"] is None
-        assert not (root / "realm-upgrade-backups").exists()
+    archive = Path(result["archive"])
+    manifest = json.loads((archive / "manifest.json").read_text())
+    assert manifest["source_schema_version"] == 23
+    assert manifest["target_schema_version"] == SCHEMA_VERSION
+    assert manifest["historical_managed_outputs"]["migrated"] == 1
+    assert set(manifest["legacy_tables"]) >= {"schema_migrations", "lost_and_found"}
+    assert (archive / "realm.sqlite3").is_file()
+    archived = sqlite3.connect(archive / "realm.sqlite3")
+    try:
+        assert archived.execute("SELECT payload FROM lost_and_found WHERE id=1").fetchone()[0] == b"legacy-bytes"
+    finally:
+        archived.close()
 
     reopened = RealmStore(root)
     try:
@@ -513,7 +515,7 @@ def test_current_inspection_and_noop_reject_symlink_alias_without_mutation(tmp_p
 def test_upgrade_repairs_missing_historical_object_indexes(tmp_path):
     root = tmp_path / "realm"
     realm_id = _legacy_realm(root, register_indexes=False)
-    result = upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    result = upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     assert result["historical_managed_outputs"]["migrated"] == 1
     reopened = RealmStore(root)
     try:
@@ -617,27 +619,29 @@ def test_repair_generic_media_types_updates_object_association_and_variant(tmp_p
 def test_upgrade_is_not_repeatable_and_refuses_live_owner(tmp_path):
     root = tmp_path / "realm"
     realm_id = _legacy_realm(root)
-    upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     active_names = ("realm.sqlite3", "realm.sqlite3-wal", "realm.sqlite3-shm", "realm.sqlite3-journal")
     after = {
         name: hashlib.sha256((root / name).read_bytes()).hexdigest()
         for name in active_names
         if (root / name).exists()
     }
-    with pytest.raises(ValidationError, match="schema_migrations"):
-        upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    with pytest.raises(ValidationError, match="legacy v23 manifest"):
+        upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     assert {
         name: hashlib.sha256((root / name).read_bytes()).hexdigest()
         for name in active_names
         if (root / name).exists()
     } == after
 
+    root = tmp_path / "other-legacy"
+    realm_id = _legacy_realm(root)
     lock = (root / "owner.lock").open("a+")
     try:
         from runtime_protocol import platform as runtime_platform
         runtime_platform.lock_file(lock.fileno(), exclusive=True, blocking=False)
         with pytest.raises(OwnerBusyError):
-            upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+            upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     finally:
         runtime_platform.unlock_file(lock.fileno())
         lock.close()
@@ -665,8 +669,8 @@ os._exit(0)
         path.name: path.read_bytes() for path in root.glob("realm.sqlite3*") if path.is_file()
     }
 
-    result = upgrade_realm(root, retain_backup=True, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
-    archive = root / "realm-upgrade-backups" / result["archive"].split("/")[-1]
+    result = upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    archive = Path(result["archive"])
     manifest = json.loads((archive / "manifest.json").read_text())
     assert "realm.sqlite3-wal" in manifest["components"]
     assert (archive / "realm.sqlite3-wal").is_file()
@@ -736,14 +740,15 @@ def test_upgrade_restores_after_publication_and_preserves_uncertain_rollback(
     error_type = OSError if rollback_failure is None else RuntimeError
     message = "injected" if rollback_failure is None else "rollback failed; recovery snapshot preserved at"
     with pytest.raises(error_type, match=message) as error:
-        upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+        upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
 
     assert len(failed_forward) == 1
     assert bool(failed_rollback) == (rollback_failure is not None)
-    snapshots = list(tmp_path.glob(".realm-upgrade-transaction-*/v23-*/realm.sqlite3"))
+    snapshots = list((tmp_path / "archives").glob("v23-*/realm.sqlite3"))
     if rollback_failure is None:
         assert source_db.read_bytes() == original
-        assert snapshots == []
+        assert len(snapshots) == 1
+        assert snapshots[0].read_bytes() == original
     else:
         assert len(snapshots) == 1
         assert snapshots[0].read_bytes() == original
@@ -774,7 +779,7 @@ def test_upgrade_and_compaction_flush_owned_files_through_writable_handles(tmp_p
 
     monkeypatch.setattr(upgrade.os, "fsync", writable_fsync)
     if operation == "upgrade":
-        assert upgrade_realm(root, confirmation=f"UPGRADE {realm_id}")["ok"]
+        assert upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", confirmation=f"UPGRADE {realm_id}")["ok"]
     else:
         assert upgrade.compact_idempotency_ledger(root, confirmation=f"COMPACT IDEMPOTENCY {realm_id}")["ok"]
     assert flushed_files
@@ -809,7 +814,7 @@ os._exit(0)
 
     monkeypatch.setattr(platform, "flush_replace", flush)
     with pytest.raises(OSError, match="injected post-publication failure"):
-        upgrade_realm(root, confirmation=f"UPGRADE {realm_id}")
+        upgrade_realm(root, retain_backup=True, archive_root=tmp_path / "archives", confirmation=f"UPGRADE {realm_id}")
     assert len(publications) == 1
     assert {path.name: path.read_bytes() for path in root.glob("realm.sqlite3*") if path.is_file()} == original
     assert not list(tmp_path.glob(".realm-upgrade-transaction-*"))

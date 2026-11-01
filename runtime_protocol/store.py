@@ -832,6 +832,8 @@ class RealmStore:
             # copied. A malformed or unsupported root with no marker is still
             # inspected first, preserving the no-side-effect admission
             # contract; the directory lock serializes competing fresh opens.
+            from .v33_lifecycle import check_startup
+            check_startup(self.root)
             owner_marker_present = self.lock_path.exists() or self.lock_path.is_symlink()
             if acquire_owner and owner_marker_present:
                 self._acquire_owner()

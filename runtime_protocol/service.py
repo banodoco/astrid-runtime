@@ -563,6 +563,7 @@ class RuntimeService:
         self._admission_failure = None
         self._readiness_callback = None
         self._timeline_commit_provider = None
+        self._v33_provider_registered = False
         self._timeline_commit_started = False
         self._timeline_commit_store = None
         self._timeline_commit_coordinator = None
@@ -845,6 +846,11 @@ class RuntimeService:
         return {"status": "ok" if self._verified and live else "degraded", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"], "runtime_session_id": self.runtime_session_id}
 
     def _assert_mutation_admitted(self):
+        if not getattr(self, "_registering_v33_provider", False):
+            from .v33_lifecycle import require_ready, MARKER
+            require_ready(self.store.root)
+            if (self.store.root / MARKER).exists() and not self._v33_provider_registered:
+                raise ConflictError("v33 provider registration is required for this process before requests and fresh pins")
         if not self._verified:
             raise RealmAdmissionError(
                 "realm is not admitted for mutations",
@@ -3021,16 +3027,76 @@ class RuntimeService:
             # Install verified legacy facts before serving requests. Preview
             # and rejected edits must never persist baseline/history rows.
             heads = self.store.conn.execute(
-                "SELECT project_id, timeline_id FROM parent_composition_heads "
-                "WHERE revision_id IS NOT NULL AND publication_id IS NULL",
+                "SELECT project_id, timeline_id, publication_id FROM parent_composition_heads "
+                "WHERE revision_id IS NOT NULL",
             ).fetchall()
-            for head in heads:
-                try:
-                    commits.install_verified_baseline(head["project_id"], head["timeline_id"],
-                                                      authorize=self._assert_mutation_admitted)
-                except (CommitRejected, ConflictError):
-                    pass  # An unprovable existing timeline stays read-only.
-            self._timeline_commit_provider = provider
+            inventory = []
+            self._registering_v33_provider = True
+            try:
+                for head in heads:
+                    try:
+                        if head["publication_id"] is None:
+                            commits.install_verified_baseline(head["project_id"], head["timeline_id"],
+                                                              authorize=self._assert_mutation_admitted,
+                                                              verify_inputs=self._verify_legacy_media_selections)
+                        else:
+                            verified_head = commits.head(head["project_id"], head["timeline_id"])
+                            self._verify_legacy_media_selections(commits.revision_closure(head["project_id"], head["timeline_id"], verified_head["revision_id"]))
+                        inventory.append({**dict(head), "access": "verified"})
+                    except (CommitRejected, ConflictError, ValidationError) as exc:
+                        inventory.append({**dict(head), "access": "read_only", "reason": str(exc), "details": getattr(exc, "details", None)})
+                from .v33_lifecycle import provider_ready
+                provider_ready(self.store.root, inventory)
+                self._timeline_commit_provider = provider
+                self._v33_provider_registered = True
+            finally:
+                self._registering_v33_provider = False
+
+    def _verify_legacy_media_selections(self, document):
+        """Recheck explicit retained five-field pins without rewriting them."""
+        from .timeline_commit_port import MediaReads
+        def verify(value):
+            if isinstance(value, dict):
+                if set(value) == {"asset", "generation_id", "variant_id", "object_id", "catalog_digest"}:
+                    try:
+                        MediaReads(self).selected(document["project_id"], value)
+                    except (ConflictError, ValidationError, NotFoundError) as exc:
+                        raise ConflictError("Timeline is read-only because a retained media selection changed. Inspect/export the original or restore the matching backup.",
+                            details={"reason": "history_unavailable", "integrity_reason": "retained_media_selection_changed", "input": value}) from exc
+                for child in value.values():
+                    verify(child)
+            elif isinstance(value, list):
+                for child in value:
+                    verify(child)
+        verify(document)
+
+    def timeline_recovery_inventory(self, project_id, timeline_id, *, authorize):
+        """Authenticated per-timeline D4 reason and original inspect/export facts."""
+        from .timeline_recovery import inventory
+        from .timeline_commit import CommitRejected
+        from .v33_lifecycle import activation
+        check = self._timeline_authorize(project_id, timeline_id, authorize, mutation=False)
+        with self.store._mutex:
+            check()
+            commits, _ = self._timeline_commits()
+            try:
+                head = commits.head(project_id, timeline_id)
+                self._verify_legacy_media_selections(commits.revision_closure(project_id, timeline_id, head["revision_id"]))
+                reason = {"code": "provider_unavailable", "message": "Register the selected Timeline provider before editing."} if self._timeline_commit_provider is None else None
+            except (CommitRejected, ConflictError) as exc:
+                head = None
+                reason = {"code": "history_unavailable", "message": str(exc), "details": getattr(exc, "details", None)}
+            state = activation(self.store.root)
+            if reason and state:
+                retained = next((item for item in state[1].get("baseline_inventory", [])
+                                 if item.get("project_id") == project_id and item.get("timeline_id") == timeline_id
+                                 and item.get("access") == "read_only"), None)
+                if retained:
+                    reason = {"code": "history_unavailable", "message": retained["reason"], "details": retained.get("details")}
+            recovery = inventory(self.store.conn, self.store.root, project_id, timeline_id,
+                                 reason=reason, backup={"id": state[1]["backup_id"], "location": str(state[0])} if state else None)
+            recovery.update(access="read_only" if reason else "verified", last_verified_head=head)
+            return recovery
 
     def _timeline_commits(self):
         from .timeline_commit_validation import validate_commit_value
@@ -3148,6 +3214,8 @@ class RuntimeService:
         def port_factory(bound_context):
             require_active()
             self._ensure_timeline_commit_baseline(commits, project_id, timeline_id, require_active)
+            current_head = commits.head(project_id, timeline_id)
+            self._verify_legacy_media_selections(commits.revision_closure(project_id, timeline_id, current_head["revision_id"]))
             return RequestCommitPort(self, commits, bound_context, require_active)
         if timing is not None:
             timing.end("service_admission")
@@ -3315,6 +3383,7 @@ class RuntimeService:
             raise
 
     def get_project_media_selection(self, project_id, selectors, *, authorize):
+        self._assert_mutation_admitted()
         from .timeline_commit_port import MediaReads, detached
         selectors = detached(selectors)
         if not isinstance(selectors, dict) or set(selectors) not in (
