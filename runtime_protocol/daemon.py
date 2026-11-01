@@ -1275,12 +1275,15 @@ class RuntimeDaemon:
             first = verify_restore_candidate(candidate, directory_identity=candidate_identity)
             if self.service.realm["id"] != first["manifest"].get("realm", {}).get("id"):
                 raise ConflictError("replacement realm identity does not match the live realm")
+            from .v34_lifecycle import assert_replacement_preserves_custody
+            assert_replacement_preserves_custody(self.root, candidate)
             self._write_replacement_state(state="verified", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
             self.stop()
             self._write_replacement_state(state="owner_stopped", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
             validate_parent(self.root, active_identity)
             validate_parent(candidate, candidate_identity)
             second = verify_restore_candidate(candidate, directory_identity=candidate_identity)
+            assert_replacement_preserves_custody(self.root, candidate)
             if second["database_sha256"] != first["database_sha256"]:
                 raise ConflictError("replacement candidate changed during preparation")
             parent_fd = int(active_identity["_parent_fd"])
@@ -1457,6 +1460,8 @@ class RuntimeDaemon:
             custody = self._acquire_offline_custody()
             validate_parent(self.root, active_identity)
             validate_parent(candidate, candidate_identity)
+            from .v34_lifecycle import assert_replacement_preserves_custody
+            assert_replacement_preserves_custody(self.root, candidate)
             self._write_replacement_state(state="offline_verified", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
             if sys.platform == "win32":
                 # Directory admission now fences every opener; Windows needs

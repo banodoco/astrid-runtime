@@ -414,9 +414,9 @@ def test_reconcile_timeout_and_reference_bound_never_prove_stop(world,monkeypatc
     with pytest.raises(ConflictError):c.stage_evidence(r['custody_id'],b'two',expected_version=2,custody_seq=3,ref='two')
     b=body(w)
     monotonic=module.time.monotonic
-    ticks=iter([monotonic(),monotonic()+31])
+    start=monotonic();ticks=iter([start,start,start+31])
     with monkeypatch.context() as patch:
-        patch.setattr(module.time,'monotonic',lambda:next(ticks))
+        patch.setattr(module.time,'monotonic',lambda:next(ticks,start+31))
         with pytest.raises(module.UnresolvedTimeout):reconcile(w,b)
     retained(w)
     assert c.compact()==0
@@ -463,3 +463,33 @@ def test_actual_wall_timeout_returns_without_stuck_transport(world,monkeypatch):
         assert time.monotonic()-start<1
         retained(w)
     finally:gate.set()
+
+
+def test_cancellation_racing_staged_recovery_keeps_exact_lineage(world,monkeypatch):
+    w=world;r=arm(w);b=body(w)
+    def cancel(self,name):
+        if name=='proof_staged':
+            self.store.cancel_task(r['task_id'])
+            retained(w)
+    with monkeypatch.context() as patch:
+        patch.setattr(Custody,'_boundary',cancel)
+        result=reconcile(w,b)
+    assert result['custody_state']=='released'
+    assert result['recovery_generation']==1
+    assert w['service'].store.conn.execute("SELECT COUNT(*) FROM events WHERE kind='task.custody_released'").fetchone()[0]==1
+
+
+def test_conflicting_concurrent_recovery_only_one_commits(world):
+    w=world;arm(w);first=body(w);second=copy.deepcopy(first)
+    e=second['proof']['envelope'];e['nonce']='competing-recovery'
+    second['proof']['signature']=base64.b64encode(w['key'].sign(signed_bytes(e))).decode()
+    def recover(item):
+        b,key=item
+        try:return reconcile(w,b,replay=key)
+        except ConflictError:return 'conflict'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results=list(pool.map(recover,[(first,'first'),(second,'second')]))
+    assert sum(isinstance(result,dict) for result in results)==1
+    assert results.count('conflict')==1
+    assert w['service'].store.custody.row(w['custody_id'])['recovery_generation']==1
+    assert w['service'].store.conn.execute("SELECT COUNT(*) FROM events WHERE kind='task.custody_released'").fetchone()[0]==1

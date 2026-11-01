@@ -3056,6 +3056,8 @@ class RuntimeService:
                         inventory.append({**dict(head), "access": "read_only", "reason": str(exc), "details": getattr(exc, "details", None)})
                 from .v33_lifecycle import provider_ready
                 provider_ready(self.store.root, inventory)
+                from .v34_lifecycle import provider_ready as custody_provider_ready
+                custody_provider_ready(self.store.root, inventory)
                 self._timeline_commit_provider = provider
                 self._v33_provider_registered = True
             finally:
@@ -7914,6 +7916,8 @@ class RuntimeService:
         custody = self.store.custody.blocking(task_id) if task_id else None
         if not custody:
             return
+        if body.get("stop_observed") is True:
+            raise ConflictError("bare stop_observed is not custody release authority")
         self._assert_attempt_identity(row, kwargs.get("identity"))
         self._validate_attempt_lease(row, body, self.store._current_runtime_epoch())
         self._validate_terminal_result_body(body)
@@ -7953,7 +7957,6 @@ class RuntimeService:
             self.store.custody.stage_evidence(current["custody_id"],data,
                 expected_version=current["custody_version"],custody_seq=current["custody_seq"]+1,ref=object_ref)
 
-    @_verified_mutation
     def reconcile_task_custody(self, task_id, body, *, idempotency_key, identity):
         # Separate recovery authority; no reuse of ordinary lease credentials.
         self._assert_mutation_admitted()
@@ -9681,6 +9684,11 @@ class RuntimeService:
                 if sha256_bytes(existing_bytes) != existing["checkpoint_digest"] or json.loads(existing_bytes.decode("utf-8")) != payload:
                     raise ConflictError("recovery checkpoint authorization already binds different bytes")
                 return {"checkpoint_id": existing["id"], "attempt_id": existing["attempt_id"], "task_id": existing["task_id"], "runtime_epoch": existing["runtime_epoch"], "nonce": nonce, "digest": "sha256:" + existing["checkpoint_digest"], "size": existing["checkpoint_size"], "state": existing["state"], "path": existing["checkpoint_path"]}
+            custody = self.store.custody.blocking(row["task_id"])
+            if custody and not any(ref["ref"] == "checkpoint:" + sha256_bytes(durable_bytes) for ref in json.loads(custody["evidence_refs_json"])):
+                self.store.custody.stage_evidence(custody["custody_id"],durable_bytes,
+                    expected_version=custody["custody_version"],custody_seq=custody["custody_seq"]+1,
+                    ref="checkpoint:" + sha256_bytes(durable_bytes))
             checkpoint_id = new_id()
             path = self.store.root / "checkpoints" / f"{checkpoint_id}.json"
             root_identity, root_fd, _ = _pin_directory(self.store.root)

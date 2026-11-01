@@ -173,6 +173,11 @@ def _interruption_report(connection: sqlite3.Connection) -> dict[str, object]:
             lease_expires_at=row["lease_expires_at"], lease_expired=row["lease_expired"],
             runtime_epoch=row["runtime_epoch"],
         ))
+    if "attempt_custody" in tables:
+        for row in connection.execute("SELECT custody_id,task_id,attempt_id,custody_state,recovery_generation FROM attempt_custody WHERE custody_state<>'released'"):
+            task = task_metadata.get(row["task_id"], {})
+            blockers.append(_normalized_blocker(task,row["task_id"],"attempt_custody_unresolved",observed_at,
+                custody_id=row["custody_id"],attempt_id=row["attempt_id"],custody_state=row["custody_state"],recovery_generation=row["recovery_generation"]))
     blockers.sort(
         key=lambda row: (
             str(row["task_id"]),
@@ -180,12 +185,7 @@ def _interruption_report(connection: sqlite3.Connection) -> dict[str, object]:
             str(row.get("attempt_id", row.get("binding_id", row.get("resource_key", "")))),
         )
     )
-    is_blocked = bool(
-        active_tasks
-        or unreconciled_attempts
-        or claimed_bindings
-        or unreleased_reservations
-    )
+    is_blocked = bool(blockers)
     task_count = len({str(row["task_id"]) for row in blockers})
     headline, message = _blocker_text(blockers, task_count=task_count)
     return {

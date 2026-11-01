@@ -48,6 +48,9 @@ def phase(root, archive, record, state):
 
 
 def begin(root, identity, observation):
+    pending = activation(root)
+    if pending and pending[1]["state"] != "ready":
+        raise ConflictError("v34 activation already exists; resume its verified recovery set")
     archive = root.parent / '.v34-recovery' / uuid.uuid4().hex
     platform.private_directory(archive)
     if archive.stat().st_dev != root.stat().st_dev:
@@ -169,7 +172,7 @@ def migrate(root, *, confirmation, expected_realm_id=None, timeout_seconds=120):
             'admission_closed': True, 'recovery_set': str(archive), 'next_action': 'activate_v34'}
 
 
-def activate(root):
+def activate(root, *, admit=True):
     """Offline acknowledgement after complete V34 and archive verification."""
     from .upgrade import inspect_realm_schema, _owner_fence
     root = Path(root).resolve()
@@ -189,11 +192,18 @@ def activate(root):
                     raise ConflictError('v34 activation integrity failed')
             finally:
                 connection.close()
-        phase(root, archive, record, 'ready')
-    return {'ok': True, 'admission_closed': False, 'schema_version': 34}
+        if not admit:
+            record['provider_verified'] = False
+        phase(root, archive, record, 'ready' if admit else 'activation_verified')
+    return {'ok': True, 'admission_closed': not admit, 'schema_version': 34}
 
 
 def check_startup(root):
+    pending = activation(root)
+    if pending and pending[1]['state'] == 'activation_verified' and pending[1].get('operator_owned'):
+        import os
+        if os.environ.get('ASTRID_V33_ACTIVATION') == pending[1]['operation_id']:
+            return
     require_ready(root)
 
 
@@ -217,3 +227,53 @@ def rollback(root, archive):
 
 def boundary(name):
     """Crash injection seam."""
+
+
+def assert_replacement_preserves_custody(active, candidate):
+    """A snapshot cannot erase custody, keys, quarantine or replay history.
+
+    Call under owner/admission exclusion immediately before publication too.
+    Unreadable active authority is uncertainty and is refused, not guessed away.
+    """
+    from .custody_schema import CUSTODY_TABLES
+    from .upgrade import _row_digest, _table_columns, _tables
+    def facts(root):
+        with old.sqlite_observation(root) as observation:
+            db = sqlite3.connect(observation / 'realm.sqlite3')
+            db.row_factory = sqlite3.Row
+            try:
+                tables = _tables(db)
+                schema = db.execute('SELECT version FROM runtime_schema WHERE id=1').fetchone()
+                if not schema:
+                    raise ConflictError('replacement cannot establish the active custody schema')
+                if schema[0] < 34:
+                    canonical_manifest(db)
+                    return {}
+                if not CUSTODY_TABLES.issubset(tables):
+                    raise ConflictError('replacement cannot exclude damaged custody authority')
+                result = {t:_row_digest(db,t,_table_columns(db,t)) for t in CUSTODY_TABLES}
+                # An empty fresh domain has no old authority to preserve.
+                if not any(count for count, _ in result.values()):
+                    return {}
+                rows = list(db.execute('SELECT task_id,attempt_id FROM attempt_custody'))
+                for task in rows:
+                    for table,field,value in [('tasks','id',task['task_id']),('attempts','id',task['attempt_id']),('reservations','task_id',task['task_id'])]:
+                        entries = [dict(r) for r in db.execute(f'SELECT * FROM {table} WHERE {field}=? ORDER BY rowid',(value,))]
+                        result[(table,value)] = old.digest(entries)
+                return result
+            except sqlite3.DatabaseError as exc:
+                raise ConflictError('replacement cannot exclude surviving custody in an unreadable realm') from exc
+            finally:
+                db.close()
+    before = facts(active)
+    if before and before != facts(candidate):
+        raise ConflictError('replacement would erase or change custody, reservations, quarantine or replay state')
+
+
+def provider_ready(root, inventory):
+    pending = activation(root)
+    if pending and pending[1]['state'] == 'activation_verified':
+        archive, record = pending
+        record['provider_verified'] = True
+        record['baseline_inventory'] = inventory
+        phase(Path(root), archive, record, 'activation_verified')

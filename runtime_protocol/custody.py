@@ -14,6 +14,7 @@ import sqlite3
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -88,6 +89,17 @@ def timestamp(value):
         return parsed
     except (ValueError, TypeError, AttributeError) as exc:
         raise ValidationError('custody timestamp requires an explicit timezone') from exc
+
+
+@contextmanager
+def deadline_lock(lock, started):
+    remaining = INVOCATION_SECONDS - (time.monotonic() - started)
+    if remaining <= 0 or not lock.acquire(timeout=remaining):
+        raise UnresolvedTimeout('reconciliation timed out waiting for Runtime authority; custody retained')
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def declared_binding(spec):
@@ -289,7 +301,7 @@ class Custody:
             if prior:
                 if prior['request_digest'] != request_digest:
                     raise ConflictError('custody create idempotency conflict')
-                return json.loads(prior['result_json'])
+                return self.public(self.row(prior['custody_id']))
             if self.db.execute('SELECT id FROM realm').fetchone()[0] != request['realm_id']:
                 raise ConflictError('custody realm differs')
             self.assert_clear(installation_id=request['installation_id'])
@@ -349,6 +361,7 @@ class Custody:
             raise ValidationError('pending custody metadata exceeds 64 KiB; stage evidence first')
         if row['custody_state'] not in {'unresolved', 'lost_fenced'} or pending is not None:
             self.db.execute("UPDATE attempt_custody SET custody_state=CASE WHEN custody_state='lost_fenced' THEN custody_state ELSE 'unresolved' END, custody_version=custody_version+1, custody_seq=custody_seq+1, pending_publication_json=COALESCE(?,pending_publication_json), updated_at=? WHERE custody_id=?", (canonical_json(pending) if pending is not None else None, now(), row['custody_id']))
+            self._bounded_row(self.row(row['custody_id']))
             self._event(self.row(row['custody_id']), 'task.custody_unresolved', {'reason': reason, 'stop_confirmed': False})
         self.db.execute("UPDATE tasks SET waiting_reason='attempt_custody_unresolved', lease_expires_at=NULL, updated_at=? WHERE id=?", (now(), task_id))
         self.store.release_execution_attempt(task_id, status='stale')
@@ -527,7 +540,7 @@ class Custody:
         target = integer(body['target_recovery_generation'], 'target_recovery_generation', 1)
         sha(body['old_identity_digest']); opaque(body['custody_id'])
         rd = digest(body)
-        with self.store._mutex:
+        with deadline_lock(self.store._mutex, started):
             if self.db.in_transaction:
                 raise ConflictError('reconcile requires its own durable transaction boundaries')
             row = self.row(body['custody_id'])
@@ -622,6 +635,8 @@ class Custody:
                 self._event(result_row, 'task.custody_' + state, {'proof_digest': proof_digest, 'reservation_disposition': disposition if state == 'released' else 'retained'})
                 result = self._record(result_row, 'reconcile', idempotency_key, rd)
                 self._record(result_row, 'generation', target, rd)
+                if time.monotonic() - started >= INVOCATION_SECONDS:
+                    raise UnresolvedTimeout('reconciliation timed out before release commit; custody retained')
                 self._boundary('before_release_commit')
             self._boundary('release_committed')
             return result
@@ -643,12 +658,14 @@ class Custody:
         cutoff = timestamp(before) if before else datetime.now(timezone.utc) - timedelta(days=30)
         cutoff = min(cutoff, datetime.now(timezone.utc) - timedelta(days=30))
         with self.store._mutex, self.store._transaction():
-            rows = list(self.db.execute("SELECT * FROM attempt_custody WHERE custody_state='released' AND released_at<?", (cutoff.isoformat(),)))
+            rows = list(self.db.execute("SELECT * FROM attempt_custody WHERE custody_state='released' AND released_at<? AND (metadata_json<>'{}' OR pending_publication_json IS NOT NULL OR evidence_refs_json<>'[]')", (cutoff.isoformat(),)))
             for row in rows:
                 for pin in self.db.execute('SELECT digest FROM custody_evidence_pins WHERE custody_id=?', (row['custody_id'],)).fetchall():
                     self.db.execute('UPDATE custody_evidence SET refcount=refcount-1 WHERE digest=?', (pin['digest'],))
                 self.db.execute('DELETE FROM custody_evidence_pins WHERE custody_id=?', (row['custody_id'],))
-                self.db.execute("UPDATE attempt_custody SET metadata_json='{}', pending_publication_json=NULL, evidence_refs_json='[]' WHERE custody_id=?", (row['custody_id'],))
+                self.db.execute("UPDATE attempt_custody SET metadata_json='{}', pending_publication_json=NULL, evidence_refs_json='[]', custody_version=custody_version+1, custody_seq=custody_seq+1 WHERE custody_id=?", (row['custody_id'],))
+                current = self.row(row["custody_id"])
+                self._record(current, "compact", current["custody_seq"], digest({"released_version": row["released_version"]}))
             # Replay receipts, nonces, create identities and tombstones live for
             # the realm lifetime. Unresolved detail is never compacted.
             return len(rows)
@@ -695,7 +712,10 @@ class Custody:
             if remaining <= 0:
                 raise UnresolvedTimeout('dispatch query timed out; custody retained')
             try:
-                return bounded_call(lambda: supervisor.query(row['dispatch_intent_id']), remaining)
+                reply = bounded_call(lambda: supervisor.query(row['dispatch_intent_id']), remaining)
+                if not isinstance(reply, dict) or reply.get('dispatch_intent_id') != row['dispatch_intent_id']:
+                    raise OSError('dispatch query remains uncertain')
+                return reply
             except (OSError, UnresolvedTimeout):
                 if attempt == AUTOMATIC_RETRIES:
                     raise UnresolvedTimeout('dispatch query retry bound exhausted; custody retained')

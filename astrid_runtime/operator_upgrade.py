@@ -277,6 +277,9 @@ def _capture_installation(paths, archive, record):
 def _restore_installation(paths, realm_root, archive):
     from runtime_protocol import v33_lifecycle as lifecycle
     record = lifecycle.read_record(archive / "activation.json")
+    if record.get("format") == "astrid-v34-activation/v1":
+        from runtime_protocol.v34_lifecycle import rollback
+        rollback(realm_root, archive)
     lifecycle.verify_tree(archive / "support", record["support_inventory"])
     lifecycle.verify_tree(archive / "executable", record["executable_inventory"])
     if record.get("environment_inventory") is not None:
@@ -364,8 +367,41 @@ def recover_workspace(paths, boundary, config, *, timeout_seconds=DEFAULT_UPGRAD
         realm_id, realm_root = _realm_from_catalog(paths)
         if journal.get("realm_id") != realm_id or journal.get("realm_root") != str(realm_root):
             raise OperatorUpgradeError("recovery selection differs from the recorded upgrade")
-        _stop_selected(paths, boundary, realm_id, realm_root, config)
         archive = Path(journal["recovery_set"]) if journal.get("recovery_set") else None
+        if archive is not None:
+            from runtime_protocol import v33_lifecycle as records
+            record = records.read_record(archive / "activation.json")
+            if record.get("format") == "astrid-v34-activation/v1":
+                # Classify before stopping or mutating anything. Hybrids have
+                # no automatic recovery authority and must remain untouched.
+                current = inspect_realm_schema(realm_root, expected_realm_id=realm_id)
+                if current["kind"] not in {"U33", "V34"}:
+                    raise OperatorUpgradeError("custody recovery requires an intact U33 or V34 schema")
+                if record.get("target_profile") != config.resolve_source_profile(paths).as_dict():
+                    raise OperatorUpgradeError("custody recovery requires the recorded candidate executable")
+                records.verify_tree(archive / "support", record["support_inventory"])
+                records.verify_tree(archive / "executable", record["executable_inventory"])
+                _stop_selected(paths, boundary, realm_id, realm_root, config)
+                from runtime_protocol import v34_lifecycle as custody_lifecycle
+                custody_lifecycle.migrate(realm_root, confirmation=f"MIGRATE CANONICAL {realm_id}", expected_realm_id=realm_id, timeout_seconds=timeout_seconds)
+                custody_lifecycle.activate(realm_root, admit=False)
+                prior_token = os.environ.get("ASTRID_V33_ACTIVATION")
+                os.environ["ASTRID_V33_ACTIVATION"] = record["operation_id"]
+                try:
+                    result = _start_operation(paths, boundary, config, journal["operation_id"])
+                    verification = _verify_running(paths, boundary, result, timeout_seconds=timeout_seconds)
+                finally:
+                    if prior_token is None:
+                        os.environ.pop("ASTRID_V33_ACTIVATION", None)
+                    else:
+                        os.environ["ASTRID_V33_ACTIVATION"] = prior_token
+                record = records.read_record(archive / "activation.json")
+                if not record.get("provider_verified"):
+                    raise OperatorUpgradeError("candidate did not freshly verify its Timeline provider/baseline inventory")
+                custody_lifecycle.phase(realm_root, archive, record, "ready")
+                _journal(paths, operation_id=journal["operation_id"], state="complete", verification=verification)
+                return {"ok": True, "state": "complete", "operation_id": journal["operation_id"], "verification": verification}
+        _stop_selected(paths, boundary, realm_id, realm_root, config)
         with _owner_fence(realm_root):
             prior_config = _restore_installation(paths, realm_root, archive) if archive else config
         if archive is not None:
@@ -399,6 +435,7 @@ def upgrade_workspace(
     except Exception as exc:
         raise OperatorUpgradeError(str(exc)) from exc
     kind = _schema_kind(realm_root, expected_realm_id=realm_id)
+    custody_upgrade = int(identity["version"]) >= 33
     idle = _assert_idle(realm_root)
     operation_id = uuid.uuid4().hex
     archive = None
@@ -429,8 +466,15 @@ def upgrade_workspace(
                     if (current["fingerprint"] != identity["fingerprint"] or
                             (stat_now.st_dev, stat_now.st_ino) != identity["source_file_identity"][:2]):
                         raise OperatorUpgradeError("realm changed between preflight and exclusive ownership")
-                    archive, record = lifecycle.begin(realm_root, identity, sqlite_image=original_sqlite,
-                        recovery_root=paths.app_support.parent / ".astrid-v33-recovery" / operation_id)
+                    if custody_upgrade:
+                        from runtime_protocol import v34_lifecycle as custody_lifecycle
+                        previous = lifecycle.activation(realm_root)
+                        if previous and previous[1]["state"] != "ready":
+                            raise OperatorUpgradeError("complete the prior round-1b activation before custody migration")
+                        archive, record = custody_lifecycle.begin(realm_root, identity, original_sqlite)
+                    else:
+                        archive, record = lifecycle.begin(realm_root, identity, sqlite_image=original_sqlite,
+                            recovery_root=paths.app_support.parent / ".astrid-v33-recovery" / operation_id)
                     _capture_installation(paths, archive, record)
                     lifecycle.phase(archive, record, record["state"], target_profile=config.resolve_source_profile(paths).as_dict())
                     _journal(paths, operation_id=operation_id, state="backup_verified", recovery_set=str(archive))
@@ -442,6 +486,11 @@ def upgrade_workspace(
                 else:
                     migration = migrate_canonical_to_current(realm_root, timeout_seconds=timeout_seconds,
                         confirmation=f"MIGRATE CANONICAL {realm_id}", expected_realm_id=realm_id)
+            if custody_upgrade:
+                # Admission opens only after the committed V34 schema and its
+                # full recovery set have been independently verified offline.
+                from runtime_protocol import v34_lifecycle as custody_lifecycle
+                custody_lifecycle.activate(realm_root, admit=False)
             _journal(paths, operation_id=operation_id, state="activated", migration=migration)
             # Persistent marker restricts custody transfer to this operation.
             previous_token = os.environ.get("ASTRID_V33_ACTIVATION")
@@ -456,9 +505,14 @@ def upgrade_workspace(
                     os.environ["ASTRID_V33_ACTIVATION"] = previous_token
             # A real service must verify/register its provider before activation.
             record = lifecycle.read_record(archive / "activation.json")
-            if record["state"] not in {"provider_verified", "ready"}:
+            if record["state"] not in ({"activation_verified", "ready"} if custody_upgrade else {"provider_verified", "ready"}):
                 raise OperatorUpgradeError("candidate did not verify its Timeline provider/baseline inventory")
-            lifecycle.phase(archive, record, "ready", ready_at=now())
+            if custody_upgrade:
+                if not record.get("provider_verified"):
+                    raise OperatorUpgradeError("candidate did not freshly verify its Timeline provider/baseline inventory")
+                custody_lifecycle.phase(realm_root, archive, record, "ready")
+            else:
+                lifecycle.phase(archive, record, "ready", ready_at=now())
             _journal(paths, operation_id=operation_id, state="restarted", migration=migration, verification=verification)
             _journal(paths, operation_id=operation_id, state="complete", migration=migration, verification=verification)
         except Exception as exc:
