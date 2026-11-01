@@ -111,7 +111,7 @@ def _assert_no_generation_effect(service):
     assert service.store.conn.execute("SELECT COUNT(*) FROM generation_variants").fetchone()[0] == 0
 
 
-def _managed_evidence(service, task, attempt, *, task_id=None, attempt_id=None):
+def _managed_evidence(service, task, attempt, *, task_id=None, attempt_id=None, terminal="success"):
     """Build the contract envelope from project-associated input/output bytes."""
     project_id = task["run"]["project_id"]
     source = b"exact-submitted-workflow-bytes"
@@ -126,8 +126,8 @@ def _managed_evidence(service, task, attempt, *, task_id=None, attempt_id=None):
         "schema_version": 1,
         "kind": "managed-generation-result.v1",
         "inputs": {
-            "source": {"sha256": _digest(source).removeprefix("sha256:"), "bytes": len(source), "filename": "workflow.json"},
-            "effective_settings": {"sha256": _digest(settings).removeprefix("sha256:"), "bytes": len(settings), "filename": "compiled.json"},
+            "source": {"object_id": source_ref["data"]["digest"], "sha256": _digest(source).removeprefix("sha256:"), "bytes": len(source), "filename": "workflow.json"},
+            "effective_settings": {"object_id": settings_ref["data"]["digest"], "sha256": _digest(settings).removeprefix("sha256:"), "bytes": len(settings), "filename": "compiled.json"},
             "values": {},
         },
         "outputs": [{
@@ -141,7 +141,8 @@ def _managed_evidence(service, task, attempt, *, task_id=None, attempt_id=None):
         "attempt_id": attempt_id or attempt["attempt_id"],
         "producer_run_id": "producer-run-managed",
         "outcomes": {
-            "execution": {"status": "succeeded"}, "retrieval": {"status": "succeeded"},
+            "execution": {"status": {"success": "succeeded", "failure": "failed", "cancel": "cancelled"}[terminal]},
+            "retrieval": {"status": "succeeded"},
             "verification": {"status": "succeeded"}, "publication": {"status": "pending"},
         },
         "evidence": {"producer": {}, "transport": {}},
@@ -182,7 +183,7 @@ def test_failure_evidence_survives_restart_and_exact_replay(tmp_path):
 @pytest.mark.parametrize("terminal", ["success", "failure", "cancel"], ids=["success", "failure", "observed-cancel"])
 def test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart(tmp_path, terminal):
     service, task, attempt, root = _service(tmp_path, key=f"managed-{terminal}", inputs=True)
-    outputs, result, fence, source_digest, settings_digest = _managed_evidence(service, task, attempt)
+    outputs, result, fence, source_digest, settings_digest = _managed_evidence(service, task, attempt, terminal=terminal)
     if terminal == "success":
         publish = lambda: service.settle_attempt(attempt["attempt_id"], {**fence, "outputs": outputs, "result": result}, idempotency_key="managed-terminal")
     elif terminal == "failure":
@@ -212,9 +213,18 @@ def test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart(tmp_pat
         for digest in (source_digest, settings_digest):
             bare_digest = digest.removeprefix("sha256:")
             assert service.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, bare_digest)).fetchone()
-        for input_name in ("source", "effective_settings"):
+        for input_name, expected_digest, expected_filename in (
+            ("source", source_digest, "workflow.json"),
+            ("effective_settings", settings_digest, "compiled.json"),
+        ):
             reference = envelope["inputs"][input_name]
-            service._verify_child_object_bytes(reference["sha256"], reference["bytes"], label=f"test {input_name} readback")
+            assert reference["object_id"] == expected_digest
+            assert reference["sha256"] == expected_digest.removeprefix("sha256:")
+            assert reference["filename"] == expected_filename
+            service._verify_child_object_bytes(reference["object_id"].removeprefix("sha256:"), reference["bytes"], label=f"test {input_name} readback")
+        assert envelope["outcomes"]["execution"]["status"] == {
+            "success": "succeeded", "failure": "failed", "cancel": "cancelled",
+        }[terminal]
         for item in associations:
             service._verify_child_object_bytes(item["object_id"].removeprefix("sha256:"), item["size"], label="test readback")
         assert len({item["association_id"] for item in associations}) == 2
