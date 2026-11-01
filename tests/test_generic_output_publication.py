@@ -18,12 +18,12 @@ def _digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
-def _new_service(root: Path) -> RuntimeService:
+def _new_service(root: Path, *, export_root: Path | None = None) -> RuntimeService:
     RealmStore.initialize(root).close()
-    return RuntimeService(root)
+    return RuntimeService(root, export_root=export_root)
 
 
-def _filmstrip_attempt(service: RuntimeService, project_id: str):
+def _filmstrip_attempt(service: RuntimeService, project_id: str, *, suffix: str = ""):
     definition = _digest(b"rendering.timeline_visualize-v1")
     service.register_capability(
         {"capability_id": "rendering.timeline_visualize", "definition_digest": definition}
@@ -37,7 +37,7 @@ def _filmstrip_attempt(service: RuntimeService, project_id: str):
             "capability_id": "rendering.timeline_visualize",
             "capability_digest": definition,
             "project": project_id,
-            "idempotency_key": f"filmstrip-task-{project_id}",
+            "idempotency_key": f"filmstrip-task-{project_id}{suffix}",
         }
     )
     return task, service.claim_next(
@@ -46,7 +46,7 @@ def _filmstrip_attempt(service: RuntimeService, project_id: str):
             "capability_ids": ["rendering.timeline_visualize"],
             "runtime_epoch": service.health()["runtime_epoch"],
         },
-        idempotency_key=f"filmstrip-claim-{project_id}",
+        idempotency_key=f"filmstrip-claim-{project_id}{suffix}",
     )
 
 
@@ -329,6 +329,7 @@ def test_equal_content_does_not_bypass_output_association_protections(tmp_path: 
 
 
 def test_inline_equal_content_rejects_conflicting_object_metadata(tmp_path: Path) -> None:
+    """Retain the historical selector while proving descriptor-level metadata."""
     service = _new_service(tmp_path / "realm")
     try:
         project = service.create_project({"slug": "metadata", "name": "Metadata"})
@@ -342,14 +343,121 @@ def test_inline_equal_content_rejects_conflicting_object_metadata(tmp_path: Path
             }
             for index, media_type in enumerate(("audio/wav", "application/octet-stream"))
         ]
-        with pytest.raises(ConflictError, match="output metadata does not match existing object"):
-            service.settle_attempt(
-                attempt["attempt_id"], _settle_body(attempt, outputs), idempotency_key="metadata-settle",
-            )
-        assert service.task(attempt["task_id"])["task"]["status"] == "running"
-        assert service.managed_outputs(attempt["task_id"]) == []
-        assert service.store.conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == 0
-        assert not service.cas.path_for(hashlib.sha256(payload).hexdigest()).exists()
+        service.settle_attempt(
+            attempt["attempt_id"], _settle_body(attempt, outputs), idempotency_key="metadata-settle",
+        )
+        associations = service.managed_outputs(attempt["task_id"])
+        assert {(item["filename"], item["media_type"]) for item in associations} == {
+            ("output-0.bin", "audio/wav"),
+            ("output-1.bin", "application/octet-stream"),
+        }
+        object_row = service.store.conn.execute(
+            "SELECT size, media_type, original_name FROM objects"
+        ).fetchone()
+        assert tuple(object_row) == (len(payload), "audio/wav", "output-0.bin")
+        digest = hashlib.sha256(payload).hexdigest()
+        assert service.cas.path_for(digest).read_bytes() == payload
+        assert [path for path in service.cas.root.rglob("*") if path.is_file()] == [service.cas.path_for(digest)]
+        assert service.store.integrity_report()["ok"]
+    finally:
+        service.close()
+
+
+def test_equal_bytes_keep_cross_settlement_descriptors_and_immutable_associations(tmp_path: Path) -> None:
+    export_root = tmp_path / "exports"
+    export_root.mkdir()
+    service = _new_service(tmp_path / "realm", export_root=export_root)
+    try:
+        project = service.create_project({"slug": "cross-settlement", "name": "Cross settlement"})
+        payload = b"same-managed-output-bytes"
+        _first_task, first_attempt = _filmstrip_attempt(service, project["id"])
+        first_output = {
+            **_descriptor(
+                payload, name="z_image_turbo", filename="z_image_turbo.py",
+                output_port="script", primary=True, media_type="text/x-python",
+            ),
+            "data_base64": base64.b64encode(payload).decode(),
+        }
+        first_body = _settle_body(first_attempt, [first_output])
+        first_settled = service.settle_attempt(
+            first_attempt["attempt_id"], first_body, idempotency_key="first-settle",
+        )
+        assert service.settle_attempt(
+            first_attempt["attempt_id"], first_body, idempotency_key="first-settle",
+        ) == first_settled
+
+        _second_task, second_attempt = _filmstrip_attempt(service, project["id"], suffix="-evidence")
+        second_output = {
+            **_descriptor(
+                payload, name="evidence-source", filename="evidence-source-source.json",
+                output_port="evidence", primary=True, media_type="application/json",
+            ),
+            "data_base64": base64.b64encode(payload).decode(),
+        }
+        service.settle_attempt(
+            second_attempt["attempt_id"], _settle_body(second_attempt, [second_output]),
+            idempotency_key="second-settle",
+        )
+
+        associations = {
+            item["output_port"]: item
+            for item in service.managed_outputs(first_attempt["task_id"])
+            + service.managed_outputs(second_attempt["task_id"])
+        }
+        assert set(associations) == {"script", "evidence"}
+        assert associations["script"]["association_id"] != associations["evidence"]["association_id"]
+        assert associations["script"]["filename"] == "z_image_turbo.py"
+        assert associations["script"]["media_type"] == "text/x-python"
+        assert associations["evidence"]["filename"] == "evidence-source-source.json"
+        assert associations["evidence"]["media_type"] == "application/json"
+
+        digest = hashlib.sha256(payload).hexdigest()
+        object_row = service.store.conn.execute(
+            "SELECT size, media_type, original_name FROM objects WHERE digest=?", (digest,)
+        ).fetchone()
+        assert tuple(object_row) == (len(payload), "text/x-python", "z_image_turbo.py")
+        assert service.store.conn.execute(
+            "SELECT COUNT(*) FROM objects WHERE digest=?", (digest,)
+        ).fetchone()[0] == 1
+        assert service.cas.path_for(digest).read_bytes() == payload
+
+        for output_port, association in associations.items():
+            source, _attempt, data, export_filename = service._export_source(association["association_id"])
+            assert source["media_type"] == association["media_type"]
+            assert export_filename == association["filename"]
+            assert data == payload
+            exported = service.export_managed_output(
+                association["association_id"],
+                {
+                    "destination_filename": association["filename"],
+                    "expected": {
+                        "digest": association["digest"], "filename": association["filename"],
+                        "media_type": association["media_type"],
+                    },
+                },
+                idempotency_key=f"export-{output_port}",
+            )["data"]
+            assert exported["media_type"] == association["media_type"]
+            assert (export_root / association["filename"]).read_bytes() == payload
+
+        original = associations["evidence"]
+        with service.store._transaction():
+            assert service.store._associate_managed_outputs(
+                {"outputs": [second_output]}, task_id=second_attempt["task_id"],
+                attempt_id=second_attempt["attempt_id"], project_id=project["id"],
+            ) == [original]
+        for changed in (
+            second_output | {"filename": "changed-evidence.json"},
+            second_output | {"digest": _digest(b"changed-evidence"), "size": len(b"changed-evidence")},
+        ):
+            with pytest.raises(ConflictError, match="immutable output"):
+                with service.store._transaction():
+                    service.store._associate_managed_outputs(
+                        {"outputs": [changed]}, task_id=second_attempt["task_id"],
+                        attempt_id=second_attempt["attempt_id"], project_id=project["id"],
+                    )
+        assert service.managed_output(original["association_id"]) == original
+        assert service.store.integrity_report()["ok"]
     finally:
         service.close()
 
