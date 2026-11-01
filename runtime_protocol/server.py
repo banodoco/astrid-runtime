@@ -8,6 +8,7 @@ import threading
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
 from .errors import RuntimeErrorBase, AuthorizationError, BodyTooLargeError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError, RetiredRouteError
@@ -80,7 +81,12 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
         if sys.platform == "win32":
             self.allow_reuse_address = False
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        return super().server_bind()
+        # HTTPServer.server_bind() performs a reverse-DNS lookup after binding
+        # but before it publishes server_port. Runtime listeners are loopback
+        # only and publish their numeric endpoint, so retain TCPServer's bind
+        # semantics while deriving the inherited metadata from that address.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 class RuntimeHandler(BaseHTTPRequestHandler):

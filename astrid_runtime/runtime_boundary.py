@@ -404,6 +404,7 @@ class LocalRuntimeBoundary:
             timeout=min(10.0, self.admission_timeout_seconds),
             authority_scope_root=scope,
             authority_journal=scope / "retained-authority.jsonl",
+            retain_post_exec_connection=True,
         )
         environment.update(broker.child_environment(argv, start_new_session=True))
         try:
@@ -804,6 +805,9 @@ class LocalRuntimeBoundary:
                 return
             if not isinstance(broker, RoleBoundCustodyBroker):
                 raise CustodyError("Runtime child has no registered kernel custody")
+            close_channel = getattr(broker, "close_post_exec_channel", None)
+            if close_channel is not None:
+                close_channel()
             deadline = time.monotonic() + grace + 2.0
             broker.set_cleanup_deadline(deadline)
             if broker.authority_scope_root is not None:
