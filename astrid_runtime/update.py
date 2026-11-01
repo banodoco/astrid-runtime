@@ -154,7 +154,7 @@ class UpdateAdmission:
             raise UpdateRefusal(failure_reason, failure_message)
         return value
 
-    def _selection(self, *, allow_pending=False):
+    def _selection(self, *, allow_pending=False, require_autostart=True):
         daemon = self.daemon
         identity = normalize_startup_identity(daemon.startup_identity)
         if identity["managed_by"] == "source":
@@ -166,7 +166,8 @@ class UpdateAdmission:
         snapshots = {}
         selection_path = _install_record_path(Path.home())
         selected = _json(selection_path, snapshots)
-        _assert_autostart_supported(selected)
+        if require_autostart:
+            _assert_autostart_supported(selected)
         if selected.get("owner") != INSTALL_RECORD_OWNER or selected.get("uninstalled"):
             raise ValueError("installer ownership required")
         root = _path(selected.get("program_root"))
@@ -244,19 +245,52 @@ class UpdateAdmission:
         if not self._lock.acquire(blocking=False):
             raise UpdateRefusal("update-busy", "An update request is already being prepared.")
         try:
-            selection_path, snapshots, python, agent, runtime, installed = self._selection(allow_pending=True)
+            # The Agent owns the locked reconciliation. It must decide whether
+            # an earlier operation continues, has a terminal result, or allows
+            # a new preparation before Runtime fetches any update inputs.
+            selection_path, snapshots, python, agent, runtime, installed = self._selection(
+                allow_pending=True, require_autostart=False)
             selected_record = json.loads(snapshots[selection_path])
-            _assert_autostart_supported(selected_record)
             root = Path(selected_record["program_root"])
             data = Path(selected_record["data_root"])
             old_version_name = snapshots[root / "current"].decode("utf-8").strip()
             old_version = json.loads(snapshots[root / "versions" / old_version_name / "version.json"])
-            temporary_base = Path(tempfile.gettempdir()).resolve(strict=True)
-            temporary = Path(tempfile.mkdtemp(prefix="astrid-update-", dir=temporary_base))
-            platform.private_directory(temporary)
+            p1 = self._helper(python, agent, runtime, {
+                "action": "reconcile", "root": str(root), "data_root": str(data),
+                "selection_path": str(selection_path), "old_instance_id": self.daemon.instance_id,
+                "old_identity": self.daemon.startup_identity, "old_version": old_version,
+            })
+            if not isinstance(p1, dict):
+                raise UpdateRefusal("busy", "The update reconciliation result is incomplete; no job was launched.")
+            disposition, prior = p1.get("disposition"), p1.get("job")
+            if disposition == "continued-existing":
+                operation_id = prior.get("operation_id") if isinstance(prior, dict) else None
+                if (not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
+                        or prior.get("state") not in {"launching", "active"}):
+                    raise UpdateRefusal("busy", "The continued update is not safely acknowledged; no job was launched.")
+                # The locked reconciler already performed the sole native
+                # submission. This response must never launch it again.
+                return {"accepted": True, "state": "accepted", "operation_id": operation_id,
+                        "message": "Update continued."}
+            if disposition in {"recovered-this-request", "confirmed-prior"}:
+                operation_id = prior.get("operation_id") if isinstance(prior, dict) else None
+                state = prior.get("state") if isinstance(prior, dict) else None
+                if (not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
+                        or state not in {"updated", "rolled_back", "failed"}):
+                    raise UpdateRefusal("busy", "The reconciled update result is incomplete; no job was launched.")
+                return {"accepted": False, "state": state, "operation_id": operation_id,
+                        "message": prior.get("message") or prior.get("result") or state}
+            if disposition != "prepare-new":
+                raise UpdateRefusal("busy", "The update reconciliation did not grant preparation; no job was launched.")
+
+            _assert_autostart_supported(selected_record)
+            temporary = None
             accepted = False
             operation_id = None
             try:
+                temporary_base = Path(tempfile.gettempdir()).resolve(strict=True)
+                temporary = Path(tempfile.mkdtemp(prefix="astrid-update-", dir=temporary_base))
+                platform.private_directory(temporary)
                 with self._installer_idle(selection_path):
                     # C1 owns the blocker report and the final destructive fence.
                     # This is only its read-only preflight; no stop authority here.
@@ -318,9 +352,12 @@ class UpdateAdmission:
                     # the installer lock. That explicit recovery ends this
                     # request; only a newly accepted matching ID may launch.
                     if returned_state in {"updated", "rolled_back", "failed"}:
-                        return {"accepted": False, "state": returned_state,
-                                "operation_id": returned_operation,
-                                "message": job.get("message") or job.get("result")}
+                        # A legacy accept reply lacks the durable confirmation
+                        # needed to report a terminal recovery result.
+                        raise UpdateRefusal(
+                            "acknowledgement-unknown",
+                            "The update result is uncertain. Check update status before taking another action.",
+                        )
                     raise UpdateRefusal("busy", "The unresolved update was not safely reconciled; no job was launched.")
                 if returned_state not in {"accepted", "launching", "active"}:
                     raise UpdateRefusal("busy", "The update is not accepted for launch.")
@@ -351,7 +388,7 @@ class UpdateAdmission:
             finally:
                 # Inputs belong to the durable job after acceptance; cleanup
                 # remains with the worker/job lifecycle owner.
-                if not accepted:
+                if not accepted and temporary is not None:
                     shutil.rmtree(temporary, ignore_errors=True)
         except ConflictError:
             raise
