@@ -2,10 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://astrid.haus/workspace/v1/schemas/shot-composition.json",
   "title": "Canonical one-level shot composition publication",
-  "description": "Runtime-owned immutable publication envelope. Nested TimelineConfig and ordinary timeline-clip semantics remain owned by @banodoco/timeline-schema and are intentionally not duplicated here.",
+  "description": "Runtime-owned immutable publication envelope. Raw immutable containers preserve authored and opaque data. Compiled TimelineConfig semantics remain owned by @banodoco/timeline-schema.",
   "x-astrid-runtime-owner": "astrid-runtime",
   "x-astrid-runtime-canonical-timeline-owner": "@banodoco/timeline-schema",
-  "x-astrid-runtime-generated-boundary": "Materialize or reference the pinned TimelineConfig schema during generation; do not maintain a second TimelineConfig or TimelineClip definition in this schema.",
+  "x-astrid-runtime-generated-boundary": "Use the pinned TimelineConfig only for compiled data; raw containers reuse compatible common fields without requiring Player completeness.",
   "type": "object",
   "additionalProperties": false,
   "required": ["project_id", "timeline_id", "expected_head", "parent_composition"],
@@ -21,6 +21,155 @@
     "dependency_manifest": { "$ref": "#/$defs/DependencyManifest" }
   },
   "$defs": {
+    "RawTimelinePayload": {
+      "type": "object",
+      "description": "Main immutable authoring payload, not a compiled Player configuration. Known containers are typed; missing fields, explicit opaque nulls and unknown siblings are preserved. Agent validates and compiles command/document/timing/reference semantics.",
+      "additionalProperties": true,
+      "properties": {
+        "theme": {
+          "$ref": "timeline-config.schema.json#/properties/theme"
+        },
+        "tracks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RawTrack"
+          }
+        },
+        "clips": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RawClip"
+          }
+        },
+        "effects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OpenMap"
+          }
+        },
+        "audio": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OpenMap"
+          }
+        },
+        "assets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AssetRecord"
+          }
+        },
+        "layout": {
+          "$ref": "#/$defs/OpenMap"
+        },
+        "registry": {
+          "type": "object",
+          "properties": {
+            "assets": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/AssetRecord" }
+            }
+          },
+          "additionalProperties": true
+        },
+        "output": {
+          "$ref": "#/$defs/RawOutput"
+        },
+        "playback": {
+          "$ref": "#/$defs/OpenMap"
+        },
+        "meta": {
+          "$ref": "timeline-config.schema.json#/definitions/Meta"
+        }
+      }
+    },
+    "RawTrack": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "$ref": "timeline-config.schema.json#/properties/tracks/items/properties/id"
+        },
+        "kind": {
+          "$ref": "timeline-config.schema.json#/properties/tracks/items/properties/kind"
+        },
+        "label": {
+          "$ref": "timeline-config.schema.json#/properties/tracks/items/properties/label"
+        },
+        "role": {
+          "$ref": "timeline-config.schema.json#/properties/tracks/items/properties/role"
+        },
+        "volume": {
+          "anyOf": [
+            { "$ref": "timeline-config.schema.json#/properties/tracks/items/properties/volume" },
+            { "type": "null" }
+          ]
+        },
+        "meta": {
+          "$ref": "timeline-config.schema.json#/definitions/Meta"
+        }
+      }
+    },
+    "RawClip": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "$ref": "timeline-config.schema.json#/definitions/TimelineClip/properties/id"
+        },
+        "track": {
+          "$ref": "timeline-config.schema.json#/definitions/TimelineClip/properties/track"
+        },
+        "clipType": {
+          "$ref": "timeline-config.schema.json#/definitions/TimelineClip/properties/clipType"
+        },
+        "effects": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/OpenMap"
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": {
+                "type": "number"
+              }
+            }
+          ]
+        },
+        "meta": {
+          "$ref": "timeline-config.schema.json#/definitions/Meta"
+        }
+      }
+    },
+    "RawOutput": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Authored output may be partial. Frame rate representations are preserved; Agent owns their timing semantics.",
+      "properties": {
+        "fps": {
+          "anyOf": [
+            { "type": "number" },
+            { "type": "string" },
+            {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "numerator": { "type": "number" },
+                "denominator": { "type": "number" }
+              }
+            },
+            { "type": "array", "items": { "type": "number" } }
+          ]
+        },
+        "resolution": { "$ref": "timeline-config.schema.json#/definitions/TimelineOutput/properties/resolution" },
+        "file": { "$ref": "timeline-config.schema.json#/definitions/TimelineOutput/properties/file" },
+        "background": { "$ref": "timeline-config.schema.json#/definitions/TimelineOutput/properties/background" },
+        "background_scale": { "$ref": "timeline-config.schema.json#/definitions/TimelineOutput/properties/background_scale" }
+      }
+    },
     "OpenMap": {
       "type": "object",
       "additionalProperties": true
@@ -31,22 +180,28 @@
       "required": ["config", "registry", "clips", "occurrences"],
       "properties": {
         "config": {
-          "$ref": "timeline-config.schema.json",
-          "description": "Canonical TimelineConfig, materialized from the pinned @banodoco/timeline-schema package.",
-          "x-astrid-runtime-schema-owner": "@banodoco/timeline-schema#TimelineConfig",
-          "x-astrid-runtime-schema-sha256": "f52b82024ecd44a5e6c9c68d5cb326d50d70efe9aaad6f8ac6352ea1c87b97b1"
+          "$ref": "#/$defs/RawTimelinePayload",
+          "description": "Exact authored parent config; partial output and opaque fields are preserved."
         },
         "registry": {
           "type": "object",
           "description": "Runtime-managed media registry carried by the publication envelope; Runtime-specific and outside the canonical TimelineConfig owned by @banodoco/timeline-schema.",
           "x-astrid-runtime-schema-owner": "astrid-runtime#ManagedMediaRegistry",
+          "properties": {
+            "assets": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/AssetRecord" }
+            }
+          },
           "additionalProperties": true
         },
         "clips": {
           "type": "array",
-          "description": "Ordinary timeline clips. Clip field semantics are owned by @banodoco/timeline-schema."
+          "description": "Raw authored ordinary clips; Agent owns command, timing and reference validation.",
+          "items": { "$ref": "#/$defs/RawClip" }
         },
-        "occurrences": { "type": "array", "items": { "$ref": "#/$defs/Occurrence" } }
+        "occurrences": { "type": "array", "items": { "$ref": "#/$defs/Occurrence" } },
+        "meta": { "$ref": "timeline-config.schema.json#/definitions/Meta" }
       }
     },
     "Occurrence": {
@@ -65,7 +220,8 @@
         "transform": { "type": "object", "additionalProperties": true },
         "gain": { "type": "number" },
         "mute": { "type": "boolean" },
-        "provenance": { "$ref": "#/$defs/OpenMap" }
+        "provenance": { "$ref": "#/$defs/OpenMap" },
+        "meta": { "$ref": "timeline-config.schema.json#/definitions/Meta" }
       }
     },
     "ShotRevisionInput": {
@@ -119,6 +275,9 @@
           "type": "string",
           "minLength": 1,
           "description": "Immutable link to the child timeline revision."
+        },
+        "meta": {
+          "$ref": "timeline-config.schema.json#/definitions/Meta"
         }
       }
     },
@@ -133,7 +292,15 @@
         "role": { "type": "string", "minLength": 1 },
         "type": { "type": "string", "minLength": 1 },
         "media_kind": { "type": "string", "minLength": 1 },
-        "scope": { "$ref": "#/$defs/OpenMap" }
+        "scope": { "$ref": "#/$defs/OpenMap" },
+        "meta": { "$ref": "timeline-config.schema.json#/definitions/Meta" }
+      }
+    },
+    "AssetRecord": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "meta": { "$ref": "timeline-config.schema.json#/definitions/Meta" }
       }
     },
     "OpenBinding": {
@@ -158,10 +325,8 @@
         "revision_id": { "type": "string", "minLength": 1 },
         "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
         "payload": {
-          "$ref": "timeline-config.schema.json",
-          "description": "Carries the canonical TimelineConfig fields owned by @banodoco/timeline-schema.",
-          "x-astrid-runtime-schema-owner": "@banodoco/timeline-schema#TimelineConfig",
-          "x-astrid-runtime-schema-sha256": "f52b82024ecd44a5e6c9c68d5cb326d50d70efe9aaad6f8ac6352ea1c87b97b1"
+          "$ref": "#/$defs/RawTimelinePayload",
+          "description": "Exact main immutable internal payload, including authored and opaque siblings."
         }
       }
     },
@@ -171,7 +336,8 @@
         "media": { "type": "array" },
         "shots": { "type": "array" },
         "internal_timelines": { "type": "array" },
-        "timelines": { "type": "array" }
+        "timelines": { "type": "array" },
+        "documents": { "type": "array", "items": { "$ref": "timeline-commit.json#/$defs/DocumentPin" } }
       }
     }
   }

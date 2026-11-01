@@ -7,7 +7,6 @@ import re
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "packages" / "python"))
 from astrid_runtime_client.generated import OPERATIONS as PYTHON_OPERATIONS  # noqa: E402
@@ -105,3 +104,44 @@ def test_recoverable_snapshot_client_projection_is_canonical() -> None:
     assert "Promise<MutationResult<ManagedOutput>>" in typescript
     assert '/recoverable-snapshots' in typescript and '/recoverable-snapshots' in python
     assert 'output: DerivedInputDescriptor' in typescript
+
+
+def test_view_write_scope_and_composition_retirement_contract():
+    import yaml
+
+    contract = yaml.safe_load((ROOT / "contract/openapi/workspace-v1.yaml").read_text())
+    timeline = "/v1/projects/{project_id}/timelines/{timeline_id}"
+    view = contract["paths"][timeline + "/views"]["post"]
+    assert {"$ref": "#/components/parameters/IdempotencyKey"} in view["parameters"]
+    assert "projects:write" in view["description"]
+    assert "409" in view["responses"]
+    inspect = contract["paths"][timeline + "/inspect"]["post"]
+    assert {"$ref": "#/components/parameters/IdempotencyKey"} not in inspect["parameters"]
+    publication = contract["paths"][timeline + "/composition-revisions"]["post"]
+    assert publication["responses"] == {"410": {"$ref": "#/components/responses/RetiredRoute"}}
+    for text in ("headless", "commitTimeline", "Authentication", "JSON decoding", "idempotency", "writes", "prefetched"):
+        assert text in publication["description"]
+
+
+def test_retired_route_declarations_match_runtime_gates():
+    import yaml
+
+    contract = yaml.safe_load((ROOT / "contract/openapi/workspace-v1.yaml").read_text())
+    operations = {operation["operationId"]: operation
+                  for path in contract["paths"].values() for operation in path.values()
+                  if isinstance(operation, dict) and "operationId" in operation}
+    retired = {"410": {"$ref": "#/components/responses/RetiredRoute"}}
+    for name in ("publishParentComposition", "replaceParentCompositionMedia", "createTimelineDocument",
+                 "replaceTimelineClip", "publishTimelineRender"):
+        assert operations[name]["responses"] == retired
+    for name in ("createDocument", "getDocument", "updateDocument", "recoverTimeline",
+                 "createProjectShot", "updateProjectShot", "archiveProjectShot", "recoverProjectShot",
+                 "addShotItem", "removeShotItem", "reorderShotItems"):
+        assert operations[name]["responses"]["410"] == retired["410"]
+        assert any(status.startswith("2") for status in operations[name]["responses"])
+    assert "410" not in operations["promoteProjectShotCandidate"]["responses"]
+    assert "410" not in operations["commitTimeline"]["responses"]
+    assert operations["commitTimeline"]["responses"]["409"]["content"]["application/json"]["schema"] == {
+        "$ref": "./schemas/common.json#/$defs/Error"}
+    assert contract["components"]["responses"]["RetiredRoute"]["content"]["application/json"]["schema"] == {
+        "$ref": "./schemas/common.json#/$defs/Error"}

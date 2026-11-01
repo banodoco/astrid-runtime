@@ -1131,3 +1131,25 @@ def test_generated_recoverable_snapshot_client_and_server_route_shape() -> None:
     assert authenticated == ["worker:execute"]
     assert calls == [("attempt-1", {"lease_id": "lease-1", "fence": 2, "runtime_epoch": 7, "revision": 3,
                       "output": output}, "save-1", {"actor": "reviewer"})]
+
+
+def test_create_timeline_view_sends_explicit_key_and_preserves_view_response():
+    result = {"inspection": {"revision_id": "r1"}, "artifacts": {"md": {"object_id": "view-object"}}}
+    options = {"formats": ["md"], "revision_id": "r1"}
+    calls = []
+
+    def transport(method, path, headers, body):
+        calls.append((method, path, headers, json.loads(body)))
+        return 200, {}, json.dumps(result).encode()
+
+    client = WorkspaceClient("http://runtime", "writer", transport=transport)
+    with pytest.raises(TypeError, match="idempotency_key"):
+        client.create_timeline_view("p/one", "t/two", options)
+    assert calls == []
+    assert client.create_timeline_view("p/one", "t/two", options, idempotency_key="view-retry") == result
+    method, path, headers, body = calls[0]
+    assert method == "POST"
+    assert path == "/v1/projects/p%2Fone/timelines/t%2Ftwo/views"
+    assert headers["Authorization"] == "Bearer writer"
+    assert headers["Idempotency-Key"] == "view-retry"
+    assert body == options

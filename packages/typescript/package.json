@@ -1,6 +1,6 @@
 {
   "name": "@astrid/runtime-client",
-  "version": "0.1.0",
+  "version": "0.2.14",
   "private": false,
   "type": "module",
   "exports": {

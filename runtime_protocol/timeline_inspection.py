@@ -14,6 +14,7 @@ from fractions import Fraction
 from .errors import ConflictError, NotFoundError, ValidationError
 from .util import canonical_json
 from .managed_render_snapshot import ShotExpansionError, expand_shot_clips
+from .visual_seam import agreed_clips
 
 SCHEMA = "runtime.timeline.declared_inputs/v1"
 MAX_OCCURRENCES = 500
@@ -39,6 +40,8 @@ def _fraction(value, label, *, milliseconds=False, nonnegative=True):
     try:
         if isinstance(value, bool) or value is None:
             raise ValueError
+        if isinstance(value, dict) and set(value) == {"numerator", "denominator"}:
+            value = (value["numerator"], value["denominator"])
         if isinstance(value, (list, tuple)) and len(value) == 2 and all(isinstance(item, int) and not isinstance(item, bool) for item in value):
             result = Fraction(*value)
         else:
@@ -345,7 +348,7 @@ def _clip(raw, registries, occurrence, start, end, track_scope, tracks):
         raise ConflictError("pinned internal clip has no identity")
     relative = _fraction(raw.get("at_ms", raw.get("at", 0)), "clip start", milliseconds="at_ms" in raw, nonnegative=False)
     absolute = start + relative
-    speed = _fraction(raw.get("speed", 1), "clip speed")
+    speed = _fraction(1 if raw.get("speed") is None else raw["speed"], "clip speed")
     if speed <= 0:
         raise ConflictError("pinned internal clip speed is invalid")
     if "duration_ms" in raw:
@@ -399,9 +402,7 @@ def _canonical_parent_clips(payload):
     config_clips = config.get("clips", []) if isinstance(config, dict) else None
     if not isinstance(parent_clips, list) or not isinstance(config_clips, list):
         raise ConflictError("canonical parent composition clips are invalid")
-    if config_clips and parent_clips and config_clips != parent_clips:
-        raise ConflictError("canonical parent clips and config.clips disagree", details={"reason": "canonical_payload_mismatch"})
-    return parent_clips or config_clips
+    return agreed_clips(parent_clips, config_clips)
 
 
 def _parent_clip(raw, registries, track_scope, tracks):
@@ -412,7 +413,7 @@ def _parent_clip(raw, registries, track_scope, tracks):
     if not isinstance(cid, str) or not cid:
         raise ConflictError("parent composition clip has no identity")
     start = _fraction(raw.get("at_ms", raw.get("at", 0)), "parent clip start", milliseconds="at_ms" in raw)
-    speed = _fraction(raw.get("speed", 1), "parent clip speed")
+    speed = _fraction(1 if raw.get("speed") is None else raw["speed"], "parent clip speed")
     if speed <= 0:
         raise ConflictError("parent clip speed is invalid")
     if "duration_ms" in raw:

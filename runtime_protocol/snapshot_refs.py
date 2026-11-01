@@ -51,6 +51,49 @@ def working_copy_binding(snapshot: dict, revision_id: str | None) -> dict | None
             "base_revision_digest": base["content_digest"]}
 
 
+def source_kind_of(ref: dict) -> str:
+    return ref.get("source_kind") or ("revision" if ref.get("revision_id") else "cas")
+
+
+def parent_revision_row(connection, revision_id, project_id, timeline_id):
+    return connection.execute(
+        "SELECT content_digest FROM parent_composition_revisions "
+        "WHERE id=? AND project_id=? AND timeline_id=?",
+        (revision_id, project_id, timeline_id),
+    ).fetchone()
+
+
+def check_working_copy_base(connection, binding: dict, project_id, timeline_id) -> None:
+    base = parent_revision_row(connection, binding["base_revision_id"], project_id, timeline_id)
+    if base is None or base[0] != binding["base_revision_digest"]:
+        raise NotFoundError("working-copy base parent revision is missing or changed")
+
+
+def validate_capture_scope(snapshot: dict, ref: dict, context: dict) -> None:
+    """Check each capture carrier's scope independently of its content hash."""
+    if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("config"), dict)
+            or not isinstance(snapshot.get("registry"), dict)):
+        raise ValidationError("capture snapshot must contain config and registry objects")
+    for key in ("project_id", "timeline_id"):
+        if context.get(key) is not None and context[key] != ref.get(key):
+            raise ConflictError("capture context differs from snapshot reference scope")
+    source_kind = source_kind_of(ref)
+    if source_kind == "cas":
+        if ref.get("revision_id") is not None or ref.get("revision_digest") is not None:
+            raise ValidationError("CAS capture cannot claim a canonical revision")
+        return
+    if context.get("revision_id") is not None and context["revision_id"] != ref.get("revision_id"):
+        raise ConflictError("capture context differs from snapshot revision")
+    metadata = snapshot.get("metadata") if isinstance(snapshot.get("metadata"), dict) else {}
+    for key in ("capture_authority", "canonical_timeline"):
+        authority = metadata.get(key)
+        if not isinstance(authority, dict):
+            continue
+        for field in ("project_id", "timeline_id"):
+            if authority.get(field) is not None and authority[field] != ref.get(field):
+                raise ConflictError("embedded capture authority differs from snapshot reference")
+
+
 def journal_snapshot_publication(staging_root: Path, digest: str, project_id: str | None) -> None:
     """Use the existing CAS recovery journal before publishing a new object."""
     root_fd = open_directory_chain(staging_root)
@@ -68,32 +111,21 @@ def journal_snapshot_publication(staging_root: Path, digest: str, project_id: st
     })
 
 
-def publish_snapshot(connection, cas_root: Path, staging_root: Path,
-                     snapshot: dict, provenance: dict, project_id: str | None) -> dict:
-    """Validate provenance and publish exact projected bytes through one CAS path."""
+def prepare_snapshot(connection, snapshot: dict, provenance: dict, project_id: str | None) -> dict:
+    """Resolve a snapshot reference without publishing bytes or changing rows."""
     if provenance.get("project_id") not in (None, project_id):
         raise ConflictError("snapshot project does not match task project")
     revision_id = provenance.get("revision_id")
     revision_digest = provenance.get("revision_digest")
     timeline_id = provenance.get("timeline_id")
-    source_kind = provenance.get("source_kind") or ("revision" if revision_id else "cas")
+    source_kind = source_kind_of(provenance)
     if source_kind == "working_copy":
         binding = working_copy_binding(snapshot, revision_id)
         if binding is None or binding != provenance.get("working_copy") or revision_digest != binding["candidate_digest"]:
             raise ValidationError("working-copy snapshot binding is invalid")
-        base = connection.execute(
-            "SELECT content_digest FROM parent_composition_revisions "
-            "WHERE id=? AND project_id=? AND timeline_id=?",
-            (binding["base_revision_id"], project_id, timeline_id),
-        ).fetchone()
-        if base is None or base[0] != binding["base_revision_digest"]:
-            raise NotFoundError("working-copy base parent revision is missing or changed")
+        check_working_copy_base(connection, binding, project_id, timeline_id)
     elif revision_id is not None:
-        revision = connection.execute(
-            "SELECT content_digest FROM parent_composition_revisions "
-            "WHERE id=? AND project_id=? AND timeline_id=?",
-            (revision_id, project_id, timeline_id),
-        ).fetchone()
+        revision = parent_revision_row(connection, revision_id, project_id, timeline_id)
         if revision is None:
             raise NotFoundError("snapshot parent revision is missing")
         if revision_digest is not None and revision_digest != revision[0]:
@@ -101,6 +133,16 @@ def publish_snapshot(connection, cas_root: Path, staging_root: Path,
         revision_digest = revision[0]
     elif source_kind != "cas":
         raise ValidationError("snapshot source kind is invalid")
+    return {"digest": snapshot_digest(snapshot), "project_id": project_id,
+            "timeline_id": timeline_id, "revision_id": revision_id,
+            "revision_digest": revision_digest, "source_kind": source_kind,
+            **({"working_copy": provenance["working_copy"]} if source_kind == "working_copy" else {})}
+
+
+def publish_snapshot(connection, cas_root: Path, staging_root: Path,
+                     snapshot: dict, provenance: dict, project_id: str | None) -> dict:
+    """Validate provenance and publish exact projected bytes through one CAS path."""
+    ref = prepare_snapshot(connection, snapshot, provenance, project_id)
     payload = snapshot_bytes(snapshot)
     digest = hashlib.sha256(payload).hexdigest()
     cas = ContentAddressedStore(cas_root)
@@ -120,10 +162,7 @@ def publish_snapshot(connection, cas_root: Path, staging_root: Path,
             "INSERT OR IGNORE INTO project_objects(project_id,digest,relation,created_at) "
             "VALUES (?,?,'managed',?)", (project_id, digest, stamp),
         )
-    return {"digest": "sha256:" + digest, "project_id": project_id,
-            "timeline_id": timeline_id, "revision_id": revision_id,
-            "revision_digest": revision_digest, "source_kind": source_kind,
-            **({"working_copy": provenance["working_copy"]} if source_kind == "working_copy" else {})}
+    return ref
 
 
 def rewrite_spec_snapshots(spec: dict, publish: Callable[[dict, dict], dict]) -> tuple[dict, int]:
@@ -144,7 +183,11 @@ def rewrite_spec_snapshots(spec: dict, publish: Callable[[dict, dict], dict]) ->
             "revision_id": authority.get("parent_revision_id"),
             "revision_digest": authority.get("parent_content_digest"),
         }
-        location["timeline_snapshot_ref"] = publish(snapshot, provenance)
+        ref = publish(snapshot, provenance)
+        if ("timeline_snapshot_ref" in location
+                and canonical_json(location["timeline_snapshot_ref"]) != canonical_json(ref)):
+            raise ValidationError("inline timeline snapshot differs from its reference")
+        location["timeline_snapshot_ref"] = ref
         del location["timeline_snapshot"]
         count += 1
 
@@ -170,7 +213,10 @@ def rewrite_spec_snapshots(spec: dict, publish: Callable[[dict, dict], dict]) ->
                 provenance["source_kind"] = "working_copy"
                 provenance["revision_digest"] = working_copy["candidate_digest"]
                 provenance["working_copy"] = working_copy
-            context[key + "_ref"] = publish(snapshot, provenance)
+            ref = publish(snapshot, provenance)
+            if key + "_ref" in context and canonical_json(context[key + "_ref"]) != canonical_json(ref):
+                raise ValidationError("inline capture snapshot differs from its reference")
+            context[key + "_ref"] = ref
             del context[key]
             count += 1
     filmstrip = inputs.get("filmstrip_authority")
@@ -180,6 +226,10 @@ def rewrite_spec_snapshots(spec: dict, publish: Callable[[dict, dict], dict]) ->
         except ValueError:
             duplicate = None
         if isinstance(duplicate, dict):
+            if isinstance(context, dict):
+                for field in ("project_id", "timeline_id", "revision_id"):
+                    if field in duplicate and duplicate[field] != context.get(field):
+                        raise ValidationError("filmstrip authority scope differs from admitted authority context")
             for key in SNAPSHOT_KEYS:
                 if key in duplicate:
                     if not isinstance(context, dict) or key + "_ref" not in context:
@@ -188,6 +238,10 @@ def rewrite_spec_snapshots(spec: dict, publish: Callable[[dict, dict], dict]) ->
                         raise ValidationError("filmstrip authority snapshot differs from admitted authority context")
                     duplicate[key + "_ref"] = context[key + "_ref"]
                     del duplicate[key]
+                ref = duplicate.get(key + "_ref")
+                if ref is not None and (not isinstance(context, dict)
+                        or canonical_json(ref) != canonical_json(context.get(key + "_ref"))):
+                    raise ValidationError("filmstrip authority reference differs from admitted authority context")
             inputs["filmstrip_authority"] = canonical_json(duplicate)
     return result, count
 

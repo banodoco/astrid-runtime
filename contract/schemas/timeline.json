@@ -3,11 +3,12 @@
   "$id": "https://astrid.haus/workspace/v1/schemas/timeline.json",
   "title": "Minimum product-neutral timeline composition",
   "type": "object", "additionalProperties": false,
-  "required": ["timeline_id", "project_id", "version", "shots", "references", "archived", "head_revision_id", "name"],
+  "required": ["timeline_id", "project_id", "version", "shots", "references", "archived", "head_revision_id", "head_publication_id", "name"],
   "properties": {
     "timeline_id": { "type": "string", "minLength": 1 },
     "project_id": { "type": "string", "minLength": 1 },
     "version": { "type": "integer", "minimum": 1 },
+    "head_publication_id": { "type": ["string", "null"] },
     "head_revision_id": { "type": ["string", "null"] },
     "revision_id": { "type": "string", "minLength": 1 },
     "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },

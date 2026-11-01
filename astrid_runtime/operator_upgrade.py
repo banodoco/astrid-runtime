@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import sqlite3
+import sys
 from pathlib import Path
 import time
 import uuid
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
+from contextlib import contextmanager
 from typing import Any, Mapping
 
 from .bootstrap import (
     BootstrapConfig,
+    SourceProfile,
     BootstrapError,
     RuntimeBoundary,
     _bootstrap_locked,
@@ -28,11 +34,14 @@ from .relocation import _reject_live_pack_host, relocate
 from runtime_protocol.upgrade import (
     DEFAULT_UPGRADE_TIMEOUT_SECONDS,
     _open_readonly,
+    _owner_fence,
     inspect_canonical_schema,
+    inspect_realm_schema,
     migrate_canonical_to_current,
     upgrade_realm,
 )
 from runtime_protocol.lifecycle import inspect_interruption_state, interruption_fence
+from runtime_protocol.util import now
 
 
 class OperatorUpgradeError(BootstrapError):
@@ -59,38 +68,19 @@ def _realm_from_catalog(paths: RuntimePaths) -> tuple[str, Path]:
 
 
 def _schema_kind(root: Path, *, expected_realm_id: str) -> str:
-    connection = _open_readonly(root / "realm.sqlite3")
     try:
-        tables = {
-            str(row[0]) for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            )
-        }
-        if "runtime_schema" in tables:
-            try:
-                return str(
-                    inspect_canonical_schema(
-                        root, expected_realm_id=expected_realm_id
-                    )["kind"]
-                )
-            except Exception as exc:
-                raise OperatorUpgradeError(str(exc)) from exc
-        if "schema_migrations" in tables:
-            version = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
-            if version == 23:
-                realm_rows = connection.execute("SELECT id FROM realm ORDER BY id").fetchall()
-                if len(realm_rows) != 1 or str(realm_rows[0][0]) != expected_realm_id:
-                    raise OperatorUpgradeError("legacy realm identity does not match the selected workspace")
-                return "v23"
-            raise OperatorUpgradeError(f"realm has unsupported legacy schema version {version}")
-        raise OperatorUpgradeError("realm is neither canonical v24/v25/v26/v27 nor the supported v23 format")
-    finally:
-        connection.close()
+        result = inspect_realm_schema(root, expected_realm_id=expected_realm_id)
+        return (f"v{result['version']}" if result["version"] < 31 and str(result["kind"]).startswith("C")
+                else "v23" if result["version"] == 23 else str(result["kind"]))
+    except Exception as exc:
+        raise OperatorUpgradeError(str(exc)) from exc
 
 
 def _assert_idle(root: Path) -> dict[str, Any]:
     try:
-        report = inspect_interruption_state(root)
+        from runtime_protocol.v33_lifecycle import sqlite_observation
+        with sqlite_observation(root) as observed:
+            report = inspect_interruption_state(observed)
         if not report["safe"]:
             refusal = OperatorUpgradeError(
                 "Runtime interruption refused while work is active or unreconciled.",
@@ -137,7 +127,7 @@ def _journal(paths: RuntimePaths, *, operation_id: str, state: str, journal_root
     if previous.get("operation_id") == operation_id:
         identity = {
             key: previous[key]
-            for key in ("realm_id", "realm_root", "source_support_root", "schema_before")
+            for key in ("realm_id", "realm_root", "source_support_root", "schema_before", "recovery_set")
             if key in previous
         }
         if any(key in details and details[key] != value for key, value in identity.items()):
@@ -215,131 +205,286 @@ def _verify_running(
     return {"health": True, "integrity": dict(report)}
 
 
+@contextmanager
+def _installer_mutex(paths):
+    """Share the installer lifetime lock, or an offline support-root lock."""
+    from .paths import _install_record_path
+    from .update import _installer_lock_path
+    from runtime_protocol import platform
+    selection = _install_record_path(paths.home)
+    lock = _installer_lock_path(selection) if selection.exists() else paths.runtime_support / "upgrade-installer.lock"
+    if lock.is_symlink():
+        raise OperatorUpgradeError("installer lifetime lock must not be a symlink")
+    with lock.open("a+") as handle:
+        try:
+            platform.owner_only(lock)
+            platform.lock_file(handle.fileno(), blocking=False)
+        except OSError as exc:
+            raise OperatorUpgradeError("another installer owns the installation lifetime lock") from exc
+        try:
+            yield
+        finally:
+            platform.unlock_file(handle.fileno())
+
+
+def _capture_installation(paths, archive, record):
+    """Bind catalog, supported local App/outbox state and prior executable."""
+    from runtime_protocol import v33_lifecycle as lifecycle
+    prior = _read_support_json(paths.source_profiles_dir / "astrid.json")
+    if not prior:
+        raise OperatorUpgradeError("prior executable selection is unavailable; preserve the installation")
+    source = SourceProfile.from_mapping(prior)
+    checkout = Path(source.runtime_checkout).resolve()
+    if not (checkout / "runtime_protocol" / "__init__.py").is_file():
+        raise OperatorUpgradeError("prior Runtime executable source is unavailable; preserve the installation")
+    # The selected executable is retained independently of mutable checkout/selection.
+    executable_inventory = lifecycle.snapshot_tree(checkout, archive / "executable",
+        exclude=(".git", ".venv", "__pycache__", ".pytest_cache"))
+    support_inventory = lifecycle.snapshot_tree(paths.app_support, archive / "support",
+        exclude=("runtime/realms", "runtime/upgrade-journal.json", "runtime/bootstrap.lock",
+                 "runtime/discovery.json", "runtime/instance.lock", "runtime/process-control.json", "runtime/upgrade-installer.lock"))
+    from .paths import _install_record_path
+    selection = _install_record_path(paths.home)
+    selection_fact = None
+    if selection.exists():
+        if selection.is_symlink():
+            raise OperatorUpgradeError("installed selection must not be a symlink")
+        copied_selection = archive / "installed-selection.json"
+        shutil.copy2(selection, copied_selection)
+        with copied_selection.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        selection_fact = {"path": str(selection), **lifecycle._file_fact(copied_selection)}
+    environment = None
+    if source.runtime_environment:
+        # Preserve the selected environment, resolving venv interpreter links.
+        environment = archive / "environment"
+        shutil.copytree(source.runtime_environment, environment, symlinks=False)
+        environment_inventory = {p.relative_to(environment).as_posix(): lifecycle._file_fact(p)
+                                 for p in lifecycle._files(environment)}
+        for path in lifecycle._files(environment):
+            with path.open("r+b") as handle:
+                os.fsync(handle.fileno())
+        lifecycle.verify_tree(environment, environment_inventory)
+    else:
+        environment_inventory = None
+    executable = Path(sys.executable).resolve()
+    lifecycle.phase(archive, record, record["state"], operator_owned=True, prior_profile=prior,
+        support_inventory=support_inventory, executable_inventory=executable_inventory,
+        installation_selection=selection_fact, environment_inventory=environment_inventory, interpreter={"path": str(executable), **lifecycle._file_fact(executable)},
+        scope="full realm/sidecars/CAS, local support/catalog/selection/outbox, prior Runtime executable/environment; disconnected App clients require their external update guard")
+
+
+def _restore_installation(paths, realm_root, archive):
+    from runtime_protocol import v33_lifecycle as lifecycle
+    record = lifecycle.read_record(archive / "activation.json")
+    lifecycle.verify_tree(archive / "support", record["support_inventory"])
+    lifecycle.verify_tree(archive / "executable", record["executable_inventory"])
+    if record.get("environment_inventory") is not None:
+        lifecycle.verify_tree(archive / "environment", record["environment_inventory"])
+    else:
+        interpreter = record["interpreter"]
+        if lifecycle._file_fact(Path(interpreter["path"])) != {k: interpreter[k] for k in ("size", "sha256")}:
+            raise OperatorUpgradeError("prior interpreter changed; recovery requires the matching environment")
+    if record.get("prior_launch_started"):
+        # A lost acknowledgement after launching the prior executable may
+        # conceal authorized old-version writes. Preserve current work and
+        # verify it; never restore the pre-update image a second time.
+        lifecycle.verify_sqlite_image(realm_root, realm_id=record["realm_id"], fingerprint=record["source"]["fingerprint"])
+        selected = _read_support_json(paths.source_profiles_dir / "astrid.json") or {}
+        if selected.get("runtime_checkout") != str(archive / "executable"):
+            raise OperatorUpgradeError("prior launch selection is uncertain; preserve both images for recovery")
+        return BootstrapConfig(source_profile=SourceProfile.from_mapping(selected))
+    if record["state"] != "restored":
+        lifecycle.restore(realm_root, archive)
+    else:
+        lifecycle.verify_sqlite_image(realm_root, realm_id=record["realm_id"], fingerprint=record["source"]["fingerprint"])
+        lifecycle.finish_restore_marker(realm_root, archive, record)
+    # Restore all captured support files and remove new files within that scope.
+    excluded = ("runtime/realms", "runtime/upgrade-journal.json", "runtime/bootstrap.lock",
+                "runtime/discovery.json", "runtime/instance.lock", "runtime/process-control.json", "runtime/upgrade-installer.lock")
+    for path in list(lifecycle._files(paths.app_support, exclude=excluded)):
+        path.unlink()
+    lifecycle.snapshot_tree(archive / "support", paths.app_support)
+    remove_file(paths.discovery_path)
+    remove_file(paths.instance_lock_path)
+    if record.get("installation_selection"):
+        selected = record["installation_selection"]
+        original = archive / "installed-selection.json"
+        if lifecycle._file_fact(original) != {k: selected[k] for k in ("size", "sha256")}:
+            raise OperatorUpgradeError("retained installer selection is corrupt")
+        from runtime_protocol import platform
+        fd, temporary = platform.private_temporary(Path(selected["path"]).parent, ".restore-selection-")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(original.read_bytes()); handle.flush(); os.fsync(handle.fileno())
+        platform.durable_replace(temporary, selected["path"])
+    prior = SourceProfile.from_mapping(record["prior_profile"])
+    prior = replace(prior, runtime_checkout=str(archive / "executable"),
+                    runtime_environment=str(archive / "environment") if record.get("environment_inventory") is not None else None)
+    # The restored selection names the retained matching executable, not the candidate.
+    atomic_write_json(paths.source_profiles_dir / "astrid.json", prior.as_dict())
+    catalog = dict(_read_catalog(paths))
+    catalog["source_profiles"] = {**catalog.get("source_profiles", {}), "astrid": prior.as_dict()}
+    atomic_write_json(paths.catalog_path, catalog)
+    return BootstrapConfig(source_profile=prior)
+
+
+def _stop_selected(paths, boundary, realm_id, realm_root, config):
+    owner = _owner_record(paths, realm_id, realm_root, boundary)
+    if owner:
+        source = config.resolve_source_profile(paths)
+        boundary.prepare_restart(source_profile=source, realm_id=realm_id, realm_root=realm_root,
+                                 support_root=paths.runtime_support, pid=int(owner["pid"]))
+        with interruption_fence(realm_root) as idle:
+            boundary.stop_owner(endpoint=str(owner["endpoint"]), pid=int(owner["pid"]),
+                instance_id=str(owner["runtime_instance_id"]), process_birth_id=str(owner["process_birth_id"]),
+                realm_id=realm_id, owner_lock=paths.instance_lock_path,
+                discovery_path=paths.discovery_path, require_health=False)
+        remove_file(paths.discovery_path)
+        remove_file(paths.instance_lock_path)
+
+
+def _start_operation(paths, boundary, config, operation_id):
+    previous = os.environ.get("ASTRID_V33_OPERATOR_OPERATION")
+    os.environ["ASTRID_V33_OPERATOR_OPERATION"] = operation_id
+    try:
+        return _bootstrap_locked(paths, boundary, config)
+    finally:
+        if previous is None:
+            os.environ.pop("ASTRID_V33_OPERATOR_OPERATION", None)
+        else:
+            os.environ["ASTRID_V33_OPERATOR_OPERATION"] = previous
+
+
+def recover_workspace(paths, boundary, config, *, timeout_seconds=DEFAULT_UPGRADE_TIMEOUT_SECONDS):
+    """Explicit full-set recovery; observational update status never calls this."""
+    with _bootstrap_mutex(paths), _installer_mutex(paths):
+        journal = _read_support_json(paths.runtime_support / "upgrade-journal.json")
+        if not journal or journal.get("state") in {"complete", "rolled_back"}:
+            raise OperatorUpgradeError("there is no incomplete upgrade to recover")
+        realm_id, realm_root = _realm_from_catalog(paths)
+        if journal.get("realm_id") != realm_id or journal.get("realm_root") != str(realm_root):
+            raise OperatorUpgradeError("recovery selection differs from the recorded upgrade")
+        _stop_selected(paths, boundary, realm_id, realm_root, config)
+        archive = Path(journal["recovery_set"]) if journal.get("recovery_set") else None
+        with _owner_fence(realm_root):
+            prior_config = _restore_installation(paths, realm_root, archive) if archive else config
+        if archive is not None:
+            from runtime_protocol import v33_lifecycle as lifecycle
+            record = lifecycle.read_record(archive / "activation.json")
+            lifecycle.phase(archive, record, "restored", prior_launch_started=True)
+        result = _start_operation(paths, boundary, prior_config, journal["operation_id"])
+        verification = _verify_running(paths, boundary, result, timeout_seconds=timeout_seconds)
+        _journal(paths, operation_id=journal["operation_id"], state="rolled_back", verification=verification)
+        return {"ok": True, "state": "rolled_back", "operation_id": journal["operation_id"], "verification": verification}
+
+
 def upgrade_workspace(
-    paths: RuntimePaths,
-    boundary: RuntimeBoundary,
-    config: BootstrapConfig,
-    *,
+    paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig, *,
     destination: str | Path | None = None,
     timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    """Upgrade/reconcile one selected realm and optionally relocate its support root."""
+    """Own preflight → stop → recovery set → schema/backfill → verified startup."""
+    from runtime_protocol import v33_lifecycle as lifecycle
     if config.profile != "astrid":
         raise OperatorUpgradeError("only the astrid profile is supported")
     if not hasattr(boundary, "prepare_restart") or not hasattr(boundary, "stop_owner"):
         raise OperatorUpgradeError("runtime boundary lacks the birth-checked stop handoff")
     from .bootstrap import _validate_support_paths
     _validate_support_paths(paths)
-    prior_journal = _read_support_json(paths.runtime_support / "upgrade-journal.json")
-    if prior_journal and prior_journal.get("state") in {"planned", "stopping", "stopped", "activated", "restarted", "relocating"}:
-        raise OperatorUpgradeError(
-            "an upgrade operation is already in progress or needs recovery: "
-            + str(prior_journal.get("operation_id") or "unknown")
-        )
     realm_id, realm_root = _realm_from_catalog(paths)
     config.resolve_source_profile(paths)
     _reject_live_pack_host(paths)
-    # Classify exact schema and realm identity before journaling or signaling.
-    # Unknown/newer/alternate layouts therefore retain byte-identical source
-    # and support state on refusal.
+    try:
+        identity = inspect_realm_schema(realm_root, expected_realm_id=realm_id)
+    except Exception as exc:
+        raise OperatorUpgradeError(str(exc)) from exc
     kind = _schema_kind(realm_root, expected_realm_id=realm_id)
     idle = _assert_idle(realm_root)
     operation_id = uuid.uuid4().hex
-    source_support = paths.app_support
-    _journal(
-        paths, operation_id=operation_id, state="planned", realm_id=realm_id,
-        source_support_root=str(source_support), realm_root=str(realm_root), schema_before=kind,
-    )
-    owner = None
+    archive = None
     stopped = False
-    activated = False
-    restarted = False
-    try:
-        with _bootstrap_mutex(paths):
-            owner = _owner_record(paths, realm_id, realm_root, boundary)
-            if owner:
-                source = config.resolve_source_profile(paths)
-                prepare = getattr(boundary, "prepare_restart", None)
-                stop_owner = getattr(boundary, "stop_owner", None)
-                if not callable(prepare) or not callable(stop_owner):
-                    raise OperatorUpgradeError("runtime boundary lacks the birth-checked stop handoff")
-                prepare(
-                    source_profile=source, realm_id=realm_id, realm_root=realm_root,
-                    support_root=paths.runtime_support, pid=int(owner["pid"]),
-                )
-                _journal(paths, operation_id=operation_id, state="stopping", realm_id=realm_id, schema_before=kind, idle=idle)
-                # Hold the final identity-checked stop under the interruption fence.
+    migration = None
+    with _bootstrap_mutex(paths), _installer_mutex(paths):
+        if _realm_from_catalog(paths) != (realm_id, realm_root):
+            raise OperatorUpgradeError("selected realm changed after preflight")
+        prior_journal = _read_support_json(paths.runtime_support / "upgrade-journal.json")
+        if prior_journal and prior_journal.get("state") not in {"complete", "rolled_back", "failed"}:
+            raise OperatorUpgradeError("an upgrade operation is already in progress or needs recovery: " + str(prior_journal.get("operation_id")))
+        _journal(paths, operation_id=operation_id, state="planned", realm_id=realm_id,
+                 source_support_root=str(paths.app_support), realm_root=str(realm_root), schema_before=kind)
+        try:
+            _journal(paths, operation_id=operation_id, state="stopping", idle=idle)
+            _stop_selected(paths, boundary, realm_id, realm_root, config)
+            stopped = True
+            _journal(paths, operation_id=operation_id, state="stopped", idle=idle)
+            with _owner_fence(realm_root), lifecycle.sqlite_observation(realm_root) as original_sqlite:
+                # Reclassify while holding BOTH admission and lifetime fences and
+                # SQLite's writer lock; a stale detached preflight never authorizes DDL.
+                connection = sqlite3.connect(realm_root / "realm.sqlite3", timeout=timeout_seconds)
                 try:
-                    with interruption_fence(realm_root, timeout_seconds=timeout_seconds) as fenced_idle:
-                        stop_owner(
-                            endpoint=str(owner["endpoint"]), pid=int(owner["pid"]),
-                            instance_id=str(owner["runtime_instance_id"]), process_birth_id=str(owner["process_birth_id"]),
-                            realm_id=realm_id, owner_lock=paths.instance_lock_path,
-                            discovery_path=paths.discovery_path, require_health=False,
-                        )
-                        stopped = True
-                        idle = fenced_idle
-                except Exception as exc:
-                    message, details = refusal_from(exc)
-                    raise OperatorUpgradeError(message, details=details) from exc
-                remove_file(paths.discovery_path)
-                remove_file(paths.instance_lock_path)
-            _journal(paths, operation_id=operation_id, state="stopped", realm_id=realm_id, schema_before=kind, idle=idle)
-            if kind == "v23":
-                migration = upgrade_realm(realm_root, timeout_seconds=timeout_seconds, confirmation=f"UPGRADE {realm_id}")
-            else:
-                migration = migrate_canonical_to_current(
-                    realm_root, timeout_seconds=timeout_seconds,
-                    confirmation=f"MIGRATE CANONICAL {realm_id}",
-                    expected_realm_id=realm_id,
-                )
-            activated = True
-            _journal(paths, operation_id=operation_id, state="activated", realm_id=realm_id, schema_before=kind, migration=migration)
-            restarted_result = _bootstrap_locked(paths, boundary, config)
-            restarted = True
-            verification = _verify_running(paths, boundary, restarted_result, timeout_seconds=timeout_seconds)
-            _journal(paths, operation_id=operation_id, state="restarted", realm_id=realm_id, migration=migration, verification=verification)
-        relocation_result = None
-        if destination is not None:
-            _journal(paths, operation_id=operation_id, state="relocating", realm_id=realm_id, migration=migration)
-            relocation_result = relocate(
-                paths, boundary, config, None, destination=destination,
-                confirmation=f"RELOCATE {realm_id}",
-            )
-            final_paths = RuntimePaths.current(data_root=destination)
-            _journal(final_paths, operation_id=operation_id, state="complete", realm_id=realm_id, migration=migration, verification=verification, relocation=relocation_result)
-        else:
-            _journal(paths, operation_id=operation_id, state="complete", realm_id=realm_id, migration=migration, verification=verification)
-        return {"ok": True, "operation_id": operation_id, "realm_id": realm_id, "schema_before": kind, "migration": migration, "verification": verification, "relocation": relocation_result}
-    except Exception as exc:
-        # Before activation the offline helper leaves the original database
-        # untouched. Make a best-effort restart through the same fenced owner
-        # boundary, but report recovery_required if that restart cannot be
-        # verified; never describe a restart failure as a data rollback.
-        restart_error = None
-        if stopped and not activated and not _is_lifecycle_refusal(exc):
+                    connection.execute("BEGIN IMMEDIATE")
+                    from runtime_protocol.v33_manifest import canonical_manifest, legacy_manifest
+                    current = (legacy_manifest if identity["version"] == 23 else canonical_manifest)(connection, expected_realm_id=realm_id)
+                    stat_now = (realm_root / "realm.sqlite3").stat()
+                    if (current["fingerprint"] != identity["fingerprint"] or
+                            (stat_now.st_dev, stat_now.st_ino) != identity["source_file_identity"][:2]):
+                        raise OperatorUpgradeError("realm changed between preflight and exclusive ownership")
+                    archive, record = lifecycle.begin(realm_root, identity, sqlite_image=original_sqlite,
+                        recovery_root=paths.app_support.parent / ".astrid-v33-recovery" / operation_id)
+                    _capture_installation(paths, archive, record)
+                    lifecycle.phase(archive, record, record["state"], target_profile=config.resolve_source_profile(paths).as_dict())
+                    _journal(paths, operation_id=operation_id, state="backup_verified", recovery_set=str(archive))
+                finally:
+                    connection.close()
+                if kind == "v23":
+                    migration = upgrade_realm(realm_root, timeout_seconds=timeout_seconds,
+                        confirmation=f"UPGRADE {realm_id}", retain_backup=True, archive_root=realm_root.parent / "v23-archives")
+                else:
+                    migration = migrate_canonical_to_current(realm_root, timeout_seconds=timeout_seconds,
+                        confirmation=f"MIGRATE CANONICAL {realm_id}", expected_realm_id=realm_id)
+            _journal(paths, operation_id=operation_id, state="activated", migration=migration)
+            # Persistent marker restricts custody transfer to this operation.
+            previous_token = os.environ.get("ASTRID_V33_ACTIVATION")
+            os.environ["ASTRID_V33_ACTIVATION"] = record["operation_id"]
             try:
-                with _bootstrap_mutex(paths):
-                    _bootstrap_locked(paths, boundary, config)
-                restarted = True
-            except Exception as restart_exc:  # pragma: no cover - platform/runtime dependent
-                restart_error = str(restart_exc)
-        state = "failed" if restarted or not stopped else "recovery_required"
-        journal_root = paths.runtime_support if paths.runtime_support.is_dir() else None
-        if journal_root is None and destination is not None:
-            candidate = RuntimePaths.current(data_root=destination).runtime_support
-            if candidate.is_dir():
-                journal_root = candidate
-        if journal_root is not None:
-            _journal(
-                paths, journal_root=journal_root, operation_id=operation_id, state=state, realm_id=realm_id,
-                schema_before=kind, activated=activated, error=str(exc), restart_error=restart_error,
-            )
-        message, details = refusal_from(exc)
-        raise OperatorUpgradeError(
-            message,
-            details=details if isinstance(details, Mapping) else None,
-        ) from exc
+                result = _start_operation(paths, boundary, config, operation_id)
+                verification = _verify_running(paths, boundary, result, timeout_seconds=timeout_seconds)
+            finally:
+                if previous_token is None:
+                    os.environ.pop("ASTRID_V33_ACTIVATION", None)
+                else:
+                    os.environ["ASTRID_V33_ACTIVATION"] = previous_token
+            # A real service must verify/register its provider before activation.
+            record = lifecycle.read_record(archive / "activation.json")
+            if record["state"] not in {"provider_verified", "ready"}:
+                raise OperatorUpgradeError("candidate did not verify its Timeline provider/baseline inventory")
+            lifecycle.phase(archive, record, "ready", ready_at=now())
+            _journal(paths, operation_id=operation_id, state="restarted", migration=migration, verification=verification)
+            _journal(paths, operation_id=operation_id, state="complete", migration=migration, verification=verification)
+        except Exception as exc:
+            recovery_error = None
+            restored = False
+            try:
+                if stopped and archive is not None:
+                    _stop_selected(paths, boundary, realm_id, realm_root, config)
+                    with _owner_fence(realm_root):
+                        prior_config = _restore_installation(paths, realm_root, archive)
+                    record = lifecycle.read_record(archive / "activation.json")
+                    lifecycle.phase(archive, record, "restored", prior_launch_started=True)
+                    result = _start_operation(paths, boundary, prior_config, operation_id)
+                    _verify_running(paths, boundary, result, timeout_seconds=timeout_seconds)
+                    restored = True
+            except Exception as recovery_exc:
+                recovery_error = str(recovery_exc)
+            _journal(paths, operation_id=operation_id, state="rolled_back" if restored else "recovery_required",
+                     error=str(exc), recovery_error=recovery_error)
+            message, details = refusal_from(exc)
+            raise OperatorUpgradeError(message, details=details if isinstance(details, Mapping) else None) from exc
+    relocation_result = None
+    if destination is not None:
+        relocation_result = relocate(paths, boundary, config, None, destination=destination, confirmation=f"RELOCATE {realm_id}")
+    return {"ok": True, "operation_id": operation_id, "realm_id": realm_id, "schema_before": kind,
+            "migration": migration, "verification": verification, "recovery_set": str(archive), "relocation": relocation_result}
 
 
-__all__ = ["OperatorUpgradeError", "upgrade_workspace"]
+__all__ = ["OperatorUpgradeError", "upgrade_workspace", "recover_workspace"]

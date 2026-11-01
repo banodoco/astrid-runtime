@@ -26,7 +26,6 @@ from .upgrade import (
     migrate_generation_tags,
     migrate_canonical_v24_to_v25,
     migrate_canonical_to_current,
-    compact_idempotency_ledger,
     repair_generic_media_types,
     upgrade_realm,
 )
@@ -63,6 +62,7 @@ def _parser():
     start.add_argument("--service-python", help="declaring environment's installed Python")
     start.add_argument("--service-source-checkout", help="declaring profile's source checkout")
     start.add_argument("--log-file", help="Runtime-owned rotating log")
+    start.add_argument("--authoring-profile", choices=("neutral", "astrid"), default="neutral", help="trusted semantic authoring provider profile")
     start.add_argument("--door-origin", help="exact HTTPS origin of the hosted page; opens the browser door")
     start.add_argument("--door-port", type=int, default=DEFAULT_DOOR_PORT, help="the browser door's loopback port")
     start.add_argument("--door-credential-file", help="absolute scoped product credential the browser door acts with")
@@ -138,6 +138,14 @@ def _parser():
     replace.add_argument("--display-name", default="Workspace")
     replace.add_argument("--realm-id")
     replace.add_argument("--retain-superseded", action="store_true", help="retain the replaced realm after activation")
+    recovery_set = sub.add_parser("inspect-recovery-set", help="verify/export retained original DB/sidecars/CAS and archival-only rows")
+    recovery_set.add_argument("--archive", required=True)
+    recovery_set.add_argument("--destination")
+    recovery = sub.add_parser("timeline-recovery", help="inspect/export original timeline records without rendering or changing the realm")
+    recovery.add_argument("--root", required=True)
+    recovery.add_argument("--project-id", required=True)
+    recovery.add_argument("--timeline-id", required=True)
+    recovery.add_argument("--destination", help="new external support-export directory")
     export = sub.add_parser("export", help="export structured realm state")
     export.add_argument("--root", default=os.environ.get("ASTRID_RUNTIME_ROOT", ".runtime"))
     export.add_argument("--destination")
@@ -196,6 +204,15 @@ def _main(args):
         except release_identity.ReleaseIdentityError as exc:
             print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
             return 1
+    if args.command == "inspect-recovery-set":
+        from .v33_lifecycle import inspect_recovery_set
+        print(json.dumps(inspect_recovery_set(args.archive, destination=args.destination), sort_keys=True))
+        return 0
+    if args.command == "timeline-recovery":
+        from .timeline_recovery import offline_export
+        result = offline_export(args.root, args.project_id, args.timeline_id, destination=args.destination)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["complete"] else 1
     if args.command == "doctor":
         root = Path(args.root)
         result = RealmStore.inspect_realm(
@@ -428,6 +445,7 @@ def _main(args):
             log_directory=Path(args.log_file).parent if args.log_file else None,
             runtime_checkout=runtime_checkout,
             agent_checkout=agent_checkout,
+            authoring_profile=args.authoring_profile,
         ).start()
     except KeyboardInterrupt:
         raise

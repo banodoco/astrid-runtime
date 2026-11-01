@@ -1,0 +1,1740 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrid.haus/workspace/v1/schemas/timeline-commit.json",
+  "title": "Timeline commit ABI 1",
+  "$ref": "#/$defs/CommitRequest",
+  "$defs": {
+    "ID": {
+      "type": "string",
+      "minLength": 1
+    },
+    "Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "JSON": {
+      "$ref": "edit-command.json#/$defs/JSON"
+    },
+    "EditCommand": {
+      "$ref": "edit-command.json#/$defs/EditCommand"
+    },
+    "AgentState": {
+      "$ref": "edit-command.json#/$defs/AgentState"
+    },
+    "AgentWrite": {
+      "$ref": "edit-command.json#/$defs/AgentWrite"
+    },
+    "AgentRead": {
+      "$ref": "edit-command.json#/$defs/AgentRead"
+    },
+    "AgentSelection": {
+      "$ref": "edit-command.json#/$defs/AgentSelection"
+    },
+    "AgentBinding": {
+      "$ref": "edit-command.json#/$defs/AgentBinding"
+    },
+    "AgentCreatedID": {
+      "$ref": "edit-command.json#/$defs/AgentCreatedID"
+    },
+    "AgentDependency": {
+      "$ref": "edit-command.json#/$defs/AgentDependency"
+    },
+    "AgentDerivedWrite": {
+      "$ref": "edit-command.json#/$defs/AgentDerivedWrite"
+    },
+    "AgentCommandBatch": {
+      "$ref": "edit-command.json#/$defs/CommandBatch"
+    },
+    "ParentComposition": {
+      "$ref": "shot-composition.json#/$defs/ParentComposition"
+    },
+    "ShotPayload": {
+      "$ref": "shot-composition.json#/$defs/ShotPayload"
+    },
+    "TimelineConfig": {
+      "$ref": "timeline-config.schema.json"
+    },
+    "RawTimelinePayload": {
+      "$ref": "shot-composition.json#/$defs/RawTimelinePayload"
+    },
+    "Document": {
+      "$ref": "document.json"
+    },
+    "MutationReceipt": {
+      "$ref": "../openapi/workspace-v1.yaml#/components/schemas/CommittedMutation/properties/receipt"
+    },
+    "HeadPin": {
+      "type": "object",
+      "properties": {
+        "revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "publication_id": {
+          "$ref": "#/$defs/ID"
+        }
+      },
+      "required": [
+        "revision_id",
+        "publication_id"
+      ],
+      "additionalProperties": false
+    },
+    "Source": {
+      "type": "object",
+      "properties": {
+        "via": {
+          "enum": [
+            "cli",
+            "python",
+            "app",
+            "script",
+            "sheet"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "via"
+      ],
+      "additionalProperties": false
+    },
+    "BatchMetadata": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "label": {
+          "type": "string"
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "group_id": {
+          "$ref": "#/$defs/ID"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "MergeMode": {
+      "enum": [
+        "fields",
+        "atomic"
+      ]
+    },
+    "CommitRead": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "field" },
+            "ref": { "$ref": "#/$defs/ID" },
+            "path": { "$ref": "edit-command.json#/$defs/TokenPath" },
+            "state": { "$ref": "#/$defs/AgentState" }
+          },
+          "required": ["kind", "ref", "path", "state"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "collection" },
+            "ref": { "$ref": "#/$defs/ID" },
+            "path": { "$ref": "edit-command.json#/$defs/TokenPath" },
+            "members": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/ID" },
+              "uniqueItems": true
+            },
+            "order": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/ID" },
+                  "uniqueItems": true
+                },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": ["kind", "ref", "path", "members", "order"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "scope" },
+            "ref": { "$ref": "#/$defs/ID" },
+            "path": { "$ref": "edit-command.json#/$defs/TokenPath" }
+          },
+          "required": ["kind", "ref", "path"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PatchChange": {
+      "type": "object",
+      "properties": {
+        "op": { "enum": ["set", "remove", "list.insert", "list.remove", "list.move"] },
+        "ref": { "$ref": "#/$defs/ID" },
+        "path": { "$ref": "edit-command.json#/$defs/TokenPath" },
+        "before": { "$ref": "#/$defs/AgentState" },
+        "value": { "$ref": "#/$defs/JSON" },
+        "id": { "$ref": "#/$defs/ID" },
+        "order_before": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ID" },
+          "uniqueItems": true
+        },
+        "after_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/ID" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "required": ["op", "ref", "path", "before"],
+      "additionalProperties": false
+    },
+    "RequestedStep": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/ID" },
+        "label": { "type": "string", "minLength": 1 },
+        "intent": { "type": "string" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "command_ordinals": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "patch": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PatchChange" }
+        },
+        "reads": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CommitRead" }
+        }
+      },
+      "required": ["id", "label", "intent", "tags", "command_ordinals", "patch"],
+      "additionalProperties": false
+    },
+    "AcceptedStep": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/ID" },
+        "label": { "type": "string", "minLength": 1 },
+        "intent": { "type": "string" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "command_ordinals": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "patch": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PatchChange" }
+        },
+        "reads": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CommitRead" }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CommitRead" }
+        }
+      },
+      "required": ["id", "label", "intent", "tags", "command_ordinals", "patch"],
+      "additionalProperties": false
+    },
+    "PhysicalBinding": {
+      "type": "object",
+      "properties": {
+        "key": { "$ref": "#/$defs/ID" },
+        "ref": { "$ref": "#/$defs/ID" },
+        "physical_ref": { "$ref": "#/$defs/ID" },
+        "revision_id": { "$ref": "#/$defs/ID" },
+        "content_digest": { "$ref": "#/$defs/Digest" },
+        "boundary": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/JSON" }
+        },
+        "policy": { "enum": ["follow", "fixed"] },
+        "dependencies": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ID" },
+          "uniqueItems": true
+        },
+        "path": { "$ref": "edit-command.json#/$defs/TokenPath" },
+        "change": { "$ref": "#/$defs/PatchChange" },
+        "dependency": { "$ref": "#/$defs/CommitRead" },
+        "write_range": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "command_ordinal": { "type": "integer", "minimum": 0 },
+        "change_ordinal": { "type": "integer", "minimum": 0 },
+        "phase": { "$ref": "#/$defs/ID" },
+        "side": { "enum": ["before", "after"] },
+        "owners": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ID" },
+          "uniqueItems": true
+        },
+        "step_id": { "$ref": "#/$defs/ID" },
+        "effect_ordinal": { "type": "integer", "minimum": 0 },
+        "successor": { "$ref": "#/$defs/ID" },
+        "owner": { "$ref": "#/$defs/ID" },
+        "edge_before": { "$ref": "#/$defs/ID" },
+        "edge_after": { "$ref": "#/$defs/ID" }
+      },
+      "required": ["key", "ref", "policy", "dependencies"],
+      "additionalProperties": false
+    },
+    "CommitRequest": {
+      "type": "object",
+      "properties": {
+        "api_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "project_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "timeline_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "base_revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "base_publication_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "commands": {
+          "$ref": "#/$defs/AgentCommandBatch"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/RequestedStep" },
+          "minItems": 1
+        },
+        "merge": {
+          "$ref": "#/$defs/MergeMode"
+        },
+        "reads": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CommitRead" }
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "group_id": {
+          "$ref": "#/$defs/ID"
+        }
+      },
+      "required": [
+        "api_version",
+        "project_id",
+        "timeline_id",
+        "base_revision_id",
+        "base_publication_id",
+        "commands"
+      ],
+      "additionalProperties": false
+    },
+    "Invocation": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "enum": [
+            "commitTimeline",
+            "restoreProjectParentCompositionRevision"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "edit-command.json#/$defs/JSON"
+          }
+        }
+      },
+      "required": [
+        "operation",
+        "path",
+        "body"
+      ],
+      "additionalProperties": false
+    },
+    "CommitContext": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/CommitRequest"
+        },
+        "invocation": {
+          "$ref": "#/$defs/Invocation"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/ID"
+        },
+        "request_hash": {
+          "type": "string"
+        },
+        "realm_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "publisher": {
+          "$ref": "#/$defs/ID"
+        }
+      },
+      "required": [
+        "request",
+        "invocation",
+        "idempotency_key",
+        "request_hash",
+        "realm_id",
+        "publisher"
+      ],
+      "additionalProperties": false
+    },
+    "ParentImage": {
+      "type": "object",
+      "properties": {
+        "revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "payload": {
+          "$ref": "#/$defs/ParentComposition"
+        }
+      },
+      "required": [
+        "revision_id",
+        "content_digest",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    "ShotImage": {
+      "type": "object",
+      "properties": {
+        "shot_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "internal_timeline_revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "payload": {
+          "$ref": "#/$defs/ShotPayload"
+        }
+      },
+      "required": [
+        "shot_id",
+        "revision_id",
+        "internal_timeline_revision_id",
+        "content_digest",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    "InternalImage": {
+      "type": "object",
+      "properties": {
+        "timeline_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "payload": {
+          "$ref": "#/$defs/RawTimelinePayload"
+        }
+      },
+      "required": [
+        "timeline_id",
+        "revision_id",
+        "content_digest",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    "ShotManifestEntry": {
+      "type": "object",
+      "properties": {
+        "shot_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "internal_timeline_revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "required": [
+        "shot_id",
+        "revision_id",
+        "internal_timeline_revision_id",
+        "content_digest"
+      ],
+      "additionalProperties": false
+    },
+    "InternalManifestEntry": {
+      "type": "object",
+      "properties": {
+        "timeline_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "required": [
+        "timeline_id",
+        "revision_id",
+        "content_digest"
+      ],
+      "additionalProperties": false
+    },
+    "MediaManifestEntry": {
+      "type": "object",
+      "properties": {
+        "media_id": {
+          "$ref": "#/$defs/Digest"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "required": [
+        "media_id",
+        "content_digest"
+      ],
+      "additionalProperties": false
+    },
+    "DocumentPin": {
+      "type": "object",
+      "properties": {
+        "document_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "required": [
+        "document_id",
+        "version",
+        "content_digest"
+      ],
+      "additionalProperties": false
+    },
+    "Manifest": {
+      "type": "object",
+      "properties": {
+        "shots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ShotManifestEntry"
+          }
+        },
+        "internal_timelines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InternalManifestEntry"
+          }
+        },
+        "media": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MediaManifestEntry"
+          }
+        },
+        "documents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DocumentPin"
+          }
+        }
+      },
+      "required": [
+        "shots",
+        "internal_timelines",
+        "media",
+        "documents"
+      ],
+      "additionalProperties": false
+    },
+    "CanonicalDocument": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "project_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "timeline_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "parent_revision": {
+          "$ref": "#/$defs/ParentImage"
+        },
+        "shot_revisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ShotImage"
+          }
+        },
+        "internal_timeline_revisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InternalImage"
+          }
+        },
+        "dependency_manifest": {
+          "$ref": "#/$defs/Manifest"
+        }
+      },
+      "required": [
+        "schema_version",
+        "project_id",
+        "timeline_id",
+        "parent_revision",
+        "shot_revisions",
+        "internal_timeline_revisions",
+        "dependency_manifest"
+      ],
+      "additionalProperties": false
+    },
+    "ShotClosure": {
+      "type": "object",
+      "properties": {
+        "shot_revision": {
+          "$ref": "#/$defs/ShotImage"
+        },
+        "internal_timeline_revision": {
+          "$ref": "#/$defs/InternalImage"
+        },
+        "media": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MediaManifestEntry"
+          }
+        },
+        "documents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DocumentPin"
+          }
+        }
+      },
+      "required": [
+        "shot_revision",
+        "internal_timeline_revision",
+        "media",
+        "documents"
+      ],
+      "additionalProperties": false
+    },
+    "CommandRecord": {
+      "type": "object",
+      "properties": {
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "command": {
+          "$ref": "#/$defs/EditCommand"
+        },
+        "writes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentWrite"
+          }
+        },
+        "reads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentRead"
+          }
+        },
+        "selections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentSelection"
+          }
+        },
+        "bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PhysicalBinding"
+          }
+        },
+        "created": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentCreatedID"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentDependency"
+          }
+        },
+        "derived_writes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentDerivedWrite"
+          }
+        }
+      },
+      "required": [
+        "ordinal",
+        "command",
+        "writes",
+        "reads",
+        "selections",
+        "bindings",
+        "created",
+        "dependencies",
+        "derived_writes"
+      ],
+      "additionalProperties": false
+    },
+    "RestoredFrom": {
+      "type": "object",
+      "properties": {
+        "revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "required": [
+        "revision_id",
+        "content_digest"
+      ],
+      "additionalProperties": false
+    },
+    "Recorder": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommandRecord"
+          }
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AcceptedStep" }
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "merge_mode": {
+          "$ref": "#/$defs/MergeMode"
+        },
+        "undo_of": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ID"
+          },
+          "uniqueItems": true
+        },
+        "restored_from": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RestoredFrom"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "undo_steps": {
+          "oneOf": [
+            {
+              "type": "object",
+              "propertyNames": { "$ref": "#/$defs/ID" },
+              "additionalProperties": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/ID" },
+                "minItems": 1,
+                "uniqueItems": true
+              }
+            },
+            { "type": "null" }
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "commands",
+        "undo_of",
+        "restored_from"
+      ],
+      "additionalProperties": false
+    },
+    "DomainEvent": {
+      "type": "object",
+      "properties": {
+        "command_ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/ID"
+        },
+        "subject_ref": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ID"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "edit-command.json#/$defs/JSON"
+          }
+        }
+      },
+      "required": [
+        "command_ordinal",
+        "kind",
+        "subject_ref",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    "Candidate": {
+      "type": "object",
+      "properties": {
+        "canonical_document": {
+          "$ref": "#/$defs/CanonicalDocument"
+        },
+        "document_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EditCommand"
+          }
+        },
+        "id_map": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ID"
+          }
+        },
+        "provider_version": {
+          "$ref": "#/$defs/ID"
+        },
+        "compiler_version": {
+          "$ref": "#/$defs/ID"
+        }
+      },
+      "required": [
+        "canonical_document",
+        "document_digest",
+        "commands",
+        "id_map",
+        "provider_version",
+        "compiler_version"
+      ],
+      "additionalProperties": false
+    },
+    "PreparedCommit": {
+      "type": "object",
+      "properties": {
+        "expected_head": {
+          "$ref": "#/$defs/HeadPin"
+        },
+        "canonical_document": {
+          "$ref": "#/$defs/CanonicalDocument"
+        },
+        "document_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "id_map": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ID"
+          }
+        },
+        "provider_version": {
+          "$ref": "#/$defs/ID"
+        },
+        "compiler_version": {
+          "$ref": "#/$defs/ID"
+        },
+        "records": {
+          "$ref": "#/$defs/Recorder"
+        },
+        "semantic_events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainEvent"
+          }
+        }
+      },
+      "required": [
+        "expected_head",
+        "canonical_document",
+        "document_digest",
+        "id_map",
+        "provider_version",
+        "compiler_version",
+        "records",
+        "semantic_events"
+      ],
+      "additionalProperties": false
+    },
+    "CommitAccepted": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "accepted",
+            "rebased",
+            "merged"
+          ]
+        },
+        "base_revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "base_publication_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "previous_revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "previous_publication_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "accepted_revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "rebased_onto": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/HeadPin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "canonical_document": {
+          "$ref": "#/$defs/CanonicalDocument"
+        },
+        "document_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EditCommand"
+          }
+        },
+        "id_map": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ID"
+          }
+        },
+        "provider_version": {
+          "$ref": "#/$defs/ID"
+        },
+        "compiler_version": {
+          "$ref": "#/$defs/ID"
+        },
+        "merge_mode": {
+          "$ref": "#/$defs/MergeMode"
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AcceptedStep" }
+        },
+        "publisher": {
+          "$ref": "#/$defs/ID"
+        },
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "label": {
+          "type": "string"
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "group_id": {
+          "$ref": "#/$defs/ID"
+        }
+      },
+      "required": [
+        "status",
+        "base_revision_id",
+        "base_publication_id",
+        "previous_revision_id",
+        "previous_publication_id",
+        "accepted_revision_id",
+        "rebased_onto",
+        "canonical_document",
+        "document_digest",
+        "commands",
+        "id_map",
+        "provider_version",
+        "compiler_version",
+        "publisher"
+      ],
+      "additionalProperties": false
+    },
+    "CommitPreview": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "preview"
+          ]
+        },
+        "would_status": {
+          "enum": [
+            "accepted",
+            "merged"
+          ]
+        },
+        "base_revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "base_publication_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "evaluated_head": {
+          "$ref": "#/$defs/HeadPin"
+        },
+        "canonical_document": {
+          "$ref": "#/$defs/CanonicalDocument"
+        },
+        "document_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EditCommand"
+          }
+        },
+        "id_map": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ID"
+          }
+        },
+        "provider_version": {
+          "$ref": "#/$defs/ID"
+        },
+        "compiler_version": {
+          "$ref": "#/$defs/ID"
+        },
+        "merge_mode": {
+          "$ref": "#/$defs/MergeMode"
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AcceptedStep" }
+        }
+      },
+      "required": [
+        "status",
+        "would_status",
+        "base_revision_id",
+        "base_publication_id",
+        "evaluated_head",
+        "canonical_document",
+        "document_digest",
+        "commands",
+        "id_map",
+        "provider_version",
+        "compiler_version"
+      ],
+      "additionalProperties": false
+    },
+    "CommitPreviewResponse": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/CommitPreview"
+        },
+        "receipt": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "data",
+        "receipt"
+      ],
+      "additionalProperties": false
+    },
+    "CommitAcceptedMutation": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/CommitAccepted"
+        },
+        "receipt": {
+          "$ref": "#/$defs/MutationReceipt"
+        }
+      },
+      "required": [
+        "data",
+        "receipt"
+      ],
+      "additionalProperties": false
+    },
+    "Conflict": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ID"
+        },
+        "ref": {
+          "$ref": "#/$defs/ID"
+        },
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "base": {
+          "$ref": "#/$defs/AgentState"
+        },
+        "theirs": {
+          "$ref": "#/$defs/AgentState"
+        },
+        "ours": {
+          "$ref": "#/$defs/AgentState"
+        },
+        "choices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EditCommand"
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "ref",
+        "path",
+        "base",
+        "theirs",
+        "ours",
+        "choices"
+      ],
+      "additionalProperties": false
+    },
+    "CommitFailureDetails": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "conflict",
+            "refused",
+            "invalid"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/ID"
+        },
+        "base": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/HeadPin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "current": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/HeadPin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "conflicts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Conflict"
+          }
+        },
+        "code": {
+          "$ref": "#/$defs/ID"
+        },
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "hint": {
+          "type": "string"
+        },
+        "suggested_command": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "reason",
+        "base",
+        "current",
+        "conflicts"
+      ],
+      "additionalProperties": false
+    },
+    "CommitFailure": {
+      "type": "object",
+      "properties": {
+        "http_status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "code": {
+          "$ref": "#/$defs/ID"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "$ref": "#/$defs/CommitFailureDetails"
+        }
+      },
+      "required": [
+        "http_status",
+        "code",
+        "message",
+        "details"
+      ],
+      "additionalProperties": false
+    },
+    "HistoryEntry": {
+      "type": "object",
+      "properties": {
+        "publication_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "previous": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/HeadPin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "receipt": {
+          "$ref": "#/$defs/MutationReceipt"
+        },
+        "intent": {
+          "enum": [
+            "recorded",
+            "legacy_unknown",
+            "bootstrap"
+          ]
+        },
+        "records": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Recorder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_version": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ID"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compiler_version": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ID"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recorder_abi": {
+          "type": "integer",
+          "enum": [
+            1,
+            2
+          ]
+        },
+        "merge": {
+          "$ref": "#/$defs/MergeMode"
+        },
+        "merge_mode": {
+          "$ref": "#/$defs/MergeMode"
+        },
+        "reads": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CommitRead" }
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AcceptedStep" }
+        },
+        "publisher": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ID"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "label": {
+          "type": "string"
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "group_id": {
+          "$ref": "#/$defs/ID"
+        }
+      },
+      "required": [
+        "publication_id",
+        "revision_id",
+        "previous",
+        "receipt",
+        "intent",
+        "records",
+        "provider_version",
+        "compiler_version",
+        "publisher"
+      ],
+      "additionalProperties": false
+    },
+    "HistoryPage": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HistoryEntry"
+          }
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "head": {
+          "$ref": "#/$defs/HeadPin"
+        }
+      },
+      "required": [
+        "items",
+        "next_cursor",
+        "head"
+      ],
+      "additionalProperties": false
+    },
+    "TimelineCommitPage": {
+      "$ref": "#/$defs/HistoryPage"
+    },
+    "MediaSelection": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "$ref": "#/$defs/ID"
+        },
+        "generation_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "variant_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "object_id": {
+          "$ref": "#/$defs/Digest"
+        },
+        "catalog_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "required": [
+        "asset",
+        "generation_id",
+        "variant_id",
+        "object_id",
+        "catalog_digest"
+      ],
+      "additionalProperties": false
+    },
+    "MediaSelectionQuery": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "asset": {
+              "$ref": "#/$defs/ID"
+            },
+            "generation_id": {
+              "$ref": "#/$defs/ID"
+            },
+            "variant_id": {
+              "$ref": "#/$defs/ID"
+            }
+          },
+          "required": [
+            "asset",
+            "generation_id",
+            "variant_id"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "association_id": {
+              "$ref": "#/$defs/ID"
+            },
+            "object_id": {
+              "$ref": "#/$defs/Digest"
+            },
+            "version": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "association_id",
+            "object_id",
+            "version"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "VerifiedMedia": {
+      "type": "object",
+      "properties": {
+        "selection": {
+          "$ref": "#/$defs/MediaSelection"
+        },
+        "media_type": {
+          "$ref": "#/$defs/ID"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "selection",
+        "media_type",
+        "size"
+      ],
+      "additionalProperties": false
+    },
+    "VerifiedDocument": {
+      "type": "object",
+      "properties": {
+        "pin": {
+          "$ref": "#/$defs/DocumentPin"
+        },
+        "document": {
+          "$ref": "#/$defs/Document"
+        }
+      },
+      "required": [
+        "pin",
+        "document"
+      ],
+      "additionalProperties": false
+    },
+    "VerifiedDocumentObject": {
+      "type": "object",
+      "properties": {
+        "object_id": {
+          "$ref": "#/$defs/Digest"
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "media_type": {
+          "const": "application/json"
+        },
+        "bytes_base64": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "object_id",
+        "digest",
+        "size",
+        "media_type",
+        "bytes_base64"
+      ],
+      "additionalProperties": false
+    },
+    "ManagedTakeRef": {
+      "type": "object",
+      "properties": {
+        "association_id": {
+          "$ref": "#/$defs/ID"
+        },
+        "object_id": {
+          "$ref": "#/$defs/Digest"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "association_id",
+        "object_id",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "NarrationTakeRefs": {
+      "type": "object",
+      "properties": {
+        "speech": {
+          "$ref": "#/$defs/ManagedTakeRef"
+        },
+        "speech_words": {
+          "$ref": "#/$defs/ManagedTakeRef"
+        },
+        "speech_manifest": {
+          "$ref": "#/$defs/ManagedTakeRef"
+        }
+      },
+      "required": [
+        "speech",
+        "speech_words",
+        "speech_manifest"
+      ],
+      "additionalProperties": false
+    },
+    "NarrationSpeech": {
+      "type": "object",
+      "properties": {
+        "object_id": {
+          "$ref": "#/$defs/Digest"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "media_type": {
+          "$ref": "#/$defs/ID"
+        },
+        "duration_seconds": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "object_id",
+        "size",
+        "media_type",
+        "duration_seconds"
+      ],
+      "additionalProperties": false
+    },
+    "VerifiedNarrationTake": {
+      "type": "object",
+      "properties": {
+        "refs": {
+          "$ref": "#/$defs/NarrationTakeRefs"
+        },
+        "speech": {
+          "$ref": "#/$defs/NarrationSpeech"
+        },
+        "manifest": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "edit-command.json#/$defs/JSON"
+          }
+        },
+        "words": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "edit-command.json#/$defs/JSON"
+          }
+        },
+        "dependency_objects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Digest"
+          }
+        },
+        "dependency_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "required": [
+        "refs",
+        "speech",
+        "manifest",
+        "words",
+        "dependency_objects",
+        "dependency_digest"
+      ],
+      "additionalProperties": false
+    },
+    "CommitOutcome": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/CommitAcceptedMutation"
+        },
+        {
+          "$ref": "#/$defs/CommitPreviewResponse"
+        },
+        {
+          "$ref": "#/$defs/CommitFailure"
+        }
+      ]
+    },
+    "RestoreParentCompositionRevision": {
+      "type": "object",
+      "properties": {
+        "expected_head": {
+          "$ref": "#/$defs/ID"
+        },
+        "expected_publication_id": {
+          "$ref": "#/$defs/ID"
+        }
+      },
+      "required": [
+        "expected_head",
+        "expected_publication_id"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

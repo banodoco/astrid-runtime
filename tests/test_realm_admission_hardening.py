@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import os
 import json
@@ -21,7 +22,12 @@ from runtime_protocol.errors import ConflictError, OwnerBusyError, RealmAdmissio
 from runtime_protocol.canonical_schema import CANONICAL_FORMAT_ID
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import SCHEMA_VERSION, RealmStore
+from runtime_protocol.timeline_commit_port import RequestCommitPort
+from runtime_protocol.timeline_commit_store import digest, request_identity
 from runtime_protocol import platform as runtime_platform
+from precut_realm_fixture import load_precut_realm_fixture
+from test_timeline_commit_port import prepared
+from tests.schema_fixtures import walk_back_to_v30
 
 
 def _tree_bytes(root: Path) -> dict[str, str]:
@@ -43,6 +49,130 @@ def _new_service(root: Path, **kwargs):
 def _new_daemon(root: Path, support_root: Path):
     RealmStore.initialize(root).close()
     return RuntimeDaemon(root, support_root=support_root).start()
+
+
+def _payload_media_ids(value):
+    found = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"media_id", "object_id"} and isinstance(child, str):
+                found.add(child)
+            found.update(_payload_media_ids(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.update(_payload_media_ids(child))
+    return found
+
+
+def _accept_unrelated_child_fixture(service, project_id, source_timeline, source_revision, *, omit_gain=False):
+    """Use Runtime acceptance to capture a valid same-project child graph."""
+    source = service.get_project_parent_composition_revision(
+        project_id, source_timeline, source_revision,
+    )["payload"]
+    occurrence = copy.deepcopy(source["occurrences"][0])
+    source_shot_revision = occurrence["shot_revision_id"]
+    shot_row = service.store.conn.execute(
+        "SELECT * FROM shot_revisions WHERE id=?", (source_shot_revision,),
+    ).fetchone()
+    internal_row = service.store.conn.execute(
+        "SELECT * FROM internal_timeline_revisions WHERE id=?",
+        (shot_row["internal_timeline_revision_id"],),
+    ).fetchone()
+    shot_payload = json.loads(shot_row["payload_json"])
+    shot_payload["internal_timeline_revision_id"] = "other-internal"
+    internal_payload = json.loads(internal_row["payload_json"])
+    other_shot = "other-shot"
+    other_shot_revision = "other-shot-revision"
+    occurrence.update(shot_id=other_shot, shot_revision_id=other_shot_revision)
+    if omit_gain:
+        occurrence.pop("gain")
+    parent_payload = copy.deepcopy(source)
+    parent_payload["occurrences"] = [occurrence]
+
+    other_timeline = "other"
+    service.create_timeline(project_id, other_timeline, idempotency_key="other-timeline")
+    commits, _ = service._timeline_commits()
+    head = commits.bootstrap(project_id, other_timeline, authorize=lambda: None)
+    request = {
+        "api_version": 1,
+        "project_id": project_id,
+        "timeline_id": other_timeline,
+        "base_revision_id": head["revision_id"],
+        "base_publication_id": head["publication_id"],
+        "commands": [{
+            "schema_version": 1, "op": "clip.move", "version": "1",
+            "select": "parent/clip:fixture", "args": {"on": 2},
+        }],
+        "rationale": "host acceptance fixture",
+    }
+    context = {
+        "request": request,
+        "invocation": {
+            "operation": "commitTimeline",
+            "path": f"/v1/projects/{project_id}/timelines/{other_timeline}/commit",
+            "body": copy.deepcopy(request),
+        },
+        "idempotency_key": "other-parent",
+        "realm_id": service.realm["id"],
+        "publisher": "host-fixture",
+    }
+    context["request_hash"] = request_identity(context)
+    port = RequestCommitPort(service, commits, context, lambda: None)
+    try:
+        candidate = prepared(context, port, same=True)
+    finally:
+        port.close()
+
+    internal_image = {
+        "timeline_id": other_timeline,
+        "revision_id": "other-internal",
+        "payload": internal_payload,
+        "content_digest": digest(internal_payload),
+    }
+    media_ids = sorted(
+        _payload_media_ids(parent_payload)
+        | _payload_media_ids(shot_payload)
+        | _payload_media_ids(internal_payload)
+    )
+    shot_image = {
+        "shot_id": other_shot,
+        "revision_id": other_shot_revision,
+        "internal_timeline_revision_id": "other-internal",
+        "payload": shot_payload,
+        "content_digest": digest(shot_payload),
+    }
+    document = {
+        "schema_version": 1,
+        "project_id": project_id,
+        "timeline_id": other_timeline,
+        "parent_revision": {
+            "revision_id": "other-parent",
+            "payload": parent_payload,
+            "content_digest": digest(parent_payload),
+        },
+        "shot_revisions": [shot_image],
+        "internal_timeline_revisions": [internal_image],
+        "dependency_manifest": {
+            "shots": [{
+                "shot_id": other_shot,
+                "revision_id": other_shot_revision,
+                "internal_timeline_revision_id": "other-internal",
+                "content_digest": shot_image["content_digest"],
+            }],
+            "internal_timelines": [{
+                "timeline_id": other_timeline,
+                "revision_id": "other-internal",
+                "content_digest": internal_image["content_digest"],
+            }],
+            "media": [{"media_id": media_id, "content_digest": media_id}
+                      for media_id in media_ids],
+            "documents": [],
+        },
+    }
+    candidate["canonical_document"] = document
+    candidate["document_digest"] = digest(document)
+    commits.accept(context, candidate, authorize=lambda: None)
+    return other_shot_revision
 
 
 def _admission_worker(root, release, results):
@@ -261,90 +391,55 @@ def test_existing_realm_missing_required_column_fails_admission_with_schema_deta
     ],
 )
 def test_revision_admission_legacy_declared_media_boundaries(tmp_path, case, expected_reason):
-    root = tmp_path / "realm"
-    service = _new_service(root)
+    captured = load_precut_realm_fixture(tmp_path)
+    root = captured.copy_roots[1]
+    project_id = captured.pins["project_id"]
+    timeline_id = captured.pins["timeline_id"]
+    parent_revision_id = captured.pins["parent_revision_id"]
+    service = RuntimeService(root)
     try:
-        project = service.create_project({"slug": "legacy-media", "name": "Legacy media", "metadata": {}})
-        project_id = project["id"]
-        service.create_timeline(project_id, "main", idempotency_key="timeline")
-        referenced = service.ingest_object(b"referenced-media", idempotency_key="referenced-media")["data"]["digest"]
-        legacy_extra = service.ingest_object(b"legacy-declared-media", idempotency_key="legacy-extra")["data"]["digest"]
-        for digest in (referenced, legacy_extra):
-            service.store.conn.execute(
-                "INSERT INTO project_objects(project_id,digest,relation,created_at) VALUES (?, ?, 'managed', datetime('now'))",
-                (project_id, digest.removeprefix("sha256:")),
-            )
-        service.publish_parent_composition(
-            project_id,
-            "main",
-            {
-                "project_id": project_id,
-                "timeline_id": "main",
-                "expected_head": None,
-                "parent_revision_id": "legacy-parent",
-                "parent_composition": {
-                    "config": {}, "clips": [], "occurrences": [],
-                    "registry": {"assets": {"tone": {"media_id": referenced}}},
-                },
-                "dependency_manifest": {"media": [referenced]},
-            },
-            idempotency_key="legacy-parent-publication",
-        )
+        parent_payload = service.get_project_parent_composition_revision(
+            project_id, timeline_id, parent_revision_id,
+        )["payload"]
+        referenced = sorted(_payload_media_ids(parent_payload))[0]
+        legacy_extra = service.ingest(
+            project_id, b"legacy-declared-media", idempotency_key="legacy-extra",
+        )["data"]["digest"]
         if case == "unrelated_child_revision":
-            # Publish a separate valid same-project child graph through the
-            # ordinary API, so its ownership and digest are independently valid.
-            service.create_timeline(project_id, "other", idempotency_key="other-timeline")
-            service.publish_parent_composition(
-                project_id,
-                "other",
-                {
-                    "project_id": project_id, "timeline_id": "other",
-                    "expected_head": None, "parent_revision_id": "other-parent",
-                    "internal_timeline_revisions": [{
-                        "timeline_id": "other", "revision_id": "other-internal",
-                        "payload": {"tracks": [], "clips": [], "effects": [], "audio": [], "layout": {}, "registry": {}, "assets": []},
-                    }],
-                    "shot_revisions": [{
-                        "shot_id": "other-shot", "revision_id": "other-shot-revision",
-                        "internal_timeline_revision_id": "other-internal",
-                        "payload": {"metadata": {}, "items": [], "pools": [], "selected_variants": {}, "provenance": {}, "generation_inputs": {}, "audio_bindings": [], "text_bindings": []},
-                    }],
-                    "parent_composition": {
-                        "config": {}, "registry": {}, "clips": [],
-                        "occurrences": [{
-                            "occurrence_id": "other-occurrence", "shot_id": "other-shot",
-                            "shot_revision_id": "other-shot-revision",
-                            "placement": {"start_ms": 0}, "source_offset": 0,
-                            "duration_ms": 1000, "speed": 1, "track": "video-1",
-                            "transform": {}, "gain": 1, "mute": False, "provenance": {},
-                        }],
-                    },
-                },
-                idempotency_key="other-parent-publication",
+            other_shot_revision = _accept_unrelated_child_fixture(
+                service, project_id, timeline_id, parent_revision_id,
             )
         assert service.store.integrity_report()["ok"] is True
+        dependencies = service.store.conn.execute(
+            "SELECT COUNT(*) FROM composition_revision_dependencies WHERE parent_revision_id=?",
+            (parent_revision_id,),
+        ).fetchone()[0]
         service.store.conn.execute(
-            "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'media', ?, ?, 1)",
-            ("legacy-parent", legacy_extra, legacy_extra),
+            "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'media', ?, ?, ?)",
+            (parent_revision_id, legacy_extra, legacy_extra, dependencies),
         )
         if case == "missing_payload_media":
+            removed = service.store.conn.execute(
+                "SELECT ordinal FROM composition_revision_dependencies WHERE parent_revision_id=? AND dependency_kind='media' AND dependency_id=?",
+                (parent_revision_id, referenced),
+            ).fetchone()["ordinal"]
             service.store.conn.execute(
                 "DELETE FROM composition_revision_dependencies WHERE parent_revision_id=? AND dependency_kind='media' AND dependency_id=?",
-                ("legacy-parent", referenced),
+                (parent_revision_id, referenced),
             )
             # Preserve contiguous ordinals: this case must fail for missing
             # payload closure rather than an incidental ordinal gap.
             service.store.conn.execute(
-                "UPDATE composition_revision_dependencies SET ordinal=0 WHERE parent_revision_id=?",
-                ("legacy-parent",),
+                "UPDATE composition_revision_dependencies SET ordinal=ordinal-1 WHERE parent_revision_id=? AND ordinal>?",
+                (parent_revision_id, removed),
             )
         elif case == "unrelated_child_revision":
             child = service.store.conn.execute(
-                "SELECT content_digest FROM shot_revisions WHERE id=?", ("other-shot-revision",),
+                "SELECT content_digest FROM shot_revisions WHERE id=?", (other_shot_revision,),
             ).fetchone()
             service.store.conn.execute(
-                "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'shot_revision', ?, ?, 2)",
-                ("legacy-parent", "other-shot-revision", child["content_digest"]),
+                "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'shot_revision', ?, ?, ?)",
+                (parent_revision_id, other_shot_revision, child["content_digest"], dependencies + 1),
             )
         elif case == "unowned_extra_media":
             service.store.conn.execute(
@@ -354,19 +449,19 @@ def test_revision_admission_legacy_declared_media_boundaries(tmp_path, case, exp
         elif case == "wrong_extra_media_digest":
             service.store.conn.execute(
                 "UPDATE composition_revision_dependencies SET content_digest=? WHERE parent_revision_id=? AND dependency_id=?",
-                (referenced, "legacy-parent", legacy_extra),
+                (referenced, parent_revision_id, legacy_extra),
             )
         elif case == "duplicate_dependency":
             # The canonical primary key includes ordinal, so a duplicate
             # dependency triple at another ordinal is representable.
             service.store.conn.execute(
-                "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'media', ?, ?, 2)",
-                ("legacy-parent", legacy_extra, legacy_extra),
+                "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'media', ?, ?, ?)",
+                (parent_revision_id, legacy_extra, legacy_extra, dependencies + 1),
             )
         elif case == "noncontiguous_ordinals":
             service.store.conn.execute(
-                "UPDATE composition_revision_dependencies SET ordinal=2 WHERE parent_revision_id=? AND dependency_id=?",
-                ("legacy-parent", legacy_extra),
+                "UPDATE composition_revision_dependencies SET ordinal=? WHERE parent_revision_id=? AND dependency_id=?",
+                (dependencies + 1, parent_revision_id, legacy_extra),
             )
     finally:
         service.close()
@@ -386,7 +481,7 @@ def test_revision_admission_legacy_declared_media_boundaries(tmp_path, case, exp
         errors = revisions["errors"]
         assert any(
             error["table"] == "composition_revision_dependencies"
-            and str(error["identity"]).startswith("legacy-parent")
+            and str(error["identity"]).startswith(parent_revision_id)
             and error["reason"] == expected_reason
             for error in errors
         ), errors
@@ -445,6 +540,107 @@ def test_runtime_strict_identity_admission_rejects_before_open_and_preserves_byt
 
     assert error.value.details["checks"]["realm_identity"]["reason"] == "realm_identity_missing"
     assert _tree_bytes(root) == before
+
+
+def test_omitted_occurrence_gain_admits_but_stored_gain_corruption_refuses_before_daemon_boot(tmp_path):
+    captured = load_precut_realm_fixture(tmp_path)
+    root = captured.copy_roots[1]
+    project_id = captured.pins["project_id"]
+    timeline_id = captured.pins["timeline_id"]
+    parent_revision_id = captured.pins["parent_revision_id"]
+    service = RuntimeService(root)
+    try:
+        connection = service.store.conn
+        assert connection is not None
+        original = service.get_project_parent_composition_revision(
+            project_id, timeline_id, parent_revision_id,
+        )["payload"]
+        original_parent_bytes = connection.execute(
+            "SELECT payload_json FROM parent_composition_revisions WHERE id=?",
+            (parent_revision_id,),
+        ).fetchone()[0]
+        source_occurrence = original["occurrences"][0]
+        shared_closure_before = tuple(
+            connection.execute(
+                "SELECT payload_json FROM " + table + " WHERE id=?",
+                (revision_id,),
+            ).fetchone()[0]
+            for table, revision_id in (
+                ("shot_revisions", source_occurrence["shot_revision_id"]),
+                ("internal_timeline_revisions", connection.execute(
+                    "SELECT internal_timeline_revision_id FROM shot_revisions WHERE id=?",
+                    (source_occurrence["shot_revision_id"],),
+                ).fetchone()[0]),
+            )
+        )
+        _accept_unrelated_child_fixture(
+            service, project_id, timeline_id, parent_revision_id, omit_gain=True,
+        )
+        omitted_parent = json.loads(connection.execute(
+            "SELECT payload_json FROM parent_composition_revisions WHERE id='other-parent'"
+        ).fetchone()[0])
+        assert "gain" not in omitted_parent["occurrences"][0]
+        omitted_row = connection.execute(
+            "SELECT gain FROM composition_revision_occurrences WHERE parent_revision_id='other-parent'"
+        ).fetchone()
+        assert omitted_row["gain"] == 1.0
+        assert [row["gain"] for row in connection.execute(
+            "SELECT gain FROM composition_revision_occurrences WHERE parent_revision_id=? ORDER BY ordinal",
+            (parent_revision_id,),
+        )] == [1.0, 1.0, 1.0]
+        assert connection.execute(
+            "SELECT payload_json FROM parent_composition_revisions WHERE id=?",
+            (parent_revision_id,),
+        ).fetchone()[0] == original_parent_bytes
+        shared_closure_after = tuple(
+            connection.execute(
+                "SELECT payload_json FROM " + table + " WHERE id=?",
+                (revision_id,),
+            ).fetchone()[0]
+            for table, revision_id in (
+                ("shot_revisions", source_occurrence["shot_revision_id"]),
+                ("internal_timeline_revisions", connection.execute(
+                    "SELECT internal_timeline_revision_id FROM shot_revisions WHERE id=?",
+                    (source_occurrence["shot_revision_id"],),
+                ).fetchone()[0]),
+            )
+        )
+        assert shared_closure_after == shared_closure_before
+    finally:
+        service.close()
+
+    assert RealmStore.inspect_realm(root)["ok"]
+    assert RealmStore.inspect_realm(root, deep=True)["ok"]
+    reopened = RealmStore(root)
+    try:
+        assert reopened.admission_report["ok"]
+    finally:
+        reopened.close()
+
+    connection = sqlite3.connect(root / "realm.sqlite3")
+    try:
+        connection.execute(
+            "UPDATE composition_revision_occurrences SET gain=2.0 WHERE parent_revision_id='other-parent'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    corrupt = RealmStore.inspect_realm(root, deep=True)
+    assert not corrupt["ok"]
+    gain_errors = [
+        error for error in corrupt["checks"]["revisions"]["errors"]
+        if error["reason"] == "occurrence_field_mismatch" and error["field"] == "gain"
+    ]
+    assert len(gain_errors) == 1
+    assert gain_errors[0]["expected"] == 1
+    assert gain_errors[0]["actual"] == 2.0
+
+    daemon = RuntimeDaemon(root, support_root=tmp_path / "support")
+    with pytest.raises(RealmAdmissionError):
+        daemon.start()
+    assert daemon.httpd is None
+    assert not (tmp_path / "support" / "credentials").exists()
 
 
 def test_wal_only_commit_survives_owned_backup_and_restore(tmp_path):
@@ -793,6 +989,7 @@ def _authenticated_v28_backup(tmp_path):
     connection = sqlite3.connect(backup / "realm.sqlite3")
     try:
         connection.execute("PRAGMA journal_mode=DELETE")
+        walk_back_to_v30(connection)
         connection.execute("ALTER TABLE timelines DROP COLUMN name")  # v30 -> v29/v28 layout
         connection.execute("DROP TABLE user_app_state")
         connection.execute("DROP INDEX idx_generations_gen")

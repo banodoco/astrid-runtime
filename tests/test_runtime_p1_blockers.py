@@ -9,8 +9,9 @@ import pytest
 from http_helpers import Api
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.store import RealmStore
-from runtime_protocol.errors import ConflictError, InvalidRequestError, LeaseError, ValidationError
+from runtime_protocol.errors import ConflictError, InvalidRequestError, LeaseError, RetiredRouteError, ValidationError
 from runtime_protocol.service import RuntimeService
+from test_timeline_commit_integration import Editing, agent, film, positions, rows
 
 
 def _digest(value: bytes | str) -> str:
@@ -196,12 +197,11 @@ def test_startup_reconciles_journaled_publication_after_crash_seam(tmp_path: Pat
         recovered.close()
 
 
-def test_project_updates_require_idempotency_keys_at_service_boundary(tmp_path: Path) -> None:
+def test_project_reference_updates_require_idempotency_keys_at_service_boundary(tmp_path: Path) -> None:
     RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         project = service.create_project({"slug": "p1", "name": "P1"}, idempotency_key="project")
-        shot = service.create_project_shot(project["id"], {"name": "Shot", "metadata": {}}, idempotency_key="shot")
         media = service.ingest(project["id"], b"reference-media", idempotency_key="media")
         reference = service.create_project_reference(
             project["id"],
@@ -209,15 +209,61 @@ def test_project_updates_require_idempotency_keys_at_service_boundary(tmp_path: 
             idempotency_key="reference",
         )
         with pytest.raises(InvalidRequestError, match="Idempotency-Key is required"):
-            service.update_project_shot(project["id"], shot["data"]["shot_id"], {"expected_version": 1, "name": "Updated"})
-        with pytest.raises(InvalidRequestError, match="Idempotency-Key is required"):
             service.update_project_reference(
                 project["id"], reference["data"]["reference_id"], {"expected_version": 1, "name": "Updated"}
             )
         with pytest.raises(InvalidRequestError, match="at most 256"):
-            service.update_project_shot(
-                project["id"], shot["data"]["shot_id"], {"expected_version": 1, "name": "Updated"}, idempotency_key="x" * 257
+            service.update_project_reference(
+                project["id"], reference["data"]["reference_id"], {"expected_version": 1, "name": "Updated"}, idempotency_key="x" * 257
             )
+    finally:
+        service.close()
+
+
+@pytest.mark.integration
+def test_project_shot_updates_require_idempotency_keys_at_service_boundary(
+    film, agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retired shot writer maps to the keyed, real-provider commit path."""
+    service = RuntimeService(film.fixture.duplicate_root)
+    try:
+        service.register_timeline_commit_provider(agent.provider())
+        editing = Editing(service, film, agent)
+        editing.assert_baseline()
+        body = editing.body([editing.move("music-bed", 1)])
+        before = rows(service)
+
+        # The public direct shot route remains retired; its replacement is the
+        # command below, not a resurrection of the old writer.
+        with pytest.raises(RetiredRouteError, match="direct shot writes are retired"):
+            service.update_project_shot(
+                film.fixture.project_id, "shot-1", {"expected_version": 1, "name": "Updated"},
+                idempotency_key="retired-shot-write",
+            )
+        assert rows(service) == before
+
+        with pytest.raises(InvalidRequestError, match="Idempotency-Key is required"):
+            editing.commit(body, None)
+        assert rows(service) == before
+        with pytest.raises(InvalidRequestError, match="must start"):
+            editing.commit(body, "")
+        assert rows(service) == before
+        with pytest.raises(InvalidRequestError, match="at most 256"):
+            editing.commit(body, "x" * 257)
+        assert rows(service) == before
+
+        accepted = editing.commit(body, "film-shot-edit")
+        assert accepted["data"]["status"] == "accepted"
+        assert positions(accepted["data"]["canonical_document"])["music-bed"] == 1
+        after = rows(service)
+
+        def forbidden(self, context, port):
+            raise AssertionError("idempotent retry executed the semantic provider")
+
+        with monkeypatch.context() as retry:
+            retry.setattr(type(service._timeline_commit_provider), "commit", forbidden)
+            assert editing.commit(body, "film-shot-edit") == accepted
+        assert rows(service) == after
     finally:
         service.close()
 

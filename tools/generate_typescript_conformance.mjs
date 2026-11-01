@@ -213,6 +213,8 @@ export type PreferenceScope = "user" | "project";
 export interface PreferenceResource { scope: PreferenceScope; actor_id: string | null; project_id: string | null; document_id: string; content: string; version: number; created_at: string | null; updated_at: string | null }
 export type PreferenceMutationResult = PreferenceResource & { readonly receipt: Record<string, unknown> | null };
 export type MutationResult<T> = T & { readonly receipt: Record<string, unknown> };
+export interface TerminalEvidence { outputs?: Record<string, unknown>[]; result?: Record<string, unknown> }
+export interface CancellationEvidence extends TerminalEvidence { attempt_id: string; lease_id: string; fence: number; runtime_epoch: number; stop_observed?: boolean }
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string, message: string, public request_id = "", public details: Record<string, unknown> = {}) {
@@ -333,9 +335,13 @@ export class WorkspaceClient {
     const headers: HeadersLike = { "Content-Type": "application/json" }; if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
     return this.json<Record<string, unknown>>((await this.call("registerCapability", "POST", "/v1/capabilities", new TextEncoder().encode(JSON.stringify({ status: "ready", required_resource_keys: [], estimated_scratch_bytes: 0, estimated_output_bytes: 0, ...capability })), headers, [200, 201])).body);
   }
-  async failAttempt(attemptId: string, leaseId: string, fence: number, error: unknown, runtimeEpoch: number | string, idempotencyKey?: string): Promise<MutationResult<Record<string, unknown>>> {
+  async cancelTask(taskId: string, idempotencyKey: string, expectedVersion?: number, evidence?: CancellationEvidence): Promise<MutationResult<Record<string, unknown>>> {
+    const payload = { ...evidence, ...(expectedVersion === undefined ? {} : { expected_version: expectedVersion }) };
+    return this.mutation<Record<string, unknown>>((await this.call("cancelTask", "POST", "/v1/tasks/" + encodeURIComponent(taskId) + "/cancel", new TextEncoder().encode(JSON.stringify(payload)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
+  }
+  async failAttempt(attemptId: string, leaseId: string, fence: number, error: unknown, runtimeEpoch: number, idempotencyKey?: string, evidence: TerminalEvidence = {}): Promise<MutationResult<Record<string, unknown>>> {
     const headers: HeadersLike = { "Content-Type": "application/json" }; if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
-    return this.mutation<Record<string, unknown>>((await this.call("failAttempt", "POST", "/v1/attempts/" + encodeURIComponent(attemptId) + "/fail", new TextEncoder().encode(JSON.stringify({ lease_id: leaseId, fence, runtime_epoch: runtimeEpoch, error })), headers)).body);
+    return this.mutation<Record<string, unknown>>((await this.call("failAttempt", "POST", "/v1/attempts/" + encodeURIComponent(attemptId) + "/fail", new TextEncoder().encode(JSON.stringify({ ...evidence, lease_id: leaseId, fence, runtime_epoch: runtimeEpoch, error })), headers)).body);
   }
   async prepareReboot(attemptId: string, leaseId: string, fence: number, runtimeEpoch: number): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("prepareReboot", "POST", "/v1/attempts/" + encodeURIComponent(attemptId) + "/prepare-reboot", new TextEncoder().encode(JSON.stringify({ lease_id: leaseId, fence, runtime_epoch: runtimeEpoch })), { "Content-Type": "application/json" })).body);
@@ -373,8 +379,8 @@ export class WorkspaceClient {
   async inspectTimeline(projectId: string, timelineId: string, options: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("inspectTimeline", "POST", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/inspect", new TextEncoder().encode(JSON.stringify(options)), { "Content-Type": "application/json" })).body);
   }
-  async createTimelineView(projectId: string, timelineId: string, options: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-    return this.json<Record<string, unknown>>((await this.call("createTimelineView", "POST", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/views", new TextEncoder().encode(JSON.stringify(options)), { "Content-Type": "application/json" })).body);
+  async createTimelineView(projectId: string, timelineId: string, options: Record<string, unknown>, idempotencyKey: string): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("createTimelineView", "POST", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/views", new TextEncoder().encode(JSON.stringify(options)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
   }
   async updateTimelineDocument(projectId: string, timelineId: string, expectedVersion: number, idempotencyKey: string, config: Record<string, unknown>, registry: Record<string, unknown>): Promise<MutationResult<Record<string, unknown>>> {
     const body = { expected_version: expectedVersion, content: { config, registry } };

@@ -333,13 +333,17 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         owner = default_process_identity(os.getpid())
         if owner is None or not isinstance(epoch, str) or not epoch:
             raise ConflictError("host-only original Runtime owner is unavailable")
+        owner = {key: owner[key] for key in ("pid", "uid", "birth_id")}
         owner.update(runtime_instance_id=epoch, coordinator_epoch=epoch)
-        owner.pop("parent_pid", None)
         if not operation_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in operation_id):
             raise ConflictError("host-only operation identity is invalid")
         scope = profile.support_root / "local-execution-custody" / operation_id
         request = host_prepare_request(operation_id=operation_id, channel_id=channel_id, owner_epoch=epoch,
             runtime_owner=owner, profile=selected, custody_scope=str(scope))
+        external_sources = None
+        if profile.host_launch.get("additional_pack_roots"):
+            from .external_pack_sources import OwnerSourceCapture
+            external_sources = OwnerSourceCapture(preparation=request, config=self.config)
         parent, control_child = socket.socketpair()
         activation, activation_child = socket.socketpair()
         binding_parent, binding_child = socket.socketpair()
@@ -376,7 +380,9 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             # Fixed product roots are owner-selected, not ambient authority.
             environment.update(ASTRID_OUTPUT_ROOT=str(profile.support_root / "host-output"), ASTRID_RUNTIME_DATA_ROOT=str(profile.realm_root))
             Path(environment["ASTRID_OUTPUT_ROOT"]).mkdir(parents=True, exist_ok=True)
-            verifier = TrustedLocalHostLaunchVerifier(installed_release=_installed_host_release(profile, self.config))
+            release = _installed_host_release(profile, self.config)
+            verifier = (TrustedLocalHostLaunchVerifier(installed_release=release, external_sources=external_sources)
+                if external_sources is not None else TrustedLocalHostLaunchVerifier(installed_release=release))
             verified = verifier.verify(preparation=request, config=self.config, host_argv=argv, environment=environment)
             mapped_argv, binding = verifier.claim(verified, preparation=request, config=self.config,
                 host_argv=argv, environment=environment, binding_fd=binding_child.fileno())

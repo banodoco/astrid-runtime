@@ -5,6 +5,8 @@ is created explicitly from this format; an existing database must already
 match it and is never upgraded while being opened or inspected.
 """
 
+from .timeline_commit_inputs import DOCUMENT_INPUT_SCHEMA_SQL
+
 CANONICAL_FORMAT_ID = "astrid-runtime-sqlite-v1"
 
 def generation_tag_expression(field: str) -> str:
@@ -31,6 +33,22 @@ def generation_tag_index_is_current(connection) -> bool:
     ).fetchone()
     return row is not None and " ".join(row[0].split()).rstrip(";") == GENERATION_TAG_INDEX_SQL
 
+TIMELINE_COMMIT_SCHEMA_SQL = r"""
+CREATE TABLE timeline_commit_history (
+    publication_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    timeline_id TEXT NOT NULL REFERENCES timelines(id),
+    revision_id TEXT NOT NULL REFERENCES parent_composition_revisions(id),
+    previous_publication_id TEXT REFERENCES timeline_commit_history(publication_id),
+    previous_revision_id TEXT REFERENCES parent_composition_revisions(id),
+    intent TEXT NOT NULL CHECK (intent IN ('recorded', 'legacy_unknown', 'bootstrap')),
+    records_json TEXT CHECK (records_json IS NULL OR json_valid(records_json)),
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    provider_version TEXT, compiler_version TEXT, publisher TEXT,
+    project_seq INTEGER NOT NULL,
+    UNIQUE(project_id, timeline_id, project_seq)
+);
+"""
 
 CANONICAL_SCHEMA_SQL = r"""
 CREATE TABLE runtime_schema (
@@ -376,6 +394,7 @@ CREATE TABLE parent_composition_revisions (
     timeline_id TEXT NOT NULL REFERENCES timelines(id) ON DELETE CASCADE,
     payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
     content_digest TEXT NOT NULL,
+    commit_manifest_json TEXT CHECK (commit_manifest_json IS NULL OR json_valid(commit_manifest_json)),
     created_at TEXT NOT NULL,
     UNIQUE(project_id, timeline_id, id)
 );
@@ -389,6 +408,7 @@ CREATE TABLE parent_composition_heads (
     timeline_id TEXT PRIMARY KEY REFERENCES timelines(id) ON DELETE CASCADE,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     revision_id TEXT REFERENCES parent_composition_revisions(id),
+    publication_id TEXT REFERENCES timeline_commit_history(publication_id),
     updated_at TEXT NOT NULL
 );
 CREATE TABLE composition_revision_occurrences (
@@ -447,6 +467,6 @@ CREATE UNIQUE INDEX idx_timeline_render_publications_render_task
     ON timeline_render_publications(render_task_id) WHERE render_task_id IS NOT NULL;
 CREATE INDEX idx_managed_output_task ON managed_output_associations(task_id, created_at);
 CREATE INDEX idx_managed_output_manifest ON managed_output_associations(manifest_digest, created_at);
-"""
+""" + TIMELINE_COMMIT_SCHEMA_SQL + DOCUMENT_INPUT_SCHEMA_SQL
 
 CANONICAL_SCHEMA_SQL += GENERATION_TAG_INDEX_SQL + ";\n"

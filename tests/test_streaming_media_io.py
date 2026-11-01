@@ -25,6 +25,7 @@ from runtime_protocol.errors import ConflictError, NotFoundError, ProtocolError,
 from runtime_protocol.server import RuntimeHandler
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
+from precut_realm_fixture import load_precut_realm_fixture
 
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aKz8AAAAASUVORK5CYII=')
 
@@ -42,6 +43,16 @@ def daemon(tmp_path):
     RealmStore.initialize(tmp_path / 'realm').close()
     value = RuntimeDaemon(tmp_path / 'realm', support_root=tmp_path / 'support').start()
     yield value
+    value.stop()
+
+
+@pytest.fixture
+def precut_daemon(tmp_path):
+    captured = load_precut_realm_fixture(tmp_path)
+    value = RuntimeDaemon(
+        captured.copy_roots[1], support_root=tmp_path / 'support',
+    ).start()
+    yield value, captured
     value.stop()
 
 
@@ -387,32 +398,17 @@ def test_stage_counts_memoryview_bytes_and_cleans_oversized_transfer(service):
     assert_clean(service)
 
 
-def test_concurrent_upload_and_real_timeline_view_preserve_health_and_receipts(daemon, monkeypatch):
+def test_concurrent_upload_and_real_timeline_view_preserve_health_and_receipts(precut_daemon, monkeypatch):
+    daemon, captured = precut_daemon
     service = daemon.service
-    project = service.create_project({'slug': 'concurrent-views', 'name': 'Concurrent views'}, idempotency_key='view-project')['id']
-    service.create_timeline(project, 'main', idempotency_key='view-timeline')
-    service.publish_parent_composition(project, 'main', {
-        'project_id': project, 'timeline_id': 'main', 'expected_head': None,
-        'parent_revision_id': 'view-parent-1',
-        'internal_timeline_revisions': [{
-            'timeline_id': 'main', 'revision_id': 'view-internal-1',
-            'payload': {'tracks': [{'id': 'picture'}], 'clips': [
-                {'id': 'caption', 'clip_type': 'text', 'track': 'picture', 'at_ms': 0,
-                 'duration_ms': 500, 'text': 'Concurrent view'}],
-                'effects': [], 'audio': [], 'layout': {}, 'registry': {}, 'assets': []},
-        }],
-        'shot_revisions': [{
-            'shot_id': 'view-shot', 'revision_id': 'view-shot-1',
-            'internal_timeline_revision_id': 'view-internal-1',
-            'payload': {'metadata': {}, 'items': [], 'pools': [], 'selected_variants': {},
-                        'provenance': {}, 'generation_inputs': {}, 'audio_bindings': [], 'text_bindings': []},
-        }],
-        'parent_composition': {'config': {}, 'registry': {}, 'clips': [], 'occurrences': [{
-            'occurrence_id': 'opening', 'shot_id': 'view-shot', 'shot_revision_id': 'view-shot-1',
-            'placement': {'start_ms': 0}, 'duration_ms': 1000, 'source_offset': 0,
-            'speed': 1, 'track': 'picture', 'transform': {}, 'gain': 1, 'mute': False, 'provenance': {},
-        }]},
-    }, idempotency_key='view-publication')
+    project = captured.pins['project_id']
+    timeline = captured.pins['timeline_id']
+    occurrence = 'occurrence-1'
+    parent_revision = captured.pins['parent_revision_id']
+    initial_objects = service.store.conn.execute('SELECT COUNT(*) FROM objects').fetchone()[0]
+    initial_ingest_receipts = service.store.conn.execute(
+        "SELECT COUNT(*) FROM command_idempotency WHERE command_kind='object.ingest'"
+    ).fetchone()[0]
     payload = b'concurrent binary upload'
     upload_digest = hashlib.sha256(payload).hexdigest()
     view_holds_store = threading.Event()
@@ -481,9 +477,9 @@ def test_concurrent_upload_and_real_timeline_view_preserve_health_and_receipts(d
     monkeypatch.setattr(service, 'create_timeline_view', scheduled_view)
     monkeypatch.setattr(service.cas, 'existing_identity', observed_existing_identity)
     try:
-        start_request('view', 'POST', f'/v1/projects/{project}/timelines/main/views',
-                      json.dumps({'occurrence': 'opening', 'formats': ['md']}).encode(),
-                      headers={'Content-Type': 'application/json'})
+        start_request('view', 'POST', f'/v1/projects/{project}/timelines/{timeline}/views',
+                      json.dumps({'occurrence': occurrence, 'formats': ['md']}).encode(),
+                      headers={'Content-Type': 'application/json', 'Idempotency-Key': 'concurrent-view'})
         assert view_holds_store.wait(2), 'real view route did not hold store'
         start_request('upload', 'POST', '/v1/objects', payload,
                       headers={'Idempotency-Key': 'concurrent-upload'})
@@ -515,24 +511,27 @@ def test_concurrent_upload_and_real_timeline_view_preserve_health_and_receipts(d
     assert uploaded['receipt']['result'] == uploaded['data']
     view = json.loads(outcomes['view'][2])
     artifact = view['artifacts']['md']
-    assert view['inspection']['revision_id'] == 'view-parent-1'
+    assert view['inspection']['revision_id'] == parent_revision
     assert artifact['status'] == 'available'
     with service.store._mutex:
         rows = service.store.conn.execute(
             "SELECT txn_id, aggregate_id, idempotency_key, result_json FROM command_idempotency WHERE command_kind='object.ingest'"
         ).fetchall()
-        assert len(rows) == 2
-        assert all(row['txn_id'] for row in rows)
-        assert {json.loads(row['result_json'])['object_id'] for row in rows} == {
+        assert len(rows) == initial_ingest_receipts + 2
+        new_rows = [row for row in rows if row['idempotency_key'] == 'concurrent-upload'
+                    or json.loads(row['result_json'])['object_id'] == artifact['object_id']]
+        assert len(new_rows) == 2
+        assert all(row['txn_id'] for row in new_rows)
+        assert {json.loads(row['result_json'])['object_id'] for row in new_rows} == {
             uploaded['data']['object_id'], artifact['object_id'],
         }
-        assert {row['aggregate_id'] for row in rows} == {'objects', project}
-        assert service.store.conn.execute('SELECT COUNT(*) FROM objects').fetchone()[0] == 2
+        assert {row['aggregate_id'] for row in new_rows} == {'objects', project}
+        assert service.store.conn.execute('SELECT COUNT(*) FROM objects').fetchone()[0] == initial_objects + 2
         assert service.store.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
         assert not service.store.conn.in_transaction
     assert request(daemon, 'GET', '/v1/objects/' + uploaded['data']['object_id'])[2] == payload
     view_bytes = request(daemon, 'GET', '/v1/objects/' + artifact['object_id'])[2]
-    assert b'view-parent-1' in view_bytes and b'opening' in view_bytes
+    assert parent_revision.encode() in view_bytes and occurrence.encode() in view_bytes
     assert service.object_location(project, artifact['object_id'])['verified'] is True
     retry = request(daemon, 'POST', '/v1/objects', payload,
                     headers={'Idempotency-Key': 'concurrent-upload'})

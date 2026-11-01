@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -91,6 +92,39 @@ def operation_index(manifest_path: Path = MANIFEST) -> list[str]:
     return [line.split(":", 1)[1].strip() for line in text.splitlines() if re.match(r"^\s+operationId:", line)]
 
 
+def validate_command_schema() -> None:
+    """Require the candidate to contain published schemas and the Agent freeze.
+
+    Keep older snapshots immutable; advance this floor only after an authorized
+    publication passes against the previous floor. Unsupported structural or
+    regex rewrites require review, not sample-based compatibility guesses.
+    """
+    from generators.command_schema_compatibility import compatibility_errors, legacy_022_compatibility_errors
+
+    fixtures = ROOT / "tests/fixtures/published-command-schemas"
+    sources = json.loads(_regular(fixtures / "sources.json", "published schema sources"))
+    candidate = json.loads(_regular(ROOT / "contract/schemas/edit-command.json", "candidate command schema"))
+    # The Agent freeze is a staging floor, not a published Runtime release.
+    floors = {
+        "runtime-0.2.3.json": "472622c45fa6b5c7a425c949516a64a52d83192d3749e78a0f000decd088aee9",
+        "runtime-0.2.10.json": "472622c45fa6b5c7a425c949516a64a52d83192d3749e78a0f000decd088aee9",
+        "runtime-0.2.2.json": "460e61c70702f1f6bfa5cd033c8da859c913c3c8839f2a5b928df7691e08a388",
+        "agent-0a0ac7ba.json": "30da4fde84c328e7cb44035b50eb53fd2cd9637a14a0c948f4412f6469ce34bd",
+        "agent-26ef2bbb.json": "a6f1aaa9dfcc31828bd04c908158fd7fd9a825df6c9f88f79b81779273a190ef",
+    }
+    for filename, digest in floors.items():
+        previous = _regular(fixtures / filename, "published command schema")
+        if hashlib.sha256(previous).hexdigest() != digest or sources[filename]["sha256"] != digest:
+            raise SystemExit("published command schema floor digest mismatch")
+        check = legacy_022_compatibility_errors if filename == "runtime-0.2.2.json" else compatibility_errors
+        errors = check(json.loads(previous), candidate)
+        if errors:
+            raise SystemExit(
+                f"command schema compatibility failed against {filename}:\n  "
+                + "\n  ".join(errors)
+            )
+
+
 def render_python_client(manifest_path: Path = MANIFEST) -> str:
     """Render the checked-in Python client from its tracked template.
 
@@ -112,7 +146,7 @@ def render_python_client(manifest_path: Path = MANIFEST) -> str:
 
 
 def render_typescript_client() -> str:
-    """Render the source-frame thumbnail operations into the typed TS client."""
+    """Render contract response guards and resource operations into the TS client."""
     source = _regular(TYPESCRIPT_CLIENT_OUTPUT, "TypeScript client").decode("utf-8")
     generation_query_method = '  async listGenerations(projectId: string, cursor?: string, limit = 50, filters: { kind?: string; model?: string; target?: string; tag?: string } = {}): Promise<Page<Generation>> { const query = new URLSearchParams({ limit: String(limit) }); if (cursor) query.set("cursor", cursor); for (const name of ["kind", "model", "target", "tag"] as const) { const value = filters[name]; if (value !== undefined) query.set(name, value); } return this.page((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/generations?${query}`)).body) }'
     source = '\n'.join(generation_query_method if line.startswith('  async listGenerations(') else line for line in source.split('\n'))
@@ -142,6 +176,63 @@ def render_typescript_client() -> str:
     exact_claim_method = '  async claimDelegatedChild(taskId: string, body: { executor_id: string; capability_ids: string[]; runtime_epoch: number; target: ExecutionTarget; authority: string }, idempotencyKey: string): Promise<AttemptFence> { return this.json<AttemptFence>((await this.request("POST", `/v1/tasks/${encodeURIComponent(taskId)}/claim-delegated-child`, new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [200])).body) }'
     if "  async claimDelegatedChild(" not in source:
         source = source.replace("  async claimTask(", exact_claim_method + "\n  async claimTask(", 1)
+    terminal_evidence_types = (
+        'export interface TerminalEvidence { outputs?: Record<string, unknown>[]; result?: Record<string, unknown> }\n'
+        'export interface CancellationEvidence extends TerminalEvidence { attempt_id: string; lease_id: string; fence: number; runtime_epoch: number; stop_observed?: boolean }\n'
+    )
+    source = re.sub(
+        r"^export interface (?:TerminalEvidence|CancellationEvidence)[^\n]*\n",
+        "",
+        source,
+        flags=re.MULTILINE,
+    )
+    terminal_anchor = "export interface RecoveryAuthorization"
+    if terminal_anchor not in source:
+        raise SystemExit("TypeScript client is missing the terminal-evidence type insertion point")
+    source = source.replace(terminal_anchor, terminal_evidence_types + terminal_anchor, 1)
+    cancel_method = '  async cancelTask(taskId: string, idempotencyKey: string, expectedVersion?: number, evidence?: CancellationEvidence): Promise<MutationResult<Task>> { const payload = { ...evidence, ...(expectedVersion === undefined ? {} : { expected_version: expectedVersion }) }; return this.mutation<Task>((await this.request("POST", `/v1/tasks/${encodeURIComponent(taskId)}/cancel`, new TextEncoder().encode(JSON.stringify(payload)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body) }'
+    source, cancel_count = re.subn(
+        r"^  async cancelTask\([^\n]*\n",
+        cancel_method + "\n",
+        source,
+        flags=re.MULTILINE,
+    )
+    if cancel_count != 1:
+        raise SystemExit("TypeScript client must contain exactly one cancel task method")
+    fail_method = '  async failAttempt(attemptId: string, leaseId: string, fence: number, error: unknown, runtimeEpoch: number, idempotencyKey: string, evidence: TerminalEvidence = {}): Promise<MutationResult<Task>> { return this.mutation<Task>((await this.request("POST", `/v1/attempts/${encodeURIComponent(attemptId)}/fail`, new TextEncoder().encode(JSON.stringify({ ...evidence, lease_id: leaseId, fence, runtime_epoch: runtimeEpoch, error })), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body) }'
+    source, fail_count = re.subn(
+        r"^  async failAttempt\([^\n]*\n",
+        fail_method + "\n",
+        source,
+        flags=re.MULTILINE,
+    )
+    if fail_count != 1:
+        raise SystemExit("TypeScript client must contain exactly one fail attempt method")
+    commit_response = '''  private commitResponse(body: Uint8Array, preview: boolean): CommitAcceptedMutation | CommitPreviewResponse {
+    const value = this.json<Record<string, unknown>>(body);
+    if (!value || typeof value !== "object" || Array.isArray(value) || !value.data || typeof value.data !== "object" || Array.isArray(value.data) || !("receipt" in value)) throw new Error("invalid commit response");
+    const data = value.data as Record<string, unknown>;
+    const receipt = value.receipt;
+    if (preview) {
+      if (data.status !== "preview" || !["accepted", "merged"].includes(data.would_status as string) || receipt !== null) throw new Error("invalid commit preview status, would_status or receipt");
+    } else {
+      if (!["accepted", "rebased", "merged"].includes(data.status as string) || !receipt || typeof receipt !== "object" || Array.isArray(receipt)) throw new Error("invalid commit status or receipt");
+      const committed = receipt as Record<string, unknown>;
+      const sequence = committed.project_seq;
+      if (["receipt_id", "command_kind", "idempotency_key", "request_hash", "project_id", "created_at"].some(key => typeof committed[key] !== "string") || !("result" in committed) || !Array.isArray(sequence) || sequence.length !== 2 || sequence.some(item => !Number.isInteger(item) || item < 1) || !Array.isArray(committed.event_ids) || committed.event_ids.some(item => typeof item !== "string")) throw new Error("invalid commit receipt fields");
+    }
+    return value as unknown as CommitAcceptedMutation | CommitPreviewResponse;
+  }
+'''
+    source, count = re.subn(r"^  private commitResponse\([^\n]*\n.*?^  }\n", lambda _: commit_response, source, flags=re.MULTILINE | re.DOTALL)
+    if count != 1:
+        raise SystemExit("TypeScript client must contain exactly one commit response guard")
+    agent = json.loads(_regular(ROOT / "contract/schemas/edit-command.json", "command schema"))["$defs"]
+    native_types = [name for name in agent if name.endswith("Args") or name.startswith("Producer")]
+    native_types += ["ElementRef", "SettledProducerProposal", "DocumentPin", "VerifiedDocument", "VerifiedDocumentObject"]
+    native_exports = 'export type { ' + ', '.join(native_types) + ' } from "./timeline-commit-types.js";'
+    source = re.sub(r'^export type \{ [^\n]*\bClipAddArgs\b[^\n]* from "\./timeline-commit-types.js";\n', '', source, flags=re.MULTILINE)
+    source = native_exports + "\n" + source
     child_authority_types = (
         'export interface ChildAuthorityChild { child_id: string; capability_id: string; capability_digest: string }\n'
         'export interface DerivedInputDescriptor { name: string; output_port: string; filename: string; object_id: string; size: number; media_type: string }\n'
@@ -161,6 +252,34 @@ def render_typescript_client() -> str:
     snapshot_type = 'export interface RecoverableSnapshotRequest { lease_id: string; fence: number; runtime_epoch: number; revision: number; output: DerivedInputDescriptor }'
     if "export interface RecoverableSnapshotRequest " not in source:
         source = source.replace("export interface ObjectLocation", snapshot_type + "\nexport interface ObjectLocation", 1)
+    app_state_types = 'export interface AppStateResource { scope: "user"; actor_id: string; key: string; content: Record<string, unknown> | null; version: number; created_at: string | null; updated_at: string | null }\n'
+    if "export interface AppStateResource " not in source:
+        anchor = "export type PreferenceScope"
+        if anchor not in source:
+            raise SystemExit("TypeScript client is missing the app-state type insertion point")
+        source = source.replace(anchor, app_state_types + anchor, 1)
+    app_state_methods = '''  private appStateResource(value: unknown, key: string): AppStateResource {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid app-state resource");
+    const v = value as Record<string, unknown>;
+    if (["scope", "actor_id", "key", "content", "version", "created_at", "updated_at"].some(name => !(name in v))) throw new Error("invalid app-state resource fields");
+    const content = v.content;
+    if (v.scope !== "user" || typeof v.actor_id !== "string" || !v.actor_id || v.key !== key || !(content === null || (typeof content === "object" && !Array.isArray(content))) || !Number.isInteger(v.version) || (v.version as number) < 0 || (content === null) !== (v.version === 0) || [v.created_at, v.updated_at].some(item => item !== null && typeof item !== "string")) throw new Error("invalid app-state resource ownership, content or version");
+    return v as unknown as AppStateResource;
+  }
+  async getUserAppState(key: string): Promise<AppStateResource> {
+    return this.appStateResource(this.json((await this.request("GET", `/v1/app-state/user/${encodeURIComponent(key)}`)).body), key);
+  }
+  async updateUserAppState(key: string, content: Record<string, unknown>, expectedVersion: number, idempotencyKey: string): Promise<AppStateResource> {
+    const value = this.json<Record<string, unknown>>((await this.request("PUT", `/v1/app-state/user/${encodeURIComponent(key)}`, new TextEncoder().encode(JSON.stringify({ content, expected_version: expectedVersion })), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
+    if (!value || typeof value !== "object" || !("data" in value) || value.receipt !== null) throw new Error("invalid app-state mutation: data and null receipt are required");
+    return this.appStateResource(value.data, key);
+  }
+'''
+    if "  async getUserAppState(" not in source:
+        anchor = "  async handshake("
+        if anchor not in source:
+            raise SystemExit("TypeScript client is missing the handshake insertion point")
+        source = source.replace(anchor, app_state_methods + anchor, 1)
     snapshot_method = '  async publishRecoverableSnapshot(attemptId: string, body: RecoverableSnapshotRequest, idempotencyKey: string): Promise<MutationResult<ManagedOutput>> { return this.mutation<ManagedOutput>((await this.request("POST", `/v1/attempts/${encodeURIComponent(attemptId)}/recoverable-snapshots`, new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body) }'
     if "  async publishRecoverableSnapshot(" not in source:
         source = source.replace("  async issueChildAuthority(", snapshot_method + "\n  async issueChildAuthority(", 1)
@@ -213,6 +332,20 @@ def validate_typescript_client(manifest_path: Path = MANIFEST) -> None:
         "run_id: string; project_id: string | null; lease_id: string",
         "lease_expires_at: string; runtime_epoch: number",
         "provider_state_unknown",
+        "request: CommitRequest, idempotencyKey: string",
+        "Promise<CommitAcceptedMutation | CommitPreviewResponse>",
+        "expected_publication_id: expectedPublicationId",
+        "Promise<HistoryPage>",
+        "selection: MediaSelectionQuery",
+        "async getProjectVerifiedMedia(projectId: string, selection: MediaSelection): Promise<VerifiedMedia>",
+        "async getProjectVerifiedDocument(projectId: string, pin: DocumentPin): Promise<VerifiedDocument>",
+        "async getProjectVerifiedDocumentObject(projectId: string, pin: DocumentPin, objectId: string): Promise<VerifiedDocumentObject>",
+        "export interface TerminalEvidence { outputs?: Record<string, unknown>[]; result?: Record<string, unknown> }",
+        "export interface CancellationEvidence extends TerminalEvidence",
+        "async cancelTask(taskId: string, idempotencyKey: string, expectedVersion?: number, evidence?: CancellationEvidence)",
+        "const payload = { ...evidence, ...(expectedVersion === undefined ? {} : { expected_version: expectedVersion }) };",
+        "async failAttempt(attemptId: string, leaseId: string, fence: number, error: unknown, runtimeEpoch: number, idempotencyKey: string, evidence: TerminalEvidence = {})",
+        "JSON.stringify({ ...evidence, lease_id: leaseId, fence, runtime_epoch: runtimeEpoch, error })",
     )
     missing_fragments = [value for value in required_fragments if value not in source]
     if missing_fragments:
@@ -254,9 +387,22 @@ def main() -> int:
     parser.add_argument("--component-manifest", default=str(COMPONENT_MANIFEST))
     parser.add_argument("--python-output", default=str(PYTHON_CLIENT_OUTPUT), help="Python client output path (for isolated checks)")
     args = parser.parse_args()
-    generated = render(component_path=Path(args.component_manifest).expanduser())
+    sys.path.insert(0, str(ROOT))
+    validate_command_schema()
+    sys.path.insert(0, str(ROOT / "generators"))
+    from timeline_commit_types import render as render_commit_types
+    generated = render_commit_types()
+    generated.update(render(component_path=Path(args.component_manifest).expanduser()))
+    generated["packages/python/astrid_runtime_client/__init__.py"] = _regular(
+        ROOT / "generators/python_client_init_template.py", "Python package exports template"
+    ).decode("utf-8").replace(
+        "Authoritative Python package exports; rendered by generators/generate.py.",
+        "Generated, product-neutral client for the workspace.v1 protocol.",
+    )
     generated["packages/python/astrid_runtime_client/generated.py"] = render_python_client()
     generated["packages/typescript/src/generated.ts"] = render_typescript_client()
+    from timeline_commit_resources import render as render_commit_resources
+    generated.update(render_commit_resources())
     for relative, content in generated.items():
         path = Path(args.python_output).expanduser().resolve() if relative == "packages/python/astrid_runtime_client/generated.py" else ROOT / relative
         if args.check:

@@ -1,0 +1,72 @@
+{
+  "hiddenAuthored": {
+    "opaque": [
+      null,
+      false,
+      []
+    ],
+    "nullable": null,
+    "ordered": [
+      3,
+      1,
+      2
+    ],
+    "__proto__": {
+      "literal": true
+    },
+    "clips": [
+      {
+        "id": "edited",
+        "at": 0
+      }
+    ],
+    "tracks": []
+  },
+  "submitted": {
+    "project_id": "project",
+    "timeline_id": "headless-shell",
+    "expected_head": null,
+    "parent_revision_id": "9be1e5ad-b184-51cc-9ae1-34f8fa79e3a7",
+    "parent_composition": {
+      "slug": "main",
+      "name": "Main",
+      "config": {
+        "output": {
+          "resolution": "1280x720",
+          "fps": 30,
+          "file": "output.mp4",
+          "background": null,
+          "background_scale": null
+        },
+        "clips": [],
+        "tracks": [
+          {
+            "id": "V1",
+            "kind": "visual",
+            "label": "V1",
+            "scale": 1,
+            "fit": "contain",
+            "opacity": 1,
+            "blendMode": "normal"
+          },
+          {
+            "id": "A1",
+            "kind": "audio",
+            "label": "A1",
+            "scale": 1,
+            "fit": "contain",
+            "opacity": 1,
+            "blendMode": "normal"
+          }
+        ]
+      },
+      "registry": {
+        "assets": {}
+      },
+      "clips": [],
+      "occurrences": []
+    },
+    "shot_revisions": [],
+    "internal_timeline_revisions": []
+  }
+}
