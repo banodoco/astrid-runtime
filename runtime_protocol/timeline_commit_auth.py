@@ -379,8 +379,15 @@ def _sequential_assertion(claim, ordinals, sequential, key, phase="input"):
     return matches[0]
 
 
+def _created_occurrence_child(record, ref):
+    """Whether ``ref`` is a child of this command's declared occurrence birth."""
+    owner, separator, _ = ref.partition("/")
+    created = {item.get("ref") for item in record.get("created", [])}
+    return separator and owner.startswith("occurrence:") and owner in created
+
+
 def validate_step(request, records, step, boundary, batch_reads, continuations, command_inputs=None, sequential=None,
-                  inverse_boundaries=None):
+                  inverse_boundaries=None, created_inputs=None):
     submitted = next((item for item in request.get("steps", []) if item["id"] == step["id"]), None)
     dependencies = step["dependencies"]
     step_reads = []
@@ -393,10 +400,13 @@ def validate_step(request, records, step, boundary, batch_reads, continuations, 
     for ordinal in step["command_ordinals"]:
         record = records["commands"][ordinal]
         command_boundary = (command_inputs or {}).get(ordinal, boundary)
+        created_boundary = (created_inputs or {}).get(ordinal)
         created = {item["ref"] for item in record["created"]}
         for read in record["reads"]:
             if read["ref"] in created and read["state"] == {"state": "absent"}:
                 continue
+            created_child = (_created_occurrence_child(record, read["ref"])
+                             and created_boundary is not None)
             owner, separator, _ = read["ref"].partition("/")
             owner_path = ["occurrences", "occurrence_id:" + owner.removeprefix("occurrence:")]
             if (inverse_boundaries is not None and record["command"]["op"] == "timeline.inverse"
@@ -423,11 +433,21 @@ def validate_step(request, records, step, boundary, batch_reads, continuations, 
                 for capture in native_asset_reads(command_boundary["parent"]["payload"]):
                     require(covers(dependencies, capture), "provider dependency union omits a captured read")
                 continue
-            ref, path = native_site(command_boundary, read["ref"], read["path"])
+            read_boundary = (created_boundary if created_boundary is not None
+                             and created_child
+                             else command_boundary)
+            ref, path = native_site(read_boundary, read["ref"], read["path"])
+            if created_child:
+                # A same-command child has no pre-command physical image. Its
+                # root/write/link closure is staged above, while the recorder
+                # retains the exact pre-command parent scope as its dependency.
+                require(covers(dependencies, {"kind": "scope", "ref": "parent", "path": []}),
+                        "provider dependency union omits a created child input parent")
+                continue
             if ref == "timeline" or not path or "/collection:" in read["ref"]:
                 capture = {"kind": "scope", "ref": ref, "path": []}
                 if "/collection:" in read["ref"] and ref != "timeline":
-                    observed = location(command_boundary[ref]["payload"], path).get("value")
+                    observed = location(read_boundary[ref]["payload"], path).get("value")
                     if isinstance(observed, list):
                         if read["ref"].endswith("/collection:text-binding"):
                             owner = read["ref"].rsplit("/collection:", 1)[0]
@@ -488,7 +508,8 @@ def validate_step(request, records, step, boundary, batch_reads, continuations, 
 
 
 def validate_bindings(request, records, expected, boundary, output, step, ordinal, continuations, original,
-                      step_input, effect_boundaries=None, input_parent_revision=None, sequential=None):
+                      step_input, effect_boundaries=None, input_parent_revision=None, sequential=None,
+                      created_input=None):
     record = records["commands"][ordinal]
     for binding_index, binding in enumerate(record["bindings"]):
         if "physical_ref" not in binding:
@@ -532,8 +553,18 @@ def validate_bindings(request, records, expected, boundary, output, step, ordina
                     "provider sequential source-to-landing binding is inconsistent")
             ref = physical
         else:
-            ref, _ = (site(bound, binding["ref"], [], continuations) if resolve is site
-                      else resolve(bound, binding["ref"], []))
+            created_child = (created_input is not None
+                             and _created_occurrence_child(record, binding["ref"]))
+            if created_child and physical == "parent":
+                # Same-command child observations have no pre-command child
+                # image. Their recorder pin is therefore the exact input
+                # parent; the staged creation closure authenticates the alias.
+                ref = "parent"
+            else:
+                if created_child:
+                    bound = created_input
+                ref, _ = (site(bound, binding["ref"], [], continuations) if resolve is site
+                          else resolve(bound, binding["ref"], []))
         require(ref == physical or ref == "timeline" and binding["key"] in {"commit.read", "commit.atomic"},
                 "provider alias names a different physical image")
         # Materialization observes the authenticated landing input, whose
@@ -541,6 +572,7 @@ def validate_bindings(request, records, expected, boundary, output, step, ordina
         # Its owner/edge correspondence is verified below. Submitted aliases
         # still have to retain their original physical source.
         if (pair is None and ordinal == 0 and phase != "effect" and resolve is site and binding["ref"] != "timeline"
+                and not (created_input is not None and _created_occurrence_child(record, binding["ref"]))
                 and binding["key"] != "commit.materialization"):
             original_ref, _ = site(original, binding["ref"], [], continuations)
             continued_ref, _ = site(bound, original_ref, [], continuations)
@@ -2133,15 +2165,15 @@ def _fork_owner_before(boundary, record, occurrence_ref, owner_row, identity_sco
     return expected
 
 
-def _project_created_child(boundary, record, following, accepted, identity_scope=None):
-    """Carry an authenticated child allocation into the next command input.
+def _project_created_child(boundary, record, following, accepted, identity_scope=None, *, same_command=False):
+    """Stage an authenticated child allocation for a later or same command.
 
     Native occurrence creation records authored aggregate roots, while the
-    Runtime closure stores their physical shot/internal images.  A later
-    command in the same step must see the birth, but must not inherit the
-    later command's final payload. Build the intermediate view and scoped
-    allocation identities from creation writes; check the accepted owner
-    edges without borrowing their later payloads.
+    Runtime closure stores their physical shot/internal images. A later
+    command in the same step, or a child read in the creating command, must
+    see the birth without inheriting its final payload. Build the intermediate
+    view and scoped allocation identities from creation writes; check the
+    accepted owner edges without borrowing their later payloads.
     """
     created = {item.get("ref"): item for item in record.get("created", [])}
     projected_roots = set()
@@ -2314,10 +2346,17 @@ def _project_created_child(boundary, record, following, accepted, identity_scope
                 projected_parent.setdefault("occurrences", []).append(intermediate_occurrence)
             parent_pins = [binding for binding in following.get("bindings", [])
                            if binding.get("physical_ref") == "parent"
-                           and binding.get("boundary", {}).get("phase") == "input"
-                           and binding.get("content_digest") == digest(projected_parent)]
-            require(parent_pins,
-                    "provider created occurrence lacks an authenticated authoring allocation mapping")
+                           and binding.get("boundary", {}).get("phase") == "input"]
+            if same_command:
+                require(not parent_pins or all(
+                    binding.get("revision_id") == boundary["parent"]["revision_id"]
+                    and binding.get("content_digest") == boundary["parent"]["content_digest"]
+                    for binding in parent_pins),
+                    "provider created occurrence child has a different input parent mapping")
+            else:
+                require(any(binding.get("content_digest") == digest(projected_parent)
+                            for binding in parent_pins),
+                        "provider created occurrence lacks an authenticated authoring allocation mapping")
         if fork:
             expected_occurrence = copy.deepcopy(owner_row)
             expected_occurrence["shot_id"] = shot_id
@@ -3290,6 +3329,21 @@ def validate(request, prepared, source, base=None, continuations=None, history=N
                 manifest=command_manifests[ordinal],
                 previous_manifest=command_input_manifests[ordinal],
                 step_ordinal=step_ordinal, command_ordinal=ordinal)
+        created_inputs = {}
+        for ordinal in step["command_ordinals"]:
+            record = records["commands"][ordinal]
+            child_refs = [capture.get("ref") for capture in [*record["reads"], *record["bindings"]]
+                          if isinstance(capture.get("ref"), str)]
+            if not any(_created_occurrence_child(record, ref) for ref in child_refs):
+                continue
+            staged = copy.deepcopy(command_inputs[ordinal])
+            projected = _project_created_child(
+                staged, record, record, accepted,
+                identity_scope=(source["project_id"], source["timeline_id"]), same_command=True)
+            require(all(ref.split("/", 1)[0] in projected
+                        for ref in child_refs if _created_occurrence_child(record, ref)),
+                    "provider created occurrence child lacks an authenticated staged root")
+            created_inputs[ordinal] = staged
         if records["merge_mode"] == "atomic":
             # Resolve aliases only after earlier commands establish their input
             # images; the complete batch union is checked against every step below.
@@ -3297,7 +3351,11 @@ def validate(request, prepared, source, base=None, continuations=None, history=N
                 record = records["commands"][ordinal]
                 command_boundary = command_inputs[ordinal]
                 for capture in [*record["writes"], *record["reads"], *record["derived_writes"]]:
-                    touched.add(native_site(command_boundary, capture["ref"], capture["path"])[0])
+                    capture_boundary = (created_inputs[ordinal]
+                                        if ordinal in created_inputs
+                                        and _created_occurrence_child(record, capture["ref"])
+                                        else command_boundary)
+                    touched.add(native_site(capture_boundary, capture["ref"], capture["path"])[0])
                 touched.update(binding["physical_ref"] for binding in record["bindings"] if "physical_ref" in binding)
         if sequential is not None:
             for ordinal in step["command_ordinals"]:
@@ -3325,7 +3383,7 @@ def validate(request, prepared, source, base=None, continuations=None, history=N
                     "provider sequential command output differs from its authenticated projection")
         effect_boundaries = _inverse_stage_boundaries(boundary, output, step, records, accepted, original, history)
         validate_step(request, records, step, boundary, batch_reads, continuations, command_inputs, sequential,
-                      effect_boundaries)
+                      effect_boundaries, created_inputs)
         for ordinal in step["command_ordinals"]:
             record = records["commands"][ordinal]
             command_input = command_inputs[ordinal]
@@ -3336,7 +3394,7 @@ def validate(request, prepared, source, base=None, continuations=None, history=N
                         "provider patch bindings do not cover its ordered changes")
             validate_bindings(request, records, prepared["expected_head"], command_input, output, step, ordinal,
                               continuations, original, boundary, effect_boundaries, input_parent_revision,
-                              sequential)
+                              sequential, created_inputs.get(ordinal))
         for ordinal in step["command_ordinals"]:
             for binding in records["commands"][ordinal]["bindings"]:
                 if binding.get("key") == "commit.materialization":

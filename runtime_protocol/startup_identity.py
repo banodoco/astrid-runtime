@@ -17,8 +17,16 @@ def capture_startup_identity(*, runtime_checkout: str | Path | None = None,
     if "ASTRID_INSTALL_RELEASE" not in env and "ASTRID_INSTALL_MANAGED_BY" not in env and (runtime_checkout is not None or agent_checkout is not None):
         if runtime_checkout is None or agent_checkout is None:
             raise ValueError("source startup identity requires both Runtime and agent checkouts")
-        from .source_identity import capture_source_identity
-        return capture_source_identity(Path(runtime_checkout), Path(agent_checkout))
+        runtime_root, agent_root = Path(runtime_checkout), Path(agent_checkout)
+        # Only two existing, absolute non-checkout directories imply an
+        # unstamped installed profile. Mixed or invalid roots still go through
+        # strict source validation and cannot silently lose source provenance.
+        installed_roots = all(p.is_absolute() and p.is_dir() and not (p / ".git").exists()
+                              and not (p / ".git").is_symlink()
+                              for p in (runtime_root, agent_root))
+        if not installed_roots:
+            from .source_identity import capture_source_identity
+            return capture_source_identity(runtime_root, agent_root)
     raw_release = env.get("ASTRID_INSTALL_RELEASE", "0")
     try:
         release = int(raw_release, 10)
