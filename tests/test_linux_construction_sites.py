@@ -192,21 +192,15 @@ def test_relay_broker_does_not_change_existing_scope_parent(tmp_path, monkeypatc
     _close('relay', owner)
 
 
-def test_retained_wait_currently_cannot_reap_signalled_child(tmp_path, monkeypatch, launch):
+def test_retained_wait_reaps_a_signalled_child_promptly(tmp_path, monkeypatch, launch):
+    """F3: a real broker TERM is reaped by the retained waiter; wait() returns -15 promptly."""
     run, get_owner = _site('host_only', tmp_path, monkeypatch, launch)
     try:
         owner = run()
         retained = owner.retained
         owner.broker.signal(signal.SIGTERM, expected_pid=retained.child.pid)
-        # Observe exit without consuming it, so the test proves the failure is
-        # in retained.wait rather than in signal delivery or scheduling.
-        deadline = time.monotonic() + 10
-        while os.waitid(os.P_PID, retained.child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
-            assert time.monotonic() < deadline, 'child did not exit after TERM'
-            time.sleep(0.01)
-        with pytest.raises(supervisor.RelayError, match='exit remains unresolved'):
-            retained.wait(0.25)
-        with retained.guard:
-            assert retained.child.wait(timeout=10) == -15
+        started = time.monotonic()
+        assert retained.wait(10) == -15
+        assert time.monotonic() - started < 10
     finally:
         _close('host_only', get_owner())
