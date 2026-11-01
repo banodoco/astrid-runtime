@@ -194,11 +194,24 @@ def test_terminal_legacy_installer_boolean_is_not_migration_stop_authority(world
 
 
 @pytest.mark.parametrize('attributed', [False, True])
-def test_legacy_attempt_lost_from_task_projection_remains_quarantined(world, attributed):
+@pytest.mark.parametrize('damage', ['attempt', 'run', 'event'])
+def test_legacy_attempt_lost_from_task_projection_remains_quarantined(world, attributed, damage):
     w = world
     db = w['service'].store.conn
     db.execute("UPDATE tasks SET status='failed',attempt_id=NULL WHERE id=?", (w['attempt']['task_id'],))
     legacy_world(w, attributed=attributed)
+    candidate = w['root'].parent / 'erased-lineage'
+    shutil.copytree(w['root'], candidate)
+    life.assert_replacement_preserves_custody(w['root'], candidate)
+    with sqlite3.connect(candidate / 'realm.sqlite3') as db:
+        if damage == 'attempt':
+            db.execute('DELETE FROM attempts')
+        elif damage == 'run':
+            db.execute("UPDATE runs SET status='queued'")
+        else:
+            db.execute('DELETE FROM events WHERE id=(SELECT MAX(id) FROM events)')
+    with pytest.raises(ConflictError, match='erase or change custody'):
+        life.assert_replacement_preserves_custody(w['root'], candidate)
     for _ in range(2):
         db = w['service'].store.conn
         task = db.execute('SELECT * FROM tasks WHERE id=?', (w['attempt']['task_id'],)).fetchone()

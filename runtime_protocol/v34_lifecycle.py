@@ -272,7 +272,17 @@ def assert_replacement_preserves_custody(active, candidate):
                     return {}
                 rows = list(db.execute('SELECT task_id,attempt_id FROM attempt_custody')) + legacy
                 for task in rows:
-                    for table,field,value in [('tasks','id',task['task_id']),('attempts','id',task['attempt_id']),('reservations','task_id',task['task_id'])]:
+                    summary = db.execute('SELECT run_id FROM tasks WHERE id=?', (task['task_id'],)).fetchone()
+                    if summary is None:
+                        raise ConflictError('replacement cannot establish surviving task lineage')
+                    for table,field,value in [
+                        ('tasks','id',task['task_id']),
+                        ('attempts','task_id',task['task_id']),
+                        ('reservations','task_id',task['task_id']),
+                        ('execution_bindings','task_id',task['task_id']),
+                        ('runs','id',summary['run_id']),
+                        ('events','run_id',summary['run_id']),
+                    ]:
                         entries = [dict(r) for r in db.execute(f'SELECT * FROM {table} WHERE {field}=? ORDER BY rowid',(value,))]
                         result[(table,value)] = old.digest(entries)
                 return result
