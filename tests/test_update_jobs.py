@@ -763,7 +763,7 @@ def test_explicit_update_returns_agent_recovery_without_a_second_launch(tmp_path
     result = admission.request()
 
     assert selection_calls == [{"allow_pending": True, "require_autostart": False}]
-    assert helper_actions == [None, "accept"]
+    assert helper_actions == ["reconcile", None, "accept"]
     assert launches == []
     assert result == {
         "accepted": False, "state": "rolled_back", "operation_id": "b" * 32,
