@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import struct
 import sys
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -24,6 +26,18 @@ def _digest(value: bytes | str) -> str:
     if isinstance(value, str):
         value = value.encode()
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _one_pixel_png() -> bytes:
+    """A small valid image used to exercise retained partial-media evidence."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00\x20\x80\xff\xff"))
+            + chunk(b"IEND", b""))
 
 
 def _output(value: bytes, *, name: str, output_port: str, role: str, **fields) -> dict:
@@ -120,7 +134,7 @@ def _managed_evidence(service, task, attempt, *, task_id=None, attempt_id=None, 
                                 idempotency_key=f"{task['task']['id']}-managed-source")
     settings_ref = service.ingest(project_id, settings, media_type="application/octet-stream",
                                   idempotency_key=f"{task['task']['id']}-managed-settings")
-    partial = b"managed-partial-output"
+    partial = _one_pixel_png()
     partial_digest = _digest(partial).removeprefix("sha256:")
     envelope = {
         "schema_version": 1,
@@ -132,7 +146,7 @@ def _managed_evidence(service, task, attempt, *, task_id=None, attempt_id=None, 
         },
         "outputs": [{
             "producer_output_id": "partial-0", "output_port": "partial", "ordinal": 0,
-            "path": "partial.bin", "media_type": "application/octet-stream",
+            "path": "partial.png", "media_type": "image/png",
             "bytes": len(partial), "sha256": partial_digest,
         }],
         "created": "2026-10-31T00:00:00Z",
@@ -145,12 +159,26 @@ def _managed_evidence(service, task, attempt, *, task_id=None, attempt_id=None, 
             "retrieval": {"status": "succeeded"},
             "verification": {"status": "succeeded"}, "publication": {"status": "pending"},
         },
-        "evidence": {"producer": {}, "transport": {}},
+        "evidence": {
+            "producer": {
+                "engine": "fixture-image-engine", "entry": {"id": "fixture-entry", "mode": "workflow"},
+                "models": [], "versions": {"engine": {"recorded": None, "observed": "fixture-1"}},
+                "provider": None, "build": None,
+            },
+            "transport": {
+                "target": None, "execution_binding": {"kind": "local-fixture"},
+                "failure": ({"code": "producer_failed", "message": "fixture failure", "native": None}
+                            if terminal == "failure" else None),
+                "cancel": ({"requested": True, "observed": True, "native": None}
+                           if terminal == "cancel" else None),
+            },
+        },
     }
     payload = json.dumps(envelope, sort_keys=True).encode()
     outputs = [
         _output(payload, name="managed-result", output_port="result_manifest", role="manifest"),
-        _output(partial, name="managed-partial", output_port="partial", role="result"),
+        _output(partial, name="managed-partial", output_port="partial", role="result",
+                filename="partial.png", media_type="image/png"),
     ]
     result = {"manifest_ref": {"object_id": _digest(payload), "size": len(payload)}}
     fence = {key: attempt[key] for key in ("lease_id", "fence", "runtime_epoch")}
@@ -213,6 +241,10 @@ def test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart(tmp_pat
         for digest in (source_digest, settings_digest):
             bare_digest = digest.removeprefix("sha256:")
             assert service.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, bare_digest)).fetchone()
+        expected_content = {
+            "source": b"exact-submitted-workflow-bytes",
+            "effective_settings": b"exact-compiled-settings-bytes",
+        }
         for input_name, expected_digest, expected_filename in (
             ("source", source_digest, "workflow.json"),
             ("effective_settings", settings_digest, "compiled.json"),
@@ -221,12 +253,20 @@ def test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart(tmp_pat
             assert reference["object_id"] == expected_digest
             assert reference["sha256"] == expected_digest.removeprefix("sha256:")
             assert reference["filename"] == expected_filename
-            service._verify_child_object_bytes(reference["object_id"].removeprefix("sha256:"), reference["bytes"], label=f"test {input_name} readback")
+            metadata, content = service.object(reference["object_id"])
+            assert content == expected_content[input_name]
+            assert len(content) == reference["bytes"] == metadata["size"]
+            assert _digest(content) == expected_digest
         assert envelope["outcomes"]["execution"]["status"] == {
             "success": "succeeded", "failure": "failed", "cancel": "cancelled",
         }[terminal]
         for item in associations:
-            service._verify_child_object_bytes(item["object_id"].removeprefix("sha256:"), item["size"], label="test readback")
+            metadata, content = service.object(item["object_id"])
+            assert metadata["size"] == item["size"] == len(content)
+            assert _digest(content) == item["object_id"]
+            if item["output_port"] == "partial":
+                assert content == _one_pixel_png()
+                assert item["media_type"] == "image/png"
         assert len({item["association_id"] for item in associations}) == 2
     finally:
         service.close()
