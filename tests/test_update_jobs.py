@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -44,13 +45,16 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
     _write(folder / "manifest.json", {"release": 4})
     (root / "current").write_text("old\n")
     realm = data / "runtime" / "realms" / "test"
-    try:
-        create_realm(realm)
-    except subprocess.CalledProcessError as exc:
-        pytest.fail(
-            f"realm CLI failed: {exc}\nstdout:\n{exc.stdout}\nstderr:\n{exc.stderr}",
-            pytrace=True,
-        )
+    # HOME changes the user site, so make the checkout importable by the CLI.
+    with monkeypatch.context() as cli_env:
+        cli_env.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1]), prepend=os.pathsep)
+        try:
+            create_realm(realm)
+        except subprocess.CalledProcessError as exc:
+            pytest.fail(
+                f"realm CLI failed: {exc}\nstdout:\n{exc.stdout}\nstderr:\n{exc.stderr}",
+                pytrace=True,
+            )
     credential = home / "astrid.json"
     daemon = RuntimeDaemon(realm, support_root=data / "runtime", door=DoorConfig(origin=HOSTED, port=0, credential_file=credential), agent_checkout=agent, runtime_checkout=runtime).start()
     world = DoorWorld(tmp_path, daemon, credential)
