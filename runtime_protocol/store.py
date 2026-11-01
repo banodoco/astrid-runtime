@@ -97,6 +97,7 @@ def retire_terminal_specs(connection: sqlite3.Connection, *, retention_days: int
     retired_tasks = connection.execute(
         "UPDATE tasks SET spec_digest=NULL, expected_effect_json=NULL, execution_request_json=NULL "
         "WHERE spec_digest IS NOT NULL AND status IN ('completed','failed','cancelled') AND updated_at < ? "
+        "AND COALESCE(waiting_reason,'') <> 'legacy_install_custody_unknown' "
         "AND run_id IN (SELECT r.id FROM runs r WHERE r.status IN ('completed','failed','cancelled') "
         "AND r.updated_at < ? AND NOT EXISTS (SELECT 1 FROM command_idempotency c "
         "WHERE c.command_kind='task.create' AND c.aggregate_id=COALESCE(r.project_id,'unscoped') "

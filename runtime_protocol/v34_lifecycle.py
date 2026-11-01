@@ -87,8 +87,18 @@ def apply(connection):
     for statement in CUSTODY_SCHEMA_SQL.split(';'):
         if statement.strip():
             connection.execute(statement)
-    # Historical in-flight work is uncertainty, never fabricated stop evidence.
-    for task in connection.execute('SELECT * FROM tasks WHERE attempt_id IN (SELECT id FROM attempts WHERE settled=0)').fetchall():
+    # Old terminal/settled booleans cannot prove a declared installer stopped.
+    # Inventory all surviving attempts, including ones no longer projected by
+    # tasks.attempt_id; preserve the old projections rather than inventing them.
+    legacy_tasks = connection.execute("""
+        SELECT DISTINCT t.* FROM attempts a JOIN tasks t ON t.id=a.task_id
+        LEFT JOIN task_specs s ON s.digest=t.spec_digest
+        WHERE a.settled=0 OR CASE WHEN json_valid(s.body_json) THEN
+            json_type(s.body_json,'$.install_binding')='object'
+            OR json_type(s.body_json,'$.spec.install_binding')='object'
+        ELSE 0 END
+    """).fetchall()
+    for task in legacy_tasks:
         connection.execute("UPDATE tasks SET waiting_reason='legacy_install_custody_unknown' WHERE id=?", (task['id'],))
         if task['spec_digest']:
             import json

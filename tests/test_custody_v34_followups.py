@@ -159,6 +159,61 @@ def assert_legacy_retained(w):
     assert db.execute("SELECT COUNT(*) FROM events WHERE kind LIKE 'task.custody_%'").fetchone()[0] == 0
 
 
+def test_terminal_legacy_installer_boolean_is_not_migration_stop_authority(world):
+    w = world
+    supervisor = SupervisorDouble()
+    supervisor.dispatch({'dispatch_intent_id': 'old-untracked-intent', 'launch_permit_id': 'old-permit',
+                         'launch_permit_expires_at': w['request']['launch_permit_expires_at']})
+    w['service'].store.cancel_task(w['attempt']['task_id'], stop_observed=True)
+    legacy_world(w, attributed=True)
+    db = w['service'].store.conn
+    spec_digest = db.execute('SELECT spec_digest FROM tasks').fetchone()[0]
+    db.execute("UPDATE tasks SET updated_at='2000-01-01T00:00:00Z'")
+    db.execute("UPDATE runs SET updated_at='2000-01-01T00:00:00Z'")
+    db.execute("UPDATE command_idempotency SET created_at='2000-01-01T00:00:00Z'")
+    from runtime_protocol.store import retire_terminal_specs
+    with w['service'].store._transaction():
+        retired = retire_terminal_specs(db, retention_days=30)
+    assert retired['retired_tasks'] == retired['retired_runs'] == retired['removed_specs'] == 0
+    assert db.execute('SELECT spec_digest FROM tasks').fetchone()[0] == spec_digest
+    for _ in range(2):
+        db = w['service'].store.conn
+        task = db.execute('SELECT * FROM tasks WHERE id=?', (w['attempt']['task_id'],)).fetchone()
+        attempt = db.execute('SELECT * FROM attempts WHERE id=?', (w['attempt']['attempt_id'],)).fetchone()
+        assert task['status'] == 'cancelled' and attempt['settled'] == 1
+        assert task['waiting_reason'] == 'legacy_install_custody_unknown'
+        assert db.execute('SELECT quarantined FROM custody_installations WHERE installation_id=?',
+                          (w['request']['installation_id'],)).fetchone()[0] == 1
+        assert db.execute('SELECT COUNT(*) FROM attempt_custody').fetchone()[0] == 0
+        assert db.execute('SELECT COUNT(*) FROM reservations WHERE released_at IS NULL').fetchone()[0] == 0
+        with pytest.raises(ConflictError):
+            w['service'].store.create_task('custody.test', {'install_binding': w['request']['install_binding']})
+        assert supervisor.invoked == 1
+        assert not supervisor.revoked
+        restart(w)
+
+
+@pytest.mark.parametrize('attributed', [False, True])
+def test_legacy_attempt_lost_from_task_projection_remains_quarantined(world, attributed):
+    w = world
+    db = w['service'].store.conn
+    db.execute("UPDATE tasks SET status='failed',attempt_id=NULL WHERE id=?", (w['attempt']['task_id'],))
+    legacy_world(w, attributed=attributed)
+    for _ in range(2):
+        db = w['service'].store.conn
+        task = db.execute('SELECT * FROM tasks WHERE id=?', (w['attempt']['task_id'],)).fetchone()
+        assert task['attempt_id'] is None and task['waiting_reason'] == 'legacy_install_custody_unknown'
+        attempt = db.execute('SELECT * FROM attempts WHERE id=?', (w['attempt']['attempt_id'],)).fetchone()
+        assert attempt['settled'] == 0
+        for key in ('lease_id','fence','runtime_epoch','executor_id'):
+            assert attempt[key] == w['request'][key]
+        assert db.execute('SELECT COUNT(*) FROM reservations WHERE released_at IS NULL').fetchone()[0] == 1
+        assert db.execute('SELECT COUNT(*) FROM attempt_custody').fetchone()[0] == 0
+        with pytest.raises(ConflictError):
+            w['service'].store.create_task('custody.test', {'install_binding': w['request']['install_binding']})
+        restart(w)
+
+
 @pytest.mark.parametrize('attributed', [False, True])
 @pytest.mark.parametrize('path', ['claim', 'claim_replay', 'task_retry', 'run_retry', 'resume', 'reset', 'release', 'new_task', 'bare_stop'])
 def test_legacy_quarantine_blocks_every_admission_and_release_path(world, attributed, path):

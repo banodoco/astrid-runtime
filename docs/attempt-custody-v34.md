@@ -91,6 +91,11 @@ Legacy in-flight attempts without custody are quarantined without synthesizing
 custody or stop history. Their attempts and reservations survive restart,
 backup/restore and replacement checks. Missing installation attribution closes
 realm execution admission, including new work for another installation.
+Inventory includes unsettled attempts absent from the task's current projection
+and declared installers whose old Runtime projection is already terminal. Old
+booleans do not prove stop: terminal flags and previously released reservations
+are preserved truthfully, while installation reuse stays blocked. Quarantined
+specs and bindings are excluded from terminal-detail retirement.
 The authenticated exit is deferred to `A03B-LEGACY-QUARANTINE-REPAIR`.
 Migrated-realm relocation is deferred to `A03B-V34-RELOCATION-HANDOFF`:
 preflight refuses before mutation and rechecks under launcher exclusion, including
