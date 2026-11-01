@@ -17,4 +17,7 @@ PRIMITIVE = linux_process_binding.PRIMITIVE if LINUX else "proc_signal_with_audi
 
 
 def supported() -> bool:
-    return LINUX or sys.platform in ("darwin", "win32")
+    """Linux custody needs proven pidfd signalling (no ENOSYS fallback); Darwin and Windows unchanged."""
+    if LINUX:
+        return linux_process_binding.pidfd_available()
+    return sys.platform in ("darwin", "win32")

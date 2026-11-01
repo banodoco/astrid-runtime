@@ -1,6 +1,7 @@
 """Linux process-binding provider: exact identity, refusal before signal, real process."""
 from __future__ import annotations
 
+import errno
 import os
 import subprocess
 import sys
@@ -108,3 +109,114 @@ def test_real_host_broker_constructs_on_linux_and_custody_branches_stay_in_one_m
     from pathlib import Path
     source = Path(custody_broker.__file__).read_text(encoding="utf-8")
     assert source.count("sys.platform") <= 25
+
+
+def test_missing_or_denied_boot_id_fails_closed_for_token_and_signal(monkeypatch):
+    child = _sleeper()
+    try:
+        words = lpb.token(child.pid)["words"]
+        real_identity = platform.process_identity
+
+        def without_boot(pid, **kwargs):
+            identity = real_identity(pid, **kwargs)
+            if identity is not None:
+                identity = dict(identity)
+                identity["birth_id"] = identity["birth_id"].split(";boot:")[0] + ";pidns:" + identity["birth_id"].split(";pidns:")[1]
+            return identity
+
+        monkeypatch.setattr(platform, "process_identity", without_boot)
+        with pytest.raises(lpb.LinuxBindingError, match="boot_id"):
+            lpb.token(child.pid)
+        with pytest.raises(lpb.LinuxBindingError, match="boot_id"):
+            lpb.signal(words, platform.TERM)
+        assert child.poll() is None  # refusal delivered no signal
+    finally:
+        child.kill(); child.wait()
+
+
+def test_hidepid_without_pid_namespace_fails_closed(monkeypatch):
+    child = _sleeper()
+    try:
+        real_identity = platform.process_identity
+
+        def without_namespace(pid, **kwargs):
+            identity = real_identity(pid, **kwargs)
+            if identity is not None:
+                identity = dict(identity)
+                identity["birth_id"] = identity["birth_id"].split(";pidns:")[0]
+            return identity
+
+        monkeypatch.setattr(platform, "process_identity", without_namespace)
+        with pytest.raises(lpb.LinuxBindingError):
+            lpb.token(child.pid)
+    finally:
+        child.kill(); child.wait()
+
+
+def test_pidfd_probe_failure_refuses_admission_and_never_uses_bare_pid_fallback(monkeypatch):
+    from runtime_protocol import process_binding
+
+    def enosys(*_args, **_kwargs):
+        raise OSError(errno.ENOSYS, "pidfd unsupported")
+
+    monkeypatch.setattr(platform, "pidfd_open", enosys)
+    monkeypatch.setattr(platform, "_signal_checked_pid", lambda *a, **k: pytest.fail("bare-pid fallback reached"), raising=False)
+    assert lpb.pidfd_available() is False
+    assert process_binding.supported() is False
+    child = _sleeper()
+    try:
+        words = None
+        # Build a token before the probe failure: the signal path must still refuse.
+        monkeypatch.undo()
+        words = lpb.token(child.pid)["words"]
+        monkeypatch.setattr(platform, "pidfd_open", enosys)
+        monkeypatch.setattr(platform, "_signal_checked_pid", lambda *a, **k: pytest.fail("bare-pid fallback reached"), raising=False)
+        with pytest.raises(OSError):
+            lpb.signal(words, platform.TERM)
+        assert child.poll() is None
+    finally:
+        child.kill(); child.wait()
+
+
+def test_pidfd_probe_succeeds_on_this_kernel():
+    from runtime_protocol import process_binding
+    assert lpb.pidfd_available() is True
+    assert process_binding.supported() is True
+
+
+def test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child(tmp_path):
+    """N2: real broker, real wrapper exec, nothing mocked: seal, bind, TERM ends the child."""
+    import json
+    import os
+    import signal as _signal
+    import threading
+    from pathlib import Path
+    from astrid_runtime import custody_broker as custody
+
+    scope = tmp_path / "scope"
+    platform.private_directory(scope)
+    broker = custody.RoleBoundCustodyBroker(role="host", identity_provider=custody.default_process_identity,
+        ledger_root=scope / "admission", authority_scope_root=scope,
+        authority_journal=scope / "admissions.jsonl", owner_epoch="owner", timeout=15)
+    target = [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
+    environment = {**os.environ, **broker.child_environment(target, start_new_session=True)}
+    process = None
+    try:
+        # The production wrapper is `python -I -m astrid_runtime.custody_broker`; -I ignores PYTHONPATH and
+        # would import an unrelated checkout from site-packages. The test runs this lane's module explicitly.
+        lane_root = str(Path(custody.__file__).resolve().parents[1])
+        wrapper = [sys.executable, "-X", "utf8", "-m", "astrid_runtime.custody_broker", "--custody-exec"]
+        environment = {**environment, "PYTHONPATH": lane_root}
+        process = platform.spawn_tree(wrapper, env=environment, start_new_session=False, close_fds=True)
+        broker.wait_until_sealed()
+        actor = custody.AuthenticatedCleanupActor.retained_child(process, reap_guard=threading.RLock())
+        assert actor.verify()["pid"] == process.pid
+        assert broker.role_authority.reference()["target"] == actor.verify()
+        broker.signal(int(_signal.SIGTERM), expected_pid=process.pid)
+        assert process.wait(timeout=15) in (-int(_signal.SIGTERM), 128 + int(_signal.SIGTERM))
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill(); process.wait()
+        else:
+            if process is None:
+                broker.abort_before_spawn()

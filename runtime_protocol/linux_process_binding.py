@@ -52,7 +52,10 @@ def _parse_birth(birth_id: object) -> tuple[int, int]:
     except (IndexError, ValueError) as exc:
         raise LinuxBindingError("linux process start ticks are malformed") from exc
     namespace = 0
+    boot = ""
     for part in parts[1:]:
+        if part.startswith("boot:"):
+            boot = part.split(":", 1)[1]
         if part.startswith("pidns:"):
             try:
                 namespace = int(part.split(":", 1)[1])
@@ -60,6 +63,9 @@ def _parse_birth(birth_id: object) -> tuple[int, int]:
                 raise LinuxBindingError("linux pid namespace is malformed") from exc
     if namespace == 0:
         raise LinuxBindingError("linux pid namespace is unavailable; refusing")
+    # Start ticks repeat across reboots; without boot scope two births can match. Refuse.
+    if not boot:
+        raise LinuxBindingError("linux boot_id is unavailable or denied; refusing custody")
     return ticks, namespace
 
 
@@ -156,4 +162,20 @@ def signal(words: Sequence[int], signum: int) -> None:
     finally:
         import os
 
+        os.close(fd)
+
+
+def pidfd_available() -> bool:
+    """Prove pidfd_open and pidfd_send_signal work on this kernel (probe on self, signal 0)."""
+    import os
+    try:
+        fd = platform.pidfd_open(os.getpid())
+    except (OSError, NotImplementedError):
+        return False
+    try:
+        platform.pidfd_send_signal(fd, 0)
+        return True
+    except (OSError, NotImplementedError):
+        return False
+    finally:
         os.close(fd)
