@@ -261,3 +261,31 @@ def test_non_child_same_user_connection_is_never_bound_and_holds_the_single_acce
         else:
             broker.abort_before_spawn()
         shutil.rmtree(scope_root, ignore_errors=True)
+
+
+def test_registration_frame_pid_must_match_the_kernel_peer_pid(tmp_path):
+    """(c) frame pid vs peer: a registration frame that names another pid is refused by kernel identity."""
+    import os
+    import socket
+    import threading
+    from astrid_runtime import custody_broker as custody
+
+    scope = tmp_path / "scope"
+    platform.private_directory(scope)
+    broker = custody.RoleBoundCustodyBroker(role="host", identity_provider=custody.default_process_identity,
+        ledger_root=scope / "admission", authority_scope_root=scope,
+        authority_journal=scope / "admissions.jsonl", owner_epoch="owner", timeout=10)
+    try:
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        peer.settimeout(10)
+        peer.connect(str(broker.socket_path))  # the kernel peer pid is this test process
+        frame = {"version": custody.PROTOCOL_VERSION, "command": "register_pre_exec", "run_id": broker.run_id,
+                 "role": broker.role, "pid": os.getpid() + 1, "ppid": os.getpid(), "argv_digest": "sha256:" + "0" * 64}
+        custody._send_frame(peer, frame)
+        with pytest.raises(custody.CustodyError) as refused:
+            broker.wait_until_sealed()
+        assert "kernel identity differs" in str(refused.value)  # the peer-pid check, not an earlier shape check
+        assert broker.registration is None
+        peer.close()
+    finally:
+        broker.abort_before_spawn()
