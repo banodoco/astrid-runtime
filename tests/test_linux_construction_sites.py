@@ -53,7 +53,7 @@ def launch(tmp_path, monkeypatch):
             child.wait(timeout=10)
 
 
-def _site(site, tmp_path, monkeypatch, launch, *, create_relay_scope=True):
+def _site(site, tmp_path, monkeypatch, launch):
     """Return a callable and a way to obtain its published real broker/child."""
     if site == 'host_only':
         profile = replace(host_only_profile_case(), support_root=tmp_path,
@@ -94,8 +94,6 @@ def _site(site, tmp_path, monkeypatch, launch, *, create_relay_scope=True):
         profile = replace(profile, worker_executable=composition._actual_executable(os.getpid()))
         preparer = composition.CrossProcessWorkerPreparer(profile=profile,
             config={'runtime_instance_id': 'epoch'}, environment={}, timeout_seconds=2)
-        if create_relay_scope:
-            (tmp_path / 'local-execution-custody' / 'op').mkdir(parents=True, mode=0o700)
         monkeypatch.setattr(preparer, '_rpc', lambda handle, request: {'report': {}})
         monkeypatch.setattr(preparer, 'abort', lambda handle: None)
         return (lambda: preparer._prepare_relay(profile, operation_id='op', channel_id='channel'),
@@ -160,16 +158,38 @@ def test_real_site_refuses_child_exiting_before_seal(site, tmp_path, monkeypatch
         _close(site, get_owner())
 
 
-def test_relay_without_precreated_scope_refuses_implicit_nonprivate_directory(tmp_path, monkeypatch, launch):
-    run, get_owner = _site('relay', tmp_path, monkeypatch, launch, create_relay_scope=False)
+def test_relay_broker_creates_owner_only_scope_under_restrictive_umask(tmp_path, monkeypatch, launch):
+    run, get_owner = _site('relay', tmp_path, monkeypatch, launch)
     old_umask = os.umask(0o022)
+    owner = None
     try:
-        with pytest.raises(custody.CustodyError, match='scope is not owner-only'):
-            run()
+        owner = run()
     finally:
         os.umask(old_umask)
-    assert get_owner() is None
-    assert launch[1] == []
+    assert owner is not None
+    scope = tmp_path / 'local-execution-custody' / 'op'
+    for directory in (tmp_path / 'local-execution-custody', scope, scope / 'relay-admission'):
+        assert directory.stat().st_mode & 0o777 == 0o700
+    _close('relay', owner)
+
+
+def test_relay_broker_does_not_change_existing_scope_parent(tmp_path, monkeypatch, launch):
+    preexisting = tmp_path / 'local-execution-custody'
+    preexisting.mkdir(mode=0o750)
+    preexisting.chmod(0o750)
+    run, _ = _site('relay', tmp_path, monkeypatch, launch)
+    old_umask = os.umask(0o022)
+    owner = None
+    try:
+        owner = run()
+    finally:
+        os.umask(old_umask)
+    assert owner is not None
+    assert preexisting.stat().st_mode & 0o777 == 0o750
+    scope = preexisting / 'op'
+    assert scope.stat().st_mode & 0o777 == 0o700
+    assert (scope / 'relay-admission').stat().st_mode & 0o777 == 0o700
+    _close('relay', owner)
 
 
 def test_retained_wait_currently_cannot_reap_signalled_child(tmp_path, monkeypatch, launch):

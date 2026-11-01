@@ -269,13 +269,48 @@ def _write_all(descriptor: int, value: bytes) -> None:
         offset += written
 
 
+def _mkdir_owner_only(path: Path, *, parents: bool = False, exist_ok: bool = False) -> None:
+    """Create directories one at a time and restrict only directories we made."""
+    path = Path(path)
+    if not parents:
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            if not exist_ok:
+                raise
+        else:
+            platform.owner_only(path, directory=True)
+        return
+
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    if current.exists() and not current.is_dir():
+        raise NotADirectoryError(str(current))
+    if not missing and not exist_ok:
+        raise FileExistsError(str(path))
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            # Another creator won the race. It is not ours to chmod.
+            if directory == path and not exist_ok:
+                raise
+            continue
+        platform.owner_only(directory, directory=True)
+
+
 def _atomic_owner_json(path: Path, value: Mapping[str, object]) -> None:
     if platform.sys.platform == "win32":
         from .io import atomic_write_json
         atomic_write_json(path, dict(value))
         return
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    platform.owner_only(path.parent)
+    _mkdir_owner_only(path.parent, parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(name)
     try:
@@ -296,7 +331,7 @@ def _append_owner_jsonl(path: Path, value: Mapping[str, object]) -> None:
 
     if not path.is_absolute() or path.is_symlink():
         raise CustodyError("custody authority journal path is unsafe")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _mkdir_owner_only(path.parent, parents=True, exist_ok=True)
     parent = os.lstat(path.parent)
     if (
         stat.S_ISLNK(parent.st_mode)
@@ -331,9 +366,9 @@ def _open_authority_scope_lock(scope_root: Path) -> int:
     if not root.is_absolute() or root.is_symlink():
         raise CustodyError("custody authority scope is unsafe")
     if sys.platform == "win32":
-        platform.private_directory(root)
+        _mkdir_owner_only(root, parents=True, exist_ok=True)
     else:
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _mkdir_owner_only(root, parents=True, exist_ok=True)
     observed_root = os.lstat(root)
     if (
         not stat.S_ISDIR(observed_root.st_mode)
@@ -934,8 +969,10 @@ class RoleBoundCustodyBroker:
         self._authority_scope_guard = threading.Lock()
         self.run_id = _digest_bytes(os.urandom(32))
         if sys.platform == "win32":
-            platform.private_directory(ledger_root.parent)
-        ledger_root.mkdir(parents=True, exist_ok=False, mode=0o700)
+            _mkdir_owner_only(ledger_root.parent, parents=True, exist_ok=True)
+            if not platform.is_owner_only(ledger_root.parent):
+                raise CustodyError("custody ledger parent is not owner-only")
+        _mkdir_owner_only(ledger_root, parents=True, exist_ok=False)
         platform.owner_only(ledger_root)
         self.root = ledger_root
         self.journal_path = ledger_root / "custody.journal.jsonl"
