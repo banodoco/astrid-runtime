@@ -157,7 +157,7 @@ def _managed_evidence(service, task, attempt, *, task_id=None, attempt_id=None, 
         "outcomes": {
             "execution": {"status": {"success": "succeeded", "failure": "failed", "cancel": "cancelled"}[terminal]},
             "retrieval": {"status": "succeeded"},
-            "verification": {"status": "succeeded"}, "publication": {"status": "pending"},
+            "verification": {"status": "succeeded"}, "publication": {"status": "not_started"},
         },
         "evidence": {
             "producer": {
