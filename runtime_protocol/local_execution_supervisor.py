@@ -1003,6 +1003,7 @@ class NativeHostSession:
             raise RelayError("local execution descriptor transport is unavailable on Windows")
         import subprocess
         import tempfile
+        from .render_observer import TIMELINE_OBSERVER_FD_ENV, close_observer, open_host_observer
         from .verified_host_launch import HostLaunchVerifier
         requested_protocol = preparation["profile"].get("host_protocol")
         self.launch_verifier = launch_verifier if launch_verifier is not None else HostLaunchVerifier()
@@ -1013,18 +1014,24 @@ class NativeHostSession:
         self.preparation = preparation
         self.config = dict(config)
         self.retained = None
+        self.observer_read_fd = None
         self.control, control_child = socket.socketpair()
         self.activation, activation_child = socket.socketpair()
         self.control.settimeout(timeout)
         self.activation.settimeout(timeout)
+        observer_read_fd = observer_write_fd = None
         self.broker = RoleBoundCustodyBroker(role="host", identity_provider=default_process_identity,
             ledger_root=Path(preparation["custody_scope"]) / "host-admission",
             authority_scope_root=Path(preparation["custody_scope"]),
             authority_journal=Path(preparation["custody_scope"]) / "admissions.jsonl",
             owner_epoch=preparation["owner_epoch"], timeout=min(timeout, 60.0))
         try:
+            observer_read_fd, observer_write_fd = open_host_observer()
             argv = selected_host_argv(config, preparation, activation_fd=activation_child.fileno(), host_control_fd=control_child.fileno(), timeout=timeout)
             environment = {k: v for k, v in os.environ.items() if k in {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP", "XDG_RUNTIME_DIR", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "ASTRID_EXECUTION_TARGET_JSON"}}
+            # This launch-owned descriptor replaces any profile or ambient
+            # overlay before the verifier binds the final child environment.
+            environment[TIMELINE_OBSERVER_FD_ENV] = str(observer_write_fd)
             if requested_protocol is None:
                 if config["source_checkout"] is not None:
                     environment["PYTHONPATH"] = config["source_checkout"]
@@ -1044,9 +1051,13 @@ class NativeHostSession:
             environment.update(self.broker.child_environment(argv, start_new_session=True))
             child = runtime_platform.spawn_tree(custody_wrapper_argv(runtime_platform.handoff_custody_executable(preparation["profile"]["worker_executable"], argv[0])), start_new_session=False, env=environment,
                 cwd=config["support_root"], stdin=subprocess.DEVNULL, close_fds=True,
-                pass_fds=(control_child.fileno(), activation_child.fileno(), *((self.binding_file.fileno(),) if self.binding_file is not None else ())))
+                pass_fds=(control_child.fileno(), activation_child.fileno(), *((self.binding_file.fileno(),) if self.binding_file is not None else ()), observer_write_fd))
             # Publish the exact owned child before fallible sealing/binding.
             self.retained = RetainedProcess(child)
+            self.observer_read_fd = observer_read_fd
+            observer_read_fd = None
+            close_observer(observer_write_fd)
+            observer_write_fd = None
             if self.binding_file is not None:
                 self.binding_file.close()
             control_child.close()
@@ -1061,6 +1072,8 @@ class NativeHostSession:
                 exchange=self.exchange, verify_host=self._verify_launch_host,
                 host_current_roles_version=protocol)
         except BaseException:
+            close_observer(observer_write_fd)
+            close_observer(observer_read_fd)
             if self.binding_file is not None:
                 self.binding_file.close()
             control_child.close()
@@ -1148,6 +1161,9 @@ class NativeHostSession:
                 result = self.retained.wait(min(self.timeout, 5.0))
         self.control.close()
         self.activation.close()
+        from .render_observer import close_observer
+        close_observer(self.observer_read_fd)
+        self.observer_read_fd = None
         return result
 
 

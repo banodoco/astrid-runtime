@@ -116,6 +116,7 @@ class _PreparedWorker:
     custody_scope: str | None = None
     host_only: bool = False
     activation: socket.socket | None = None
+    observer_read_fd: int | None = None
     preparation: dict[str, Any] | None = None
     launch_verifier: Any = None
     verified_launch: Any = None
@@ -322,6 +323,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
 
     def _prepare_host_only(self, profile, *, operation_id, channel_id):
         from .local_execution_supervisor import host_prepare_request, RetainedProcess
+        from .render_observer import TIMELINE_OBSERVER_FD_ENV, close_observer, open_host_observer
         from .verified_host_launch import TrustedLocalHostLaunchVerifier, canonical
         from astrid_runtime.custody_broker import RoleBoundCustodyBroker, default_process_identity, custody_wrapper_argv
         if self._active is not None:
@@ -347,6 +349,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         parent, control_child = socket.socketpair()
         activation, activation_child = socket.socketpair()
         binding_parent, binding_child = socket.socketpair()
+        observer_parent, observer_child = open_host_observer()
         broker = handle = None
         try:
             # Child materialization admissions use the existing default selector.
@@ -377,6 +380,10 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             if set(selected_environment) - ENV_KEYS:
                 raise ConflictError("host-only selected environment contains unapproved fields")
             environment.update(selected_environment)
+            # This descriptor is allocated by the retained Runtime launch,
+            # never by a selected profile or capability/action overlay.
+            environment.pop(TIMELINE_OBSERVER_FD_ENV, None)
+            environment[TIMELINE_OBSERVER_FD_ENV] = str(observer_child)
             # Fixed product roots are owner-selected, not ambient authority.
             environment.update(ASTRID_OUTPUT_ROOT=str(profile.support_root / "host-output"), ASTRID_RUNTIME_DATA_ROOT=str(profile.realm_root))
             Path(environment["ASTRID_OUTPUT_ROOT"]).mkdir(parents=True, exist_ok=True)
@@ -394,14 +401,17 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 environment.update(broker.child_environment(mapped_argv, start_new_session=True))
                 process = runtime_platform.spawn_tree(custody_wrapper_argv(str(profile.host_executable)), start_new_session=False, cwd=str(profile.support_root),
                     env=environment, stdin=subprocess.DEVNULL, close_fds=True,
-                    pass_fds=(control_child.fileno(), activation_child.fileno(), binding_child.fileno()))
+                    pass_fds=(control_child.fileno(), activation_child.fileno(), binding_child.fileno(), observer_child))
                 retained = RetainedProcess(process)
                 handle = _PreparedWorker(process, "", parent, {}, scope / "host-launch.json", retained=retained,
                     broker=broker, owner_epoch=epoch, custody_scope=str(scope), host_only=True,
-                    activation=activation, preparation=request, launch_verifier=verifier, verified_launch=verified)
+                    activation=activation, observer_read_fd=observer_parent, preparation=request,
+                    launch_verifier=verifier, verified_launch=verified)
+                observer_parent = None
                 self._active = handle  # Before birth/seal/readiness can fail.
                 for channel in (control_child, activation_child, binding_child):
                     channel.close()
+                close_observer(observer_child); observer_child = None
                 parent.settimeout(self.timeout_seconds); activation.settimeout(self.timeout_seconds)
             broker.wait_until_sealed(); retained.bind_actor()
             identity = retained.verify(); handle.birth_id = identity["birth_id"]
@@ -423,6 +433,8 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         except BaseException as primary:
             for channel in (control_child, activation_child, binding_child, binding_parent):
                 channel.close()
+            close_observer(observer_child)
+            close_observer(observer_parent)
             if handle is None:
                 parent.close(); activation.close()
                 if broker is not None: broker.abort_before_spawn()
@@ -445,6 +457,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             "profile_binding_digest": _digest(_selected_profile_payload(self.profile))}
 
     def _host_only_abort(self, handle):
+        from .render_observer import close_observer
         with handle.cleanup_lock:
             if handle.closed: return
             bound = {k: handle.preparation[k] for k in ("version", "operation_id", "channel_id", "owner_epoch")}
@@ -466,7 +479,9 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             with handle.cleanup_resolution_lock:
                 if handle.cleanup_abandoned:
                     raise ConflictError("host-only cleanup exceeded terminal shutdown custody")
-                handle.control.close(); handle.activation.close(); handle.closed = True
+                handle.control.close(); handle.activation.close()
+                close_observer(handle.observer_read_fd); handle.observer_read_fd = None
+                handle.closed = True
                 if self._active is handle: self._active = None
 
     def _prepare_relay(self, profile, *, operation_id, channel_id):
@@ -584,6 +599,10 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     except OSError:
                         pass
                     channel.close()
+            if handle.host_only:
+                from .render_observer import close_observer
+                close_observer(handle.observer_read_fd)
+                handle.observer_read_fd = None
 
     def report(self, handle: _PreparedWorker) -> Mapping[str, Any]:
         if handle.host_only:
