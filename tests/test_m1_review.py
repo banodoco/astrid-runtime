@@ -24,7 +24,8 @@ def test_listener_sets_exclusive_windows_option_before_bind(monkeypatch, host):
     events = []
     listener = object.__new__(server.RuntimeHTTPServer)
     listener.socket = SimpleNamespace(setsockopt=lambda *args: events.append(args))
-    monkeypatch.setattr(server.ThreadingHTTPServer, "server_bind", lambda self: events.append("bind"))
+    listener.server_address = ("127.0.0.1", 4321)
+    monkeypatch.setattr(server.TCPServer, "server_bind", lambda self: events.append("bind"))
     listener.server_bind()
     if host == "win32":
         assert listener.allow_reuse_address is False
@@ -32,6 +33,8 @@ def test_listener_sets_exclusive_windows_option_before_bind(monkeypatch, host):
     else:
         assert listener.allow_reuse_address is True
         assert events == ["bind"]
+    assert listener.server_name == "127.0.0.1"
+    assert listener.server_port == 4321
 
 
 @pytest.mark.parametrize("killpg_missing", [False, True])

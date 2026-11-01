@@ -55,6 +55,10 @@ class CustodyError(RuntimeError):
     """The exact registered Runtime incarnation cannot be proved or signalled."""
 
 
+class _TaskNameUnavailable(CustodyError):
+    """The Darwin task-name lookup was denied before a task port was acquired."""
+
+
 def _create_compact_socket_root() -> Path:
     """Create an owner-only socket directory below the native short temp parent."""
 
@@ -196,7 +200,7 @@ def current_process_audit_token(pid: int) -> dict[str, object]:
     task_self = ctypes.c_uint32.in_dll(library, "mach_task_self_").value
     task_name = ctypes.c_uint32(0)
     if int(library.task_name_for_pid(task_self, int(pid), ctypes.byref(task_name))) != 0:
-        raise CustodyError("final-ready Runtime task-name port is unavailable")
+        raise _TaskNameUnavailable("final-ready Runtime task-name port is unavailable")
 
     def read_token() -> list[int]:
         token = _AuditToken()
@@ -956,6 +960,7 @@ class RoleBoundCustodyBroker:
         authority_scope_root: Path | None = None,
         owner_epoch: str | None = None,
         launch_parent: AuthenticatedCleanupActor | None = None,
+        retain_post_exec_connection: bool = False,
     ) -> None:
         if not role or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in role):
             raise CustodyError("custody role is invalid")
@@ -1040,6 +1045,8 @@ class RoleBoundCustodyBroker:
         self.ack: dict[str, object] | None = None
         self.error: BaseException | None = None
         self._post_exec_authority_validated = False
+        self._retain_post_exec_connection = bool(retain_post_exec_connection and sys.platform == "darwin")
+        self._post_exec_connection: socket.socket | None = None
         self._cleanup_deadline: float | None = None
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
@@ -1188,6 +1195,14 @@ class RoleBoundCustodyBroker:
                                    identity_provider=self._observe_registered_identity,
                                    request_authorizer=authenticate_request)
 
+    def close_post_exec_channel(self) -> None:
+        """Close the retained authenticated child channel after its last use."""
+
+        connection = self._post_exec_connection
+        self._post_exec_connection = None
+        if connection is not None:
+            connection.close()
+
     def bind_ready_token(
         self,
         *,
@@ -1198,6 +1213,7 @@ class RoleBoundCustodyBroker:
         """Replace the provisional post-exec token with the final ready owner."""
 
         if self.state != "sealed" or self.registration is None:
+            self.close_post_exec_channel()
             raise CustodyError("custody admission is not provisionally sealed")
         pinned = self.registration.get("identity")
         expected = {key: expected_identity.get(key) for key in ("pid", "birth_id", "uid")}
@@ -1206,39 +1222,48 @@ class RoleBoundCustodyBroker:
             or expected_pid != expected.get("pid")
             or {key: pinned.get(key) for key in expected} != expected
         ):
+            self.close_post_exec_channel()
             raise CustodyError("final-ready Runtime identity differs from provisional custody")
-        before = self.identity_provider(expected_pid)
-        if before is None or {key: before.get(key) for key in expected} != expected:
-            raise CustodyError("final-ready Runtime incarnation is unavailable")
-        token = dict(token_provider(expected_pid))
-        after = self.identity_provider(expected_pid)
-        if after is None or {key: after.get(key) for key in expected} != expected:
-            raise CustodyError("final-ready Runtime incarnation changed while binding")
-        words = token.get("words")
-        if (
-            token.get("pid") != expected_pid
-            or token.get("uid") != expected.get("uid")
-            or not isinstance(token.get("pidversion"), int)
-            or not isinstance(token.get("sha256"), str)
-            or not isinstance(words, list)
-            or audit_token_details(words) != {
-                key: token[key] for key in ("pid", "pidversion", "uid", "sha256")
-            }
-        ):
-            raise CustodyError("final-ready Runtime audit token is invalid")
-        self.registration.update({
-            "post_exec_audit_token_sha256": self.registration.get("audit_token_sha256"),
-            "post_exec_pidversion": self.registration.get("audit_token_pidversion"),
-            "identity": dict(after),
-            "audit_token_words": list(words),
-            "audit_token_sha256": token["sha256"],
-            "audit_token_pidversion": token["pidversion"],
-        })
-        self.role_authority.bind_target(actor=self.cleanup_actor, generation=self.custody_generation,
-                                        identity=after, token=token)
-        self.sequence = 3
-        self.state = "ready-bound"
-        self._persist("readiness_token_bound")
+        try:
+            before = self.identity_provider(expected_pid)
+            if before is None or {key: before.get(key) for key in expected} != expected:
+                raise CustodyError("final-ready Runtime incarnation is unavailable")
+            try:
+                token = dict(token_provider(expected_pid))
+            except _TaskNameUnavailable:
+                if self._post_exec_connection is None:
+                    raise
+                token = dict(_peer_token(self._post_exec_connection))
+            after = self.identity_provider(expected_pid)
+            if after is None or {key: after.get(key) for key in expected} != expected:
+                raise CustodyError("final-ready Runtime incarnation changed while binding")
+            words = token.get("words")
+            if (
+                token.get("pid") != expected_pid
+                or token.get("uid") != expected.get("uid")
+                or not isinstance(token.get("pidversion"), int)
+                or not isinstance(token.get("sha256"), str)
+                or not isinstance(words, list)
+                or audit_token_details(words) != {
+                    key: token[key] for key in ("pid", "pidversion", "uid", "sha256")
+                }
+            ):
+                raise CustodyError("final-ready Runtime audit token is invalid")
+            self.registration.update({
+                "post_exec_audit_token_sha256": self.registration.get("audit_token_sha256"),
+                "post_exec_pidversion": self.registration.get("audit_token_pidversion"),
+                "identity": dict(after),
+                "audit_token_words": list(words),
+                "audit_token_sha256": token["sha256"],
+                "audit_token_pidversion": token["pidversion"],
+            })
+            self.role_authority.bind_target(actor=self.cleanup_actor, generation=self.custody_generation,
+                                            identity=after, token=token)
+            self.sequence = 3
+            self.state = "ready-bound"
+            self._persist("readiness_token_bound")
+        finally:
+            self.close_post_exec_channel()
 
     def _persist(self, event_name: str) -> None:
         snapshot = {
@@ -1397,11 +1422,13 @@ class RoleBoundCustodyBroker:
             self._persist("registration_post_exec")
             self.state = "sealed"
             self._persist("admission_sealed")
+            if self._retain_post_exec_connection:
+                self._post_exec_connection = connection
         except BaseException as exc:
             self.error = exc
         finally:
             self._ready.set()
-            if connection is not None:
+            if connection is not None and connection is not self._post_exec_connection:
                 connection.close()
             self.listener.close()
             self.socket_path.unlink(missing_ok=True)

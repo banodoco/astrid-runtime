@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import multiprocessing
-import os
+import threading
 
 import pytest
 
 from tests.lanes import requires_posix_fork
 
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol import server
 from runtime_protocol.server import RuntimeHandler, RuntimeHTTPServer
 from runtime_protocol.store import RealmStore
 from runtime_protocol.catalog import RealmCatalog
@@ -165,6 +166,46 @@ def test_cleanup_does_not_shutdown_http_server_without_serving_thread():
         assert daemon.thread is None
     finally:
         daemon._shutdown_http()
+
+
+def test_listener_binds_ephemeral_loopback_without_hostname_lookup(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+    result = {}
+
+    def blocking_getfqdn(host):
+        entered.set()
+        release.wait()
+        return host
+
+    monkeypatch.setattr(server.socket, "getfqdn", blocking_getfqdn)
+
+    def create_listener():
+        try:
+            result["listener"] = RuntimeHTTPServer(("127.0.0.1", 0), RuntimeHandler)
+        except BaseException as exc:  # pragma: no cover - surfaced by the parent assertion
+            result["error"] = exc
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=create_listener, daemon=True)
+    worker.start()
+    try:
+        assert done.wait(1), "listener creation reached a hostname lookup"
+        assert not entered.is_set()
+        assert "error" not in result
+        listener = result["listener"]
+        assert listener.server_address[0] == "127.0.0.1"
+        assert listener.server_port > 0
+        assert listener.server_port == listener.server_address[1] == listener.socket.getsockname()[1]
+    finally:
+        release.set()
+        worker.join(1)
+        listener = result.get("listener")
+        if listener is not None:
+            listener.server_close()
+        assert not worker.is_alive()
 
 
 def _register_catalog_worker(path, realm_id, ready, release, result):

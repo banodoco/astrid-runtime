@@ -28,6 +28,7 @@ MANIFEST_URL = "https://astrid.haus/install-manifest.json"
 BOOTSTRAP_URL = "https://astrid.haus/install"
 WINDOWS_BOOTSTRAP_URL = "https://astrid.haus/install.ps1"
 MAX_METADATA_BYTES = 1024 * 1024
+_STATUS_REASONS = frozenset({"busy", "autostart-off", "unsupported-service-manager"})
 
 
 class UpdateRefusal(ConflictError):
@@ -72,7 +73,7 @@ def _assert_autostart_supported(selected):
         autostart = preferences.get("autostart")
         if autostart is False or (isinstance(autostart, str) and autostart.casefold() == "off"):
             raise UpdateRefusal(
-                "autostart-off-unsupported",
+                "autostart-off",
                 "In-app update is unavailable while saved autostart is off; this installer cannot preserve that choice yet.",
             )
 
@@ -86,15 +87,47 @@ class UpdateAdmission:
         self._lock = threading.Lock()
 
     def status(self):
-        # Use the same live-install selection as POST. Production launches via
-        # the selected Agent helper, so an injected launcher is not required.
-        # Selection only reads records; preparation and job creation remain POST-only.
+        """Project update availability without admitting or reconciling an update."""
+        home = Path.home()
+        if self._lock.locked():
+            return read_update_status(home, available=False, reason="busy")
+        reason = None
+        available = True
         try:
-            self._selection()
-            available = True
-        except (UpdateRefusal, OSError, ValueError, KeyError, TypeError):
+            # A pending journal is status evidence, not permission for GET to
+            # recover it. POST reaches the Agent's locked reconciler instead.
+            selection = self._selection(allow_pending=True)
+            if sys.platform == "linux":
+                availability = self._status_availability(*selection[2:5])
+                if availability["available"] is False:
+                    available = False
+                    candidate = availability.get("reason")
+                    reason = candidate if candidate in _STATUS_REASONS else None
+        except UpdateRefusal as refusal:
             available = False
-        return read_update_status(Path.home(), available=available)
+            candidate = refusal.details.get("reason")
+            reason = candidate if candidate in _STATUS_REASONS else None
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            available = False
+        if available and _installer_lock_held(home):
+            available, reason = False, "busy"
+        return read_update_status(home, available=available, reason=reason)
+
+    def _status_availability(self, python, agent, runtime):
+        """Read the Agent capability without invoking admission or recovery."""
+        try:
+            availability = self._helper(python, agent, runtime, {"action": "availability"})
+        except UpdateRefusal as refusal:
+            reason = refusal.details.get("reason")
+            return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}
+        except (OSError, subprocess.SubprocessError):
+            return {"available": False}
+        if not isinstance(availability, dict) or type(availability.get("available")) is not bool:
+            return {"available": False}
+        if availability["available"]:
+            return {"available": True}
+        reason = availability.get("reason")
+        return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}
 
     def _helper(self, python, agent, runtime, payload):
         script = ("import sys; sys.path[:0]=sys.argv[1:3]; "
@@ -107,17 +140,21 @@ class UpdateAdmission:
         failure_reason = "update-record-failed" if payload.get("action") == "accept" else "inputs-unavailable"
         failure_message = ("The update request could not be saved safely." if failure_reason == "update-record-failed"
                            else "Update inputs are unavailable or invalid.")
-        if result.returncode:
-            raise UpdateRefusal(failure_reason, failure_message)
         try:
             value = json.loads(result.stdout)
         except (TypeError, json.JSONDecodeError):
             raise UpdateRefusal(failure_reason, failure_message) from None
+        if result.returncode:
+            helper_reason = value.get("reason") if isinstance(value, dict) else None
+            helper_message = value.get("message") if isinstance(value, dict) else None
+            if helper_reason in _STATUS_REASONS:
+                raise UpdateRefusal(helper_reason, helper_message or failure_message)
+            raise UpdateRefusal(failure_reason, failure_message)
         if not isinstance(value, dict):
             raise UpdateRefusal(failure_reason, failure_message)
         return value
 
-    def _selection(self):
+    def _selection(self, *, allow_pending=False):
         daemon = self.daemon
         identity = normalize_startup_identity(daemon.startup_identity)
         if identity["managed_by"] == "source":
@@ -146,7 +183,7 @@ class UpdateAdmission:
         journal = root / "update-transaction.json"
         if journal.exists() or journal.is_symlink():
             transaction = _json(journal, snapshots)
-            if transaction.get("step") not in {"complete", "rolled_back"}:
+            if not allow_pending and transaction.get("step") not in {"complete", "rolled_back"}:
                 raise UpdateRefusal("recovery-needed", "The installer must recover its pending update first. Run the install line.")
         pointer = _bytes(root / "current")
         snapshots[root / "current"] = pointer
@@ -207,7 +244,7 @@ class UpdateAdmission:
         if not self._lock.acquire(blocking=False):
             raise UpdateRefusal("update-busy", "An update request is already being prepared.")
         try:
-            selection_path, snapshots, python, agent, runtime, installed = self._selection()
+            selection_path, snapshots, python, agent, runtime, installed = self._selection(allow_pending=True)
             selected_record = json.loads(snapshots[selection_path])
             _assert_autostart_supported(selected_record)
             root = Path(selected_record["program_root"])
@@ -265,7 +302,6 @@ class UpdateAdmission:
                 # probe lock first so accept can reacquire the real installer lock.
                 try:
                     job = self._helper(python, agent, runtime, durable)
-                    accepted = True
                 except Exception:
                     current = _read_bounded_object(root / "install.json") or {}
                     current_job = current.get("update_job")
@@ -273,6 +309,22 @@ class UpdateAdmission:
                         accepted = True
                         raise UpdateRefusal("accept-acknowledgement-unknown", "The update request was saved; check update status before taking another action.") from None
                     raise
+                if not isinstance(job, dict):
+                    raise UpdateRefusal("busy", "The update acceptance result is incomplete; no job was launched.")
+                returned_operation = job.get("operation_id")
+                returned_state = job.get("state")
+                if returned_operation != operation_id:
+                    # The Agent may have reconciled an older operation under
+                    # the installer lock. That explicit recovery ends this
+                    # request; only a newly accepted matching ID may launch.
+                    if returned_state in {"updated", "rolled_back", "failed"}:
+                        return {"accepted": False, "state": returned_state,
+                                "operation_id": returned_operation,
+                                "message": job.get("message") or job.get("result")}
+                    raise UpdateRefusal("busy", "The unresolved update was not safely reconciled; no job was launched.")
+                if returned_state not in {"accepted", "launching", "active"}:
+                    raise UpdateRefusal("busy", "The update is not accepted for launch.")
+                accepted = True
                 # Launcher acknowledgement can be lost after OS acceptance.
                 # Keep the durable job active and never retry it here.
                 try:
@@ -329,12 +381,50 @@ def _read_bounded_object(path):
         return None
 
 
-def read_update_status(home=None, *, available=False):
+def _terminal_success_verified(root, selected, job, transaction, state):
+    """Corroborate the selected version and live owner without changing either."""
+    try:
+        name = _bytes(root / "current").decode("utf-8").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+            return False
+        folder = root / "versions" / name
+        version = _json(folder / "version.json", {})
+        expected = transaction.get("candidate" if state == "updated" else "old")
+        if (not isinstance(expected, dict) or version != expected
+                or version.get("root") != str(folder)):
+            return False
+        identity = normalize_startup_identity(version.get("identity"))
+        if state == "updated":
+            if identity != {"release": job.get("target_release"), "managed_by": None}:
+                return False
+        elif version != job.get("old_version") or identity != normalize_startup_identity(job.get("old_identity")):
+            return False
+        if "identity" in selected and normalize_startup_identity(selected["identity"]) != identity:
+            return False
+        data = _path(selected.get("data_root"))
+        discovery = _json(data / "runtime" / "discovery.json", {})
+        instance = discovery.get("runtime_instance_id")
+        endpoint = discovery.get("endpoint") or discovery.get("door_endpoint")
+        old_instance = job.get("old_instance_id")
+        if (not isinstance(old_instance, str) or not old_instance
+                or not isinstance(instance, str) or not instance or instance == old_instance
+                or not isinstance(endpoint, str) or not endpoint):
+            return False
+        from .identity import validate_live_owner_identity
+        from .runtime_boundary import LocalRuntimeBoundary
+        health = LocalRuntimeBoundary().owner_startup_identity(endpoint=endpoint, instance_id=instance)
+        return (isinstance(health, dict) and health.get("status") == "ok"
+                and validate_live_owner_identity(health, instance_id=instance) == identity)
+    except (OSError, ValueError, TypeError, KeyError, UnicodeDecodeError):
+        return False
+
+
+def read_update_status(home=None, *, available=False, reason=None):
     """Read the authoritative accepted job and C2 journal without recovery."""
     def none():
         result = {"available": bool(available), "state": "none"}
-        if not available:
-            result["reason"] = "updater-unavailable"
+        if not available and reason in _STATUS_REASONS:
+            result["reason"] = reason
         return result
 
     def recovery_needed():
@@ -390,6 +480,15 @@ def read_update_status(home=None, *, available=False):
                    and job.get("transaction_id") == transaction.get("operation_id"))
     if journal_corrupt:
         state = "recovery-needed"
+    elif (state == "accepted"
+          or (state == "launching" and job.get("launch_status") != "acknowledged")):
+        # A durable acceptance or registration is not proof of a native launch
+        # acknowledgement. It stays unresolved until an explicit Update asks
+        # the installer to reconcile it.
+        state = "recovery-needed"
+    elif state in {"updated", "rolled_back", "failed", "recovery-needed"} and step and step not in terminal_steps:
+        # A terminal result cannot be validated by an unfinished transaction.
+        state = "recovery-needed"
     elif step and step not in terminal_steps:
         state = "active" if matched and _installer_lock_held(home) else "recovery-needed"
     elif step in terminal_steps and matched and state in {"accepted", "active"}:
@@ -397,6 +496,20 @@ def read_update_status(home=None, *, available=False):
         # means the worker still owns the final result write; after release,
         # report the unresolved handoff without inferring success or rollback.
         state = "active" if _installer_lock_held(home) else "recovery-needed"
+    elif state in {"updated", "rolled_back", "failed"}:
+        transaction_id = job.get("transaction_id")
+        bound = (state != "failed" or "transaction_id" in job
+                 or (isinstance(journal_job, dict) and journal_job.get("operation_id") == operation_id))
+        if bound:
+            linked = (transaction.get("format") == "astrid-install-update/v1"
+                      and step in terminal_steps and isinstance(journal_job, dict)
+                      and journal_job.get("operation_id") == operation_id
+                      and isinstance(transaction_id, str) and bool(re.fullmatch(r"[0-9a-f]{32}", transaction_id))
+                      and transaction_id == transaction.get("operation_id"))
+            expected_step = {"updated": "complete", "rolled_back": "rolled_back"}.get(state)
+            if (not linked or (expected_step is not None
+                    and (step != expected_step or not _terminal_success_verified(root, selected, job, transaction, state)))):
+                state = "recovery-needed"
     outcome = state if state in {"updated", "rolled_back", "failed"} else None
     api_state = "active" if state in {"accepted", "launching", "active"} else "terminal" if outcome else state
     result = "Recovery needed." if state == "recovery-needed" else job.get("result") or job.get("message") or (outcome or api_state)

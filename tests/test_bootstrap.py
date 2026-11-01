@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import pytest
 from importlib import import_module
 from contextlib import closing, contextmanager
 from unittest.mock import patch
@@ -1271,10 +1272,10 @@ class BootstrapTests(unittest.TestCase):
                          "Current selection metadata")
         self.assertEqual(order, [("manager", False), ("manager", True)])
 
+    @pytest.mark.darwin_native
     def test_restore_selection_accepts_system_temp_alias(self):
         root = Path(self.temp.name)
-        if root == root.resolve():
-            self.skipTest("temporary directory has no system path alias")
+        self.assertNotEqual(root, root.resolve())
         self.paths = RuntimePaths.sandbox(root)
         fixture = self._restore_selection_fixture(realm_id="restore-alias")
         self.assertTrue(preflight_stop(self.paths, restore_selection=fixture["selection"])["safe"])
