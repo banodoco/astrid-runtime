@@ -3,6 +3,7 @@ name: CI
 
 on:
   push:
+    branches: [main, int/r1]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -10,6 +11,10 @@ on:
         description: Full immutable Agent commit SHA (empty uses fixture pin)
         required: false
         type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   windows-realm-publication:
