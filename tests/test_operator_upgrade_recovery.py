@@ -33,7 +33,7 @@ def test_sigkill_keeps_upgrade_transaction_identity_at_every_journal_step(tmp_pa
     assert result.returncode == -signal.SIGKILL, result.stderr
     support = tmp_path / "support"
     journal = json.loads((support / "runtime" / "upgrade-journal.json").read_text())
-    assert journal["state"] == ("stopped" if state == "migration-committed" else state)
+    assert journal["state"] == ("backup_verified" if state == "migration-committed" else state)
     assert len(journal["operation_id"]) == 32
     assert journal["realm_id"] == "realm-1"
     assert journal["source_support_root"] == str(support)
@@ -75,19 +75,15 @@ def test_recovery_required_journal_refuses_new_upgrade_without_mutation(tmp_path
     assert boundary.calls == []
 
 
-def test_historical_upgrade_refuses_before_journal_or_stop_without_coordinator(tmp_path):
+def test_historical_upgrade_refuses_unknown_manifest_before_journal_or_stop(tmp_path):
     from astrid_runtime.bootstrap import BootstrapConfig
-
     paths, profile, realm = _fixture(tmp_path, version=SCHEMA_VERSION)
     with sqlite3.connect(realm / "realm.sqlite3") as connection:
-        walk_back_to_v30(connection)
-        connection.execute("ALTER TABLE timelines DROP COLUMN name")
-        connection.execute("DROP TABLE user_app_state")
-        connection.execute("DROP INDEX idx_generations_gen")
-        connection.execute("UPDATE runtime_schema SET version=29 WHERE id=1")
+        connection.execute("CREATE TRIGGER unknown_write AFTER INSERT ON projects BEGIN SELECT 1; END")
     before = (realm / "realm.sqlite3").read_bytes()
     boundary = _Boundary(paths)
-    with pytest.raises(operator_upgrade.OperatorUpgradeError, match="durable recovery and generation-tag backfill coordinator"):
+    from runtime_protocol.errors import ValidationError
+    with pytest.raises(operator_upgrade.OperatorUpgradeError, match="unsupported SQLite schema object"):
         operator_upgrade.upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
     assert (realm / "realm.sqlite3").read_bytes() == before
     assert not (paths.runtime_support / "upgrade-journal.json").exists()
@@ -117,6 +113,11 @@ if __name__ == "__main__":
         return result
 
     def start(target, *_args):
+        from runtime_protocol.service import RuntimeService
+        from test_timeline_commit_provider import Provider
+        service = RuntimeService(realm)
+        service.register_timeline_commit_provider(Provider())
+        service.close()
         discovery = {
             "pid": 1235, "active_realm": "realm-1", "endpoint": "http://127.0.0.1:17540",
             "runtime_instance_id": "instance-2", "process_birth_id": "birth-2", "realm_root": str(realm),

@@ -56,7 +56,7 @@ def test_empty_legacy_rebuild(tmp_path, nullable):
 
 
 @pytest.mark.parametrize("nullable", [False, True])
-def test_legacy_retired_workers_are_refused_before_archive(tmp_path, nullable):
+def test_legacy_retired_workers_are_retained_in_archive(tmp_path, nullable):
     root = tmp_path / "realm"
     source = legacy_database(nullable)
     source.execute("INSERT INTO realm_lifecycle(realm_id, state, version) VALUES ('r', 'active', 1)")
@@ -69,10 +69,12 @@ def test_legacy_retired_workers_are_refused_before_archive(tmp_path, nullable):
     source.execute("INSERT INTO workers(id, capabilities_json, max_concurrency, resource_keys_json, created_at, last_seen_at) VALUES ('w', '[]', 1, '[]', 't', 't')")
     write_realm(root, source)
     before = (root / "realm.sqlite3").read_bytes()
-    with pytest.raises(ValidationError, match="workers.*preserve"):
-        upgrade_realm(root, confirmation="UPGRADE r", retain_backup=True, archive_root=tmp_path / "backups")
-    assert (root / "realm.sqlite3").read_bytes() == before
-    assert not (tmp_path / "backups").exists()
+    result = upgrade_realm(root, confirmation="UPGRADE r", retain_backup=True, archive_root=tmp_path / "backups")
+    from pathlib import Path
+    archived = Path(result["archive"]) / "realm.sqlite3"
+    assert archived.read_bytes() == before
+    with sqlite3.connect(archived) as connection:
+        assert connection.execute("SELECT id FROM workers").fetchone()[0] == "w"
 
 
 def test_legacy_locked_reclassification_precedes_archive(tmp_path, monkeypatch):
@@ -112,14 +114,17 @@ def test_unknown_workers_refused_before_lock(tmp_path):
     assert sorted(p.name for p in root.iterdir()) == ["realm.sqlite3"]
 
 
-def test_populated_generations_refused_before_fencing(tmp_path):
+def test_orphan_generation_refuses_before_migration(tmp_path):
     root = tmp_path / "realm"
     connection = database("C31")
     connection.execute("INSERT INTO generations(id, project_id, type, status, metadata_json, version, created_at, updated_at) VALUES ('g', 'p', 'generation', 'succeeded', '{}', 1, 't', 't')")
     write_realm(root, connection)
-    with pytest.raises(ValidationError, match="durable coordinator"):
+    from runtime_protocol.errors import ConflictError
+    before = (root / "realm.sqlite3").read_bytes()
+    with pytest.raises(ConflictError, match="integrity checks"):
         migrate_canonical_to_current(root, confirmation="MIGRATE CANONICAL r")
-    assert sorted(p.name for p in root.iterdir()) == ["realm.sqlite3"]
+    assert (root / "realm.sqlite3").read_bytes() == before
+    assert not (root / ".v33-activation.json").exists()
 
 
 def test_locked_reclassification_refuses_schema_change(tmp_path, monkeypatch):
@@ -201,19 +206,26 @@ def test_empty_legacy_additive_tables_use_existing_rebuild(tmp_path):
     assert result["target_schema_version"] == 33
 
 
-def test_populated_legacy_additive_table_is_refused_before_lock(tmp_path):
+def test_populated_legacy_additive_table_is_preserved(tmp_path):
     root = tmp_path / "realm"
     source = legacy_database(components=("user_app_state",))
+    source.execute("INSERT INTO realm_lifecycle(realm_id,state,version) VALUES ('r','active',1)")
     source.execute("INSERT INTO user_app_state VALUES ('a', 'k', '{}', 1, 't', 't')")
     write_realm(root, source)
-    with pytest.raises(ValidationError, match="additive tables.*preserve"):
-        upgrade_realm(root, confirmation="UPGRADE r", retain_backup=True, archive_root=tmp_path / "backups")
-    assert sorted(p.name for p in root.iterdir()) == ["realm.sqlite3"]
+    upgrade_realm(root, confirmation="UPGRADE r", retain_backup=True, archive_root=tmp_path / "backups")
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        assert connection.execute("SELECT actor_id,key,content_json FROM user_app_state").fetchone() == ("a","k","{}")
 
 
-def test_legacy_task_specs_refused_by_existing_rebuild(tmp_path):
+def test_legacy_task_specs_preserved_by_rebuild(tmp_path):
+    import hashlib
     root = tmp_path / "realm"
-    write_realm(root, legacy_database(components=("task_specs",)))
-    with pytest.raises(ValidationError, match="task_specs"):
-        upgrade_realm(root, confirmation="UPGRADE r", retain_backup=True, archive_root=tmp_path / "backups")
-    assert sorted(p.name for p in root.iterdir()) == ["realm.sqlite3"]
+    source = legacy_database(components=("task_specs",))
+    source.execute("INSERT INTO realm_lifecycle(realm_id,state,version) VALUES ('r','active',1)")
+    body = '{"retained":true}'
+    checksum = hashlib.sha256(body.encode()).hexdigest()
+    source.execute("INSERT INTO task_specs VALUES (?,?,?)", (checksum, body, 't'))
+    write_realm(root, source)
+    upgrade_realm(root, confirmation="UPGRADE r", retain_backup=True, archive_root=tmp_path / "backups")
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        assert connection.execute("SELECT digest,body_json FROM task_specs").fetchone() == (checksum,body)

@@ -37,7 +37,7 @@
     ,"waiting_reason": { "type": "string" }
     ,"lease_fence": { "type": "integer", "minimum": 1 }
     ,"lease_expires_at": { "type": "string", "format": "date-time" }
-    ,"result": { "type": "object", "additionalProperties": true }
+    ,"result": {"type": "object", "additionalProperties": true, "description": "Durable task outcome. outputs and manifest_ref identify hash-verified project CAS artifacts on success, failure or cancellation. cancel records requested and stop_observed; attempted=false and attempt_id=null identify cancellation before execution."}
   },
   "definitions": {
     "CanonicalRenderRevision": {

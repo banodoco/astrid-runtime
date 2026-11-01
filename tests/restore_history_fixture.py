@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from runtime_protocol.backup import restore_backup, verify_backup
+from runtime_protocol.upgrade import inspect_realm_schema, migrate_canonical_to_current
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.timeline_commit_baseline import verify_baseline
 
@@ -40,11 +41,13 @@ def load_restore_history_fixture(tmp_path: Path) -> RestoreHistoryFixture:
     Provider registration is left to the caller's normal startup path.
     """
     backup = _extract_archive(tmp_path / "restore-history-archive", ARCHIVE)
-    verified = verify_backup(backup, key=FIXTURE_BACKUP_KEY)
+    verified = verify_backup(backup, key=FIXTURE_BACKUP_KEY, older_schema=True)
     if verified["manifest"]["schema"]["version"] != 31:
         raise AssertionError("restore history fixture is not schema 31")
     root = tmp_path / "restore-history-realm"
-    restore_backup(backup, root, key=FIXTURE_BACKUP_KEY)
+    restore_backup(backup, root, key=FIXTURE_BACKUP_KEY, older_schema=True)
+    identity = inspect_realm_schema(root)
+    migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
     service = RuntimeService(root)
     try:
         project_id = service.get_project("composition")["id"]

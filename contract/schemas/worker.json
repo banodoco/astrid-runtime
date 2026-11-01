@@ -315,6 +315,134 @@
         "task": { "type": "object", "additionalProperties": true }
       }
     },
+    "AttemptFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lease_id",
+        "fence",
+        "runtime_epoch",
+        "error"
+      ],
+      "properties": {
+        "lease_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "runtime_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "error": {},
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Output"
+          }
+        },
+        "result": {
+          "type": "object",
+          "additionalProperties": true,
+          "not": {
+            "required": [
+              "outputs"
+            ]
+          }
+        }
+      }
+    },
+    "TaskCancellation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "lease_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "runtime_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Output"
+          }
+        },
+        "result": {
+          "type": "object",
+          "additionalProperties": true,
+          "not": {
+            "required": [
+              "outputs"
+            ]
+          }
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stop_observed": {
+          "type": "boolean"
+        }
+      },
+      "dependentRequired": {
+        "attempt_id": [
+          "attempt_id",
+          "lease_id",
+          "fence",
+          "runtime_epoch"
+        ],
+        "lease_id": [
+          "attempt_id",
+          "lease_id",
+          "fence",
+          "runtime_epoch"
+        ],
+        "fence": [
+          "attempt_id",
+          "lease_id",
+          "fence",
+          "runtime_epoch"
+        ],
+        "runtime_epoch": [
+          "attempt_id",
+          "lease_id",
+          "fence",
+          "runtime_epoch"
+        ],
+        "outputs": [
+          "attempt_id",
+          "lease_id",
+          "fence",
+          "runtime_epoch"
+        ],
+        "result": [
+          "attempt_id",
+          "lease_id",
+          "fence",
+          "runtime_epoch"
+        ],
+        "stop_observed": [
+          "attempt_id",
+          "lease_id",
+          "fence",
+          "runtime_epoch"
+        ]
+      }
+    },
     "Settlement": {
       "type": "object", "additionalProperties": false,
       "required": ["attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "effect"],

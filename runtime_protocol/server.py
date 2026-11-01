@@ -1169,12 +1169,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     task_id, self._body(), idempotency_key=key, identity=identity
                 )
                 return self._send(200, value)
-            self._identity("tasks:write")
             if method == "POST" and action == "cancel":
+                body = self._body()
+                fenced = isinstance(body, dict) and bool(set(body) & {
+                    "attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "result", "stop_observed"})
+                identity = self._identity("worker:execute" if fenced else "tasks:write")
                 key = self._idempotency_key()
-                value = self.runtime.cancel_task_canonical(task_id, self._body(), idempotency_key=key)
+                value = self.runtime.cancel_task_canonical(task_id, body, idempotency_key=key, identity=identity)
                 task = self.runtime.store.get_task(task_id)
                 return self._send(200, value)
+            self._identity("tasks:write")
             if method == "POST" and action == "retry":
                 key = self._idempotency_key()
                 value = self.runtime.retry_task(task_id, self._body(), idempotency_key=key)

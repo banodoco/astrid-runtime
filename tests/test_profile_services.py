@@ -339,6 +339,28 @@ def test_service_environment_and_argv_keep_spaces_and_literal_shell_syntax(tmp_p
     assert (tmp_path / "logs/service-example.log").read_text() == "first\nsecond\n"
 
 
+def test_service_child_receives_node_environment_without_import_or_custody_overrides(tmp_path, monkeypatch):
+    node = str(tmp_path / "node tools" / "node")
+    node_path = str(Path(node).parent)
+    monkeypatch.setenv("PATH", node_path)
+    monkeypatch.setenv("ASTRID_NODE_EXECUTABLE", node)
+    monkeypatch.setenv("PYTHONPATH", "/unexpected")
+    monkeypatch.setenv("PYTHONHOME", "/unexpected")
+    monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_OWNER", "secret")
+    code = ("import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+        "('PATH', 'ASTRID_NODE_EXECUTABLE', 'PYTHONPATH', 'PYTHONHOME', "
+        "'ASTRID_RUNTIME_CUSTODY_OWNER')}))")
+    spec = ServiceSpec("example", ("{python}", "-c", code), "on-failure")
+    supervisor = _supervisor(tmp_path, [spec])
+    with RotatingLog(tmp_path / "logs/service-example.log") as log:
+        exit_code, _, _ = supervisor._attempt(supervisor._services[0], log)
+    child = json.loads((tmp_path / "logs/service-example.log").read_text())
+    assert exit_code == 0
+    assert child["PATH"].split(os.pathsep) == [str(Path(sys.executable).parent), node_path]
+    assert child["ASTRID_NODE_EXECUTABLE"] == node
+    assert child["PYTHONPATH"] is child["PYTHONHOME"] is child["ASTRID_RUNTIME_CUSTODY_OWNER"] is None
+
+
 def test_windows_service_environment_uses_userprofile_when_home_is_absent(tmp_path, monkeypatch):
     from runtime_protocol import services
     monkeypatch.setattr(services, "sys", SimpleNamespace(platform="win32"))

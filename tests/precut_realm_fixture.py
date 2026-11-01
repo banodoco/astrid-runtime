@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from runtime_protocol.backup import restore_backup, verify_backup
+from runtime_protocol.upgrade import inspect_realm_schema, migrate_canonical_to_current
 
 
 ARCHIVE = Path(__file__).with_name("fixtures") / "precut-v31.tar.gz"
@@ -161,14 +162,18 @@ def load_precut_realm_fixture(tmp_path: Path, *, variant: str | None = None) -> 
     stem = archive_path.name.removesuffix(".tar.gz")
     extracted = tmp_path / f"{stem}-archive"
     backup_root = _extract_archive(extracted, archive_path)
-    verified = verify_backup(backup_root, key=FIXTURE_BACKUP_KEY)
+    verified = verify_backup(backup_root, key=FIXTURE_BACKUP_KEY, older_schema=True)
     manifest = verified["manifest"]
     if manifest["schema"]["version"] != SCHEMA_VERSION:
         raise AssertionError("pre-cut fixture is not schema 31")
     copy_a = tmp_path / f"{stem}-copy-a"
     copy_b = tmp_path / f"{stem}-copy-b"
-    restore_backup(backup_root, copy_a, key=FIXTURE_BACKUP_KEY)
-    restore_backup(backup_root, copy_b, key=FIXTURE_BACKUP_KEY)
+    restore_backup(backup_root, copy_a, key=FIXTURE_BACKUP_KEY, older_schema=True)
+    identity = inspect_realm_schema(copy_a)
+    migrate_canonical_to_current(copy_a, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
+    restore_backup(backup_root, copy_b, key=FIXTURE_BACKUP_KEY, older_schema=True)
+    identity = inspect_realm_schema(copy_b)
+    migrate_canonical_to_current(copy_b, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
     return PrecutRealmFixture(
         backup_root=backup_root,
         copy_roots=(copy_a, copy_b),
