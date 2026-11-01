@@ -319,7 +319,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             raise
 
     def _prepare_host_only(self, profile, *, operation_id, channel_id):
-        from .local_execution_supervisor import host_prepare_request, RetainedProcess
+        from .local_execution_supervisor import host_prepare_request, runtime_owner_record, RetainedProcess
         from .verified_host_launch import TrustedLocalHostLaunchVerifier, canonical
         from astrid_runtime.custody_broker import RoleBoundCustodyBroker, default_process_identity, custody_wrapper_argv
         if self._active is not None:
@@ -336,8 +336,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         # in the observation and never enter the strict owner record.
         if any(native_owner.get(k) is None for k in ("pid", "uid", "birth_id")):
             raise ConflictError("host-only original Runtime owner is unavailable")
-        owner = {"pid": native_owner["pid"], "uid": native_owner["uid"], "birth_id": native_owner["birth_id"],
-                 "runtime_instance_id": epoch, "coordinator_epoch": epoch}
+        owner = runtime_owner_record(native_owner, epoch)
         if not operation_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in operation_id):
             raise ConflictError("host-only operation identity is invalid")
         scope = profile.support_root / "local-execution-custody" / operation_id
@@ -464,7 +463,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             if self._active is handle: self._active = None
 
     def _prepare_relay(self, profile, *, operation_id, channel_id):
-        from .local_execution_supervisor import host_prepare_request, RetainedProcess
+        from .local_execution_supervisor import host_prepare_request, runtime_owner_record, RetainedProcess
         from astrid_runtime.custody_broker import RoleBoundCustodyBroker, default_process_identity, custody_wrapper_argv
         if self._active is not None:
             self.abort(self._active)
@@ -475,8 +474,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         owner = default_process_identity(os.getpid())
         if owner is None or not isinstance(epoch, str) or not epoch:
             raise ConflictError("Runtime launch owner identity is unavailable")
-        owner.update(runtime_instance_id=epoch, coordinator_epoch=epoch)
-        owner.pop("parent_pid", None)
+        owner = runtime_owner_record(owner, epoch)
         # Operation IDs originate in Runtime. Reject path syntax before using
         # one to select this private, launch-specific protected scope.
         if not isinstance(operation_id, str) or not operation_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in operation_id):

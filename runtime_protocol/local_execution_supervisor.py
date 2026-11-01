@@ -42,6 +42,17 @@ class RelayError(RuntimeError):
     """A bounded delegated transition lacks exact identity or custody."""
 
 
+def runtime_owner_record(native_observation: Mapping[str, Any], epoch: str) -> dict[str, Any]:
+    """Project a native Runtime observation into the exact owner contract."""
+    return {
+        "pid": native_observation["pid"],
+        "uid": native_observation["uid"],
+        "birth_id": native_observation["birth_id"],
+        "runtime_instance_id": epoch,
+        "coordinator_epoch": epoch,
+    }
+
+
 def canonical_json(value: object) -> bytes:
     try:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")

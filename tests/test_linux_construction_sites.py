@@ -53,7 +53,7 @@ def launch(tmp_path, monkeypatch):
             child.wait(timeout=10)
 
 
-def _site(site, tmp_path, monkeypatch, launch, *, adapt_relay=True, create_relay_scope=True):
+def _site(site, tmp_path, monkeypatch, launch, *, create_relay_scope=True):
     """Return a callable and a way to obtain its published real broker/child."""
     if site == 'host_only':
         profile = replace(host_only_profile_case(), support_root=tmp_path,
@@ -94,17 +94,6 @@ def _site(site, tmp_path, monkeypatch, launch, *, adapt_relay=True, create_relay
         profile = replace(profile, worker_executable=composition._actual_executable(os.getpid()))
         preparer = composition.CrossProcessWorkerPreparer(profile=profile,
             config={'runtime_instance_id': 'epoch'}, environment={}, timeout_seconds=2)
-        # The Linux owner currently includes extra observation fields, which
-        # the request validator rejects. Project the contract fields here so
-        # the remaining production relay custody path can be exercised.
-        original_request = supervisor.host_prepare_request
-        def project_request(**kwargs):
-            owner = kwargs['runtime_owner']
-            kwargs['runtime_owner'] = {key: owner[key] for key in
-                ('pid', 'uid', 'birth_id', 'runtime_instance_id', 'coordinator_epoch')}
-            return original_request(**kwargs)
-        if adapt_relay:
-            monkeypatch.setattr(supervisor, 'host_prepare_request', project_request)
         if create_relay_scope:
             (tmp_path / 'local-execution-custody' / 'op').mkdir(parents=True, mode=0o700)
         monkeypatch.setattr(preparer, '_rpc', lambda handle, request: {'report': {}})
@@ -169,14 +158,6 @@ def test_real_site_refuses_child_exiting_before_seal(site, tmp_path, monkeypatch
         assert calls == []
     finally:
         _close(site, get_owner())
-
-
-def test_relay_rejects_real_linux_owner_before_construction(tmp_path, monkeypatch, launch):
-    run, get_owner = _site('relay', tmp_path, monkeypatch, launch, adapt_relay=False)
-    with pytest.raises(supervisor.RelayError, match='exact Runtime owner incarnation'):
-        run()
-    assert get_owner() is None
-    assert launch[1] == []
 
 
 def test_relay_without_precreated_scope_refuses_implicit_nonprivate_directory(tmp_path, monkeypatch, launch):
