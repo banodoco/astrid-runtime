@@ -6461,8 +6461,8 @@ class RuntimeService:
                 or provenance.get("runtime_epoch") != int(attempt["runtime_epoch"])):
             raise AuthorizationError("derived input managed association no longer matches its receipt")
         digest = ref["object_id"].removeprefix("sha256:")
-        obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
-        if (obj is None or int(obj["size"]) != ref["size"]
+        obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+        if (obj is None or int(obj["size"]) != ref["size"] or obj["media_type"] != ref["media_type"]
                 or not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project, digest)).fetchone()):
             raise ConflictError("derived input object metadata or project association changed")
         self._verify_child_object_bytes(digest, ref["size"], label="derived input CAS object")
@@ -6523,8 +6523,8 @@ class RuntimeService:
                     raise ConflictError("derived input was already registered with another descriptor")
                 ref = previous
             else:
-                obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
-                if obj is None or int(obj["size"]) != item["size"]:
+                obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+                if obj is None or int(obj["size"]) != item["size"] or obj["media_type"] != item["media_type"]:
                     raise ConflictError("derived input object metadata does not match upload")
                 self._verify_child_object_bytes(digest, item["size"], label="derived input CAS object")
                 self.store.conn.execute("INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)", (project, digest, now()))
@@ -7147,8 +7147,8 @@ class RuntimeService:
                 output_port=item["output_port"], filename=item["filename"], recorded_filename=item["filename"],
                 attempt_row=attempt, task_row=task, project_id=project, lease_body=body):
             raise AuthorizationError("snapshot requires the producing child's authenticated upload receipt")
-        obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
-        if obj is None or int(obj["size"]) != item["size"]:
+        obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+        if obj is None or int(obj["size"]) != item["size"] or obj["media_type"] != item["media_type"]:
             raise ConflictError("snapshot object metadata does not match upload")
         self._verify_child_object_bytes(digest, item["size"], label="snapshot CAS object")
         self.store.conn.execute("INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)", (project, digest, now()))
