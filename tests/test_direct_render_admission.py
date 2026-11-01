@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -155,6 +156,8 @@ def test_direct_managed_render_admission_freezes_snapshot_before_claim(tmp_path)
             "capability_ids": ["rendering.render"],
             "runtime_epoch": epoch,
         })
+        assert re.fullmatch(r"[0-9a-f]{32}", claimed["run_id"])
+        assert claimed["run_id"] == task["run_id"]
         assert "timeline_snapshot" not in claimed["spec"]["spec"]
         assert claimed["spec"]["spec"]["timeline_snapshot_ref"] == snapshot_ref
         assert claimed["spec"]["spec"]["inputs"]["timeline_authority"] == admitted_spec["inputs"]["timeline_authority"]

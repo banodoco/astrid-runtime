@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
+import fcntl
 import importlib.metadata
 from pathlib import Path
 import platform
@@ -887,7 +889,7 @@ def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_withou
     config={**profile.host_launch,'runtime_endpoint':'http://127.0.0.1:1','runtime_instance_id':'epoch',
         'credential_file':str(tmp_path/'credential'),'ready_file':str(tmp_path/'ready')}
     captures={};read_done=threading.Event()
-    for key in ('PYTHONPATH','PYTHONHOME','PYTHONDONTWRITEBYTECODE','ASTRID_RUNTIME_DATA_ROOT','ASTRID_RUNTIME_OWNER_TOKEN','ASTRID_OUTPUT_ROOT','ASTRID_EXECUTION_TARGET_JSON'):
+    for key in ('PYTHONPATH','PYTHONHOME','PYTHONDONTWRITEBYTECODE','ASTRID_RUNTIME_DATA_ROOT','ASTRID_RUNTIME_OWNER_TOKEN','ASTRID_OUTPUT_ROOT','ASTRID_EXECUTION_TARGET_JSON','ASTRID_TIMELINE_OBSERVER_FD'):
         monkeypatch.setenv(key,'unadmitted-ambient')
     class Verifier:
         def __init__(self,**kwargs):pass
@@ -910,6 +912,9 @@ def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_withou
         def child_environment(self,argv,**kwargs):return {}
         def wait_until_sealed(self):pass
     def popen(argv,**kwargs):
+        captures['pass_fds']=kwargs['pass_fds']
+        observer=int(kwargs['env']['ASTRID_TIMELINE_OBSERVER_FD'])
+        captures['observer']=os.dup(observer)
         descriptor=os.dup(captures['binding_fd'])
         def read_binding():
             data=b''
@@ -941,9 +946,16 @@ def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_withou
         env=captures['environment']
         assert env['ASTRID_OUTPUT_ROOT']==str(profile.support_root/'host-output')
         assert env['ASTRID_RUNTIME_DATA_ROOT']==str(profile.realm_root)
+        observer=int(env['ASTRID_TIMELINE_OBSERVER_FD'])
+        assert env['ASTRID_TIMELINE_OBSERVER_FD'] != 'unadmitted-ambient' and observer in captures['pass_fds']
+        assert stat.S_ISFIFO(os.fstat(captures['observer']).st_mode)
+        assert not os.get_blocking(captures['observer'])
+        assert fcntl.fcntl(captures['observer'], fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
+        assert handle.observer_read_fd is not None and stat.S_ISFIFO(os.fstat(handle.observer_read_fd).st_mode)
         assert not set(env)&{'PYTHONPATH','PYTHONHOME','PYTHONDONTWRITEBYTECODE','ASTRID_RUNTIME_OWNER_TOKEN','ASTRID_EXECUTION_TARGET_JSON'}
     finally:
         handle.control.close();handle.activation.close()
+        os.close(captures['observer']);os.close(handle.observer_read_fd)
 
 
 def test_host_only_observation_rejects_missing_original_handle():

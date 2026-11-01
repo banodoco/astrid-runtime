@@ -27,6 +27,7 @@ MODE = "isolated-source/v1"
 TRUSTED_LOCAL_MODE = "trusted-local-isolated-source/v1"
 LIMIT = 64 * 1024 * 1024
 ENV_KEYS = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP", "XDG_RUNTIME_DIR", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "ASTRID_EXECUTION_TARGET_JSON"})
+TIMELINE_OBSERVER_FD_ENV = "ASTRID_TIMELINE_OBSERVER_FD"
 _COMPONENTS = {
     "host": "astrid/core/execution/generic_host.py", "core": "astrid/core",
     "sdk": "astrid/sdk", "launcher": "astrid/omp_agent.py",
@@ -38,6 +39,24 @@ _COMPONENTS = {
 
 class HostLaunchError(RuntimeError):
     """Selection or retained import authority is unresolved."""
+
+
+def _validate_timeline_observer_fd(value) -> None:
+    """Accept only Runtime's live nonblocking FIFO write endpoint."""
+    if os.name == "nt" or not isinstance(value, str) or not value.isdecimal():
+        raise HostLaunchError("host environment timeline observer descriptor is invalid")
+    descriptor = int(value)
+    if descriptor < 3 or str(descriptor) != value:
+        raise HostLaunchError("host environment timeline observer descriptor is invalid")
+    try:
+        import fcntl
+        observed = os.fstat(descriptor)
+        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    except OSError as exc:
+        raise HostLaunchError("host environment timeline observer descriptor is unavailable") from exc
+    if (not stat.S_ISFIFO(observed.st_mode) or os.get_blocking(descriptor)
+            or flags & os.O_ACCMODE != os.O_WRONLY):
+        raise HostLaunchError("host environment timeline observer descriptor is not an admitted write pipe")
 
 
 def canonical(value):
@@ -283,7 +302,12 @@ class HostLaunchVerifier:
         self._external_sources = None
 
     def _validate_environment(self, profile, config, environment):
-        if (not isinstance(environment, dict) or set(environment) - ENV_KEYS
+        if not isinstance(environment, dict):
+            raise HostLaunchError("isolated host environment contains import overrides or invalid values")
+        observer = environment.get(TIMELINE_OBSERVER_FD_ENV)
+        if observer is not None:
+            _validate_timeline_observer_fd(observer)
+        if (set(environment) - ENV_KEYS - {TIMELINE_OBSERVER_FD_ENV}
                 or any(not isinstance(v, str) or "\0" in v for v in environment.values())):
             raise HostLaunchError("isolated host environment contains import overrides or invalid values")
 
