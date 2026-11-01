@@ -680,7 +680,7 @@ def test_reconcile_before_manifest_and_newer_target_checks(tmp_path, monkeypatch
         calls.append(payload)
         assert payload["action"] == "reconcile"
         return {"disposition": "continued-existing", "job": {
-            "operation_id": operation_id, "state": "launching",
+            "operation_id": operation_id, "state": "launching", "launch_status": "acknowledged",
         }}
 
     admission._helper = helper
@@ -690,6 +690,22 @@ def test_reconcile_before_manifest_and_newer_target_checks(tmp_path, monkeypatch
         "message": "Update continued.",
     }
     assert [call["action"] for call in calls] == ["reconcile"]
+    assert prepared == []
+    assert launches == []
+
+
+@pytest.mark.parametrize("launch_status", [None, "unknown", "launching", "failed"])
+def test_unacknowledged_continuation_reply_is_observe_only(tmp_path, monkeypatch, launch_status):
+    launches = []
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: launches.append(job))
+    admission._helper = lambda *_args, **_kwargs: {
+        "disposition": "continued-existing", "job": {
+            "operation_id": "c" * 32, "state": "launching", "launch_status": launch_status,
+        },
+    }
+    with pytest.raises(update.UpdateRefusal) as refusal:
+        admission.request()
+    assert refusal.value.details["reason"] == "acknowledgement-unknown"
     assert prepared == []
     assert launches == []
 

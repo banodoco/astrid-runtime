@@ -269,8 +269,9 @@ class UpdateAdmission:
             if disposition == "continued-existing":
                 operation_id = prior.get("operation_id") if isinstance(prior, dict) else None
                 if (not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
-                        or prior.get("state") not in {"launching", "active"}):
-                    raise UpdateRefusal("busy", "The continued update is not safely acknowledged; no job was launched.")
+                        or prior.get("state") not in {"launching", "active"}
+                        or prior.get("launch_status") != "acknowledged"):
+                    raise UpdateRefusal("acknowledgement-unknown", "The update result is uncertain. Check update status before taking another action.")
                 # The locked reconciler already performed the sole native
                 # submission. This response must never launch it again.
                 return {"accepted": True, "state": "accepted", "operation_id": operation_id,
