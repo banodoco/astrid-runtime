@@ -570,6 +570,16 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(len(self.boundary.starts), starts)
         self.assertEqual(self.paths.instance_lock_path.read_bytes(), live_lock)
 
+        # The restored marker must still repair a subsequent discovery loss.
+        discovery = self.paths.discovery_path.read_bytes()
+        self.paths.discovery_path.unlink()
+        recovered = bootstrap(self.paths, self.boundary, self.config)
+        self.assertEqual(recovered.status, "reconnected")
+        self.assertEqual(recovered.runtime_instance_id, first.runtime_instance_id)
+        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery)
+        self.assertEqual(self.paths.instance_lock_path.read_bytes(), live_lock)
+        self.assertEqual(len(self.boundary.starts), starts)
+
         calls = []
         down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
         self.assertEqual(calls, ["manager"])

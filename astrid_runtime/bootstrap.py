@@ -1725,9 +1725,11 @@ def _validate_stopping_marker(marker: Mapping[str, Any]) -> dict[str, Any]:
     never live health or discovery.
     """
     intent = marker.get("stopping")
-    if (set(marker) != {"pid", "process_birth_id", "runtime_instance_id", "realm_id",
-                        "realm_root", "data_root", "state", "stopping"}
+    required = {"pid", "process_birth_id", "runtime_instance_id", "realm_id",
+                "realm_root", "data_root", "state", "stopping"}
+    if (set(marker) not in (required, required | {"discovery"})
             or marker.get("state") != "stopping"
+            or ("discovery" in marker and not isinstance(marker["discovery"], Mapping))
             or not isinstance(intent, Mapping)
             or set(intent) != {"version", "binding"}
             or type(intent.get("version")) is not int
@@ -1825,11 +1827,14 @@ def _restore_admitted_live_lock(paths: RuntimePaths) -> None:
     if marker is None or marker.get("state") != "stopping":
         return
     owner = _validate_stopping_marker(marker)
-    atomic_write_json(paths.instance_lock_path, {
+    live = {
         key: owner[key] for key in (
             "pid", "process_birth_id", "runtime_instance_id", "realm_id", "realm_root",
         )
-    })
+    }
+    if "discovery" in owner:
+        live["discovery"] = owner["discovery"]
+    atomic_write_json(paths.instance_lock_path, live)
 
 
 @contextmanager
@@ -1930,6 +1935,9 @@ def _fenced_stop_and_manager(
                                         if completed_stop_binding is not None else None),
                         },
                     }
+                    # Preserve the owner's recovery snapshot across a refused stop.
+                    if final_marker is not None and "discovery" in final_marker:
+                        intent["discovery"] = final_marker["discovery"]
                     if final_marker != intent:
                         atomic_write_json(paths.instance_lock_path, intent)
                     marker = intent
