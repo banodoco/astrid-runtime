@@ -2567,6 +2567,7 @@ class RealmStore:
             raise ValidationError("capability is required")
         if not isinstance(spec, dict):
             raise ValidationError("task spec must be an object")
+        self.custody.assert_execution_admitted()
         from .custody import declared_binding
         install_binding = declared_binding(spec)
         if isinstance(install_binding, dict):

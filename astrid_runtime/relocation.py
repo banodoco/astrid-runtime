@@ -236,11 +236,21 @@ def _validate_profile_environments(paths: RuntimePaths, old_root: Path, catalog:
         _validate_environment_relocation(value.get("runtime_environment"), old_root)
 
 
+def _reject_custody_relocation(paths, catalog):
+    from runtime_protocol.v34_lifecycle import MARKER
+    for realm in catalog['realms']:
+        root = _absolute(str(realm['data_root']), 'catalog realm root')
+        marker = root / MARKER
+        if _inside(root, paths.app_support) and (marker.exists() or marker.is_symlink()):
+            raise RelocationError('activated v34 relocation requires A03B-V34-RELOCATION-HANDOFF')
+
+
 def plan_relocation(paths: RuntimePaths, destination: str | Path, backup: str | Path | None = None) -> dict[str, Any]:
     """Return a read-only support-root relocation plan bound to the owner."""
 
     _validate_support_paths(paths)
     catalog = _read_relocation_catalog(paths)
+    _reject_custody_relocation(paths, catalog)
     realm_id, realm = _selected(catalog)
     old_support = _absolute(paths.app_support, "current support root")
     target_support = _absolute(destination, "relocation destination")
@@ -288,6 +298,7 @@ def relocate(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCo
         _validate_move(old_support, new_support)
         snapshot = _snapshot_metadata(paths)
         catalog = _read_relocation_catalog(paths)
+        _reject_custody_relocation(paths, catalog)
         realm_id, realm = _selected(catalog)
         source = config.resolve_source_profile(paths)
         discovery = _read_support_json(paths.discovery_path) or {}

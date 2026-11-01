@@ -252,10 +252,11 @@ def assert_replacement_preserves_custody(active, candidate):
                 if not CUSTODY_TABLES.issubset(tables):
                     raise ConflictError('replacement cannot exclude damaged custody authority')
                 result = {t:_row_digest(db,t,_table_columns(db,t)) for t in CUSTODY_TABLES}
+                legacy = list(db.execute("SELECT id AS task_id,attempt_id FROM tasks WHERE waiting_reason='legacy_install_custody_unknown'"))
                 # An empty fresh domain has no old authority to preserve.
-                if not any(count for count, _ in result.values()):
+                if not legacy and not any(count for count, _ in result.values()):
                     return {}
-                rows = list(db.execute('SELECT task_id,attempt_id FROM attempt_custody'))
+                rows = list(db.execute('SELECT task_id,attempt_id FROM attempt_custody')) + legacy
                 for task in rows:
                     for table,field,value in [('tasks','id',task['task_id']),('attempts','id',task['attempt_id']),('reservations','task_id',task['task_id'])]:
                         entries = [dict(r) for r in db.execute(f'SELECT * FROM {table} WHERE {field}=? ORDER BY rowid',(value,))]

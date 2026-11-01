@@ -142,6 +142,7 @@ class Custody:
                 raise ConflictError('installation has unreleased custody')
 
     def assert_task_installation_clear(self, task_id):
+        self.assert_execution_admitted()
         self.assert_clear(task_id=task_id)
         task = self.db.execute('SELECT * FROM tasks WHERE id=?', (str(task_id),)).fetchone()
         if task:
@@ -149,12 +150,27 @@ class Custody:
             if binding:
                 self.assert_clear(installation_id=binding.get('installation_id'))
 
+    def assert_execution_admitted(self):
+        # A legacy observation without attribution cannot exclude any target.
+        for task in self.db.execute("SELECT * FROM tasks WHERE waiting_reason='legacy_install_custody_unknown'"):
+            binding = declared_binding(self.store._spec(task))
+            if not isinstance(binding, dict) or not binding.get('installation_id'):
+                raise ConflictError('legacy installation attribution is missing; realm execution admission is closed',
+                                    details={'reason': 'legacy_install_custody_unknown',
+                                             'next_action': 'A03B-LEGACY-QUARANTINE-REPAIR'})
+
     def public(self, row):
+        pending = json.loads(row['pending_publication_json'] or '{}')
+        task = self.db.execute('SELECT status FROM tasks WHERE id=?', (row['task_id'],)).fetchone()
+        pending_success = (row['custody_state'] != 'released' and pending.get('kind') == 'completion'
+                           and task and task['status'] not in {'completed', 'failed', 'cancelled'})
         return {k: row[k] for k in ('custody_id', 'custody_state', 'custody_version', 'custody_seq',
                 'recovery_generation', 'recovery_ref', 'disposition', 'stop_confirmed', 'dispatch_intent_id')} | {
                 'stop_confirmed': bool(row['stop_confirmed']),
-                'hold_reason': 'attempt_custody_unresolved' if row['custody_state'] != 'released' else None,
-                'next_action': 'owner_reconcile_repair_or_lost' if row['custody_state'] != 'released' else None}
+                'hold_reason': ('custody_pending_success' if pending_success else
+                                'attempt_custody_unresolved' if row['custody_state'] != 'released' else None),
+                'next_action': ('A03B-PENDING-SUCCESS-RECONCILE' if pending_success else
+                                'owner_reconcile_repair_or_lost' if row['custody_state'] != 'released' else None)}
 
     def integrity_errors(self):
         errors = []
@@ -625,7 +641,9 @@ class Custody:
                     # A stop proof cannot manufacture or discard a successful
                     # pending publication or its journal linkage. Keep custody
                     # until that exact publication has an authorized outcome.
-                    raise ConflictError('pending publication needs independent reconciliation before custody release')
+                    raise ConflictError('pending publication needs independent reconciliation before custody release',
+                                        details={'reason': 'custody_pending_success',
+                                                 'next_action': 'A03B-PENDING-SUCCESS-RECONCILE'})
                 stop = mode == 'reconcile'
                 if mode in {'lost','repair'}:
                     evidence = envelope['fencing_evidence']
