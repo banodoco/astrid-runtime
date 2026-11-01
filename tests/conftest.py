@@ -154,6 +154,22 @@ def stage1_runtime_environment(tmp_path_factory: pytest.TempPathFactory) -> Path
     environment = tmp_path_factory.mktemp("stage1-runtime") / "venv"
     wheelhouse = environment.parent / "wheelhouse"
     source = environment.parent / "source"
+    builders = [sys.executable, "python3.11", "python3.12", "python3.13", "python3", "python"]
+    builder = None
+    for candidate in builders:
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", "import setuptools.build_meta"],
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            continue
+        if probe.returncode == 0:
+            builder = candidate
+            break
+    if builder is None:
+        raise RuntimeError("Stage 1 tests require an available Python with setuptools.build_meta")
     # setuptools writes build/ and egg-info beside the source tree. Build
     # from a private copy so concurrent pytest sessions cannot delete or
     # replace each other's generated package files in the checkout.
@@ -172,9 +188,15 @@ def stage1_runtime_environment(tmp_path_factory: pytest.TempPathFactory) -> Path
     )
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
     wheelhouse.mkdir()
+    build_env = os.environ.copy()
+    if builder == sys.executable:
+        build_env.pop("SETUPTOOLS_USE_DISTUTILS", None)
+    else:
+        build_env["SETUPTOOLS_USE_DISTUTILS"] = "stdlib"
     subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", "--no-index", "--no-build-isolation", "--no-deps", "--wheel-dir", str(wheelhouse), str(source), str(client_source)],
+        [builder, "-m", "pip", "wheel", "--no-index", "--no-build-isolation", "--no-deps", "--wheel-dir", str(wheelhouse), str(source), str(client_source)],
         cwd=str(source),
+        env=build_env,
         check=True,
     )
     scripts = "Scripts" if os.name == "nt" else "bin"

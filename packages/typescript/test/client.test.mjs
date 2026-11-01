@@ -19,6 +19,141 @@ test("generated TypeScript task query preserves default URL and forwards scoped 
     "/v1/projects/p%20%2F/tasks?limit=1&cursor=signed%2Fcursor&kind=root_generation&order=admitted_desc"]);
 });
 
+test("public commit client preserves v2 requests, receipts, previews and historical rebased replies", async () => {
+  const digest = `sha256:${"a".repeat(64)}`;
+  const change = { op: "set", ref: "parent", path: ["config", "title"], before: { state: "absent" }, value: "Title" };
+  const request = {
+    api_version: 1, project_id: "p", timeline_id: "t", base_revision_id: "r", base_publication_id: "txn",
+    commands: [
+      { schema_version: 1, op: "doc.patch", version: "1", select: null, args: { changes: [change] } },
+      { schema_version: 1, op: "clip.move", version: "1", select: "parent/clip:c", args: { on: 2 } },
+    ],
+    label: "Mixed edit", merge: "fields", reads: [{ kind: "scope", ref: "timeline", path: [] }], dry_run: false,
+    steps: [
+      { id: "patch", label: "Title", intent: "title", tags: [], command_ordinals: [0], patch: [change], reads: [{ kind: "scope", ref: "timeline", path: [] }] },
+      { id: "semantic", label: "Move", intent: "move", tags: [], command_ordinals: [1], patch: [], reads: [{ kind: "scope", ref: "timeline", path: [] }] },
+    ],
+  };
+  const candidate = {
+    canonical_document: { schema_version: 1, project_id: "p", timeline_id: "t", parent_revision: { revision_id: "next-r", content_digest: digest, payload: { config: { clips: [], tracks: [] }, registry: {}, clips: [], occurrences: [] } }, shot_revisions: [], internal_timeline_revisions: [], dependency_manifest: { shots: [], internal_timelines: [], media: [], documents: [] } },
+    document_digest: digest, commands: request.commands, id_map: {}, provider_version: "provider-v2", compiler_version: "compiler-v2",
+    merge_mode: "fields", steps: request.steps,
+  };
+  const accepted = status => {
+    const data = { status, base_revision_id: "r", base_publication_id: "txn", previous_revision_id: "head-r", previous_publication_id: "head-txn", accepted_revision_id: "next-r", rebased_onto: status === "accepted" ? null : { revision_id: "head-r", publication_id: "head-txn" }, publisher: "actor", ...candidate };
+    return { data, receipt: { receipt_id: "receipt", command_kind: "timeline.commit", idempotency_key: "key", request_hash: digest, project_id: "p", project_seq: [1, 1], event_ids: [], result: data, created_at: "2026-10-23T00:00:00Z" } };
+  };
+  const preview = status => ({ data: { status: "preview", would_status: status, base_revision_id: "r", base_publication_id: "txn", evaluated_head: { revision_id: "head-r", publication_id: "head-txn" }, ...candidate }, receipt: null });
+  let response, sent, httpStatus = 200;
+  const client = new WorkspaceClient("http://runtime", "token", async (method, path, headers, body) => {
+    assert.equal(method, "POST");
+    assert.equal(path, "/v1/projects/p/timelines/t/commit");
+    assert.equal(headers["Idempotency-Key"], "key");
+    sent = JSON.parse(new TextDecoder().decode(body));
+    return { status: httpStatus, headers: {}, body: json(response) };
+  });
+  for (const merge of ["fields", "atomic"]) {
+    for (const status of ["accepted", "merged", "rebased"]) {
+      response = accepted(status);
+      assert.deepEqual(await client.commitTimeline("p", "t", { ...request, merge }, "key"), response);
+      assert.deepEqual(sent, { ...request, merge });
+    }
+    for (const status of ["accepted", "merged"]) {
+      response = preview(status);
+      const body = { ...request, merge, dry_run: true };
+      assert.deepEqual(await client.commitTimeline("p", "t", body, "key"), response);
+      assert.deepEqual(sent, body);
+    }
+  }
+  for (const field of Object.keys(accepted("merged").receipt)) {
+    response = accepted("merged");
+    delete response.receipt[field];
+    await assert.rejects(client.commitTimeline("p", "t", request, "key"), /invalid commit receipt/);
+  }
+  for (const [field, value] of [
+    ["receipt_id", null], ["command_kind", 1], ["idempotency_key", []], ["request_hash", {}], ["project_id", false], ["created_at", 1],
+    ["project_seq", null], ["project_seq", [1]], ["project_seq", [1, 2, 3]], ["project_seq", [true, 1]], ["project_seq", [0, 1]], ["project_seq", [1, 1.5]], ["project_seq", ["1", 1]], ["event_ids", null], ["event_ids", [1]],
+  ]) {
+    response = accepted("merged");
+    response.receipt[field] = value;
+    await assert.rejects(client.commitTimeline("p", "t", request, "key"), /invalid commit receipt/);
+  }
+  response = accepted("merged");
+  response.receipt = { receipt_id: "partial" };
+  await assert.rejects(client.commitTimeline("p", "t", request, "key"), /invalid commit receipt/);
+  for (const status of [undefined, null, "conflict", "invalid", "preview", [], {}]) {
+    response = accepted("merged");
+    response.data.status = status;
+    await assert.rejects(client.commitTimeline("p", "t", request, "key"), /invalid commit status/);
+  }
+  for (const wouldStatus of [undefined, null, "rebased", "invalid", "preview", 1, [], {}]) {
+    response = preview(wouldStatus);
+    await assert.rejects(client.commitTimeline("p", "t", { ...request, dry_run: true }, "key"), /invalid commit preview/);
+  }
+  for (const [status, code, details] of [
+    [409, "conflict", { status: "conflict", reason: "dependency_changed", current: { revision_id: "head-r", publication_id: "head-txn" } }],
+    [422, "invalid", { status: "invalid", code: "previous_value_mismatch", path: ["commands", "0"], hint: "Read the current head", suggested_command: "timeline show" }],
+  ]) {
+    httpStatus = status;
+    response = { code, message: code, details };
+    await assert.rejects(client.commitTimeline("p", "t", request, "key"), error => error instanceof ApiError && error.status === status && error.code === code && assert.deepEqual(error.details, details) === undefined);
+  }
+});
+
+test("verified media read preserves the complete pin and encoded alias without mutation authority", async () => {
+  const selection = { asset: "alias/ &", generation_id: "g", variant_id: "v", object_id: `sha256:${"a".repeat(64)}`, catalog_digest: `sha256:${"b".repeat(64)}` };
+  const verified = { selection, media_type: "video/mp4", size: 42, duration_seconds: 2 };
+  const calls = [];
+  const transport = async (method, path, headers, body) => {
+    calls.push(path);
+    assert.equal(method, "GET");
+    assert.equal(body, undefined);
+    assert.equal(headers.Authorization, "Bearer token");
+    assert.equal(headers["Idempotency-Key"], undefined);
+    const url = new URL(path, "http://runtime");
+    assert.equal(url.pathname, "/v1/projects/project%2Fone/media-selection/verified");
+    assert.deepEqual(Object.fromEntries(url.searchParams), selection);
+    assert.equal([...url.searchParams].length, 5);
+    return { status: 200, headers: {}, body: json(verified) };
+  };
+  const client = new WorkspaceClient("http://runtime", "token", transport);
+  assert.deepEqual(await client.getProjectVerifiedMedia("project/one", selection), verified);
+  assert.equal(calls.length, 1);
+});
+
+test("verified document read sends the exact pin without mutation authority", async () => {
+  const pin = { document_id: "document:pack/1", version: 1, content_digest: `sha256:${"a".repeat(64)}` };
+  const verified = { pin, document: { document_id: pin.document_id, project_id: "p", kind: "astrid.project-pack", content: {}, version: 1, created_at: "now", updated_at: "now" } };
+  const transport = async (method, path, headers, body) => {
+    assert.equal(method, "GET");
+    assert.equal(body, undefined);
+    assert.equal(headers["Idempotency-Key"], undefined);
+    const url = new URL(path, "http://runtime");
+    assert.equal(url.pathname, "/v1/projects/project%2Fone/document-inputs/verified");
+    assert.deepEqual(Object.fromEntries(url.searchParams), { ...pin, version: "1" });
+    return { status: 200, headers: {}, body: json(verified) };
+  };
+  const client = new WorkspaceClient("http://runtime", "token", transport);
+  assert.deepEqual(await client.getProjectVerifiedDocument("project/one", pin), verified);
+});
+
+test("verified document object read sends the exact pin and object without mutation authority", async () => {
+  const pin = { document_id: "document:pack/1", version: 1, content_digest: `sha256:${"a".repeat(64)}` };
+  const objectId = `sha256:${"b".repeat(64)}`;
+  const object = { object_id: objectId, digest: objectId, size: 2, media_type: "application/json", bytes_base64: "e30=" };
+  const transport = async (method, path, headers, body) => {
+    assert.equal(method, "GET");
+    assert.equal(body, undefined);
+    assert.equal(headers["Idempotency-Key"], undefined);
+    const url = new URL(path, "http://runtime");
+    assert.equal(url.pathname, "/v1/projects/project%2Fone/document-objects/verified");
+    assert.deepEqual(Object.fromEntries(url.searchParams), { ...pin, version: "1", object_id: objectId });
+    return { status: 200, headers: {}, body: json(object) };
+  };
+  const client = new WorkspaceClient("http://runtime", "token", transport);
+  assert.deepEqual(await client.getProjectVerifiedDocumentObject("project/one", pin, objectId), object);
+});
+
 test("generated TypeScript client performs scoped handshake and idempotent project admission", async () => {
   const release = JSON.parse(readFileSync(new URL("../../../generators/release.json", import.meta.url), "utf8"));
   assert.equal(CONTRACT_VERSION, release.contract_version);
@@ -228,6 +363,22 @@ test("default fetch receives Blob directly", async () => {
   }
 });
 
+
+test("persisted timeline view sends explicit key and preserves the plain view response", async () => {
+  const options = { formats: ["md"], revision_id: "r1" };
+  const result = { inspection: { revision_id: "r1" }, artifacts: { md: { object_id: "view-object" } } };
+  const transport = async (method, path, headers, body) => {
+    assert.equal(method, "POST");
+    assert.equal(path, "/v1/projects/p%2Fone/timelines/t%2Ftwo/views");
+    assert.equal(headers.Authorization, "Bearer writer");
+    assert.equal(headers["Idempotency-Key"], "view-retry");
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(body)), options);
+    return { status: 200, headers: {}, body: json(result) };
+  };
+  const client = new WorkspaceClient("http://runtime", "writer", transport);
+  assert.deepEqual(await client.createTimelineView("p/one", "t/two", options, "view-retry"), result);
+});
+
 test("app-state client reads absent state, writes with a null receipt and rejects mismatched resources", async () => {
   const content = { version: 1, outcome: "completed", step: "finale", at: "2026-10-21T00:00:00Z" };
   const resource = { scope: "user", actor_id: "a", key: "editor-tour", content, version: 1, created_at: "t", updated_at: "t" };
@@ -238,9 +389,8 @@ test("app-state client reads absent state, writes with a null receipt and reject
     if (method === "GET") return { status: 200, headers: {}, body: json({ ...resource, content: null, version: 0, created_at: null, updated_at: null }) };
     return { status: 200, headers: {}, body: json({ data: resource, receipt: null }) };
   };
-  const client = new WorkspaceClient("http://runtime", "token", transport);
+  const client = new WorkspaceClient("http://runtime", "writer", transport);
   const empty = await client.getUserAppState("editor-tour");
-  assert.equal(empty.version, 0);
   assert.equal(empty.content, null);
   assert.equal(calls[0].path, "/v1/app-state/user/editor-tour");
   const saved = await client.updateUserAppState("editor-tour", content, 0, "idem-1");

@@ -58,7 +58,7 @@ def compact_result(kind, result):
 
 
 def command_result(result_json, *, kind=None, created_at=None, connection=None, window_seconds=RESULT_WINDOW_SECONDS):
-    if created_at is not None:
+    if created_at is not None and kind != "timeline.commit":
         timestamp = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
         if timestamp.tzinfo is None or timestamp < datetime.now(timezone.utc) - timedelta(seconds=window_seconds):
             raise IdempotencyWindowExpired("idempotency result is outside its replay window; the command was not executed again")

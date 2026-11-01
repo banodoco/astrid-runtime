@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -9,10 +11,16 @@ from runtime_protocol.errors import ConflictError, NotFoundError, ValidationErro
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
-from runtime_protocol.timeline_inspection import MAX_RESPONSE_BYTES
+from runtime_protocol.timeline_inspection import MAX_RESPONSE_BYTES, _clip as project_clip, _fraction, _parent_clip as project_parent_clip
+from runtime_protocol.timeline_commit import CommitRejected
+from runtime_protocol.timeline_commit_store import TimelineCommitStore, digest
 from runtime_protocol.util import canonical_json
 
 from astrid_runtime_client import WorkspaceClient
+from http_helpers import Api
+from test_timeline_authority_door import _snapshot
+from runtime_protocol.timeline_view import markdown, png
+from test_timeline_commit_acceptance import accept, context, prepared, validate_prepared
 
 
 def _service(tmp_path):
@@ -21,7 +29,106 @@ def _service(tmp_path):
     service = RuntimeService(root)
     project = service.create_project({"slug": "views", "name": "Views"}, idempotency_key="project")
     service.create_timeline(project["id"], "main", idempotency_key="timeline")
+    commits = TimelineCommitStore(service.store, validate_prepared=validate_prepared)
+    commits.bootstrap(project["id"], "main", authorize=lambda: None)
     return service, project["id"], root
+
+
+def _canonical_publication(project, publication, current):
+    """Convert fixture input into the accepted immutable closure shape."""
+    parent_payload = copy.deepcopy(publication["parent_composition"])
+    parent = {
+        "revision_id": publication["parent_revision_id"],
+        "content_digest": digest(parent_payload),
+        "payload": parent_payload,
+    }
+    occurrences = parent_payload["occurrences"]
+    required_shots = {(row["shot_id"], row["shot_revision_id"]) for row in occurrences}
+    source_shots = publication.get("shot_revisions", current["shot_revisions"])
+    shots = []
+    for source in source_shots:
+        if (source["shot_id"], source["revision_id"]) not in required_shots:
+            continue
+        payload = copy.deepcopy(source["payload"])
+        payload["internal_timeline_revision_id"] = source["internal_timeline_revision_id"]
+        shots.append({
+            "shot_id": source["shot_id"],
+            "revision_id": source["revision_id"],
+            "internal_timeline_revision_id": source["internal_timeline_revision_id"],
+            "content_digest": digest(payload),
+            "payload": payload,
+        })
+    required_internals = {source["internal_timeline_revision_id"] for source in shots}
+    source_internals = publication.get("internal_timeline_revisions", current["internal_timeline_revisions"])
+    internals = []
+    for source in source_internals:
+        if source["revision_id"] not in required_internals:
+            continue
+        payload = copy.deepcopy(source["payload"])
+        internals.append({
+            "timeline_id": source["timeline_id"],
+            "revision_id": source["revision_id"],
+            "content_digest": digest(payload),
+            "payload": payload,
+        })
+    shots.sort(key=lambda image: (image["shot_id"], image["revision_id"]))
+    internals.sort(key=lambda image: (image["timeline_id"], image["revision_id"]))
+
+    media = {}
+
+    def collect(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"media_id", "object_id"} and isinstance(child, str):
+                    media_id = child if child.startswith("sha256:") else "sha256:" + child
+                    if len(media_id) == len("sha256:") + 64:
+                        media[media_id] = {"media_id": media_id, "content_digest": media_id}
+                collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    for image in [parent, *shots, *internals]:
+        collect(image["payload"])
+    manifest = {
+        "shots": [
+            {key: image[key] for key in ("shot_id", "revision_id", "internal_timeline_revision_id", "content_digest")}
+            for image in shots
+        ],
+        "internal_timelines": [
+            {key: image[key] for key in ("timeline_id", "revision_id", "content_digest")}
+            for image in internals
+        ],
+        "media": [media[key] for key in sorted(media)],
+        "documents": [],
+    }
+    return {
+        "schema_version": 1,
+        "project_id": project,
+        "timeline_id": "main",
+        "parent_revision": parent,
+        "shot_revisions": shots,
+        "internal_timeline_revisions": internals,
+        "dependency_manifest": manifest,
+    }
+
+
+def _publish(service, project, publication, *, idempotency_key):
+    """Accept a fixture closure through the host commit store, then inspect it."""
+    commits = TimelineCommitStore(service.store, validate_prepared=validate_prepared)
+    head = commits.head(project, "main")
+    current = commits.revision_closure(project, "main", head["revision_id"])
+    context_value = context(service, project, head, idempotency_key)
+    value = prepared(commits, context_value, expected=head, revision=publication["parent_revision_id"])
+    value["canonical_document"] = _canonical_publication(project, publication, current)
+    value["document_digest"] = digest(value["canonical_document"])
+    try:
+        return accept(commits, context_value, value)
+    except CommitRejected as exc:
+        if (exc.failure["details"]["reason"] == "invalid_closure"
+                and "canonical parent clips" in exc.failure["message"]):
+            raise ConflictError(exc.failure["message"]) from exc
+        raise
 
 
 def _publication(project, *, revision="parent-1", expected_head=None, offset=0):
@@ -70,6 +177,102 @@ def _parent_clip(clip_id, *, clip_type="media", track="V1", at_ms=0, duration_ms
     }
 
 
+@pytest.mark.parametrize(("speed_fields", "expected_speed", "expected_duration"), [
+    ({}, [1, 1], [1, 2]),
+    ({"speed": 1}, [1, 1], [1, 2]),
+    ({"speed": 2}, [2, 1], [1, 4]),
+    ({"speed": 0.5}, [1, 2], [1, 1]),
+])
+def test_known_clip_speed_defaults_preserve_published_bytes(
+        tmp_path, speed_fields, expected_speed, expected_duration):
+    service, project, root = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        child = {**_clip("child"), **speed_fields}
+        parent = {**_parent_clip("parent", duration_ms=500), **speed_fields}
+        publication["internal_timeline_revisions"][0]["payload"]["clips"] = [child]
+        publication["parent_composition"]["clips"] = [parent]
+        _publish(service, project, publication, idempotency_key="speed-publication")
+        images = {table: [tuple(row) for row in service.store.conn.execute(
+            f"SELECT * FROM {table} ORDER BY id",
+        )] for table in ("parent_composition_revisions", "shot_revisions", "internal_timeline_revisions")}
+        service.close()
+        service = RuntimeService(root)
+        before = tuple(service.store.conn.iterdump())
+        for table, expected in images.items():
+            assert [tuple(row) for row in service.store.conn.execute(
+                f"SELECT * FROM {table} ORDER BY id",
+            )] == expected
+
+        for options in ({}, {"revision_id": "parent-1"}):
+            result = service.inspect_timeline(project, "main", options)
+            clips = [result["selected"][0]["clips"][0], result["selected_parent_clips"][0]]
+            for projected, authored in zip(clips, (child, parent)):
+                assert projected["speed"] == expected_speed
+                assert projected["duration"] == expected_duration
+                assert projected["authored_fields"] == authored
+                if "speed" in speed_fields:
+                    assert projected["authored_timing"]["speed"] == speed_fields["speed"]
+            assert service.get_project_timeline_revision(
+                project, "main", "internal-1",
+            )["payload"]["clips"] == [child]
+            assert service.get_project_parent_composition_revision(
+                project, "main", "parent-1",
+            )["payload"]["clips"] == [parent]
+            assert tuple(service.store.conn.iterdump()) == before
+    finally:
+        service.close()
+
+
+def _project_speed(scope, raw):
+    track_scope = {"kind": "parent_composition", "id": "parent-1"}
+    if scope == "parent":
+        return project_parent_clip(raw, [], track_scope, {})
+    occurrence = {"occurrence_id": "first", "shot_id": "shot-1"}
+    return project_clip(raw, [], occurrence, Fraction(0), Fraction(1), track_scope, {})
+
+
+@pytest.mark.parametrize("scope", ["child", "parent"])
+@pytest.mark.parametrize(("speed", "expected_speed", "expected_duration"), [
+    (None, [1, 1], [1, 2]),
+    ([3, 2], [3, 2], [1, 3]),
+    ("3/2", [3, 2], [1, 3]),
+])
+def test_known_clip_speed_null_and_rational_projection(scope, speed, expected_speed, expected_duration):
+    raw = {**_clip("speed"), "speed": speed}
+    before = canonical_json(raw)
+    projected = _project_speed(scope, raw)
+    assert projected["speed"] == expected_speed
+    assert projected["duration"] == expected_duration
+    assert canonical_json(projected["authored_fields"]) == before
+    assert canonical_json(projected["authored_timing"]["speed"]) == canonical_json(speed)
+    assert canonical_json(raw) == before
+
+
+@pytest.mark.parametrize("scope", ["child", "parent"])
+@pytest.mark.parametrize("speed", [True, False, -1, 0, "invalid", [1, 0]])
+def test_known_clip_speed_defaults_do_not_accept_invalid_values(scope, speed):
+    with pytest.raises((ValidationError, ConflictError), match="speed"):
+        _project_speed(scope, {**_clip("speed"), "speed": speed})
+
+
+@pytest.mark.parametrize("label", ["value", "fps"])
+def test_generic_fraction_still_rejects_null(label):
+    with pytest.raises(ValidationError, match=label):
+        _fraction(None, label)
+
+
+def test_publication_still_rejects_null_fps(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["config"]["output"] = {"fps": None}
+        with pytest.raises(CommitRejected, match="frozen schema"):
+            _publish(service, project, publication, idempotency_key="null-fps")
+    finally:
+        service.close()
+
+
 def test_config_only_parent_clips_project_maple_and_parent_media_rows(tmp_path):
     service, project, _ = _service(tmp_path)
     try:
@@ -84,7 +287,7 @@ def test_config_only_parent_clips_project_maple_and_parent_media_rows(tmp_path):
             _parent_clip("audio-bed", clip_type="audio", track="A1", at_ms=125),
             _parent_clip("overlay", clip_type="overlay", track="V2", at_ms=500, duration_ms=250),
         ]
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-config-only")
+        _publish(service, project, publication, idempotency_key="publish-config-only")
 
         result = service.inspect_timeline(project, "main", {"limit": 20})
 
@@ -118,7 +321,7 @@ def test_parent_clip_projection_uses_one_canonical_list(tmp_path, config_clips, 
         publication["parent_composition"]["occurrences"] = []
         publication["parent_composition"]["config"]["clips"] = config_clips
         publication["parent_composition"]["clips"] = parent_clips
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-list-shape")
+        _publish(service, project, publication, idempotency_key="publish-list-shape")
 
         result = service.inspect_timeline(project, "main", {})
 
@@ -135,7 +338,7 @@ def test_conflicting_parent_clip_lists_fail_closed(tmp_path):
         publication["parent_composition"]["config"]["clips"] = [_parent_clip("config")]
         publication["parent_composition"]["clips"] = [_parent_clip("top-level")]
         with pytest.raises(ConflictError, match="clips"):
-            service.publish_parent_composition(project, "main", publication, idempotency_key="publish-conflicting-lists")
+            _publish(service, project, publication, idempotency_key="publish-conflicting-lists")
             service.inspect_timeline(project, "main", {})
     finally:
         service.close()
@@ -148,7 +351,7 @@ def test_malformed_parent_clip_collections_are_rejected(tmp_path, field):
         publication = _publication(project)
         publication["parent_composition"]["occurrences"] = []
         publication["parent_composition"]["clips"] = [_parent_clip("valid")]
-        service.publish_parent_composition(project, "main", publication, idempotency_key=f"publish-malformed-{field}")
+        _publish(service, project, publication, idempotency_key=f"publish-malformed-{field}")
         row = service.store.conn.execute(
             "SELECT payload_json FROM parent_composition_revisions WHERE id=?",
             ("parent-1",),
@@ -179,7 +382,7 @@ def test_config_only_parent_clips_support_selectors_pagination_and_pinned_revisi
             _parent_clip("config-two", track="V2", at_ms=1000),
             _parent_clip("config-three", track="V2", at_ms=2000),
         ]
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-config-page-1")
+        _publish(service, project, publication, idempotency_key="publish-config-page-1")
 
         first = service.inspect_timeline(project, "main", {"limit": 2})
         second = service.inspect_timeline(project, "main", {"limit": 2, "cursor": first["next_cursor"]})
@@ -191,7 +394,7 @@ def test_config_only_parent_clips_support_selectors_pagination_and_pinned_revisi
         later = _publication(project, revision="parent-2", expected_head="parent-1")
         later["parent_composition"]["occurrences"] = []
         later["parent_composition"]["config"]["clips"] = [_parent_clip("current-only")]
-        service.publish_parent_composition(project, "main", later, idempotency_key="publish-config-page-2")
+        _publish(service, project, later, idempotency_key="publish-config-page-2")
 
         pinned = service.inspect_timeline(project, "main", {
             "revision_id": "parent-1", "clip": "config-one",
@@ -206,7 +409,7 @@ def test_config_only_parent_clips_support_selectors_pagination_and_pinned_revisi
 def test_pinned_inspection_and_neighbor_order(tmp_path):
     service, project, _ = _service(tmp_path)
     try:
-        service.publish_parent_composition(project, "main", _publication(project), idempotency_key="publish-1")
+        _publish(service, project, _publication(project), idempotency_key="publish-1")
         first = service.inspect_timeline(project, "main", {"occurrence": "second", "neighbors": 1})
         assert first["revision_id"] == "parent-1"
         assert [row["occurrence"]["occurrence_id"] for row in first["selected"]] == ["first", "second", "third"]
@@ -217,7 +420,7 @@ def test_pinned_inspection_and_neighbor_order(tmp_path):
         later = _publication(project, revision="parent-2", expected_head="parent-1", offset=5000)
         later.pop("internal_timeline_revisions")
         later.pop("shot_revisions")
-        service.publish_parent_composition(project, "main", later, idempotency_key="publish-2")
+        _publish(service, project, later, idempotency_key="publish-2")
         pinned = service.inspect_timeline(project, "main", {"revision_id": "parent-1", "occurrence": "second"})
         current = service.inspect_timeline(project, "main", {"occurrence": "second"})
         assert pinned["snapshot_digest"] == first["snapshot_digest"]
@@ -231,7 +434,7 @@ def test_pinned_inspection_and_neighbor_order(tmp_path):
 def test_selector_miss_validation_and_project_scope(tmp_path):
     service, project, _ = _service(tmp_path)
     try:
-        service.publish_parent_composition(project, "main", _publication(project), idempotency_key="publish-1")
+        _publish(service, project, _publication(project), idempotency_key="publish-1")
         missing = service.inspect_timeline(project, "main", {"occurrence": "missing", "neighbors": 2})
         assert missing["selection_status"] == "selector_miss"
         assert missing["selected"] == []
@@ -266,7 +469,7 @@ def test_selection_and_range_filter_before_presentation_limit(tmp_path):
             {**shot, "shot_id": "shot-selected", "revision_id": "shot-rev-selected", "internal_timeline_revision_id": "internal-selected"},
             {**shot, "shot_id": "shot-unrelated", "revision_id": "shot-rev-unrelated", "internal_timeline_revision_id": "internal-unrelated"},
         ]
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-dense")
+        _publish(service, project, publication, idempotency_key="publish-dense")
         selected = service.inspect_timeline(project, "main", {"occurrence": "second", "limit": 1})
         assert selected["target_count"] == 1
         assert [clip["clip_id"] for row in selected["selected"] for clip in row["clips"]] == ["dense-selected-0"]
@@ -285,7 +488,7 @@ def test_selection_and_range_filter_before_presentation_limit(tmp_path):
             occurrence["shot_revision_id"] = "shot-rev-2"
             occurrence["duration_ms"] = 4000
         _with_clips(range_publication, [_clip("ends-at-one", 0, 1000), _clip("overlaps", 1000, 1000), _clip("gap", 2500, 500)])
-        service.publish_parent_composition(project, "main", range_publication, idempotency_key="publish-range")
+        _publish(service, project, range_publication, idempotency_key="publish-range")
         ranged = service.inspect_timeline(project, "main", {"occurrence": "first", "range": "1..2", "limit": 10})
         assert [clip["clip_id"] for row in ranged["selected"] for clip in row["clips"]] == ["overlaps"]
     finally:
@@ -307,7 +510,7 @@ def test_visible_time_vectors_apply_speed_once_clip_to_occurrence_and_keep_half_
             {"id": "hold-slow-clipped", "clip_type": "text", "track": "picture", "at": 1.75, "hold": 1, "speed": 0.5},
             {"id": "adjacent", "clip_type": "text", "track": "picture", "at": 0.625, "hold": 0.25, "speed": 1},
         ])
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-visible-time")
+        _publish(service, project, publication, idempotency_key="publish-visible-time")
 
         result = service.inspect_timeline(project, "main", {"occurrence": "first", "limit": 20})
         clips = {clip["clip_id"]: clip for row in result["selected"] for clip in row["clips"]}
@@ -346,7 +549,7 @@ def test_inspection_continuation_is_stable_bounded_and_query_bound(tmp_path):
         publication = _publication(project)
         publication["parent_composition"]["occurrences"] = publication["parent_composition"]["occurrences"][:1]
         _with_clips(publication, [_clip(f"clip-{index}") for index in range(7)])
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-pages")
+        _publish(service, project, publication, idempotency_key="publish-pages")
         options = {"occurrence": "first", "limit": 3}
         first = service.inspect_timeline(project, "main", options)
         second = service.inspect_timeline(project, "main", {**options, "cursor": first["next_cursor"]})
@@ -374,7 +577,7 @@ def test_inspection_continuation_is_stable_bounded_and_query_bound(tmp_path):
         later = _publication(project, revision="parent-2", expected_head="parent-1")
         later.pop("internal_timeline_revisions")
         later.pop("shot_revisions")
-        service.publish_parent_composition(project, "main", later, idempotency_key="publish-new-head")
+        _publish(service, project, later, idempotency_key="publish-new-head")
         with pytest.raises(ValidationError, match="cursor does not match"):
             service.inspect_timeline(project, "main", {**options, "cursor": first["next_cursor"]})
     finally:
@@ -411,7 +614,7 @@ def test_authored_aliases_track_scopes_and_media_provenance_are_explicit(tmp_pat
             "extensions": {"vendor": {"retain": True}}, "presentation": {"anchor": "center"},
             "x": 12, "opacity": 0.4,
         }]
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-authored-fields")
+        _publish(service, project, publication, idempotency_key="publish-authored-fields")
 
         result = service.inspect_timeline(project, "main", {"limit": 10})
         children = [clip for row in result["selected"] for clip in row["clips"]]
@@ -482,7 +685,7 @@ def test_authored_asset_and_track_omissions_merge_for_child_parent_and_occurrenc
             "at_ms": 0, "duration_ms": 500, "asset": "child-key",
             "params": {"payload": "c" * 5000},
         }]
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-merged-omissions")
+        _publish(service, project, publication, idempotency_key="publish-merged-omissions")
 
         result = service.inspect_timeline(project, "main", {"limit": 10})
         child = result["selected"][0]["clips"][0]
@@ -516,7 +719,7 @@ def test_oversize_authored_values_are_omitted_with_byte_evidence(tmp_path):
             "duration_ms": 500, "params": {"blob": "p" * 12000},
             "extensions": {"large": "e" * 9000}, "text": "t" * 6000,
         }]
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-oversize-authored")
+        _publish(service, project, publication, idempotency_key="publish-oversize-authored")
 
         result = service.inspect_timeline(project, "main", {"occurrence": "first", "limit": 1})
         clip = result["selected"][0]["clips"][0]
@@ -548,7 +751,7 @@ def test_response_budget_pages_at_clip_boundaries_with_truthful_cursor(tmp_path)
             for index in range(100)
         ]
         _with_clips(publication, clips)
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-budget")
+        _publish(service, project, publication, idempotency_key="publish-budget")
 
         first = service.inspect_timeline(project, "main", {"occurrence": "first", "limit": 100})
         assert first["bounds"]["max_response_bytes"] == MAX_RESPONSE_BYTES
@@ -607,7 +810,7 @@ def test_response_budget_shrinks_mixed_parent_child_sequence_without_cursor_gaps
         publication["internal_timeline_revisions"][0]["payload"]["tracks"] = [
             {"id": "picture", "kind": "visual", "label": "c" * 3000},
         ]
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-mixed-budget")
+        _publish(service, project, publication, idempotency_key="publish-mixed-budget")
 
         expected = ["parent-0", "parent-1", *(f"child-{index}" for index in range(5))]
         seen = []
@@ -655,7 +858,7 @@ def test_inspection_retains_global_closure_safety_cap(tmp_path):
             for index in range(21)
         ]
         _with_clips(publication, [_clip(f"clip-{index}") for index in range(100)])
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-too-many")
+        _publish(service, project, publication, idempotency_key="publish-too-many")
         with pytest.raises(ValidationError, match="closure exceeds clip limit"):
             service.inspect_timeline(project, "main", {"limit": 1})
     finally:
@@ -665,25 +868,35 @@ def test_inspection_retains_global_closure_safety_cap(tmp_path):
 def test_markdown_png_custody_and_dedup(tmp_path):
     service, project, root = _service(tmp_path)
     try:
-        service.publish_parent_composition(project, "main", _publication(project), idempotency_key="publish-1")
+        _publish(service, project, _publication(project), idempotency_key="publish-1")
         options = {"occurrence": "second", "neighbors": 1, "formats": ["md", "png"]}
-        result = service.create_timeline_view(project, "main", options)
-        again = service.create_timeline_view(project, "main", options)
-        assert result["artifacts"]["md"] == again["artifacts"]["md"]
+        result = service.create_timeline_view(project, "main", options, idempotency_key="view-1")
+        again = service.create_timeline_view(project, "main", options, idempotency_key="view-1")
+        assert result == again
+        count = service.store.conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+        assert service.create_timeline_view(project, "main", options, idempotency_key="view-2") == result
+        assert service.store.conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == count
+        before = _snapshot(service)
+        with pytest.raises(ConflictError, match="different input"):
+            service.create_timeline_view(project, "main", {"formats": ["md"]}, idempotency_key="view-1")
+        assert _snapshot(service) == before
         assert result["formats"]["png"]["status"] == "available"
         object_id = result["artifacts"]["md"]["object_id"]
         assert service.object_location(project, object_id)["verified"] is True
         _, content = service.object(object_id)
+        assert content == markdown(result["inspection"])
         assert b"Parent revision: parent-1" in content
         assert b"first" in content and b"second" in content and b"third" in content
         assert b"A &#124; &lt;B&gt;" in content
         png_id = result["artifacts"]["png"]["object_id"]
+        assert service.object(png_id)[1] == png(result["inspection"])
         assert service.object(png_id)[1].startswith(b"\x89PNG\r\n\x1a\n")
-        assert "png" in service.create_timeline_view(project, "main", {"formats": ["png"]})["artifacts"]
+        assert "png" in service.create_timeline_view(project, "main", {"formats": ["png"]}, idempotency_key="view-png")["artifacts"]
     finally:
         service.close()
     reopened = RuntimeService(root)
     try:
+        assert reopened.create_timeline_view(project, "main", options, idempotency_key="view-1") == result
         assert reopened.object_location(project, object_id)["verified"] is True
         assert reopened.object(object_id)[1] == content
         assert reopened.object_location(project, png_id)["verified"] is True
@@ -694,7 +907,7 @@ def test_markdown_png_custody_and_dedup(tmp_path):
 def test_daemon_generated_client_without_executor_catalog(tmp_path):
     service, project, root = _service(tmp_path)
     try:
-        service.publish_parent_composition(project, "main", _publication(project), idempotency_key="publish-1")
+        _publish(service, project, _publication(project), idempotency_key="publish-1")
     finally:
         service.close()
     daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start()
@@ -702,7 +915,7 @@ def test_daemon_generated_client_without_executor_catalog(tmp_path):
         client = WorkspaceClient(daemon.endpoint, daemon.token)
         inspection = client.inspect_timeline(project, "main", {"occurrence": "second", "neighbors": 1})
         assert inspection["revision_id"] == "parent-1"
-        view = client.create_timeline_view(project, "main", {"occurrence": "second", "formats": ["md", "png"]})
+        view = client.create_timeline_view(project, "main", {"occurrence": "second", "formats": ["md", "png"]}, idempotency_key="client-view")
         assert view["formats"]["png"]["status"] == "available"
         assert b"second" in client.get_object(view["artifacts"]["md"]["object_id"]).data
         assert daemon.service.store.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
@@ -753,7 +966,7 @@ def test_canonical_head_names_and_parent_targets_are_distinct_from_occurrences(t
             {"id": effect["clip_id"], "clip_type": "effect", "track": "effects", "at_ms": 100, "duration_ms": 400, "asset": "media-1" if "source_object_id" in effect else None, "parameters": effect["parameters"], "elementRef": effect["element_ref"]}
             for effect in fixture["parent_effects"]
         ]
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-parity")
+        _publish(service, project, publication, idempotency_key="publish-parity")
         result = service.inspect_timeline(project, "main", {})
         assert result["representation"] == "canonical_head"
         assert result["authority"] == "runtime_parent_composition"
@@ -769,7 +982,7 @@ def test_canonical_head_names_and_parent_targets_are_distinct_from_occurrences(t
         selected = service.inspect_timeline(project, "main", {"clip": "effect-code-only"})
         assert selected["target_count"] == 0
         assert [clip["clip_id"] for clip in selected["selected_parent_clips"]] == ["effect-code-only"]
-        view = service.create_timeline_view(project, "main", {"clip": "effect-code-only", "formats": ["md"]})
+        view = service.create_timeline_view(project, "main", {"clip": "effect-code-only", "formats": ["md"]}, idempotency_key="view-effect")
         assert view["inspection"]["authority"] == "runtime_parent_composition"
         assert [clip["clip_id"] for clip in view["inspection"]["selected_parent_clips"]] == ["effect-code-only"]
     finally:
@@ -786,7 +999,7 @@ def test_inspection_timing_context_keeps_off_page_transition_siblings(tmp_path):
              'transition': {'id': 'cross-fade', 'durationFrames': 6}},
             {'id': 'b', 'clipType': 'media', 'track': 'picture', 'at': .5, 'hold': .6},
         ]
-        service.publish_parent_composition(project, 'main', publication, idempotency_key='timing-context')
+        _publish(service, project, publication, idempotency_key='timing-context')
         result = service.inspect_timeline(project, 'main', {'limit': 1})
         assert result['selected_clip_count'] == 1
         context = result['render_timing_context']
@@ -838,6 +1051,68 @@ def test_occurrence_speed_discrepancy_keeps_authored_values_and_marks_missing_pr
     assert projected[0]['authored_fields']['hold'] == 2
 
 
+def test_view_write_authority_and_key_before_any_persistence(tmp_path, monkeypatch):
+    service, project, root = _service(tmp_path)
+    try:
+        _publish(service, project, _publication(project), idempotency_key="publish-1")
+    finally:
+        service.close()
+    daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start()
+    try:
+        reader, _ = daemon.credentials.provision("view-reader", ["projects:read"])
+        writer, _ = daemon.credentials.provision("view-writer", ["projects:write"])
+        path = f"/v1/projects/{project}/timelines/main/views"
+        options = {"formats": ["md", "png"]}
+        with monkeypatch.context() as denied:
+            def no_ingest(*args, **kwargs):
+                pytest.fail("refused view reached CAS ingestion")
+            denied.setattr(daemon.service, "ingest", no_ingest)
+            before = _snapshot(daemon.service)
+            for token, key, status in (
+                (reader, "reader-view", 401), (reader, None, 401),
+                (writer, None, 400), (writer, "", 400), (writer, "bad key", 400),
+            ):
+                with pytest.raises(RuntimeError) as caught:
+                    Api(daemon.endpoint, token).request(
+                        "POST", path, options,
+                        headers={"Idempotency-Key": key} if key is not None else {},
+                    )
+                assert caught.value.status == status
+                assert _snapshot(daemon.service) == before
+            inspection = Api(daemon.endpoint, reader).request(
+                "POST", f"/v1/projects/{project}/timelines/main/inspect", options,
+            )
+            assert inspection["revision_id"] == "parent-1"
+            assert _snapshot(daemon.service) == before
+        owner = WorkspaceClient(daemon.endpoint, daemon.token)
+        result = owner.create_timeline_view(project, "main", options, idempotency_key="owner-view")
+        assert owner.create_timeline_view(project, "main", options, idempotency_key="owner-view") == result
+        for kind, render in (("md", markdown), ("png", png)):
+            artifact = result["artifacts"][kind]
+            assert owner.get_object(artifact["object_id"]).data == render(result["inspection"])
+            assert daemon.service.object_location(project, artifact["object_id"])["verified"] is True
+        assert WorkspaceClient(daemon.endpoint, writer).create_timeline_view(
+            project, "main", options, idempotency_key="writer-view",
+        ) == result
+    finally:
+        daemon.stop()
+
+
+def test_view_retry_keeps_original_revision_after_head_advances(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        _publish(service, project, _publication(project), idempotency_key="publish-1")
+        original = service.create_timeline_view(project, "main", idempotency_key="view-head")
+        publication = _publication(project, revision="parent-2", expected_head="parent-1")
+        _publish(service, project, publication, idempotency_key="publish-2")
+        assert service.inspect_timeline(project, "main")["revision_id"] == "parent-2"
+        before = _snapshot(service)
+        assert service.create_timeline_view(project, "main", idempotency_key="view-head") == original
+        assert _snapshot(service) == before
+    finally:
+        service.close()
+
+
 def test_shot_clip_track_resolves_from_the_film_when_the_shot_defines_none(tmp_path):
     service, project, _ = _service(tmp_path)
     try:
@@ -846,7 +1121,7 @@ def test_shot_clip_track_resolves_from_the_film_when_the_shot_defines_none(tmp_p
             {"id": "picture", "kind": "visual", "label": "Film picture"},
         ]
         publication["internal_timeline_revisions"][0]["payload"].pop("tracks")
-        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-film-tracks")
+        _publish(service, project, publication, idempotency_key="publish-film-tracks")
 
         result = service.inspect_timeline(project, "main", {"limit": 10})
         child = [clip for row in result["selected"] for clip in row["clips"]][0]

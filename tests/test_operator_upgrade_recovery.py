@@ -17,6 +17,7 @@ from runtime_protocol.store import SCHEMA_VERSION
 from runtime_protocol.upgrade import inspect_canonical_schema
 from tests.lanes import requires_posix_process_groups
 from test_operator_upgrade import _Boundary, _fixture
+from tests.schema_fixtures import walk_back_to_v30
 
 
 @pytest.mark.parametrize("state", [
@@ -63,6 +64,7 @@ if __name__ == "__main__":
     base, kill_state = Path(sys.argv[1]), sys.argv[2]
     paths, profile, realm = _fixture(base, version=SCHEMA_VERSION)
     with sqlite3.connect(realm / "realm.sqlite3") as connection:
+        walk_back_to_v30(connection)
         connection.execute("ALTER TABLE timelines DROP COLUMN name")
         connection.execute("DROP TABLE user_app_state")
         connection.execute("DROP INDEX idx_generations_gen")

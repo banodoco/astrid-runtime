@@ -5,7 +5,8 @@
   "source_commit": "242f9c4306bf3b501222cb041a9eb246ef47bc85",
   "source_tree": "75a5a697f630affee40632e500b3f5b704a9b834",
   "source_artifact": "python/banodoco_timeline_schema/timeline.schema.json",
-  "sha256": "f52b82024ecd44a5e6c9c68d5cb326d50d70efe9aaad6f8ac6352ea1c87b97b1",
+  "sha256": "f870150ffd0e42365c048965e2f7c08efc959c36db76ed4cba59de2e58ab4e08",
+  "base_sha256": "f52b82024ecd44a5e6c9c68d5cb326d50d70efe9aaad6f8ac6352ea1c87b97b1",
   "role_extension": {
     "property": "TimelineConfig.tracks[].role",
     "values": [
@@ -15,5 +16,17 @@
     "source_commit": "3bd1d019715de79cd54aa208cf26de10427c29d5",
     "source_artifact": "vendor/timeline-schema/python/banodoco_timeline_schema/timeline.schema.json",
     "source_artifact_sha256": "f52b82024ecd44a5e6c9c68d5cb326d50d70efe9aaad6f8ac6352ea1c87b97b1"
+  },
+  "runtime_meta_extension": {
+    "owner": "astrid-runtime",
+    "contract_section": "contract/commit-v2.md#6-meta-namespaces-placement-limits-and-preservation",
+    "properties": [
+      "TimelineConfig.meta",
+      "TimelineConfig.tracks[].meta",
+      "TimelineConfig.clips[].meta",
+      "TimelineConfig.AssetEntry.meta"
+    ],
+    "structural_enforcement": ["namespace-key-regex", "namespace-key-length", "namespace-count", "finite-json-shape"],
+    "provider_enforcement_required": ["canonical-utf8-namespace-bytes", "canonical-utf8-meta-bytes", "container-depth"]
   }
 }

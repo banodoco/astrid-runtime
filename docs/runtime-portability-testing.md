@@ -1,14 +1,13 @@
 # Runtime portability checks
 
 The portability CI job runs the platform boundary, native process custody,
-foreground lifecycle, and installed-wheel lifecycle checks on Ubuntu and macOS.
-The `windows-realm-publication` job runs native Windows realm publication,
-console-signal, foreground cleanup, owner identity, and M1 security checks,
-including `tests/test_m1_review.py` and
+foreground lifecycle, and installed-wheel lifecycle checks on Ubuntu, macOS,
+and Windows. The `windows-realm-publication` job runs native Windows realm
+publication, console-signal, foreground cleanup, owner identity, and M1 security
+checks, including `tests/test_m1_review.py` and
 `tests/test_runtime_cli_serve_cleanup.py`. Astrid also runs an exploratory
-Windows install and task-host journey. The portability-lifecycle matrix remains
-Ubuntu/macOS; eight native Windows dir-fd tests are not wired into a Windows job
-and still need qualification. The selected tests use `-m ""` because pytest's
+Windows install and task-host journey. The portability-lifecycle matrix includes
+native Windows dir-fd qualification. The selected tests use `-m ""` because pytest's
 default configuration excludes integration-marked tests.
 
 `tests/test_windows_runtime_launch.py` also runs in `windows-realm-publication`.

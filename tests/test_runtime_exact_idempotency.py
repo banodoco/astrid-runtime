@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import pytest
+import json
 
+import pytest
 from astrid_runtime_client import ApiError, WorkspaceClient
 from http_helpers import Api
+
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.store import RealmStore
 
@@ -43,46 +45,33 @@ def test_executor_registration_requires_key_and_fences_stale_replay_after_restar
     finally:
         restarted.stop()
 
-
-def test_timeline_shot_and_reference_creation_are_keyed_durable_and_non_overwriting(tmp_path):
+def test_project_reference_creation_is_keyed_durable_and_non_overwriting(tmp_path):
     root = tmp_path / "realm"
     support = tmp_path / "support"
     RealmStore.initialize(root).close()
     daemon = RuntimeDaemon(root, support_root=support).start()
-    project_id = None
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
-        project = client.create_project("Exact Timeline", idempotency_key="exact-project")
-        project_id = project.project_id
-        client.create_timeline(project_id, "exact-timeline", idempotency_key="exact-timeline")
-        shot = {"shot_id": "exact-shot", "start_ms": 0, "duration_ms": 100, "reference_ids": []}
-        reference = {"reference_id": "exact-reference", "object_id": "object-digest", "role": "source"}
-        with pytest.raises(ApiError) as missing_shot:
-            client._request("POST", "/v1/timelines/exact-timeline/shots", body=b'{"shot_id":"exact-shot","start_ms":0,"duration_ms":100,"reference_ids":[]}', headers={"Content-Type": "application/json"})
-        assert missing_shot.value.status == 400
-        first_shot = client.create_shot("exact-timeline", shot, idempotency_key="exact-shot-key")
-        first_reference = client.create_reference("exact-timeline", reference, idempotency_key="exact-reference-key")
+        project = client.create_project("Exact Reference", idempotency_key="exact-project")
+        media = client.ingest_project_object(project.project_id, b"exact-reference", media_type="application/octet-stream", idempotency_key="exact-media")
+        reference = {"reference_id": "exact-reference", "kind": "character", "name": "Exact", "media_id": media.object_id}
+        with pytest.raises(ApiError) as missing_reference:
+            client._request("POST", f"/v1/projects/{project.project_id}/references", body=json.dumps(reference).encode(), headers={"Content-Type": "application/json"})
+        assert missing_reference.value.status == 400
+        first_reference = client.create_project_reference(project.project_id, reference, idempotency_key="exact-reference-key")
     finally:
         daemon.stop()
 
     restarted = RuntimeDaemon(root, support_root=support).start()
     try:
         client = WorkspaceClient(restarted.endpoint, restarted.token)
-        assert client.create_shot("exact-timeline", shot, idempotency_key="exact-shot-key") == first_shot
-        assert client.create_reference("exact-timeline", reference, idempotency_key="exact-reference-key") == first_reference
-        with pytest.raises(ApiError) as changed_shot:
-            client.create_shot("exact-timeline", {**shot, "duration_ms": 101}, idempotency_key="exact-shot-key")
-        assert changed_shot.value.status == 409
+        assert client.create_project_reference(project.project_id, reference, idempotency_key="exact-reference-key") == first_reference
         with pytest.raises(ApiError) as changed_reference:
-            client.create_reference("exact-timeline", {**reference, "role": "target"}, idempotency_key="exact-reference-key")
+            client.create_project_reference(project.project_id, {**reference, "name": "Changed"}, idempotency_key="exact-reference-key")
         assert changed_reference.value.status == 409
-        with pytest.raises(ApiError) as overwrite_shot:
-            client.create_shot("exact-timeline", {**shot, "duration_ms": 200}, idempotency_key="different-shot-key")
-        assert overwrite_shot.value.status == 409
         with pytest.raises(ApiError) as overwrite_reference:
-            client.create_reference("exact-timeline", {**reference, "role": "target"}, idempotency_key="different-reference-key")
+            client.create_project_reference(project.project_id, {**reference, "name": "Overwrite"}, idempotency_key="different-reference-key")
         assert overwrite_reference.value.status == 409
-        assert restarted.service.store.conn.execute("SELECT duration_ms FROM timeline_shots WHERE id='exact-shot'").fetchone()[0] == 100
-        assert restarted.service.store.conn.execute("SELECT role FROM timeline_references WHERE id='exact-reference'").fetchone()[0] == "source"
+        assert restarted.service.store.conn.execute("SELECT name FROM project_references WHERE id='exact-reference'").fetchone()[0] == "Exact"
     finally:
         restarted.stop()

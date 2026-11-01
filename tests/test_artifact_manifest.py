@@ -24,6 +24,7 @@ def test_release_manifest_contains_only_public_client_packages() -> None:
     assert "packages/python/pyproject.toml" in artifacts
     assert "packages/typescript/package.json" in artifacts
     assert "packages/typescript/src/index.ts" in artifacts
+    assert "packages/typescript/src/operation-handle.ts" in artifacts
     assert not any(path.startswith(("clients/", "conformance/typescript/")) for path in artifacts)
 
 

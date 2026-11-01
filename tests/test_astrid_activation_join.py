@@ -98,27 +98,28 @@ def _no_leaked_join_processes(tmp_path):
 @pytest.fixture
 def astrid_root(tmp_path):
     checkout = astrid_checkout()
-    source = checkout / "astrid"
     root = tmp_path / "astrid-checkout"
-    shutil.copytree(source, root / "astrid", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    # Source imports resolve the canonical version from the checkout metadata.
+    root.mkdir()
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
     shutil.copy2(checkout / "pyproject.toml", root / "pyproject.toml")
+    shutil.copytree(checkout / "astrid", root / "astrid", ignore=ignore)
+    shutil.copytree(checkout / "astrid_runtime_client", root / "astrid_runtime_client", ignore=ignore)
     return root
 
 
-# Explicit child program: graph and native identity providers are fixtures. It still enters
+# Explicit child program: the graph and CPU peer-token providers are fixtures.
+# As in the joined proof below, tokens name observed live fixture processes;
+# native audit-token authentication is not claimed. The child still enters
 # committed LocalExecutionPreparation.serve_control and
 # _await_worker_activation; it does not synthesize activation frames or ACKs.
-_ASTRID_RECEIVER = r'''import hashlib, json, os, signal, subprocess, sys, time
+_ASTRID_RECEIVER = r'''import hashlib, json, os, signal, subprocess, sys, threading, time
 from pathlib import Path
+from astrid.core.execution.generic_host import LocalExecutionPreparation, _await_worker_activation
 from astrid.core.execution import generic_host as host_module
 from astrid.core.execution import custody_broker as custody
-from astrid.core.execution.generic_host import LocalExecutionPreparation, _await_worker_activation
-from astrid_runtime.custody_broker import default_process_identity
 from runtime_protocol.local_worker_composition import _actual_executable
-from tests.test_astrid_activation_join import _install_join_providers
-
-_install_join_providers(custody, current_pid=os.getpid, peer_pid=lambda _sock: os.getppid(), host_module=host_module)
+from tests.test_astrid_activation_join import _host_diagnostics, _install_join_providers
+from astrid_runtime.custody_broker import default_process_identity
 
 control_fd, activation_fd = map(int, sys.argv[1:3])
 operation_id, channel_id, credential_file, scope, config_path = sys.argv[3:]
@@ -196,8 +197,17 @@ class CpuGraph:
         return self.cleanup
 
 prep=LocalExecutionPreparation(operation_id=operation_id,channel_id=channel_id,graph_factory=CpuGraph)
-prep.serve_control(control_fd)
+# Keep the CPU fixture's existing synthetic custody references explicit at the
+# peer boundary too; the production receiver otherwise requires Darwin tokens.
+_install_join_providers(custody,current_pid=os.getpid,peer_pid=lambda _sock:os.getppid(),host_module=host_module)
+_host_diagnostics(prep,events,"startup")
+control_thread=prep.serve_control(control_fd)
+def observe_control():
+    control_thread.join()
+    _host_diagnostics(prep,events,"control-exit")
+threading.Thread(target=observe_control,daemon=True).start()
 def stop(_sig,_frame):
+    _host_diagnostics(prep,events,"stopping")
     prep.abort()
     raise SystemExit(0)
 signal.signal(signal.SIGTERM,stop)
@@ -216,6 +226,7 @@ try:
           "generic_host_source":str(host_source),
           "generic_host_sha256":hashlib.sha256(host_source.read_bytes()).hexdigest()})
 except Exception as exc:
+    _host_diagnostics(prep,events,"activation-rejected",error=exc)
     prep.abort()
     event(".rejected.json","receiver_rejected",{"error_type":type(exc).__name__})
     events.with_suffix(".rejected").write_text(type(exc).__name__)
@@ -365,7 +376,10 @@ class _Adapter(CrossProcessWorkerPreparer):
           owner_epoch="cpu-proof-epoch",custody_scope=host_scope,preparation=preparation,report_value=None)
         self._active=handle; self._current=handle
         send_frame(runtime_end,{"version":RELAY_VERSION,"command":"prepare","preparation":preparation,"config":{}})
-        response=receive_frame(runtime_end)
+        try: response=receive_frame(observed_control)
+        except Exception:
+            _join_stderr(process,self.events,".relay-stderr.txt")
+            raise
         if response.get("status")!="ok":
             process.kill(); process.wait(timeout=2)
             raise AssertionError(f"Runtime relay prepare failed: {response}; stderr={process.stderr.read().decode(errors='replace')}")
@@ -406,6 +420,7 @@ class _Adapter(CrossProcessWorkerPreparer):
             return super().activate(handle,grant)
         except Exception as exc:
             _record_phase(self.events,".adapter-error.json","runtime_adapter_error",_bounded_error(exc,self.profile))
+            _join_stderr(handle.worker,self.events,".relay-stderr.txt")
             raise
 
     def control_alive(self,handle): return not handle.closed
@@ -444,7 +459,16 @@ class _HostSession:
         value=default_process_identity(self.process.pid)
         if self.process.poll() is not None or value is None or value["birth_id"]!=self.host_birth:
             raise RelayError("Astrid subprocess identity changed")
-    def exchange(self,request): send_frame(self.control,request); return receive_frame(self.control)
+    def exchange(self,request):
+        try:
+            send_frame(self.control,request)
+            return receive_frame(self.control)
+        except Exception as exc:
+            _record_phase(self.events,".host-exchange-error.json","host_exchange_failed",{
+                "command":request.get("command"),"exception":_join_exception(exc),
+                "host_returncode":self.process.poll()})
+            _join_stderr(self.process,self.events,".host-stderr.txt")
+            raise
     def begin_activation(self,grant):
         required={"version","operation_id","channel_id","credential_file","executor_incarnation","evidence_digest","acceptance_mode","activation_id"}
         if set(grant)!=required or grant.get("version")!="runtime.local-worker-activation/v1":
@@ -456,7 +480,10 @@ class _HostSession:
         send_frame(self.activation,frame)
         try:
             self._request=receive_frame(self.activation)
-        except Exception:
+        except Exception as exc:
+            _record_phase(self.events,".activation-read-error.json","activation_read_failed",{
+                "exception":_join_exception(exc),"host_returncode":self.process.poll()})
+            _join_stderr(self.process,self.events,".host-stderr.txt")
             if self.misbind:
                 # The rejected-binding assertion below relies on the committed
                 # host having completed its own graph abort before Runtime
@@ -508,6 +535,7 @@ class _HostSession:
         try: code=self.process.wait(timeout=4)
         except subprocess.TimeoutExpired:
             self.process.kill(); code=self.process.wait(timeout=2)
+        _join_stderr(self.process,self.events,".host-stderr.txt")
         host_identity_after=default_process_identity(self.process.pid)
         self.control.close()
         try:self.activation.close()
@@ -812,12 +840,12 @@ def _install_join_providers(custody, *, current_pid, peer_pid, patch=None, host_
         if list(words) != value["words"]:
             raise RelayError("CPU token words changed")
         return {k: value[k] for k in ("pid", "uid", "pidversion", "sha256")}
+    assign(custody, "default_process_identity", default_process_identity)
+    if sys.platform == "linux":
+        # Keep the real compact listener; supply Linux's short temp parent.
+        assign(custody, "DARWIN_CUSTODY_SOCKET_PARENT", Path("/tmp"))
     assign(custody, "audit_token_details", details)
     assign(custody, "current_process_audit_token", _join_token)
-    # These CPU graphs use Runtime's live native identities on every platform.
-    # Astrid's legacy Linux providers use different birth-token encodings; all
-    # protocol validators still compare the complete independently read token.
-    assign(custody, "default_process_identity", default_process_identity)
     if host_module is not None:
         def birth(pid=None):
             observed = default_process_identity(os.getpid() if pid is None else pid)
@@ -929,6 +957,23 @@ def _join_exception(exc, *, secret=None):
     return {"type": type(exc).__name__, "traceback_tail": text[-8192:]}
 
 
+def _host_diagnostics(prep, events, phase, *, error=None):
+    """Observe real child identity/imports and bounded errors without RPC changes."""
+    from astrid.core.execution.generic_host import process_birth_identity
+    imports = _join_import_manifest()
+    imports["actual_loaded_nonstdlib_modules"] = {
+        name: value for name, value in imports["actual_loaded_nonstdlib_modules"].items()
+        if name in {"astrid.core.execution.generic_host", "astrid.core.execution.custody_broker",
+                    "astrid.core.execution.process_group", "astrid.version", "astrid_runtime.custody_broker",
+                    "runtime_protocol.platform", "astrid_runtime_client.contract_metadata"}}
+    _record_phase(events, f".host-{phase}.json", phase, {
+        "runtime_identity": default_process_identity(os.getpid()),
+        "activation_birth_id": process_birth_identity(),
+        "control_error": _join_exception(prep.control_error) if prep.control_error else None,
+        "error": _join_exception(error) if error else None,
+        "actual_imports": imports})
+
+
 def _join_identity_failure(events, role, phase, expected, observed):
     _record_phase(events, ".identity-failure.json", "joined_identity_refusal", {
         "role": role, "phase": phase, "expected_identity": expected, "observed_identity": observed})
@@ -1027,6 +1072,7 @@ def _joined_host_main(argv):
         control_identity = (control_stat.st_dev, control_stat.st_ino)
         _install_join_providers(custody, current_pid=os.getpid, peer_pid=lambda _sock: os.getppid(), host_module=host_module)
         prep = host_module.LocalExecutionPreparation(operation_id=operation, channel_id=channel, graph_factory=_JoinCpuGraph)
+        _host_diagnostics(prep, events, "startup")
         metrics = {"gate_openings": 0, "registration_publications": 0, "dispatch_calls": {}}
         original_dispatch = prep.dispatch
         def observed_dispatch(request):
@@ -1099,6 +1145,7 @@ def _joined_host_main(argv):
             time.sleep(.02)
     except BaseException as exc:
         # Save the original host failure before any graph/descriptor teardown.
+        if prep is not None: _host_diagnostics(prep, events, "failed", error=exc)
         cleanup["original_host_exception"] = _join_exception(exc, secret=token)
         cleanup["failed_phase"] = phase
         events.with_suffix(".host-exception.json").write_text(json.dumps({
@@ -1273,7 +1320,10 @@ class _JoinedAdapter(_Adapter):
         handle.birth_id = identity["birth_id"]
         _join_designate(custody, scope, "relay", target_pid=process.pid, owner_pid=os.getpid())
         send_frame(runtime_end, {"version": RELAY_VERSION, "command": "prepare", "preparation": preparation, "config": {}})
-        response = receive_frame(runtime_end)
+        try: response = receive_frame(handle.control)
+        except Exception:
+            _join_stderr(process, self.events, ".relay-stderr.txt")
+            raise
         if response.get("status") != "ok": raise RelayError("joined CPU preparation unresolved")
         handle.report_value = response["report"]
         return handle
@@ -1549,4 +1599,15 @@ def test_runtime_relay_to_generic_host_successor_finalization_cpu(tmp_path, astr
             "runtime_pins": _JOIN_PINS, "astrid_pins": _JOIN_ASTRID_PINS, "harness_sha256": _digest(Path(__file__)),
             "receiver_wrapper_sha256": "sha256:" + hashlib.sha256(_JOINED_RECEIVER.encode()).hexdigest(),
             "evidence": evidence, "cleanup": cleanup}, sort_keys=True))
+        if sys.exc_info()[0] is not None:
+            diagnostics = {"cleanup": cleanup}
+            for suffix in (".host-phase.json", ".host-failed.json", ".host-stderr.txt", ".relay-stderr.txt"):
+                path = events.with_suffix(suffix)
+                if path.is_file(): diagnostics[suffix] = path.read_text()[-16384:]
+            if adapter is not None and adapter._current is not None:
+                scope = Path(adapter._current.custody_scope)
+                for name in ("host-handoff-state.json", "relay-handoff-state.json", "runtime-handoff-state.json"):
+                    path = scope / name
+                    if path.is_file(): diagnostics[name] = json.loads(path.read_text())
+            print("Joined handoff failure diagnostics:", json.dumps(diagnostics, sort_keys=True))
     assert cleanup["status"] == "cleaned", cleanup

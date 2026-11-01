@@ -81,6 +81,22 @@ python -m pytest -q -n 2
 (cd packages/typescript && npm ci && npm test)
 ```
 
+The release checklist also requires the real Agent provider native-seed smoke;
+the checkout and provider-origin checks are fail-closed, and Runtime-only
+fixtures do not qualify. Run it from this checkout with the exact interpreter
+used for Runtime:
+
+```bash
+ASTRID_CHECKOUT=/absolute/path/to/astrid-agent \
+PYTHON_BIN=/absolute/path/to/runtime/.venv/bin/python \
+bash scripts/check-before-push --native-provider-smoke
+```
+
+This bounded smoke selects the existing genuine D101 native-capture and
+history/guarded-Undo nodes, and each probe/test phase has a 45-second limit.
+The no-argument form of `scripts/check-before-push` retains the default pytest
+run and invokes this smoke automatically when Runtime protocol paths change.
+
 After changing released artifacts, regenerate `contract/artifacts.json` with
 `python scripts/artifact_manifest.py`. Its hashes verify the selected bytes;
 they are not interoperability admission rules. Release both packages, schemas

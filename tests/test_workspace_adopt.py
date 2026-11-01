@@ -15,6 +15,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.upgrade import inspect_canonical_schema
 from runtime_protocol.store import SCHEMA_VERSION
 from runtime_protocol import platform as runtime_platform
+from tests.schema_fixtures import walk_back_to_v30
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +45,7 @@ def _setup(tmp_path):
     try:
         # A fresh realm is the current schema; walk it back to a genuine v26 layout:
         # v28 -> v27 (inline specs, no task_specs) then v27 -> v26 (no user_preferences).
-        connection.execute("PRAGMA foreign_keys=OFF")
+        walk_back_to_v30(connection)
         connection.execute("ALTER TABLE timelines DROP COLUMN name")  # v30 -> v29: timelines.name is the only v30 change
         connection.execute("DROP TABLE user_app_state")
         connection.execute("DROP INDEX idx_generations_gen")
@@ -197,7 +198,7 @@ def _adopt_from(source, paths, config, monkeypatch, realm_id="film"):
     return adopt_workspace(paths, _Boundary(), config, source=source, realm_id=realm_id)
 
 
-def _rewrite_backup_database(backup, sql):
+def _rewrite_backup_database(backup, sql, *, walk_back_current=False):
     """Model an authenticated backup emitted by a historical canonical runtime."""
     import json
     from runtime_protocol.backup import _authenticated_digest, _manifest_digest_payload, _manifest_mac
@@ -207,6 +208,8 @@ def _rewrite_backup_database(backup, sql):
     try:
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA foreign_keys=OFF")
+        if walk_back_current:
+            walk_back_to_v30(connection)
         for statement in sql:
             connection.execute(statement)
         version = connection.execute("SELECT version FROM runtime_schema WHERE id=1").fetchone()[0]
@@ -240,7 +243,11 @@ def _historical_backup(backup, version):
         sql += ["DROP TABLE task_specs"]
     if version < 27:
         sql += ["DROP TABLE user_preferences"]
-    _rewrite_backup_database(backup, sql + [f"UPDATE runtime_schema SET version={version} WHERE id=1"])
+    _rewrite_backup_database(
+        backup,
+        sql + [f"UPDATE runtime_schema SET version={version} WHERE id=1"],
+        walk_back_current=True,
+    )
     # Version alone is insufficient fixture evidence.
     assert inspect_canonical_schema(backup)["version"] == version
 

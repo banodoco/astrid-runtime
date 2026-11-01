@@ -373,8 +373,8 @@ export class WorkspaceClient {
   async inspectTimeline(projectId: string, timelineId: string, options: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("inspectTimeline", "POST", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/inspect", new TextEncoder().encode(JSON.stringify(options)), { "Content-Type": "application/json" })).body);
   }
-  async createTimelineView(projectId: string, timelineId: string, options: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-    return this.json<Record<string, unknown>>((await this.call("createTimelineView", "POST", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/views", new TextEncoder().encode(JSON.stringify(options)), { "Content-Type": "application/json" })).body);
+  async createTimelineView(projectId: string, timelineId: string, options: Record<string, unknown>, idempotencyKey: string): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("createTimelineView", "POST", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/views", new TextEncoder().encode(JSON.stringify(options)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
   }
   async updateTimelineDocument(projectId: string, timelineId: string, expectedVersion: number, idempotencyKey: string, config: Record<string, unknown>, registry: Record<string, unknown>): Promise<MutationResult<Record<string, unknown>>> {
     const body = { expected_version: expectedVersion, content: { config, registry } };

@@ -5,7 +5,6 @@ from pathlib import Path
 
 from runtime_protocol.visual_seam import evaluate_closure
 
-
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "conformance/fixtures/visual-seam-cases-v1.json"
 

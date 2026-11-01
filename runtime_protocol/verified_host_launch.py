@@ -280,6 +280,7 @@ class HostLaunchVerifier:
         self._protection = protected_materialization
         self._issued = {}
         self._lock = threading.RLock()
+        self._external_sources = None
 
     def _validate_environment(self, profile, config, environment):
         if (not isinstance(environment, dict) or set(environment) - ENV_KEYS
@@ -304,6 +305,8 @@ class HostLaunchVerifier:
         # The independently retained release/profile equality above still comes
         # first; this check cannot establish launch authority by itself.
         self._validate_environment(profile, config, environment)
+        if profile.get("host_launch", {}).get("additional_pack_roots") and self._external_sources is None:
+            raise HostLaunchError("external source selection lacks private owner capture")
         binding = record["import_binding"]
         if (not isinstance(binding, dict) or set(binding) != {"schema_version", "mode", "launcher", "python_runtime_inventory_digest", "import_roots"}
                 or type(binding["schema_version"]) is not int or binding["schema_version"] != 1 or binding["mode"] != self._mode
@@ -317,6 +320,8 @@ class HostLaunchVerifier:
         if lease is None or not callable(getattr(lease, "verify", None)):
             raise HostLaunchError("materialization protection is not independently retained")
         lease.verify()
+        if self._external_sources is not None:
+            self._external_sources.verify(preparation=preparation, config=config)
         inventories = {}
         for identity, candidate in record["inventories"].items():
             if not _raw(identity) or raw_digest(candidate) != identity:
@@ -350,6 +355,8 @@ class HostLaunchVerifier:
             raise HostLaunchError("selected host argv module/interpreter is invalid")
         argv_tail = list(host_argv[3:]) + ["--source-closure-digest", protocol["source_closure_digest"]]
         payload = {"schema_version": 1, "mode": self._mode, "module": HOST_MODULE, "mapping": mapping, "host_argv": argv_tail}
+        if self._external_sources is not None:
+            payload["external_pack_sources"] = json.loads(self._external_sources.payload)
         if self._mode == TRUSTED_LOCAL_MODE:
             payload["distribution_metadata"] = _distribution_metadata(binding["import_roots"], inventories)
         if len(canonical(payload)) > LIMIT: raise HostLaunchError("retained launcher binding exceeds its bound")
@@ -371,6 +378,10 @@ class HostLaunchVerifier:
             context = {"preparation": preparation, "config": config, "host_argv": host_argv, "environment": environment}
             if canonical(context) != record["context"] or type(binding_fd) is not int or binding_fd < 0:
                 raise HostLaunchError("launch changed after verification")
+            if self._external_sources is not None:
+                captured = self._external_sources.claim(preparation=preparation, config=config)
+                if captured != canonical(json.loads(record["payload"])["external_pack_sources"]):
+                    raise HostLaunchError("external source capture changed after verification")
             record["lease"].verify()
             self._read(Path(record["launcher"]["path"]), record["launcher"]["sha256"])
             record["state"] = "claimed"
@@ -386,8 +397,15 @@ class HostLaunchVerifier:
             record["state"] = "failed"
             if type(identity.get("pid")) is not int or identity["pid"] != child.pid or not identity.get("birth_id"):
                 raise HostLaunchError("verified launch child identity is invalid or reused")
-            record["lease"].verify(); record.update(state="bound", child=child, identity=canonical(identity))
+            record["lease"].verify()
+            self._verify_external_sources(record)
+            record.update(state="bound", child=child, identity=canonical(identity))
             return record["protocol"]
+
+    def _verify_external_sources(self, record):
+        if self._external_sources is not None:
+            context = json.loads(record["context"])
+            self._external_sources.verify(preparation=context["preparation"], config=context["config"])
 
     def verify_child(self, result, *, child, identity):
         with self._lock:
@@ -399,6 +417,7 @@ class HostLaunchVerifier:
                 raise HostLaunchError("verified launch child/session binding changed")
             try:
                 record["lease"].verify()
+                self._verify_external_sources(record)
             except BaseException:
                 record["state"] = "failed"
                 raise
@@ -485,11 +504,12 @@ class TrustedLocalHostLaunchVerifier(HostLaunchVerifier):
     _read = staticmethod(_local_read)
     _inventory = staticmethod(_local_inventory)
 
-    def __init__(self, *, installed_release):
+    def __init__(self, *, installed_release, external_sources=None):
         retained = json.loads(canonical(installed_release))
         self._installed_release = canonical(retained)
         super().__init__(authority_resolver=lambda _: json.loads(self._installed_release),
                          protected_materialization=lambda _: None)
+        self._external_sources = external_sources
 
     def _validate_environment(self, profile, config, environment):
         if profile.get("execution_mode") != "host_only_cpu":
@@ -638,6 +658,8 @@ def launch_from_binding(payload):
     fields = {"schema_version", "mode", "module", "mapping", "host_argv"}
     if isinstance(payload, dict) and payload.get("mode") == TRUSTED_LOCAL_MODE:
         fields.add("distribution_metadata")
+        if "external_pack_sources" in payload:
+            fields.add("external_pack_sources")
     if (not isinstance(payload, dict) or set(payload) != fields
             or type(payload["schema_version"]) is not int or payload["schema_version"] != 1
             or payload["mode"] not in (MODE, TRUSTED_LOCAL_MODE) or payload["module"] != HOST_MODULE
@@ -658,12 +680,52 @@ def launch_from_binding(payload):
     # Import parents under the same policy, without ambient package initializers.
     __import__(HOST_MODULE.rpartition('.')[0])
     item = mapping[HOST_MODULE]
+    if "external_pack_sources" in payload:
+        # Agent owns this consumer. Importing under its ordinary name avoids
+        # running the CLI/discovery before the private capture is consumed.
+        module = __import__(HOST_MODULE, fromlist=["_consume_runtime_external_sources"])
+        _run_external_host(module, canonical(payload["external_pack_sources"]), payload["host_argv"])
+        return
     module = type(sys)("__main__")
     module.__package__ = HOST_MODULE.rpartition('.')[0]
     module.__spec__ = importlib.util.spec_from_file_location(HOST_MODULE, item["path"], loader=_SourceLoader(item))
     sys.modules['__main__'] = module
     sys.argv[:] = [item["path"], *payload["host_argv"]]
     _SourceLoader(item, trusted_local=payload["mode"] == TRUSTED_LOCAL_MODE).exec_module(module)
+
+
+class _RuntimeExternalSources:
+    """Private launcher-to-Agent handle; task/admission JSON cannot issue one."""
+    __slots__ = ("_capture",)
+
+    def __init__(self, capture):
+        self._capture = bytes(capture)
+
+    def __reduce__(self):
+        raise TypeError("Runtime external source handles cannot be serialized")
+
+    def inventory(self):
+        return self._capture
+
+    def select(self, *, scope, selected_profile_digest, root, definition):
+        value = json.loads(self._capture)
+        if scope != value["scope"] or selected_profile_digest != value["selected_profile_digest"]:
+            raise HostLaunchError("external source consumer scope differs")
+        matches = [source for source in value["sources"]
+            if source["root"] == root and definition in source["definitions"]]
+        if len(matches) != 1:
+            raise HostLaunchError("external selected definition has no owner grant")
+        return canonical({"scope": value["scope"], "selected_profile_digest": selected_profile_digest,
+            "source": matches[0], "definition": definition})
+
+
+def _run_external_host(module, capture, argv):
+    consumer = getattr(module, "_consume_runtime_external_sources", None)
+    if not callable(consumer):
+        raise HostLaunchError("selected Agent has no private Runtime source consumer")
+    consumer(sources=_RuntimeExternalSources(capture))
+    sys.argv[:] = [module.__file__, *argv]
+    raise SystemExit(module._cli())
 
 
 def _main():

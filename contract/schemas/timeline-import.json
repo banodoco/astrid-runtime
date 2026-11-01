@@ -8,7 +8,8 @@
       "additionalProperties": false,
       "required": ["prepared_object_id"],
       "properties": {
-        "prepared_object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        "prepared_object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "source": { "$ref": "./timeline-commit.json#/$defs/Source" }
       }
     },
     {
@@ -18,6 +19,7 @@
       "properties": {
         "timeline_id": { "type": "string", "minLength": 1, "maxLength": 256 },
         "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "source": { "$ref": "./timeline-commit.json#/$defs/Source" },
         "publication": { "$ref": "https://astrid.haus/workspace/v1/schemas/shot-composition.json" },
         "transcripts": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["document_id", "kind", "content"], "properties": { "document_id": { "type": "string" }, "kind": { "const": "media.transcript" }, "content": { "type": "object" } } } },
         "text_bindings": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["shot_id", "kind", "media_id"], "properties": { "shot_id": { "type": "string" }, "kind": { "enum": ["prompt", "voiceover_script", "transcript"] }, "slot": { "type": ["string", "null"] }, "media_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } } } },

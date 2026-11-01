@@ -26,7 +26,6 @@ from .upgrade import (
     migrate_generation_tags,
     migrate_canonical_v24_to_v25,
     migrate_canonical_to_current,
-    compact_idempotency_ledger,
     repair_generic_media_types,
     upgrade_realm,
 )
@@ -63,6 +62,7 @@ def _parser():
     start.add_argument("--service-python", help="declaring environment's installed Python")
     start.add_argument("--service-source-checkout", help="declaring profile's source checkout")
     start.add_argument("--log-file", help="Runtime-owned rotating log")
+    start.add_argument("--authoring-profile", choices=("neutral", "astrid"), default="neutral", help="trusted semantic authoring provider profile")
     start.add_argument("--door-origin", help="exact HTTPS origin of the hosted page; opens the browser door")
     start.add_argument("--door-port", type=int, default=DEFAULT_DOOR_PORT, help="the browser door's loopback port")
     start.add_argument("--door-credential-file", help="absolute scoped product credential the browser door acts with")
@@ -428,6 +428,7 @@ def _main(args):
             log_directory=Path(args.log_file).parent if args.log_file else None,
             runtime_checkout=runtime_checkout,
             agent_checkout=agent_checkout,
+            authoring_profile=args.authoring_profile,
         ).start()
     except KeyboardInterrupt:
         raise
