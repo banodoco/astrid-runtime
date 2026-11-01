@@ -108,6 +108,22 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
                 assert calls == []
                 assert {path: path.read_bytes() for path in status_sources} == status_sources
                 journal.unlink()
+            # A pending journal and private side evidence must likewise remain
+            # byte-for-byte unchanged through real authenticated HTTP reads.
+            _write(marker, {**record, "update_job": {
+                "operation_id": "a" * 32, "state": "active",
+                "bootstrap_proof": {"state": "entered"},
+            }})
+            journal = _write(root / "update-transaction.json", {"step": "stopping"})
+            evidence = _write(root / "private-evidence.json", {"blocker": "held", "history": ["attempt"]})
+            status_sources = {path: path.read_bytes() for path in (selected, marker, journal, evidence)}
+            for _ in range(2):
+                response = world.call("/api/runtime/v1/update/status")
+                assert response.status == 200
+                assert response.json()["operation_id"] == "a" * 32
+            assert calls == []
+            assert {path: path.read_bytes() for path in status_sources} == status_sources
+            journal.unlink()
             _write(marker, record)
         assert all(query == {"action": "availability"} for query in availability_queries)
         record["preferences"] = {"autostart": False}
