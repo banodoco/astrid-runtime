@@ -652,7 +652,7 @@ def _admission_fixture(tmp_path, monkeypatch, launcher):
     return admission, accepted, prepared
 
 
-def test_reconcile_runs_before_preparation_and_continues_one_operation_once(tmp_path, monkeypatch):
+def test_reconcile_before_manifest_and_newer_target_checks(tmp_path, monkeypatch):
     launches = []
     admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: launches.append(job))
     calls = []
