@@ -26,7 +26,15 @@ def _realm(root, *, old=False):
             (STAMP, STAMP),
         )
         if old:
+            # A C31 source has app state but neither the Timeline v32 bundle
+            # nor M's generation index.  Merely relabeling a U33 database as
+            # v31 would create a forbidden v33-manifest hybrid.
             connection.execute("DROP INDEX idx_generations_gen")
+            for table in ("timeline_document_input_links", "timeline_document_input_bindings",
+                          "timeline_document_input_contents", "timeline_commit_history"):
+                connection.execute(f"DROP TABLE {table}")
+            connection.execute("ALTER TABLE parent_composition_heads DROP COLUMN publication_id")
+            connection.execute("ALTER TABLE parent_composition_revisions DROP COLUMN commit_manifest_json")
             connection.execute("UPDATE runtime_schema SET version=31 WHERE id=1")
         connection.execute(
             "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) "
@@ -64,13 +72,15 @@ def test_v31_upgrade_adds_guarded_index_and_preserves_generation_metadata(tmp_pa
             _generation(connection, identity, metadata)
         before = connection.execute("SELECT * FROM generations ORDER BY id").fetchall()
     result = migrate_canonical_to_current(root, confirmation="MIGRATE CANONICAL realm-tags")
-    assert result["steps"] == [{"source_schema_version": 31, "target_schema_version": 32,
-                                "added_indexes": ["idx_generations_gen"]}]
+    assert result["steps"] == [
+        {"source_schema_version": 31, "target_schema_version": 32, "baseline_required": True},
+        {"source_schema_version": 32, "target_schema_version": 33, "source_family": "TL32"},
+    ]
     with sqlite3.connect(database) as connection:
         assert generation_tag_index_is_current(connection)
         assert connection.execute("SELECT sql FROM sqlite_master WHERE name='idx_generations_gen'").fetchone()[0] == GENERATION_TAG_INDEX_SQL
         assert connection.execute("SELECT * FROM generations ORDER BY id").fetchall() == before
-    assert inspect_canonical_schema(root)["version"] == 32
+    assert inspect_canonical_schema(root)["version"] == 33
 
 
 @pytest.mark.parametrize("replacement", [None, "CREATE INDEX idx_generations_gen ON generations(id)"])
@@ -81,8 +91,12 @@ def test_v32_index_inspection_rejects_missing_or_alternate_index(tmp_path, repla
         connection.execute("DROP INDEX idx_generations_gen")
         if replacement:
             connection.execute(replacement)
-    with pytest.raises(ValidationError, match="generation tag index"):
+    before = database.read_bytes()
+    contents = sorted(path.name for path in root.iterdir())
+    with pytest.raises(ValidationError, match="unsupported canonical v33 manifest"):
         inspect_canonical_schema(root)
+    assert database.read_bytes() == before
+    assert sorted(path.name for path in root.iterdir()) == contents
 
 
 def test_old_project_dry_run_is_read_only_and_reports_unresolved_rows(tmp_path, monkeypatch):
