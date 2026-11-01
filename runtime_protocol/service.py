@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 from .errors import RuntimeErrorBase, AuthorizationError, ForbiddenError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError, RetiredRouteError
+from .errors import VerificationReceiptMissingError, CandidateNotVerifiedError, VerificationDigestMismatchError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .timeline_commit_store import timeline_scope_is_empty
@@ -6739,6 +6740,17 @@ class RuntimeService:
         if actual != source["raw_publication"]:
             raise ConflictError("actual raw publication changed after final admission")
 
+    def _require_candidate_verification_receipt(self, source, manifest_digest):
+        verification = source.get("verification", source)
+        task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (verification["producer_task_id"],)).fetchone()
+        receipt = self.store._spec(task).get("candidate_verification_receipt")
+        if not isinstance(receipt, dict):
+            raise VerificationReceiptMissingError("Runtime verification receipt is missing")
+        if receipt.get("candidate_verified") is not True:
+            raise CandidateNotVerifiedError("candidate was not verified")
+        if manifest_digest is None or receipt.get("candidate_sha256") != manifest_digest:
+            raise VerificationDigestMismatchError("verification receipt does not match the manifest")
+
     def _live_child_authority(self, authority, *, identity):
         payload = self._decode_child_authority(authority)
         if payload.get("identity_digest") != self._child_identity_digest(identity):
@@ -8659,6 +8671,9 @@ class RuntimeService:
                 result = dict(body.get("result") or {})
                 result["outputs"] = staged["outputs"]
                 self._validate_terminal_manifest(staged, result, task, attempt_id, project_id)
+                if verified_source is not None and verified_source.get("publication_name", "final") == "final":
+                    manifest_digest = self.store._validated_manifest_digest(result, project_id=project_id)
+                    self._require_candidate_verification_receipt(verified_source, manifest_digest)
                 recorded = None
                 def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, created_at=None):
                     nonlocal recorded

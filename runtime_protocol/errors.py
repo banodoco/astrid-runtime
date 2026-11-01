@@ -24,6 +24,18 @@ class ConflictError(RuntimeErrorBase):
     status = 409
 
 
+class VerificationReceiptMissingError(ConflictError):
+    code = "verification_receipt_missing"
+
+
+class CandidateNotVerifiedError(ConflictError):
+    code = "candidate_not_verified"
+
+
+class VerificationDigestMismatchError(ConflictError):
+    code = "verification_digest_mismatch"
+
+
 class ValidationError(RuntimeErrorBase):
     code = "validation_error"
     status = 422
