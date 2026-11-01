@@ -6,13 +6,13 @@
     "conformance/fixtures/handshake.json": "sha256:259f06fa225aec0cb0e0cfc593fa89db4578fc26db9664e2b7632ce2f4fec234",
     "conformance/fixtures/health.json": "sha256:50d266793df60dd63da79305c78a8f76ea7d4ac49ec8aa760113be6d17e63da5",
     "conformance/fixtures/managed-object.json": "sha256:db5646c5c47415bbb6fe7c84751bf1b7b56cae6074df0bd28040990db9f5f031",
-    "conformance/fixtures/occurrence-media-projection.json": "sha256:34622b5f99032aad2cd21bbf9a2914538a3d4fc7abdf1ddd80d56d2d90ec3c75",
+    "conformance/fixtures/occurrence-media-projection.json": "sha256:e64df5a088c31dc5e9cf0a9ce0db487bac1560204cb94c66aa5da4f643c51f08",
     "conformance/fixtures/preferences-user-mutation.json": "sha256:5b176a96f941ddb8ae737493d2b51547568710f6e54aaa164bd7fa640410eabe",
     "conformance/fixtures/preferences-user.json": "sha256:1220094f6d80ce36fd8e0ed891b0c5418647b43ace19e74d127f3af5043125fa",
     "conformance/fixtures/project.json": "sha256:b526be614ff35276608630c602213078edc8a291eb5241dd14b82bcffad71e29",
     "conformance/fixtures/settlement.json": "sha256:f9cd0958061a2a2a25def05966b5c9ffd5837a1f7197eec2b1f1cd482ac09086",
     "conformance/fixtures/shot-composition-compatibility.json": "sha256:9d5201dd62121c278bd51037863afb59508794b96b06e1bf3f89d7b300e19fc2",
-    "conformance/fixtures/shot-layering-v1.json": "sha256:4900be369f31bd03736b7eadaf2f8595a7ce48df5218296d405162cb13cfc16c",
+    "conformance/fixtures/shot-layering-v1.json": "sha256:2989423d8eed21b548292ed9e32327345beafda489c439cdba8ed9a8c89e7f48",
     "conformance/fixtures/task.json": "sha256:7dc2f5d3f82219b439f1c1147aa230f39e706a3c3b24a7d177efc1b975f543b9",
     "conformance/fixtures/visual-boundary-v1.json": "sha256:1fc778b42f7a5ef91a1fd8620fd92417131e44f97dd5c6a238c78f13bcabfc55",
     "conformance/fixtures/visual-seam-cases-v1.json": "sha256:1f8363394e0b7049096365d38d00bf2dfed888eab30c3b2bce95cd44537a02e7",
@@ -87,5 +87,5 @@
     "runtime_protocol/schemas/timeline-commit-bundle.json": "sha256:393e9e91d4f20bf953d6f43530c0073d3d1ae2aff118516a2be39ce170df67e4"
   },
   "producer": "astrid-runtime",
-  "version": "sha256:282b8a989654444f6335de9b4d729fa7d2ab9cf86544004356e0348a133d27ed"
+  "version": "sha256:37a460109f3644e71010dd7626ea15cfbffe8e6e5705470d5ea56baa2b2a3576"
 }
