@@ -634,7 +634,7 @@ def host_only_environment_fixture(tmp_path):
     return f
 
 
-@pytest.mark.parametrize('edge',['output','realm','missing','config','PYTHONPATH','PYTHONDONTWRITEBYTECODE','ASTRID_RUNTIME_OWNER_TOKEN'])
+@pytest.mark.parametrize('edge',['output','realm','missing','config','PYTHONPATH','PYTHONDONTWRITEBYTECODE','ASTRID_RUNTIME_OWNER_TOKEN','ASTRID_TIMELINE_OBSERVER_FD'])
 def test_host_only_environment_rejects_unadmitted_roots_and_ambient_before_inventory(tmp_path,monkeypatch,edge):
     f=host_only_environment_fixture(tmp_path)
     if edge=='output': f.args['environment']['ASTRID_OUTPUT_ROOT']=str(tmp_path/'other')

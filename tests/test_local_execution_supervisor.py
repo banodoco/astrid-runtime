@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
+import os
 import socket
+import stat
 
 import pytest
 
@@ -754,7 +757,13 @@ def test_g1b_native_session_fake_launch_preserves_v1_or_consumes_closed_gate(tmp
         def abort_before_spawn(self):broker_calls.append('abort')
     custody=SimpleNamespace(RoleBoundCustodyBroker=FakeBroker,default_process_identity=lambda p:None,custody_wrapper_argv=lambda p:[p,'fake-wrapper'])
     monkeypatch.setitem(sys.modules,'astrid_runtime.custody_broker',custody)
-    monkeypatch.setattr('subprocess.Popen',lambda *a,**k:fake_child)
+    captured={}
+    def popen(*args, **kwargs):
+        captured['pass_fds']=kwargs['pass_fds']
+        observer=int(kwargs['env']['ASTRID_TIMELINE_OBSERVER_FD'])
+        captured['observer']=os.dup(observer)
+        return fake_child
+    monkeypatch.setattr('subprocess.Popen',popen)
     class FakeRetained:
         def __init__(self,child):self.child=child
         def bind_actor(self):broker_calls.append('bind-actor')
@@ -771,7 +780,14 @@ def test_g1b_native_session_fake_launch_preserves_v1_or_consumes_closed_gate(tmp
         else:
             assert launched[0][1:3]==['-m','astrid.core.execution.generic_host']
             assert session.bridge._host_current_roles_version is None and session.binding_file is None
-    finally:session.control.close();session.activation.close()
+        observer=int(captured['pass_fds'][-1])
+        assert stat.S_ISFIFO(os.fstat(captured['observer']).st_mode)
+        assert not os.get_blocking(captured['observer'])
+        assert fcntl.fcntl(captured['observer'], fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
+        assert session.observer_read_fd is not None and observer != session.observer_read_fd
+    finally:
+        session.control.close();session.activation.close()
+        os.close(captured['observer']);os.close(session.observer_read_fd)
 
 
 def test_g1b_native_session_unverified_request_never_spawns_or_sends_v2(tmp_path,monkeypatch):

@@ -22,6 +22,7 @@ from .store import (
 )
 from .util import atomic_json_write
 from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
+from .render_observer import admitted_run_id
 from .idempotency import command_result, compact_result
 import hashlib
 import json
@@ -8334,7 +8335,8 @@ class RuntimeService:
             admitted_spec = claim_capture_view(self, admitted_spec)
             if task.get("generation_intent") is not None:
                 generation_intent = task["generation_intent"]
-            result = {"attempt_id": attempt_id, "task_id": row["id"], "run_id": value["run"]["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "deadline_at": self.store._task_absolute_deadline(task).isoformat(), "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            run_id = admitted_run_id(task.get("run_id"), value["run"].get("id"))
+            result = {"attempt_id": attempt_id, "task_id": row["id"], "run_id": run_id, "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "deadline_at": self.store._task_absolute_deadline(task).isoformat(), "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
             if task.get("execution_request") is not None:
                 result["execution_request"] = dict(task["execution_request"])
             if binding is not None:
@@ -8508,7 +8510,8 @@ class RuntimeService:
             })
         admitted_spec, generation_intent = public_task_spec(task.get("spec") or {})
         generation_intent = task.get("generation_intent") or generation_intent
-        result = {"attempt_id": attempt_id, "task_id": str(task_id), "run_id": value["run"]["id"], "project_id": project, "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+        run_id = admitted_run_id(task.get("run_id"), value["run"].get("id"))
+        result = {"attempt_id": attempt_id, "task_id": str(task_id), "run_id": run_id, "project_id": project, "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
         for field in ("execution_request", "expected_effect"):
             if task.get(field) is not None:
                 result[field] = dict(task[field])
