@@ -10,9 +10,14 @@ on:
         required: false
         type: string
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     steps:

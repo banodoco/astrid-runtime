@@ -3,7 +3,7 @@ name: CI
 
 on:
   push:
-  pull_request:
+    branches: [main, release-1, "int/**"]
   workflow_dispatch:
     inputs:
       agent_sha:
@@ -11,9 +11,14 @@ on:
         required: false
         type: string
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows-realm-publication:
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Restore pip cache (C-08)
@@ -66,6 +71,7 @@ jobs:
 
   unit:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +108,7 @@ jobs:
     # The darwin_native lane is deselected by default and skipped off macOS; this
     # is the job where it runs (tests/lanes.py SKIP_REGISTRY).
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Restore pip cache (C-08)
@@ -126,6 +133,7 @@ jobs:
 
   typescript-client:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -138,6 +146,7 @@ jobs:
 
   boundary:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Restore pip cache (C-08)
@@ -166,6 +175,7 @@ jobs:
     # Sandbox mode under a seccomp profile that denies what NVIDIA OpenShell's
     # does: pidfd_open (ENOSYS), pidfd_send_signal and process-group kill (EPERM).
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: sh tests/seccomp/run-suite.sh
@@ -181,6 +191,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
