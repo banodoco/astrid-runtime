@@ -6,8 +6,15 @@ from urllib.parse import quote
 import pytest
 
 from runtime_protocol.door import classify
-from runtime_protocol.errors import AuthorizationError, BodyTooLargeError, ConflictError, ProtocolError
+from runtime_protocol.errors import (
+    AuthorizationError,
+    BodyTooLargeError,
+    ConflictError,
+    ProtocolError,
+    RetiredRouteError,
+)
 from runtime_protocol.server import RuntimeHandler
+from runtime_protocol.service import RuntimeService
 
 
 PROJECT = "project-1"
@@ -61,23 +68,54 @@ def make_handler(runtime, body, *, path=None, headers=None, command="POST", acto
     return handler
 
 
-def test_commit_route_passes_exact_service_shape_and_rechecks_authority():
+def test_authorized_requester_commit_uses_server_bound_identity_and_rechecks_authority():
     calls = []
 
     def commit(project_id, timeline_id, body, *, idempotency_key, publisher, invocation_path, authorize):
         calls.append((project_id, timeline_id, body, idempotency_key, publisher, invocation_path))
         assert authorize()["actor"] == publisher
+        handler.identity_actor = "different-requester"
+        with pytest.raises(AuthorizationError):
+            authorize()
         return {"data": {"status": "accepted"}, "receipt": {"receipt_id": "r1"}}
 
     body = request_body()
-    handler = make_handler(SimpleNamespace(commit_timeline=commit), body)
+    handler = make_handler(SimpleNamespace(commit_timeline=commit), body, actor="agent-requester")
     handler._route()
     assert handler.reply == (200, {"data": {"status": "accepted"}, "receipt": {"receipt_id": "r1"}})
     assert calls == [(
-        PROJECT, TIMELINE, body, "commit-key-1", "publisher-1",
+        PROJECT, TIMELINE, body, "commit-key-1", "agent-requester",
         f"/v1/projects/{PROJECT}/timelines/{TIMELINE}/commit",
     )]
-    assert handler.scopes_seen == ["projects:write", "projects:write"]
+    assert handler.scopes_seen == ["projects:write", "projects:write", "projects:write"]
+
+
+def test_retired_writer_route_refuses_before_decode_or_legacy_publication_dispatch():
+    legacy_calls = []
+
+    def legacy_publish(*args, **kwargs):
+        legacy_calls.append((args, kwargs))
+        pytest.fail("retired writer reached legacy publication")
+
+    handler = make_handler(
+        SimpleNamespace(publish_parent_composition=legacy_publish),
+        b'{"unterminated":',
+        path=f"/v1/projects/{PROJECT}/timelines/{TIMELINE}/composition-revisions",
+        headers={"Idempotency-Key": ""},
+    )
+
+    with pytest.raises(RetiredRouteError) as caught:
+        handler._route()
+
+    assert caught.value.code == "retired_route"
+    assert caught.value.details["replacement"] == (
+        "POST /v1/projects/{project_id}/timelines/{timeline_id}/commit"
+    )
+    assert legacy_calls == []
+    assert handler.scopes_seen == ["projects:write"]
+
+    with pytest.raises(RetiredRouteError):
+        RuntimeService.publish_parent_composition(None, PROJECT, TIMELINE, {}, idempotency_key="old-key")
 
 
 def test_commit_route_forwards_full_v2_envelope_and_reply_unchanged():
