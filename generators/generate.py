@@ -176,6 +176,38 @@ def render_typescript_client() -> str:
     exact_claim_method = '  async claimDelegatedChild(taskId: string, body: { executor_id: string; capability_ids: string[]; runtime_epoch: number; target: ExecutionTarget; authority: string }, idempotencyKey: string): Promise<AttemptFence> { return this.json<AttemptFence>((await this.request("POST", `/v1/tasks/${encodeURIComponent(taskId)}/claim-delegated-child`, new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [200])).body) }'
     if "  async claimDelegatedChild(" not in source:
         source = source.replace("  async claimTask(", exact_claim_method + "\n  async claimTask(", 1)
+    terminal_evidence_types = (
+        'export interface TerminalEvidence { outputs?: Record<string, unknown>[]; result?: Record<string, unknown> }\n'
+        'export interface CancellationEvidence extends TerminalEvidence { attempt_id: string; lease_id: string; fence: number; runtime_epoch: number; stop_observed?: boolean }\n'
+    )
+    source = re.sub(
+        r"^export interface (?:TerminalEvidence|CancellationEvidence)[^\n]*\n",
+        "",
+        source,
+        flags=re.MULTILINE,
+    )
+    terminal_anchor = "export interface RecoveryAuthorization"
+    if terminal_anchor not in source:
+        raise SystemExit("TypeScript client is missing the terminal-evidence type insertion point")
+    source = source.replace(terminal_anchor, terminal_evidence_types + terminal_anchor, 1)
+    cancel_method = '  async cancelTask(taskId: string, idempotencyKey: string, expectedVersion?: number, evidence?: CancellationEvidence): Promise<MutationResult<Task>> { const payload = { ...evidence, ...(expectedVersion === undefined ? {} : { expected_version: expectedVersion }) }; return this.mutation<Task>((await this.request("POST", `/v1/tasks/${encodeURIComponent(taskId)}/cancel`, new TextEncoder().encode(JSON.stringify(payload)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body) }'
+    source, cancel_count = re.subn(
+        r"^  async cancelTask\([^\n]*\n",
+        cancel_method + "\n",
+        source,
+        flags=re.MULTILINE,
+    )
+    if cancel_count != 1:
+        raise SystemExit("TypeScript client must contain exactly one cancel task method")
+    fail_method = '  async failAttempt(attemptId: string, leaseId: string, fence: number, error: unknown, runtimeEpoch: number, idempotencyKey: string, evidence: TerminalEvidence = {}): Promise<MutationResult<Task>> { return this.mutation<Task>((await this.request("POST", `/v1/attempts/${encodeURIComponent(attemptId)}/fail`, new TextEncoder().encode(JSON.stringify({ ...evidence, lease_id: leaseId, fence, runtime_epoch: runtimeEpoch, error })), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body) }'
+    source, fail_count = re.subn(
+        r"^  async failAttempt\([^\n]*\n",
+        fail_method + "\n",
+        source,
+        flags=re.MULTILINE,
+    )
+    if fail_count != 1:
+        raise SystemExit("TypeScript client must contain exactly one fail attempt method")
     commit_response = '''  private commitResponse(body: Uint8Array, preview: boolean): CommitAcceptedMutation | CommitPreviewResponse {
     const value = this.json<Record<string, unknown>>(body);
     if (!value || typeof value !== "object" || Array.isArray(value) || !value.data || typeof value.data !== "object" || Array.isArray(value.data) || !("receipt" in value)) throw new Error("invalid commit response");
@@ -308,6 +340,12 @@ def validate_typescript_client(manifest_path: Path = MANIFEST) -> None:
         "async getProjectVerifiedMedia(projectId: string, selection: MediaSelection): Promise<VerifiedMedia>",
         "async getProjectVerifiedDocument(projectId: string, pin: DocumentPin): Promise<VerifiedDocument>",
         "async getProjectVerifiedDocumentObject(projectId: string, pin: DocumentPin, objectId: string): Promise<VerifiedDocumentObject>",
+        "export interface TerminalEvidence { outputs?: Record<string, unknown>[]; result?: Record<string, unknown> }",
+        "export interface CancellationEvidence extends TerminalEvidence",
+        "async cancelTask(taskId: string, idempotencyKey: string, expectedVersion?: number, evidence?: CancellationEvidence)",
+        "const payload = { ...evidence, ...(expectedVersion === undefined ? {} : { expected_version: expectedVersion }) };",
+        "async failAttempt(attemptId: string, leaseId: string, fence: number, error: unknown, runtimeEpoch: number, idempotencyKey: string, evidence: TerminalEvidence = {})",
+        "JSON.stringify({ ...evidence, lease_id: leaseId, fence, runtime_epoch: runtimeEpoch, error })",
     )
     missing_fragments = [value for value in required_fragments if value not in source]
     if missing_fragments:
