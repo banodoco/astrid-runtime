@@ -328,11 +328,16 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             raise ConflictError("host-only preparation cancelled")
         selected = _selected_profile_payload(profile)
         epoch = self.config.get("runtime_instance_id")
-        owner = default_process_identity(os.getpid())
-        if owner is None or not isinstance(epoch, str) or not epoch:
+        native_owner = default_process_identity(os.getpid())
+        if native_owner is None or not isinstance(epoch, str) or not epoch:
             raise ConflictError("host-only original Runtime owner is unavailable")
-        owner.update(runtime_instance_id=epoch, coordinator_epoch=epoch)
-        owner.pop("parent_pid", None)
+        # Project exactly the five contract fields. The native observation can
+        # carry extra fields (process_group, session_id, parent_pid); those stay
+        # in the observation and never enter the strict owner record.
+        if any(native_owner.get(k) is None for k in ("pid", "uid", "birth_id")):
+            raise ConflictError("host-only original Runtime owner is unavailable")
+        owner = {"pid": native_owner["pid"], "uid": native_owner["uid"], "birth_id": native_owner["birth_id"],
+                 "runtime_instance_id": epoch, "coordinator_epoch": epoch}
         if not operation_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in operation_id):
             raise ConflictError("host-only operation identity is invalid")
         scope = profile.support_root / "local-execution-custody" / operation_id
