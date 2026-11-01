@@ -5845,6 +5845,7 @@ class RealmStore:
         duration_seconds_presence=None,
         publish=None,
         record=None,
+        verification_receipt=None,
     ):
         with self._mutex:
             self.reap_overdue_leases()
@@ -5916,6 +5917,12 @@ class RealmStore:
                     )
                 if publish is not None and not append_effect:
                     publish()
+                if verification_receipt is not None:
+                    receipt = verification_receipt(timestamp)
+                    if receipt is not None:
+                        task_spec["candidate_verification_receipt"] = receipt
+                        self.conn.execute("UPDATE tasks SET spec_digest=? WHERE id=?",
+                                          (self._store_spec(task_spec), task_id))
                 if applied_effect is not None:
                     if effect.get("effect_type") == "generation.publish_v1":
                         result["generation_publish_v1"] = {

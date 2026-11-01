@@ -1373,14 +1373,25 @@ def stage_settlement(service, attempt, data, port):
     return body
 
 
-def publication_journey(runtime, *, through="final"):
+VERIFICATION_MANIFEST = b'{"outputs":[]}'
+
+
+def add_verification_manifest(body, *, emit=False):
+    if emit:
+        body["outputs"].append(publication_output(VERIFICATION_MANIFEST, "verification_manifest"))
+    body.setdefault("result", {})["manifest_ref"] = {
+        "object_id": digest(VERIFICATION_MANIFEST), "size": len(VERIFICATION_MANIFEST)}
+    return body
+
+
+def publication_journey(runtime, *, through="final", verification_data=b'{"candidate_verified":true}'):
     service, project = runtime
     policy = publication_policy(project)
     p = publication_parent(runtime, policy=policy)
     attempts, associations, bodies = {}, {}, {}
     values = [("raw", b"raw-generation-video", "raw_video"),
               ("compose", b"composed-candidate-video", "candidate"),
-              ("verify", b'{"candidate_verified":true}', "verification"),
+              ("verify", verification_data, "verification"),
               ("final", b"composed-candidate-video", "verified_candidate")]
     for name, data, port in values:
         admitted = admit_stage(service, p, policy, name, associations)
@@ -1392,6 +1403,8 @@ def publication_journey(runtime, *, through="final"):
             manifest = publication_output(b'{"outputs":[]}', "manifest")
             manifest["role"] = "manifest"
             body["outputs"].insert(0, manifest)
+        if name in {"verify", "final"}:
+            add_verification_manifest(body)
         bodies[name] = body
         service.settle_attempt(attempt["attempt_id"], body, idempotency_key="settle-stage-" + name, identity=IDENTITY)
         associations[(name, port)] = next(item for item in service.managed_outputs(attempt["task_id"]) if item["output_port"] == port)
@@ -1677,9 +1690,12 @@ def test_legacy_single_verified_publication_still_settles(runtime):
     for name, cap in (("verify", OTHER), ("final", CHILD)):
         admit_stage(service, p, policy, name, associations)
         attempt = claim(service, cap, "claim-legacy-" + name)
-        service.settle_attempt(attempt["attempt_id"], stage_settlement(service, attempt, b"verified-legacy-video", "video"),
+        body = stage_settlement(service, attempt, b'{"candidate_verified":true}', "video")
+        add_verification_manifest(body, emit=name == "verify")
+        service.settle_attempt(attempt["attempt_id"], body,
                                idempotency_key="settle-legacy-" + name, identity=IDENTITY)
-        associations[(name, "video")] = service.managed_outputs(attempt["task_id"])[0]
+        associations[(name, "video")] = next(item for item in service.managed_outputs(attempt["task_id"])
+                                                   if item["output_port"] == "video")
     settle(service, p, "legacy-parent")
     assert service.task(p["task_id"])["task"]["status"] == "completed"
     assert associations[("final", "video")]["generation_id"]
@@ -1775,13 +1791,17 @@ def test_named_publication_accepts_raw_as_candidate_with_distinct_final_associat
     p = publication_parent(runtime, policy=policy)
     associations = {}
     for name, cap, data, port in (("raw", CHILD, b"same-candidate-video", "raw_video"),
-                                 ("verify", OTHER, b'{"verified":true}', "verification"),
+                                 ("verify", OTHER, b'{"candidate_verified":true}', "verification"),
                                  ("final", CHILD, b"same-candidate-video", "verified_candidate")):
         admit_stage(service, p, policy, name, associations)
         attempt = claim(service, cap, "claim-direct-candidate-" + name)
-        service.settle_attempt(attempt["attempt_id"], stage_settlement(service, attempt, data, port),
+        body = stage_settlement(service, attempt, data, port)
+        if name in {"verify", "final"}:
+            add_verification_manifest(body, emit=name == "verify")
+        service.settle_attempt(attempt["attempt_id"], body,
                                idempotency_key="settle-direct-candidate-" + name, identity=IDENTITY)
-        associations[(name, port)] = service.managed_outputs(attempt["task_id"])[0]
+        associations[(name, port)] = next(item for item in service.managed_outputs(attempt["task_id"])
+                                              if item["output_port"] == port)
     raw, final = associations[("raw", "raw_video")], associations[("final", "verified_candidate")]
     assert raw["object_id"] == final["object_id"]
     assert raw["association_id"] != final["association_id"] and raw["generation_id"] != final["generation_id"]
@@ -1808,18 +1828,20 @@ def test_named_selector_tracks_video_with_same_port_auxiliary_audio(runtime):
     associations = {}
     for name, data, port in (("raw", b"raw-video", "raw_video"),
                              ("compose", b"candidate-video", "candidate"),
-                             ("verify", b'{"verified":true}', "verification"),
+                             ("verify", b'{"candidate_verified":true}', "verification"),
                              ("final", b"candidate-video", "verified_candidate")):
         admit_stage(service, p, policy, name, associations)
         attempt = claim(service, CHILD if name != "verify" else OTHER, "selector-claim-" + name)
         body = stage_settlement(service, attempt, data, port)
+        if name in {"verify", "final"}:
+            add_verification_manifest(body, emit=name == "verify")
         if name in {"raw", "final"}:
             audio = publication_output(("audio-" + name).encode(), port)
             audio.update(media_type="audio/wav", variant_key="auxiliary", ordinal=1)
             body["outputs"].insert(0, audio)
         service.settle_attempt(attempt["attempt_id"], body, idempotency_key="selector-settle-" + name, identity=IDENTITY)
         outputs = service.managed_outputs(attempt["task_id"])
-        association = next(item for item in outputs if item["variant_key"] == "original")
+        association = next(item for item in outputs if item["output_port"] == port and item["variant_key"] == "original")
         associations[(name, port)] = association
         if name in {"raw", "final"}:
             audio = next(item for item in outputs if item["variant_key"] == "auxiliary")
