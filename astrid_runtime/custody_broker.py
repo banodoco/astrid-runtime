@@ -111,9 +111,18 @@ def _send_frame(connection: socket.socket, value: Mapping[str, object]) -> None:
     connection.sendall(encoded)
 
 
-def _read_frame(connection: socket.socket) -> dict[str, object]:
+def _read_frame(connection: socket.socket, *, deadline: float | None = None) -> dict[str, object]:
+    if deadline is None:
+        timeout = connection.gettimeout()
+        if timeout is not None:
+            deadline = time.monotonic() + timeout
     raw = bytearray()
     while not raw.endswith(b"\n"):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CustodyError("custody frame timed out")
+            connection.settimeout(remaining)
         part = connection.recv(min(4096, FRAME_LIMIT + 1 - len(raw)))
         if not part:
             raise CustodyError("custody peer closed before a complete frame")
@@ -125,6 +134,8 @@ def _read_frame(connection: socket.socket) -> dict[str, object]:
     value = json.loads(bytes(raw[:-1]).decode("utf-8"))
     if not isinstance(value, dict):
         raise CustodyError("custody frame is not an object")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise CustodyError("custody frame timed out")
     return value
 
 
@@ -1283,8 +1294,7 @@ class RoleBoundCustodyBroker:
             except (socket.timeout, TimeoutError) as exc:
                 raise CustodyError("custody registration timed out") from exc
             try:
-                connection.settimeout(min(2.0, max(0.05, deadline - time.monotonic())))
-                frame = _read_frame(connection)
+                frame = _read_frame(connection, deadline=min(deadline, time.monotonic() + 2.0))
                 required = {"version", "command", "run_id", "role", "pid", "ppid", "argv_digest"}
                 if (
                     set(frame) != required
@@ -1314,13 +1324,12 @@ class RoleBoundCustodyBroker:
     def _serve(self) -> None:
         connection: socket.socket | None = None
         try:
+            deadline = time.monotonic() + self.timeout
             if sys.platform == "win32":
-                deadline = time.monotonic() + self.timeout
                 connection, _ = self.listener.accept_child(self.launch_parent.verify(), deadline=deadline)
-                connection.settimeout(self.timeout)
-                frame = _read_frame(connection)
+                frame = _read_frame(connection, deadline=deadline)
             else:
-                connection, frame = self._accept_registration(deadline=time.monotonic() + self.timeout)
+                connection, frame = self._accept_registration(deadline=deadline)
             required = {"version", "command", "run_id", "role", "pid", "ppid", "argv_digest"}
             if (
                 set(frame) != required
@@ -1342,6 +1351,8 @@ class RoleBoundCustodyBroker:
                 raise CustodyError("pre-exec process identity is unavailable")
             if before.get("parent_pid") != self.launch_parent.verify()["pid"]:
                 raise CustodyError("registered process does not have the authenticated launch parent")
+            if time.monotonic() >= deadline:
+                raise CustodyError("custody registration timed out")
             self.sequence = 1
             self.registration = {
                 "pid": frame["pid"], "identity": dict(before),
@@ -1350,6 +1361,8 @@ class RoleBoundCustodyBroker:
                 "pre_exec_pidversion": pre["pidversion"],
                 "audit_token_words": pre["words"],
             }
+            if time.monotonic() >= deadline:
+                raise CustodyError("custody registration timed out")
             # Pending cleanup ownership is durable before registration can ACK
             # and let exec proceed. It conveys no destructive signal authority.
             self.role_authority.bind_pending(actor=self.cleanup_actor, admission_id=self.run_id,
@@ -1745,7 +1758,20 @@ class NativeProcessCustody:
         record = {"version": NATIVE_CAPABILITY_VERSION, "role": "runtime_owner",
                   "target": self.identity, "controller": controller,
                   "state": "owned"}
-        if sys.platform == "darwin":
+        if process_binding.LINUX:
+            if not process_binding.supported():
+                raise CustodyError("Linux pidfd custody is unavailable")
+            try:
+                observed = default_process_identity(int(self.identity["pid"]))
+                if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
+                    raise CustodyError("native Runtime incarnation changed")
+                linux_process_binding.token(int(self.identity["pid"]))
+                observed = default_process_identity(int(self.identity["pid"]))
+                if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
+                    raise CustodyError("native Runtime incarnation changed")
+            except (linux_process_binding.LinuxBindingError, OSError) as exc:
+                raise CustodyError(str(exc)) from exc
+        elif sys.platform == "darwin":
             record["audit_token_words"] = current_process_audit_token(int(self.identity["pid"]))["words"]
         with platform.file_lock(self.lock):
             _atomic_owner_json(self.path, record)
@@ -1787,11 +1813,21 @@ class NativeProcessCustody:
                 validate()
             record["controller"], record["state"] = actor, "owned"
             _atomic_owner_json(self.path, record)
-            if sys.platform == "darwin":
+            if process_binding.LINUX or sys.platform == "darwin":
                 observed = default_process_identity(int(self.identity["pid"]))
                 if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
                     raise CustodyError("native Runtime incarnation changed")
-                signal_audit_token(record["audit_token_words"], signum)
+                try:
+                    if process_binding.LINUX:
+                        words = linux_process_binding.token(int(self.identity["pid"]))["words"]
+                        observed = default_process_identity(int(self.identity["pid"]))
+                        if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
+                            raise CustodyError("native Runtime incarnation changed")
+                    else:
+                        words = record["audit_token_words"]
+                    signal_audit_token(words, signum)
+                except (linux_process_binding.LinuxBindingError, OSError, KeyError, TypeError) as exc:
+                    raise CustodyError(str(exc)) from exc
             else:
                 try:
                     platform.signal_process(self.identity, signum)
