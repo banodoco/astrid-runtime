@@ -203,7 +203,12 @@ def test_verified_legacy_baseline_exposes_manifest_without_replaying_compacted_r
         service.close()
 
 
-def test_unverified_or_missing_manifest_is_not_defaulted(tmp_path):
+def test_unverified_or_missing_manifest_is_not_defaulted(tmp_path, request):
+    # DESIGN rev 3 §8 (migration): retain this pre-activation U33 state on its owning binary.
+    from runtime_protocol.store import SCHEMA_VERSION
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(request.getfixturevalue('tmp_path'), request.node.nodeid, record_property=lambda name, value: request.node.user_properties.append((name, value)))
     service, project_id, _ = load_baseline_fixture(tmp_path)
     try:
         revision = "parent-1"

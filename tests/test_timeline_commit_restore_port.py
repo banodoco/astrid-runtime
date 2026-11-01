@@ -100,7 +100,12 @@ def _assert_source(service, first, document):
     assert "opaque" not in document["internal_timeline_revisions"][0]["payload"]
 
 
-def test_old_main_null_manifest_read_verifies_exact_source_without_installation(tmp_path, monkeypatch):
+def test_old_main_null_manifest_read_verifies_exact_source_without_installation(tmp_path, monkeypatch, request):
+    # DESIGN rev 3 §8 (migration): retain this pre-activation U33 state on its owning binary.
+    from runtime_protocol.store import SCHEMA_VERSION
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(request.getfixturevalue('tmp_path'), request.node.nodeid, record_property=lambda name, value: request.node.user_properties.append((name, value)))
     service, first = _source(tmp_path)
     try:
         _disable_renderer(monkeypatch, service)
@@ -183,7 +188,12 @@ def test_main_source_restore_uses_selected_budget_and_exact_closure(selected, mo
 
 @pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("damage", ["parent", "shot", "internal", "missing_shot", "missing_internal", "dependency", "media", "missing_media", "ownership", "scope"])
-def test_restore_rejects_damaged_exact_source_before_provider_or_writes(selected, direct, damage):
+def test_restore_rejects_damaged_exact_source_before_provider_or_writes(selected, direct, damage, request):
+    # DESIGN rev 3 §8 (migration): retain this pre-activation U33 state on its owning binary.
+    from runtime_protocol.store import SCHEMA_VERSION
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(request.getfixturevalue('tmp_path'), request.node.nodeid, record_property=lambda name, value: request.node.user_properties.append((name, value)))
     service, provider, first, _ = selected
     call = _restore(service, "parent-media", direct=direct, content_digest=first["data"]["content_digest"])
     conn = service.store.conn
@@ -295,7 +305,12 @@ def test_restart_exact_retry_is_ledger_only_but_authorized(selected, monkeypatch
 
 
 @pytest.mark.parametrize("missing_proof", ["receipt", "event", "manifest"])
-def test_null_manifest_source_requires_original_main_publication_proof(tmp_path, monkeypatch, missing_proof):
+def test_null_manifest_source_requires_original_main_publication_proof(tmp_path, monkeypatch, missing_proof, request):
+    # DESIGN rev 3 §8 (migration): retain this pre-activation U33 state on its owning binary.
+    from runtime_protocol.store import SCHEMA_VERSION
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(request.getfixturevalue('tmp_path'), request.node.nodeid, record_property=lambda name, value: request.node.user_properties.append((name, value)))
     service, first = _source(tmp_path)
     try:
         _disable_renderer(monkeypatch, service)

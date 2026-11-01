@@ -692,7 +692,12 @@ def test_integrity_report_rejects_receipt_for_missing_event_even_without_manifes
         service.close()
 
 
-def test_integrity_report_keeps_payload_only_legacy_closure_without_event(tmp_path):
+def test_integrity_report_keeps_payload_only_legacy_closure_without_event(tmp_path, request):
+    # DESIGN rev 3 §8 (migration): retain this pre-activation U33 state on its owning binary.
+    from runtime_protocol.store import SCHEMA_VERSION
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(request.getfixturevalue('tmp_path'), request.node.nodeid, record_property=lambda name, value: request.node.user_properties.append((name, value)))
     service, fixture = _restore_history_service(tmp_path)
     project_id = fixture.project_id
     try:

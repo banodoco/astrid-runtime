@@ -567,11 +567,11 @@ def test_V33_L23_ARCHIVAL_BYTES_AND_WORKERS(captures, tmp_path, archive_profile,
 
 
 @pytest.mark.parametrize("recovery_mode", ["automatic", "explicit_interruption", "interrupted_restore"])
-def test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH(captures, tmp_path, monkeypatch, recovery_mode):
+def test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH(captures, tmp_path, monkeypatch, recovery_mode, request):
     # DESIGN rev 3 §8 (migration): retain the U33-only rollback journey on its owning binary.
     if SCHEMA_VERSION == 34:
         from custody_schema_fixtures import historical_case
-        return historical_case(tmp_path, 'test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH[' + recovery_mode + ']')
+        return historical_case(tmp_path, 'test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH[' + recovery_mode + ']', record_property=lambda name, value: request.node.user_properties.append((name, value)))
     from astrid_runtime import operator_upgrade as operator
     from astrid_runtime.bootstrap import BootstrapConfig, SourceProfile
     from astrid_runtime.paths import RuntimePaths
@@ -927,11 +927,11 @@ def test_V33_BACKUP_FAILURE_PRECEDES_SCHEMA_AND_BACKFILL(captures,tmp_path,monke
     assert not (root/life.MARKER).exists()
 
 
-def test_V33_RELOCATION_REBINDS_ONLY_COMPLETED_ACTIVATION(captures,tmp_path):
+def test_V33_RELOCATION_REBINDS_ONLY_COMPLETED_ACTIVATION(captures,tmp_path,request):
     # DESIGN rev 3 §8 (migration): U33 relocation stays covered; V34 relocation has a separate refusal regression.
     if SCHEMA_VERSION == 34:
         from custody_schema_fixtures import historical_case
-        return historical_case(tmp_path, 'test_V33_RELOCATION_REBINDS_ONLY_COMPLETED_ACTIVATION')
+        return historical_case(tmp_path, 'test_V33_RELOCATION_REBINDS_ONLY_COMPLETED_ACTIVATION', record_property=lambda name, value: request.node.user_properties.append((name, value)))
     root=tmp_path/'realm';facts=family_realm(captures,root,'C31');migrate(root)
     service=assert_registration_restart(root,facts['project']);service.close()
     archive,_=life.activation(root);archived=tree(archive/'realm')

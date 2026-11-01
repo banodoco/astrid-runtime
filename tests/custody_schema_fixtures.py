@@ -120,7 +120,7 @@ def activate_fixture_to_current(root):
     return result
 
 
-def historical_case(tmp_path, node):
+def historical_case(tmp_path, node, *, record_property=None):
     """Retain a protected U33-only journey on its immutable owning binary."""
     project = Path(__file__).resolve().parents[1]
     target = Path(tmp_path) / '_historical_round1b'
@@ -140,9 +140,12 @@ def historical_case(tmp_path, node):
     temporary = Path(tmp_path) / '_historical_basetemp'
     command = ['env', '-u', 'RUNPOD_API_KEY', f'PYTHONPATH={target}:{target / "tests"}',
                'PYTHONDONTWRITEBYTECODE=1', sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
-               f'--basetemp={temporary}', 'tests/test_v33_protected_acceptance.py::' + node]
+               f'--basetemp={temporary}', node if node.startswith('tests/') else 'tests/test_v33_protected_acceptance.py::' + node]
     result = subprocess.run(command, cwd=target, capture_output=True, text=True, timeout=180)
-    (Path(tmp_path) / 'historical-result.json').write_text(json.dumps({
-        'command': command, 'exit_code': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}, indent=2))
+    details = {'source_base': BASE, 'cwd': str(target), 'command': command,
+               'exit_code': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+    (Path(tmp_path) / 'historical-result.json').write_text(json.dumps(details, indent=2))
+    if record_property:
+        record_property('historical_runtime', json.dumps(details))
     shutil.rmtree(temporary, ignore_errors=True)
     assert result.returncode == 0, result.stdout + result.stderr

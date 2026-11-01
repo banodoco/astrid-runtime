@@ -314,7 +314,12 @@ def test_editable_create_has_one_outer_commit(service, key):
     assert resource["head_publication_id"] == facts["head"]["publication_id"]
 
 
-def test_revoked_admission_prevents_startup_baseline_migration_and_history_writes(tmp_path, monkeypatch):
+def test_revoked_admission_prevents_startup_baseline_migration_and_history_writes(tmp_path, monkeypatch, request):
+    # DESIGN rev 3 §8 (migration): retain this pre-activation U33 state on its owning binary.
+    from runtime_protocol.store import SCHEMA_VERSION
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(request.getfixturevalue('tmp_path'), request.node.nodeid, record_property=lambda name, value: request.node.user_properties.append((name, value)))
     captured = load_precut_realm_fixture(tmp_path)
     runtime = RuntimeService(captured.copy_roots[0])
     try:
@@ -787,7 +792,12 @@ def test_exact_commit_replay_after_restart_needs_no_provider(service):
 
 
 @pytest.mark.parametrize("corrupt", [False, True])
-def test_existing_head_installs_only_verified_original_baseline_before_requests(tmp_path, monkeypatch, corrupt):
+def test_existing_head_installs_only_verified_original_baseline_before_requests(tmp_path, monkeypatch, corrupt, request):
+    # DESIGN rev 3 §8 (migration): retain this pre-activation U33 state on its owning binary.
+    from runtime_protocol.store import SCHEMA_VERSION
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(request.getfixturevalue('tmp_path'), request.node.nodeid, record_property=lambda name, value: request.node.user_properties.append((name, value)))
     captured = load_precut_realm_fixture(tmp_path)
     service = RuntimeService(captured.copy_roots[0])
     try:

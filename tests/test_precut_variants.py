@@ -194,7 +194,12 @@ def test_canonical_documents_have_genuine_create_receipts_and_refuse_bypass(tmp_
         service.close()
 
 
-def test_anchor_capture_stops_before_input_acceptance_and_preserves_source_config(tmp_path):
+def test_anchor_capture_stops_before_input_acceptance_and_preserves_source_config(tmp_path, request):
+    # DESIGN rev 3 §8 (migration): retain this pre-activation U33 state on its owning binary.
+    from runtime_protocol.store import SCHEMA_VERSION
+    if SCHEMA_VERSION == 34:
+        from custody_schema_fixtures import historical_case
+        return historical_case(request.getfixturevalue('tmp_path'), request.node.nodeid, record_property=lambda name, value: request.node.user_properties.append((name, value)))
     captured = load_precut_realm_fixture(tmp_path, variant="anchor")
     service = RuntimeService(captured.copy_roots[0])
     try:
