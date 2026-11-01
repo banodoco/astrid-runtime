@@ -14,6 +14,7 @@ from astrid_runtime.paths import RuntimePaths
 from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
 from astrid_runtime.refusal import refusal_from
 from runtime_protocol.store import SCHEMA_VERSION, RealmStore
+from runtime_protocol.errors import ConflictError
 from runtime_protocol.upgrade import inspect_canonical_schema, migrate_canonical_to_current
 
 
@@ -236,17 +237,21 @@ def test_operator_upgrade_refuses_running_task_before_signaling_owner(tmp_path):
     connection = sqlite3.connect(realm_root / "realm.sqlite3")
     try:
         timestamp = "2026-09-15T00:00:00Z"
+        # DESIGN rev 3 §8 (migration): the U33 predecessor stores specs by digest.
+        import hashlib
+        spec_digest = hashlib.sha256(b'{}').hexdigest()
+        connection.execute('INSERT INTO task_specs VALUES (?, ?, ?)', (spec_digest, '{}', timestamp))
         connection.execute(
             "INSERT INTO projects(id, realm_id, slug, name, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("project", "realm-1", "project", "Project", "{}", timestamp, timestamp),
         )
         connection.execute(
-            "INSERT INTO runs(id, project_id, capability, spec_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("run", "project", "rendering.render", "{}", "running", timestamp, timestamp),
+            "INSERT INTO runs(id, project_id, capability, spec_digest, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("run", "project", "rendering.render", spec_digest, "running", timestamp, timestamp),
         )
         connection.execute(
-            "INSERT INTO tasks(id, run_id, capability, spec_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("task", "run", "rendering.render", "{}", "running", timestamp, timestamp),
+            "INSERT INTO tasks(id, run_id, capability, spec_digest, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("task", "run", "rendering.render", spec_digest, "running", timestamp, timestamp),
         )
         connection.commit()
     finally:
@@ -275,11 +280,21 @@ def test_operator_upgrade_failure_before_activation_restarts_original_and_journa
     monkeypatch.setattr("astrid_runtime.operator_upgrade.migrate_canonical_to_current", fail_migration)
     with pytest.raises(OperatorUpgradeError, match="validation failed"):
         upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
-    assert started == [True]
+    # DESIGN rev 3 §8 (migration): intact U33 retries under closed admission, without an old-owner restart.
+    assert started == []
     assert (realm_root / "realm.sqlite3").is_file()
     journal = json.loads((paths.runtime_support / "upgrade-journal.json").read_text())
-    assert journal["state"] == "rolled_back"
-    assert inspect_canonical_schema(realm_root)["version"] == 25
+    # DESIGN rev 3 §8 (migration): retain the verified recovery set for the new coordinator.
+    assert journal["state"] == "recovery_required"
+    from runtime_protocol import v34_lifecycle
+    pending = v34_lifecycle.activation(realm_root)
+    assert pending[1]['state'] == 'backup_verified'
+    v34_lifecycle.verify_recovery(*pending)
+    assert inspect_canonical_schema(realm_root)['kind'] == 'U33'
+    with pytest.raises(ConflictError, match='admission is closed'):
+        RealmStore(realm_root)
+    # DESIGN rev 3 §8 (migration): a pre-DDL interruption preserves the exact U33 predecessor.
+    assert inspect_canonical_schema(realm_root)["version"] == 33
     assert Path(journal["recovery_set"]).is_dir()
 
 

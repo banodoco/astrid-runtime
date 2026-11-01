@@ -738,6 +738,8 @@ def test_V33_EXISTING_PINS_AFFECTED_AND_UNAFFECTED(captures, tmp_path):
             if name == "unaffected": metadata["gen"] = {"kind":"audio","model":"fixture","origin":"imported"}
             connection.execute("INSERT INTO generations(id,project_id,type,status,metadata_json,version,created_at,updated_at) VALUES (?,?,'audio','completed',?,1,'t','t')",(name,facts["project"],canonical_json(metadata)))
             connection.execute("INSERT INTO generation_variants(id,generation_id,object_id,variant_type,metadata_json,created_at) VALUES (?,?,?,'original','{}','t')",(name+'-variant',name,facts["audio"].removeprefix('sha256:')))
+    # DESIGN rev 3 §8 (migration): release the historical SQLite writer before offline activation.
+    connection.close()
     # This is a read of inactive historical input, never a service activation.
     with life.sqlite_observation(root) as copy:
         connection=sqlite3.connect(copy / "realm.sqlite3"); connection.row_factory=sqlite3.Row

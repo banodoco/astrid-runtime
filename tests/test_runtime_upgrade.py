@@ -739,7 +739,8 @@ def test_upgrade_restores_after_publication_and_preserves_uncertain_rollback(
             assert not source.exists()
             activated = sqlite3.connect(source_db)
             try:
-                assert activated.execute("SELECT version FROM runtime_schema").fetchone()[0] == SCHEMA_VERSION
+                # DESIGN rev 3 §8 (migration): the legacy rebuild publishes U33 before custody activation.
+                assert activated.execute("SELECT version FROM runtime_schema").fetchone()[0] == 33
             finally:
                 activated.close()
             failed_forward.append("after rename")

@@ -72,7 +72,9 @@ realm recovery inventory and is separate from the retained round-1b archive.
 
 Finish the old v33 classifier/backfill/provider activation with its owning
 coordinator before custody migration. Historical migration functions still produce
-that gated U33 intermediate; the new binary cannot serve it as v34. For a stopped,
+that gated U33 intermediate; the new binary cannot serve it as v34. The current
+upgrade coordinator refuses inputs older than U33 before journal or owner changes.
+For a stopped,
 ready U33 realm, use `migrate-canonical --confirm 'MIGRATE CANONICAL <realm-id>'`,
 then the explicit `activate-custody` command after verification. Interrupted
 intact U33 retries against its recovery set. Committed V34 remains closed until
@@ -86,12 +88,21 @@ refuse. A corrupt active authority cannot be guessed empty. A restored snapshot
 is reconciled under a new epoch and supplies no stop evidence.
 
 Legacy in-flight attempts without custody are quarantined without synthesizing
-custody or stop history. An authenticated exit for that legacy category requires
-a separate design decision. Migrated-realm relocation also requires an explicit
-v34 journal handoff; this lane leaves an unmatched root binding closed.
+custody or stop history. Their attempts and reservations survive restart,
+backup/restore and replacement checks. Missing installation attribution closes
+realm execution admission, including new work for another installation.
+The authenticated exit is deferred to `A03B-LEGACY-QUARANTINE-REPAIR`.
+Migrated-realm relocation is deferred to `A03B-V34-RELOCATION-HANDOFF`:
+preflight refuses before mutation and rechecks under launcher exclusion, including
+affected secondary realms. A copied or moved root cannot bypass startup binding.
+
+Restart changes an armed row to unresolved without changing its old identity or
+permit/dispatch facts. A duplicate create never rearms it.
 
 A stop proof with an uncommitted successful terminal publication currently stages
 verified evidence and refuses release. The exact request bytes and linkage remain
-pinned. This lane does not invent a success, cancellation, or replacement journal
-outcome for that publication. The authorized publication replay/finalization
-protocol needs design clarification before tracked installation can be enabled.
+pinned. Its typed hold is `custody_pending_success`, with next action
+`A03B-PENDING-SUCCESS-RECONCILE`. That separately scoped publication replay and
+finalization protocol must finish before tracked installation can be enabled.
+Cancellation and authenticated repair cannot replace the retained success with
+an invented terminal outcome.

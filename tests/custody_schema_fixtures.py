@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import closing
 import io
 import json
 from pathlib import Path
@@ -56,7 +57,7 @@ def finish_v33_offline(root):
     """Use the pinned owning binary to finish its real provider/baseline gate."""
     from runtime_protocol import v33_lifecycle
     root = Path(root)
-    with sqlite3.connect(root / 'realm.sqlite3') as connection:
+    with closing(sqlite3.connect(root / 'realm.sqlite3')) as connection:
         assert canonical_manifest(connection)['kind'] == 'U33'
         assert connection.execute('SELECT COUNT(*) FROM attempts WHERE settled=0').fetchone()[0] == 0
     state = v33_lifecycle.activation(root)
@@ -96,9 +97,16 @@ finally:
 
 def activate_fixture_to_current(root):
     """Complete the historical gate before admitting the current destination."""
-    from runtime_protocol import v34_lifecycle
+    from runtime_protocol.store import SCHEMA_VERSION
     from runtime_protocol.upgrade import inspect_realm_schema, migrate_canonical_to_current
     identity = inspect_realm_schema(root)
+    if SCHEMA_VERSION == 33:
+        # The reference comparison changes fixtures only, never the base Runtime.
+        assert identity['kind'] == 'U33'
+        finish_v33_offline(root)
+        return {'target_schema_version': 33}
+    assert SCHEMA_VERSION == 34
+    from runtime_protocol import v34_lifecycle
     if identity['kind'] == 'U33':
         finish_v33_offline(root)
         result = migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")

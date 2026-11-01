@@ -32,6 +32,19 @@ class NoOwnerCalls:
         raise AssertionError('relocation must refuse before an owner handoff: ' + name)
 
 
+def test_older_coordinator_input_refuses_before_journal_or_owner_calls(tmp_path):
+    from astrid_runtime.operator_upgrade import upgrade_workspace, OperatorUpgradeError
+    from test_operator_upgrade import _fixture, _Boundary
+    paths, profile, root = _fixture(tmp_path, version=25)
+    boundary = _Boundary(paths)
+    before = tree(paths.app_support)
+    with pytest.raises(OperatorUpgradeError) as error:
+        upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
+    assert error.value.details['reason'] == 'round1b_activation_required'
+    assert error.value.details['next_action'] == 'finish_v33_activation_then_migrate_v34'
+    assert tree(paths.app_support) == before and not boundary.calls
+
+
 def relocation_fixture(tmp_path, *, migrated=True, secondary=False):
     paths = RuntimePaths.sandbox(tmp_path / 'support')
     paths.ensure_support_dirs()
@@ -157,10 +170,10 @@ def test_legacy_quarantine_blocks_every_admission_and_release_path(world, attrib
     db = s.store.conn
     if path == 'claim':
         db.execute("UPDATE tasks SET status='queued' WHERE id=?", (a['task_id'],))
-        call = lambda: s.store._claim_task(a['task_id'], a['executor_id'], 'new', runtime_epoch=s.health()['runtime_epoch'])
+        call = lambda: s.store._claim_task(a['task_id'], w['request']['executor_id'], 'new', runtime_epoch=s.health()['runtime_epoch'])
     elif path == 'claim_replay':
-        call = lambda: s.claim_next({'executor_id': a['executor_id'], 'capability_ids': ['custody.test'],
-                                    'runtime_epoch': s.health()['runtime_epoch']}, idempotency_key='claim')
+        call = lambda: s.claim_next({'executor_id': w['request']['executor_id'], 'capability_ids': ['custody.test'],
+                                    'runtime_epoch': a['runtime_epoch']}, idempotency_key='claim')
     elif path in {'task_retry', 'run_retry'}:
         db.execute("UPDATE tasks SET status='failed' WHERE id=?", (a['task_id'],))
         run = db.execute('SELECT run_id FROM tasks WHERE id=?', (a['task_id'],)).fetchone()[0]
@@ -245,3 +258,57 @@ def test_pending_success_has_typed_hold_and_cannot_be_replaced_by_recovery(world
         assert w['service'].store.custody.public(row)['hold_reason'] == 'custody_pending_success'
     assert supervisor.invoked == 1
     assert w['service'].store.conn.execute("SELECT COUNT(*) FROM events WHERE kind='task.custody_released'").fetchone()[0] == 0
+
+
+def test_coordinator_retries_intact_u33_with_the_same_verified_recovery_set(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from astrid_runtime import operator_upgrade
+    from test_operator_upgrade import _fixture, _Boundary
+    from test_timeline_commit_provider import Provider
+    paths, profile, root = _fixture(tmp_path, version=33)
+    boundary = _Boundary(paths)
+    config = BootstrapConfig(source_profile=profile)
+    with sqlite3.connect(root / 'realm.sqlite3') as db:
+        db.execute("INSERT INTO user_preferences VALUES ('owner','kept','before migration',1,'t','t')")
+
+    def fail_before_ddl(*args, **kwargs):
+        raise OSError('coordinator interrupted before custody DDL')
+
+    with monkeypatch.context() as fault:
+        fault.setattr(operator_upgrade, 'migrate_canonical_to_current', fail_before_ddl)
+        with pytest.raises(operator_upgrade.OperatorUpgradeError, match='interrupted before custody DDL'):
+            operator_upgrade.upgrade_workspace(paths, boundary, config)
+    archive, record = life.activation(root)
+    original = record['operation_id'], record['recovery_digest']
+    coordinator = json.loads((paths.runtime_support / 'upgrade-journal.json').read_text())
+    assert coordinator['recovery_set'] == str(archive)
+    assert record['state'] == 'backup_verified'
+    started = []
+
+    def start(target, *_args):
+        service = RuntimeService(root)
+        try:
+            with pytest.raises(ConflictError):
+                service._assert_mutation_admitted()
+            service.register_timeline_commit_provider(Provider())
+            assert service.store.conn.execute('SELECT content FROM user_preferences').fetchone()[0] == 'before migration'
+        finally:
+            service.close()
+        started.append(1)
+        discovery = {'pid': 1235, 'active_realm': 'realm-1', 'endpoint': 'http://127.0.0.1:17540',
+                     'runtime_instance_id': 'resumed', 'process_birth_id': 'resumed-birth', 'realm_root': str(root)}
+        target.discovery_path.write_text(json.dumps(discovery))
+        target.instance_lock_path.write_text(json.dumps(discovery | {'realm_id': 'realm-1'}))
+        return SimpleNamespace(endpoint=discovery['endpoint'], pid=1235, runtime_instance_id='resumed')
+
+    monkeypatch.setattr(operator_upgrade, '_bootstrap_locked', start)
+    result = operator_upgrade.recover_workspace(paths, boundary, config)
+    assert result['state'] == 'complete' and result['operation_id'] == coordinator['operation_id']
+    assert started == [1]
+    resumed_archive, resumed = life.activation(root)
+    assert resumed_archive == archive and (resumed['operation_id'], resumed['recovery_digest']) == original
+    assert resumed['state'] == 'ready'
+    assert json.loads((paths.runtime_support / 'upgrade-journal.json').read_text())['operation_id'] == coordinator['operation_id']
+    life.verify_recovery(resumed_archive, resumed)
+    with RealmStore(root) as store:
+        assert store.conn.execute('SELECT version FROM runtime_schema').fetchone()[0] == 34
