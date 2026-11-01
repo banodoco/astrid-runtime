@@ -958,7 +958,7 @@ class RoleBoundCustodyBroker:
                 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 listener.bind(str(self.socket_path))
                 platform.owner_only(self.socket_path)
-                listener.listen(1)
+                listener.listen(8)
                 listener.settimeout(timeout)
             else:
                 _atomic_owner_json(self.socket_path, {"endpoint": listener.endpoint})
@@ -1229,16 +1229,56 @@ class RoleBoundCustodyBroker:
         self.chain_head = str(event["event_digest"])
         _atomic_owner_json(self.ledger_path, {**snapshot, "chain_digest": self.chain_head})
 
+    def _accept_registration(self, *, deadline: float) -> tuple[socket.socket, dict[str, object]]:
+        """Accept until one connection presents a valid registration frame from its own kernel peer.
+
+        A stray or failing connection is closed and the broker keeps accepting until the deadline,
+        so an unrelated same-user connection cannot starve the real child. Only the connection that
+        passes the frame and peer checks is returned; binding still happens in _serve as before.
+        """
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CustodyError("custody registration timed out")
+            self.listener.settimeout(remaining)
+            try:
+                connection, _ = self.listener.accept()
+            except (socket.timeout, TimeoutError) as exc:
+                raise CustodyError("custody registration timed out") from exc
+            try:
+                connection.settimeout(min(2.0, max(0.05, deadline - time.monotonic())))
+                frame = _read_frame(connection)
+                required = {"version", "command", "run_id", "role", "pid", "ppid", "argv_digest"}
+                if (
+                    set(frame) != required
+                    or frame["version"] != PROTOCOL_VERSION
+                    or frame["command"] != "register_pre_exec"
+                    or frame["run_id"] != self.run_id
+                    or frame["role"] != self.role
+                    or frame["ppid"] != self.launch_parent.verify()["pid"]
+                    or isinstance(frame["pid"], bool)
+                    or not isinstance(frame["pid"], int)
+                    or frame["pid"] <= 0
+                ):
+                    raise CustodyError("custody registration frame is invalid")
+                pre = _peer_token(connection)
+                if pre["pid"] != frame["pid"] or pre["uid"] != platform.current_user():
+                    raise CustodyError("custody registration kernel identity differs")
+                return connection, frame
+            except (CustodyError, OSError, ValueError, UnicodeDecodeError):
+                connection.close()
+                continue
+
     def _serve(self) -> None:
         connection: socket.socket | None = None
         try:
             if sys.platform == "win32":
                 deadline = time.monotonic() + self.timeout
                 connection, _ = self.listener.accept_child(self.launch_parent.verify(), deadline=deadline)
+                connection.settimeout(self.timeout)
+                frame = _read_frame(connection)
             else:
-                connection, _ = self.listener.accept()
-            connection.settimeout(self.timeout)
-            frame = _read_frame(connection)
+                connection, frame = self._accept_registration(deadline=time.monotonic() + self.timeout)
             required = {"version", "command", "run_id", "role", "pid", "ppid", "argv_digest"}
             if (
                 set(frame) != required

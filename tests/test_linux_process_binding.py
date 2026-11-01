@@ -219,38 +219,38 @@ def test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child(tmp_path
                 broker.abort_before_spawn()
 
 
-def test_non_child_same_user_connection_is_never_bound_and_holds_the_single_accept_slot():
-    """(c) non-child: an unrelated same-user connection is never registered or bound.
+def test_non_child_same_user_connection_does_not_starve_the_real_child():
+    """(c) non-child / N-tier: a silent same-user stray connection is dropped; the real child seals in time.
 
-    Finding (not fixed here): the Linux listener is listen(1). An unrelated connection that
-    connects first occupies the single accept slot, so a real child registering behind it times
-    out. That is a liveness issue, not a binding bypass; the rogue is never bound.
+    Before the accept loop, a stray that connected first held the single accept slot and starved the real
+    child until timeout. Now the broker closes the stray after a short read and keeps accepting.
     """
     import os
     import socket
+    import threading
     from astrid_runtime import custody_broker as custody
 
-    import shutil
     import tempfile
+    import shutil
     from pathlib import Path
     scope_root = Path(tempfile.mkdtemp(prefix="nc-", dir="/tmp"))
     scope = scope_root / "scope"
     platform.private_directory(scope)
     broker = custody.RoleBoundCustodyBroker(role="host", identity_provider=custody.default_process_identity,
         ledger_root=scope / "admission", authority_scope_root=scope,
-        authority_journal=scope / "admissions.jsonl", owner_epoch="owner", timeout=3)
+        authority_journal=scope / "admissions.jsonl", owner_epoch="owner", timeout=20)
     target = [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
     environment = {**os.environ, **broker.child_environment(target, start_new_session=True)}
     process = rogue = None
     try:
         rogue = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         rogue.settimeout(10)
-        rogue.connect(str(broker.socket_path))
+        rogue.connect(str(broker.socket_path))  # a silent, unrelated same-user connection first
         process = platform.spawn_tree(custody.custody_wrapper_argv(sys.executable), env=environment,
                                       start_new_session=False, close_fds=True)
-        with pytest.raises(custody.CustodyError):
-            broker.wait_until_sealed()
-        assert broker.registration is None  # nothing was bound to the rogue or to the child
+        broker.wait_until_sealed()
+        actor = custody.AuthenticatedCleanupActor.retained_child(process, reap_guard=threading.RLock())
+        assert actor.verify()["pid"] == process.pid  # bound to the real child, never the stray
     finally:
         if rogue is not None:
             rogue.close()
@@ -261,7 +261,6 @@ def test_non_child_same_user_connection_is_never_bound_and_holds_the_single_acce
         else:
             broker.abort_before_spawn()
         shutil.rmtree(scope_root, ignore_errors=True)
-
 
 def test_registration_frame_pid_must_match_the_kernel_peer_pid(tmp_path):
     """(c) frame pid vs peer: a registration frame that names another pid is refused by kernel identity."""
@@ -282,9 +281,10 @@ def test_registration_frame_pid_must_match_the_kernel_peer_pid(tmp_path):
         frame = {"version": custody.PROTOCOL_VERSION, "command": "register_pre_exec", "run_id": broker.run_id,
                  "role": broker.role, "pid": os.getpid() + 1, "ppid": os.getpid(), "argv_digest": "sha256:" + "0" * 64}
         custody._send_frame(peer, frame)
-        with pytest.raises(custody.CustodyError) as refused:
-            broker.wait_until_sealed()
-        assert "kernel identity differs" in str(refused.value)  # the peer-pid check, not an earlier shape check
+        peer.settimeout(10)
+        assert peer.recv(1) == b""  # the broker closed the refused connection (kernel peer pid differs)
+        with pytest.raises(custody.CustodyError):
+            broker.wait_until_sealed()  # no valid registration arrives, so the deadline expires
         assert broker.registration is None
         peer.close()
     finally:
