@@ -278,7 +278,11 @@ def test_terminal_paths_hold_without_proof(world,path):
     else:restart(w)
     assert retained(w)['custody_state']=='unresolved'
     restart(w);restart(w);retained(w)
-    assert reconcile(w)['stop_confirmed']==1
+    if path=='completion':
+        with pytest.raises(ConflictError,match='pending publication'):reconcile(w)
+        retained(w)
+    else:
+        assert reconcile(w)['stop_confirmed']==1
 
 
 def test_concurrent_recovery_commits_one_event_and_generation(world):
@@ -380,7 +384,8 @@ def test_exact_pending_publication_bytes_survive_restart_and_no_late_overwrite(w
     restart(w);restart(w)
     assert w['service'].cas.read(publication[0]['digest'])==exact
     assert retained(w)['pending_publication_json']==pending
-    reconcile(w)
+    with pytest.raises(ConflictError,match='pending publication'):reconcile(w)
+    retained(w)
     with pytest.raises(ConflictError):
         w['service'].store.custody.update(r['custody_id'],expected_version=1,custody_seq=999,state='active',binding_digest=r['install_binding_digest'],dispatch_intent_id='late')
 

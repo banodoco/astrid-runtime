@@ -92,6 +92,7 @@ def test_rollback_after_admitted_writes_refuses_without_erasing(tmp_path):
         store.conn.execute("INSERT INTO user_preferences VALUES ('owner','new-write','admitted after migration',1,'t','t')")
     before=tree(root)
     with pytest.raises(ConflictError):life.rollback(root,archive)
+    with pytest.raises(ConflictError):life.old.restore(root,archive)
     assert tree(root)==before
     with RealmStore(root) as store:
         assert store.conn.execute('SELECT content FROM user_preferences').fetchone()[0]=='admitted after migration'

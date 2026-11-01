@@ -88,3 +88,9 @@ Legacy in-flight attempts without custody are quarantined without synthesizing
 custody or stop history. An authenticated exit for that legacy category requires
 a separate design decision. Migrated-realm relocation also requires an explicit
 v34 journal handoff; this lane leaves an unmatched root binding closed.
+
+A stop proof with an uncommitted successful terminal publication currently stages
+verified evidence and refuses release. The exact request bytes and linkage remain
+pinned. This lane does not invent a success, cancellation, or replacement journal
+outcome for that publication. The authorized publication replay/finalization
+protocol needs design clarification before tracked installation can be enabled.

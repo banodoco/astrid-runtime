@@ -610,6 +610,14 @@ class Custody:
                 mode = body['mode']
                 disposition = 'released_observed_stop' if mode == 'reconcile' else 'lost_fenced'
                 state = 'lost_fenced' if mode == 'lost' else 'released'
+                task = self.db.execute('SELECT * FROM tasks WHERE id=?', (row['task_id'],)).fetchone()
+                pending = json.loads(current['pending_publication_json'] or '{}')
+                if (state == 'released' and pending.get('kind') == 'completion'
+                        and task['status'] not in {'completed','failed','cancelled'}):
+                    # A stop proof cannot manufacture or discard a successful
+                    # pending publication or its journal linkage. Keep custody
+                    # until that exact publication has an authorized outcome.
+                    raise ConflictError('pending publication needs independent reconciliation before custody release')
                 stop = mode == 'reconcile'
                 if mode in {'lost','repair'}:
                     evidence = envelope['fencing_evidence']

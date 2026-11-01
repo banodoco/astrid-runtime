@@ -313,6 +313,8 @@ def restore(root, archive):
     """
     root, archive = Path(root), Path(archive)
     record = read_record(archive / "activation.json")
+    if record.get("format") == "astrid-v34-activation/v1":
+        raise ConflictError("v34 rollback is refused; resume custody activation and preserve admitted writes")
     if record["realm_root"] != str(root) or record["state"] == "ready" or record.get("prior_launch_started"):
         raise ConflictError("automatic restore is confined to the fenced pre-admission window")
     check_root_binding(root, record["root_identity"])
