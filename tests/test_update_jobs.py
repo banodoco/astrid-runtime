@@ -714,15 +714,14 @@ def test_explicit_update_returns_agent_recovery_without_a_second_launch(tmp_path
         return real_helper(python, agent, runtime, payload, **kwargs)
 
     admission._helper = helper
-    result = admission.request()
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
 
     assert selection_calls == [{"allow_pending": True}]
     assert helper_actions == [None, "accept"]
     assert launches == []
-    assert result == {
-        "accepted": False, "state": "rolled_back", "operation_id": "b" * 32,
-        "message": "Recovered your previous version — run Update again",
-    }
+    assert error.value.details["reason"] == "acknowledgement-unknown"
+    assert str(error.value) == "The update result is uncertain. Check update status before taking another action."
     assert prepared and not prepared[0].exists()
 
 

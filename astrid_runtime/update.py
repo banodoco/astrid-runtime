@@ -318,9 +318,14 @@ class UpdateAdmission:
                     # the installer lock. That explicit recovery ends this
                     # request; only a newly accepted matching ID may launch.
                     if returned_state in {"updated", "rolled_back", "failed"}:
-                        return {"accepted": False, "state": returned_state,
-                                "operation_id": returned_operation,
-                                "message": job.get("message") or job.get("result")}
+                        # The legacy helper reply does not contain the durable
+                        # confirmation required to report a recovery result.
+                        # A returned object would be sent as HTTP 202 by the
+                        # route even though no new operation was accepted.
+                        raise UpdateRefusal(
+                            "acknowledgement-unknown",
+                            "The update result is uncertain. Check update status before taking another action.",
+                        )
                     raise UpdateRefusal("busy", "The unresolved update was not safely reconciled; no job was launched.")
                 if returned_state not in {"accepted", "launching", "active"}:
                     raise UpdateRefusal("busy", "The update is not accepted for launch.")
