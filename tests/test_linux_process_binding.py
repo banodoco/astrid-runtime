@@ -190,7 +190,6 @@ def test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child(tmp_path
     import os
     import signal as _signal
     import threading
-    from pathlib import Path
     from astrid_runtime import custody_broker as custody
 
     scope = tmp_path / "scope"
@@ -202,11 +201,9 @@ def test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child(tmp_path
     environment = {**os.environ, **broker.child_environment(target, start_new_session=True)}
     process = None
     try:
-        # The production wrapper is `python -I -m astrid_runtime.custody_broker`; -I ignores PYTHONPATH and
-        # would import an unrelated checkout from site-packages. The test runs this lane's module explicitly.
-        lane_root = str(Path(custody.__file__).resolve().parents[1])
-        wrapper = [sys.executable, "-X", "utf8", "-m", "astrid_runtime.custody_broker", "--custody-exec"]
-        environment = {**environment, "PYTHONPATH": lane_root}
+        # Production wrapper argv, exactly; the test interpreter is a task-local venv with this lane installed,
+        # so the -I wrapper resolves this checkout.
+        wrapper = custody.custody_wrapper_argv(sys.executable)
         process = platform.spawn_tree(wrapper, env=environment, start_new_session=False, close_fds=True)
         broker.wait_until_sealed()
         actor = custody.AuthenticatedCleanupActor.retained_child(process, reap_guard=threading.RLock())
