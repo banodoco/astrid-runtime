@@ -32,8 +32,11 @@ _STATUS_REASONS = frozenset({"busy", "autostart-off", "unsupported-service-manag
 
 
 class UpdateRefusal(ConflictError):
-    def __init__(self, reason, message):
-        super().__init__(message, details={"reason": reason})
+    def __init__(self, reason, message, *, remediation=None):
+        details = {"reason": reason}
+        if remediation in {"M1", "M2", "M3", "M4", "M5", "M6", "wait"}:
+            details["remediation"] = remediation
+        super().__init__(message, details=details)
 
 
 def _path(value):
@@ -278,10 +281,16 @@ class UpdateAdmission:
                 if (not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
                         or state not in {"updated", "rolled_back", "failed"}):
                     raise UpdateRefusal("busy", "The reconciled update result is incomplete; no job was launched.")
+                # The HTTP boundary consumes this private discriminator to
+                # create H3.  It never crosses the frozen accepted POST wire
+                # contract because this path is a 409 reconciliation result.
                 return {"accepted": False, "state": state, "operation_id": operation_id,
-                        "message": prior.get("message") or prior.get("result") or state}
+                        "message": prior.get("message") or prior.get("result") or state,
+                        "disposition": disposition}
             if disposition != "prepare-new":
-                raise UpdateRefusal("busy", "The update reconciliation did not grant preparation; no job was launched.")
+                remediation = p1.get("remediation") if isinstance(p1, dict) else None
+                raise UpdateRefusal("busy", "The update reconciliation did not grant preparation; no job was launched.",
+                                    remediation=remediation or "M1")
 
             _assert_autostart_supported(selected_record)
             temporary = None
