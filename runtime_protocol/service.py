@@ -503,6 +503,7 @@ def _verified_mutation(function):
     def wrapped(self, *args, **kwargs):
         with self.store._mutex:
             self._assert_mutation_admitted()
+            self._capture_custody_publication(function.__name__, args, kwargs)
             return function(self, *args, **kwargs)
     return wrapped
 
@@ -515,6 +516,7 @@ def _durable_mutation(function=None, *, reap_task_lifetimes=False):
     def wrapped(self, *args, **kwargs):
         with self.store._mutex:
             self._assert_mutation_admitted()
+            self._capture_custody_publication(function.__name__, args, kwargs)
             if reap_task_lifetimes:
                 # A rejected late settlement must not roll back its independent
                 # Runtime-owned terminal deadline transition.
@@ -7894,12 +7896,70 @@ class RuntimeService:
         return self._command_record("task.abandon", task_id, idempotency_key, request_hash, result,
             project_id=project_id, event_ids=event_ids, primary_stream_id=current["run"]["id"])
 
+    def _capture_custody_publication(self, operation, args, kwargs):
+        if operation not in {"settle_attempt", "fail_attempt", "cancel_task_canonical"}:
+            return
+        body = args[1] if len(args)>1 else kwargs.get("body")
+        if not isinstance(body, dict) or not ({"outputs", "result"} & set(body)):
+            return
+        aggregate = args[0] if args else kwargs.get("attempt_id", kwargs.get("task_id"))
+        if operation == "cancel_task_canonical":
+            row = self.store.conn.execute("SELECT * FROM attempts WHERE id=? AND task_id=?", (body.get("attempt_id"), aggregate)).fetchone()
+            task_id = aggregate
+            kind = "task.cancel"
+        else:
+            row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (aggregate,)).fetchone()
+            task_id = row["task_id"] if row else None
+            kind = "attempt.settle" if operation == "settle_attempt" else "attempt.fail"
+        custody = self.store.custody.blocking(task_id) if task_id else None
+        if not custody:
+            return
+        self._assert_attempt_identity(row, kwargs.get("identity"))
+        self._validate_attempt_lease(row, body, self.store._current_runtime_epoch())
+        self._validate_terminal_result_body(body)
+        allowed = {"lease_id", "fence", "runtime_epoch", "outputs", "result"}
+        allowed |= {"effect"} if operation == "settle_attempt" else {"error"} if operation == "fail_attempt" else {"attempt_id", "expected_version", "stop_observed"}
+        if set(body) - allowed:
+            raise ValidationError("unsupported custody publication fields")
+        key = require_idempotency_key(kwargs.get("idempotency_key"))
+        task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        project = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0] or "unscoped"
+        identity_field = "task_id" if operation == "cancel_task_canonical" else "attempt_id"
+        request_hash = hashlib.sha256(canonical_json({identity_field: aggregate, "body":body}).encode()).hexdigest()
+        if self._command_replay(kind, aggregate, key, request_hash, project_id=project) is not None:
+            return
+        from .custody import encoded, MAX_OBJECT
+        payload = encoded({"operation":kind, "idempotency_key":key, identity_field:aggregate, "body":body})
+        ref = "publication:" + hashlib.sha256(payload).hexdigest()
+        refs = json.loads(custody["evidence_refs_json"])
+        if any(item["ref"] == ref for item in refs):
+            return
+        # An exact raw publication, including inline output bytes, survives
+        # cleanup of ordinary settlement staging. External CAS references are
+        # pinned as recovery evidence too. No normal terminal result releases it.
+        objects = []
+        for output in body.get("outputs", []):
+            if isinstance(output,dict) and output.get("kind", "object")=="object" and "data_base64" not in output:
+                object_digest = str(output.get("digest", "")).removeprefix("sha256:")
+                with self.cas.open(object_digest) as stream:
+                    data = stream.read(MAX_OBJECT+1)
+                if hashlib.sha256(data).hexdigest() != object_digest:
+                    raise ConflictError("custody publication object is corrupt")
+                objects.append(("output:"+object_digest,data))
+        for object_ref, data in [(ref,payload), *objects]:
+            current = self.store.custody.row(custody["custody_id"])
+            if any(item["ref"] == object_ref for item in json.loads(current["evidence_refs_json"])):
+                continue
+            self.store.custody.stage_evidence(current["custody_id"],data,
+                expected_version=current["custody_version"],custody_seq=current["custody_seq"]+1,ref=object_ref)
+
     @_verified_mutation
     def reconcile_task_custody(self, task_id, body, *, idempotency_key, identity):
         # Separate recovery authority; no reuse of ordinary lease credentials.
         self._assert_mutation_admitted()
         return self.store.custody.reconcile(task_id, body, identity=identity, idempotency_key=idempotency_key)
 
+    @_verified_mutation
     def retry_task(self, task_id, body=None, *, idempotency_key=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = {} if body is None else body

@@ -54,7 +54,8 @@ LEGACY_TABLES = frozenset(
         "workers",
     }
 )
-NEW_TABLES = frozenset({
+from .custody_schema import CUSTODY_TABLES
+NEW_TABLES = CUSTODY_TABLES | frozenset({
     "runtime_schema", "managed_output_associations", "managed_output_lifecycle", "user_preferences", "user_app_state", "task_specs",
     "internal_timeline_revisions", "shot_revisions", "parent_composition_revisions",
     "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences",
@@ -348,11 +349,17 @@ def _canonical_shape_for(version: int, *, family: str | None = None) -> tuple[se
         TIMELINE_NAME_TARGET_SCHEMA_VERSION,
         APP_STATE_TARGET_SCHEMA_VERSION,
         TIMELINE_COMMIT_TARGET_SCHEMA_VERSION,
+        33,
         SCHEMA_VERSION,
     }:
         raise ValidationError(f"canonical schema version {version} is not supported")
     tables = set(REQUIRED_SCHEMA_TABLES)
     columns = {table: set(values) for table, values in REQUIRED_SCHEMA_COLUMNS.items()}
+    if version < 34:
+        from .custody_schema import CUSTODY_TABLES
+        for table in CUSTODY_TABLES:
+            tables.discard(table)
+            columns.pop(table, None)
     if version == 32 and family not in {"M32", "TL32"}:
         raise ValidationError("v32 shape requires the classified M32 or TL32 family")
     if version < APP_STATE_TARGET_SCHEMA_VERSION or family == "H31":
@@ -979,7 +986,18 @@ def _reclaim_after_migration(connection: sqlite3.Connection) -> dict[str, object
     return {"performed": True, "reclaimed_bytes": free_bytes}
 
 
-def migrate_canonical_to_current(
+def migrate_canonical_to_current(root, *, timeout_seconds=DEFAULT_UPGRADE_TIMEOUT_SECONDS, confirmation=None, expected_realm_id=None):
+    identity = inspect_realm_schema(root, expected_realm_id=expected_realm_id)
+    if identity['version'] in {33, 34}:
+        from .v34_lifecycle import migrate
+        return migrate(root, confirmation=confirmation, expected_realm_id=expected_realm_id, timeout_seconds=timeout_seconds)
+    # Complete the historical classifier/backfill before custody activation.
+    # This preserves the round-1b recovery archive and provider readiness gate.
+    result = migrate_canonical_to_v33(root, confirmation=confirmation, expected_realm_id=expected_realm_id, timeout_seconds=timeout_seconds)
+    return {**result, 'next_action': 'finish_v33_activation_then_migrate_v34', 'admission_closed': True}
+
+
+def migrate_canonical_to_v33(
     root: str | Path,
     *,
     timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
@@ -1005,7 +1023,7 @@ def migrate_canonical_to_current(
     pending = lifecycle.activation(root)
     if pending and pending[1]["state"] in {"restoring", "restored"}:
         raise ConflictError("full-set restoration is incomplete; use explicit operator recovery")
-    if source_version == SCHEMA_VERSION and pending and pending[1]["state"] != "ready":
+    if source_version == 33 and pending and pending[1]["state"] != "ready":
         with _owner_fence(root):
             connection = sqlite3.connect(root / "realm.sqlite3", timeout=float(timeout_seconds))
             connection.row_factory = sqlite3.Row
@@ -1015,13 +1033,13 @@ def migrate_canonical_to_current(
                 connection.close()
         return {"ok": True, "realm_id": realm_id, "source_schema_version": 33, "target_schema_version": 33,
                 "changed": False, "steps": [], "backfill": completion, "recovery_set": str(pending[0])}
-    if source_version == SCHEMA_VERSION:
+    if source_version == 33:
         lifecycle.check_startup(root)
         return {
             "ok": True,
             "realm_id": realm_id,
             "source_schema_version": source_version,
-            "target_schema_version": SCHEMA_VERSION,
+            "target_schema_version": 33,
             "steps": [],
             "changed": False,
         }
@@ -1089,7 +1107,7 @@ def migrate_canonical_to_current(
                 "recovery_set": str(archive),
                 "realm_id": realm_id,
                 "source_schema_version": source_version,
-                "target_schema_version": SCHEMA_VERSION,
+                "target_schema_version": 33,
                 "steps": steps,
                 "changed": True,
                 "vacuum": _reclaim_after_migration(connection),
@@ -1259,7 +1277,7 @@ def _copy_shared(source: sqlite3.Connection, target: sqlite3.Connection, columns
             _validate_spec_records(target)
             target.execute(
                 "INSERT INTO runtime_schema(id, format_id, version, created_at) VALUES (1, ?, ?, ?)",
-                (CANONICAL_FORMAT_ID, SCHEMA_VERSION, now()),
+                (CANONICAL_FORMAT_ID, 33, now()),
             )
             target.commit()
             target.execute("PRAGMA foreign_keys=ON")
@@ -1290,8 +1308,11 @@ def _validate_candidate(target: sqlite3.Connection, root: Path, timeout: float) 
     inspector.conn = target
     inspector._mutex = threading.RLock()
     report = inspector._integrity_report(deadline=time.monotonic() + timeout)
-    if not report.get("ok"):
+    if not report.get("ok") and report.get("issues") != ["schema"]:
         raise ValidationError("staged database failed canonical validation", details=report)
+    from .v33_manifest import canonical_manifest
+    if canonical_manifest(target)["kind"] != "U33":
+        raise ValidationError("legacy candidate must produce pinned U33")
     return report
 
 
@@ -1442,7 +1463,7 @@ def upgrade_realm(
                 "state": "validated",
                 "operation_id": archive.name.removeprefix("v23-"),
                 "source_schema_version": int(source_version),
-                "target_schema_version": SCHEMA_VERSION,
+                "target_schema_version": 33,
                 "source_realm_id": realm_id,
                 "shared_tables": fingerprints,
                 "historical_managed_outputs": {
@@ -1479,7 +1500,7 @@ def upgrade_realm(
                 "backup_retained": bool(retain_backup),
                 "root": str(root),
                 "source_schema_version": int(source_version),
-                "target_schema_version": SCHEMA_VERSION,
+                "target_schema_version": 33,
                 "shared_tables": fingerprints,
                 "historical_managed_outputs": {
                     "migrated": historical_inserted,

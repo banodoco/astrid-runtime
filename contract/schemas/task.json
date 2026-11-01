@@ -34,6 +34,7 @@
         "output_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
     }
+    ,"custody": { "$ref": "attempt-custody.json#/definitions/Disposition" }
     ,"waiting_reason": { "type": "string" }
     ,"lease_fence": { "type": "integer", "minimum": 1 }
     ,"lease_expires_at": { "type": "string", "format": "date-time" }

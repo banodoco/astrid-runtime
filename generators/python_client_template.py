@@ -1514,6 +1514,11 @@ class WorkspaceClient:
         _, _, body = self._request("GET", f"/v1/control/tasks/{_path_part(task_id)}/settlement")
         return self._json(body)
 
+    def reconcile_task_custody(self, task_id: str, body: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/control/tasks/{_path_part(task_id)}/reconcile",
+            body=json.dumps(dict(body), separators=(",", ":")).encode(),
+            headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
     def abandon_task(self, task_id: str, body: Mapping[str, Any], *, idempotency_key: str) -> MutationResult:
         return self._mutation_json(self._request("POST", f"/v1/control/tasks/{_path_part(task_id)}/abandon",
             body=json.dumps(dict(body), separators=(",", ":")).encode(),

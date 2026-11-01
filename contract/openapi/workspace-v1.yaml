@@ -821,6 +821,13 @@ paths:
       operationId: getTaskSettlement
       parameters: [ { name: task_id, in: path, required: true, schema: { type: string, minLength: 1 } } ]
       responses: { '200': { description: Owner-only exact task settlement observation using lifecycle blockers, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/TaskSettlement' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/control/tasks/{task_id}/reconcile:
+    post:
+      operationId: reconcileTaskCustody
+      description: Owner/admin recovery of durable attempt custody. Requires a persisted idempotency key, exact old identity, CAS version, target generation and a real installation-scoped Ed25519 proof. No change to update framing or journal identity.
+      parameters: [ { name: task_id, in: path, required: true, schema: { type: string, minLength: 1 } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/attempt-custody.json' } } } }
+      responses: { '200': { description: Durable custody disposition, content: { application/json: { schema: { $ref: './schemas/attempt-custody.json#/definitions/Disposition' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/control/tasks/{task_id}/abandon:
     post:
       operationId: abandonTask

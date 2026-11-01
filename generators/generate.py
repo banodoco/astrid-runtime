@@ -152,6 +152,11 @@ def render_typescript_client() -> str:
     source = '\n'.join(generation_query_method if line.startswith('  async listGenerations(') else line for line in source.split('\n'))
     task_query_method = '  async listProjectTasks(projectId: string, cursor?: string, limit = 50, kind?: "root_generation", order?: "admitted_desc"): Promise<Page<Task>> { return this.page((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/tasks?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}${kind !== undefined ? `&kind=${encodeURIComponent(kind)}` : ""}${order !== undefined ? `&order=${encodeURIComponent(order)}` : ""}`)).body) }'
     source = '\n'.join(task_query_method if line.startswith('  async listProjectTasks(') else line for line in source.split('\n'))
+    custody_method = '  async reconcileTaskCustody(taskId: string, body: Record<string, unknown>, idempotencyKey: string): Promise<Record<string, unknown>> { return this.json((await this.request("POST", `/v1/control/tasks/${encodeURIComponent(taskId)}/reconcile`, new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body) }'
+    if '  async reconcileTaskCustody(' in source:
+        source = '\n'.join(custody_method if line.startswith('  async reconcileTaskCustody(') else line for line in source.split('\n'))
+    else:
+        source = source.replace('  async getLocalWorkerGeneration(', custody_method + '\n  async getLocalWorkerGeneration(', 1)
     abandon_types = ('export interface TaskAbandonRequest { expected_task_version: number; attempt_id: string; lease_id: string; fence: number; runtime_epoch: number; execution_binding: NonNullable<Task["execution_binding"]>; reason: string }\n'
         'export interface TaskAbandonResult { task_id: string; run_id: string; attempt_id: string; disposition: "lost"; reason: string; remote_stop_confirmed: false; billing_stop_confirmed: false; task: Task }')
     if 'export interface TaskAbandonRequest ' not in source:

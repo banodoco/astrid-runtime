@@ -89,6 +89,11 @@ def retire_terminal_specs(connection: sqlite3.Connection, *, retention_days: int
         raise ValidationError("retention_days must be an integer of at least 2")
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(timespec="milliseconds")
     replay_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=IDEMPOTENCY_RESULT_WINDOW_SECONDS)).isoformat(timespec="milliseconds")
+    custody_guard = (
+        "AND id NOT IN (SELECT task_id FROM attempt_custody WHERE custody_state<>'released') "
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='attempt_custody'").fetchone()
+        else ""
+    )
     retired_tasks = connection.execute(
         "UPDATE tasks SET spec_digest=NULL, expected_effect_json=NULL, execution_request_json=NULL "
         "WHERE spec_digest IS NOT NULL AND status IN ('completed','failed','cancelled') AND updated_at < ? "
@@ -96,6 +101,7 @@ def retire_terminal_specs(connection: sqlite3.Connection, *, retention_days: int
         "AND r.updated_at < ? AND NOT EXISTS (SELECT 1 FROM command_idempotency c "
         "WHERE c.command_kind='task.create' AND c.aggregate_id=COALESCE(r.project_id,'unscoped') "
         "AND c.idempotency_key=r.idempotency_key AND c.created_at >= ?)) "
+        + custody_guard +
         "AND id NOT IN (SELECT d.predecessor_task_id FROM task_dependencies d "
         "JOIN tasks active ON active.id=d.continuation_task_id "
         "WHERE active.status NOT IN ('completed','failed','cancelled'))",
@@ -1314,12 +1320,15 @@ class RealmStore:
                     (boot_id, epoch, started_at),
                 )
                 interrupted = self.conn.execute(
-                    "SELECT id, run_id, status, lease_token, lease_fence, attempt, attempt_id "
+                    "SELECT id, run_id, status, lease_token, lease_fence, attempt, attempt_id, waiting_reason "
                     "FROM tasks WHERE status IN ('running', 'cancel_requested') ORDER BY rowid"
                 ).fetchall()
                 for task in interrupted:
                     latest = self.conn.execute("SELECT status FROM tasks WHERE id=?", (task["id"],)).fetchone()
                     if latest["status"] not in {"running", "cancel_requested"}:
+                        continue
+                    if task["waiting_reason"] == "legacy_install_custody_unknown":
+                        self.conn.execute("UPDATE tasks SET lease_expires_at=NULL WHERE id=?", (task["id"],))
                         continue
                     self.contain_delegated_children(task["id"], attempt_id=task["attempt_id"], reason="parent_runtime_epoch_ended")
                     if self.custody.hold(task["id"], "runtime_restart"):
@@ -2558,6 +2567,10 @@ class RealmStore:
             raise ValidationError("capability is required")
         if not isinstance(spec, dict):
             raise ValidationError("task spec must be an object")
+        from .custody import declared_binding
+        install_binding = declared_binding(spec)
+        if isinstance(install_binding, dict):
+            self.custody.assert_clear(installation_id=install_binding.get("installation_id"))
         if "_runtime_render_admission" in spec:
             raise ValidationError("render admission identity is Runtime-owned")
         if "execution_binding" in spec or (
@@ -3332,11 +3345,13 @@ class RealmStore:
 
     def release_execution_attempt(self, task_id, *, status="released"):
         """Close the current projection without deleting its placement facts."""
+        if status == "released":
+            self.custody.assert_clear(task_id=task_id)
         if status not in {"released", "stale"}:
             raise ValidationError("execution binding terminal status is invalid")
         self.conn.execute(
-            "UPDATE execution_bindings SET status=?, updated_at=? WHERE task_id=? AND status='claimed'",
-            (status, now(), str(task_id)),
+            "UPDATE execution_bindings SET status=?, updated_at=? WHERE task_id=? AND (status='claimed' OR (status='stale' AND ?='released'))",
+            (status, now(), str(task_id), status),
         )
 
     def _reconcile_runtime_attempt(self, task_id, attempt_id):
@@ -3347,6 +3362,7 @@ class RealmStore:
         recovery/terminal transaction and records the durable disposition
         event after this update.
         """
+        self.custody.assert_clear(task_id=task_id)
         if not attempt_id:
             return None
         self.contain_delegated_children(task_id, attempt_id=attempt_id, reason="parent_attempt_reconciled")
@@ -3840,6 +3856,8 @@ class RealmStore:
         for row in self._overdue_lease_rows():
             latest = self.conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
             if latest["status"] not in {"queued", "running", "cancel_requested"}:
+                continue
+            if latest["waiting_reason"] == "legacy_install_custody_unknown":
                 continue
             if self.custody.hold(row["id"], "lease_or_deadline_expired"):
                 continue
@@ -7191,6 +7209,9 @@ class RealmStore:
         if {"timeline_commit_history", "timeline_document_input_contents", "timeline_document_input_links"}.issubset(actual_tables):
             from .timeline_commit_store import TimelineCommitStore
             revision_errors.extend(TimelineCommitStore(self, validate_prepared=None).integrity_errors())
+        from .custody_schema import CUSTODY_TABLES
+        if CUSTODY_TABLES.issubset(actual_tables):
+            relational_errors.extend(self.custody.integrity_errors())
         healthy = sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and not relational_errors and not revision_errors and catalog_check["ok"] and activation_check["ok"]
         issues = []
         if not sqlite_ok: issues.append("sqlite_integrity")

@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrid.haus/workspace/v1/schemas/attempt-custody.json",
+  "title": "Attempt custody v34 reconciliation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "custody_id",
+    "mode",
+    "expected_custody_version",
+    "old_identity_digest",
+    "target_recovery_generation",
+    "proof"
+  ],
+  "properties": {
+    "custody_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "mode": {
+      "enum": [
+        "reconcile",
+        "repair",
+        "lost"
+      ]
+    },
+    "expected_custody_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "old_identity_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "target_recovery_generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "envelope",
+        "signature"
+      ],
+      "properties": {
+        "envelope": {
+          "type": "object",
+          "description": "Versioned domain-separated canonical JSON; exact fields are validated by the Runtime verifier."
+        },
+        "signature": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "minLength": 88,
+          "maxLength": 88
+        }
+      }
+    }
+  },
+  "definitions": {
+    "Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "realm_id",
+        "installation_id",
+        "custody_id",
+        "task_id",
+        "attempt_id",
+        "lease_id",
+        "executor_id",
+        "executor_incarnation",
+        "fence",
+        "runtime_epoch",
+        "capability_digest",
+        "source_digest",
+        "definition_digest",
+        "install_binding_digest"
+      ],
+      "properties": {
+        "realm_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "installation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "custody_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "lease_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "executor_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "executor_incarnation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "fence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "runtime_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "capability_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "definition_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "install_binding_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "Disposition": {
+      "type": "object",
+      "required": [
+        "custody_id",
+        "custody_state",
+        "custody_version",
+        "custody_seq",
+        "recovery_generation",
+        "disposition",
+        "stop_confirmed"
+      ],
+      "properties": {
+        "custody_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "custody_state": {
+          "enum": [
+            "armed",
+            "dispatching",
+            "active",
+            "unresolved",
+            "proof_staged",
+            "lost_fenced",
+            "released"
+          ]
+        },
+        "custody_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "custody_seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "recovery_generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "disposition": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "released_observed_stop",
+            "released_completed",
+            "lost_fenced",
+            null
+          ]
+        },
+        "stop_confirmed": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

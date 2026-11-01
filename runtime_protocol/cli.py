@@ -95,6 +95,8 @@ def _parser():
     canonical.add_argument("--root", required=True)
     canonical.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
     canonical.add_argument("--confirm", required=True)
+    custody_activate = sub.add_parser("activate-custody", help="offline verify the full v34 recovery set and open admission")
+    custody_activate.add_argument("--root", required=True)
     reconcile = sub.add_parser("migrate-managed-outputs", help="materialize verified associations for historical settled render outputs")
     reconcile.add_argument("--root", required=True)
     reconcile.add_argument("--project-id")
@@ -275,6 +277,15 @@ def _main(args):
         try:
             result = migrate_canonical_to_current(args.root, timeout_seconds=args.timeout,
                                                   confirmation=args.confirm)
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "activate-custody":
+        from .v34_lifecycle import activate
+        try:
+            result = activate(args.root)
         except RuntimeErrorBase as exc:
             print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
             return 1

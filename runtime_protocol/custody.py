@@ -28,8 +28,10 @@ MAX_REFS = 32
 MAX_ROWS = 1024
 MAX_EVIDENCE = 1024 ** 3
 MAX_OBJECT = 8 * 1024 ** 2
-# Reserve one maximum-sized recovery object, independent of ordinary capacity.
-RECOVERY_BUDGET = MAX_OBJECT
+# Hold one maximum-sized recovery object and two bounded signed envelopes
+# (lost then repair) before dispatch. Ordinary evidence cannot spend proof space.
+PROOF_BUDGET = 2 * MAX_METADATA
+RECOVERY_BUDGET = MAX_OBJECT + PROOF_BUDGET
 INVOCATION_SECONDS = 30
 AUTOMATIC_RETRIES = 5
 PROOF_DOMAIN = b'astrid-runtime/attempt-custody/stop/v1\x00'
@@ -88,6 +90,10 @@ def timestamp(value):
         raise ValidationError('custody timestamp requires an explicit timezone') from exc
 
 
+def declared_binding(spec):
+    return spec.get('install_binding') or (spec.get('spec') or {}).get('install_binding')
+
+
 def signed_bytes(envelope, *, repair=False):
     return (REPAIR_DOMAIN if repair else PROOF_DOMAIN) + encoded(envelope)
 
@@ -110,6 +116,10 @@ class Custody:
         return self.db.execute("SELECT * FROM attempt_custody WHERE task_id=? AND custody_state<>'released'", (str(task_id),)).fetchone()
 
     def assert_clear(self, task_id=None, installation_id=None):
+        if task_id is not None:
+            legacy = self.db.execute("SELECT waiting_reason FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+            if legacy and legacy['waiting_reason'] == 'legacy_install_custody_unknown':
+                raise ConflictError('legacy in-flight work remains quarantined until independent recovery')
         if task_id is not None and self.blocking(task_id):
             raise ConflictError('attempt custody requires independent reconciliation', details={'reason': 'attempt_custody_unresolved'})
         if installation_id is not None:
@@ -123,15 +133,51 @@ class Custody:
         self.assert_clear(task_id=task_id)
         task = self.db.execute('SELECT * FROM tasks WHERE id=?', (str(task_id),)).fetchone()
         if task:
-            binding = self.store._spec(task).get('install_binding')
+            binding = declared_binding(self.store._spec(task))
             if binding:
                 self.assert_clear(installation_id=binding.get('installation_id'))
 
     def public(self, row):
         return {k: row[k] for k in ('custody_id', 'custody_state', 'custody_version', 'custody_seq',
                 'recovery_generation', 'recovery_ref', 'disposition', 'stop_confirmed', 'dispatch_intent_id')} | {
+                'stop_confirmed': bool(row['stop_confirmed']),
                 'hold_reason': 'attempt_custody_unresolved' if row['custody_state'] != 'released' else None,
                 'next_action': 'owner_reconcile_repair_or_lost' if row['custody_state'] != 'released' else None}
+
+    def integrity_errors(self):
+        errors = []
+        try:
+            realm = self.db.execute('SELECT id FROM realm').fetchone()[0]
+            for row in self.db.execute('SELECT * FROM attempt_custody'):
+                self._bounded_row(row)
+                if row['realm_id'] != realm:
+                    raise ConflictError('custody realm differs')
+                refs = json.loads(row['evidence_refs_json'])
+                if not isinstance(refs, list) or len(refs) > MAX_REFS:
+                    raise ValidationError('invalid custody evidence inventory')
+                for ref in refs:
+                    opaque(ref['ref']); sha(ref['digest'])
+                    if not self.db.execute('SELECT 1 FROM custody_evidence_pins WHERE custody_id=? AND digest=?', (row['custody_id'],ref['digest'])).fetchone():
+                        raise ConflictError('custody evidence pin missing')
+                if row['custody_state'] != 'released':
+                    self._validate_binding(row)
+                    self._assert_reservations(row)
+                elif (row['released_version'] is None or row['released_seq'] is None or not row['disposition_digest']):
+                    raise ConflictError('released custody tombstone missing')
+                if row['custody_state'] in {'released','lost_fenced'} and not row['permit_revoked']:
+                    raise ConflictError('custody disposition without permit revocation')
+            for row in self.db.execute('SELECT * FROM custody_evidence'):
+                count = self.db.execute('SELECT COUNT(*) FROM custody_evidence_pins WHERE digest=?', (row['digest'],)).fetchone()[0]
+                obj = self.db.execute('SELECT size FROM objects WHERE digest=?', (row['digest'],)).fetchone()
+                if row['refcount'] != count or obj is None or obj['size'] != row['size']:
+                    raise ConflictError('custody evidence refcount or object metadata differs')
+        except (ConflictError, ValidationError, ValueError, TypeError, KeyError) as exc:
+            errors.append({'table': 'attempt_custody', 'reason': str(exc)})
+        return errors
+
+    def _bounded_row(self, row):
+        if len(encoded(dict(row))) > MAX_METADATA:
+            raise ValidationError('total custody metadata exceeds 64 KiB')
 
     def _event(self, row, kind, facts=None):
         task = self.db.execute('SELECT run_id FROM tasks WHERE id=?', (row['task_id'],)).fetchone()
@@ -151,6 +197,8 @@ class Custody:
         with self.store._mutex, self.store._transaction():
             realm_id = self.db.execute('SELECT id FROM realm').fetchone()[0]
             self.db.execute('INSERT OR IGNORE INTO custody_installations(installation_id, realm_id, created_at) VALUES (?,?,?)', (installation_id, realm_id, now()))
+            if self.db.execute('SELECT 1 FROM custody_keys WHERE installation_id=? AND fingerprint=? AND role<>?', (installation_id, hashlib.sha256(raw).hexdigest(), role)).fetchone():
+                raise ConflictError('repair controller must use a separate signer from the supervisor')
             prior = self.db.execute('SELECT * FROM custody_keys WHERE installation_id=? AND key_id=?', (installation_id, key_id)).fetchone()
             if prior:
                 if prior['public_key'] != public_key or prior['role'] != role or prior['revoked_at']:
@@ -191,10 +239,17 @@ class Custody:
         binding = json.loads(row['install_binding_json'])
         if (not task or not attempt or attempt['task_id'] != row['task_id']
                 or any(attempt[k] != row[k] for k in ('fence', 'runtime_epoch', 'executor_id', 'lease_id'))
-                or self.store._spec(task).get('install_binding') != binding
-                or digest(binding) != row['install_binding_digest']):
+                or declared_binding(self.store._spec(task)) != binding
+                or digest(binding) != row['install_binding_digest']
+                or any(binding.get(k) != row[k] for k in ('realm_id','installation_id','capability_digest','source_digest','definition_digest','executor_incarnation'))):
             raise ConflictError('custody full install binding changed')
+        execution = self.store.execution_binding(row['task_id'])
+        if execution and execution.get('executor_incarnation') and execution['executor_incarnation'] != row['executor_incarnation']:
+            raise ConflictError('Runtime execution incarnation differs from custody')
         if live:
+            executor = self.db.execute('SELECT * FROM executors WHERE id=?', (row['executor_id'],)).fetchone()
+            if not executor or str(executor['source_digest']).removeprefix('sha256:') != row['source_digest']:
+                raise ConflictError('live custody source identity changed')
             if (task['status'] != 'running' or task['attempt_id'] != row['attempt_id']
                     or task['lease_token'] != row['lease_id'] or task['lease_fence'] != row['fence']
                     or row['runtime_epoch'] != self.store._current_runtime_epoch()
@@ -227,6 +282,8 @@ class Custody:
         if not isinstance(binding, dict) or any(binding.get(k) != request[k] for k in ('realm_id','installation_id','capability_digest','source_digest','definition_digest','executor_incarnation')):
             raise ConflictError('incomplete install binding')
         request_digest = digest(request)
+        if self.db.in_transaction:
+            raise ConflictError('custody create requires its own durable commit boundary')
         with self.store._mutex, self.store._transaction():
             prior = self.db.execute('SELECT * FROM custody_creates WHERE realm_id=? AND idempotency_key=?', (request['realm_id'], idempotency_key)).fetchone()
             if prior:
@@ -252,9 +309,9 @@ class Custody:
             task = self._validate_binding(row, live=True)
             executor = self.db.execute('SELECT * FROM executors WHERE id=?', (request['executor_id'],)).fetchone()
             capability = self.db.execute('SELECT * FROM capabilities WHERE id=?', (task['capability'],)).fetchone()
-            if (not executor or executor['source_digest'] != request['source_digest'] or not capability
-                    or capability['definition_digest'] != request['definition_digest']
-                    or task['capability_digest'] != request['capability_digest']):
+            if (not executor or str(executor['source_digest']).removeprefix('sha256:') != request['source_digest'] or not capability
+                    or str(capability['definition_digest']).removeprefix('sha256:') != request['definition_digest']
+                    or str(task['capability_digest']).removeprefix('sha256:') != request['capability_digest']):
                 raise ConflictError('custody capability/source/definition differs from admission')
             reservations = [dict(r) for r in self.db.execute('SELECT * FROM reservations WHERE task_id=? AND released_at IS NULL ORDER BY resource_key', (request['task_id'],))]
             if any(r['lease_token'] != request['lease_id'] or any(r[k] != request[k] for k in ('fence','runtime_epoch','executor_id')) for r in reservations):
@@ -265,20 +322,29 @@ class Custody:
             except sqlite3.IntegrityError as exc:
                 raise ConflictError('attempt or installation already has custody') from exc
             row = self.row(row['custody_id'])
+            self._bounded_row(row)
             result = self.public(row)
             self.db.execute('INSERT INTO custody_creates VALUES (?,?,?,?,?)', (row['realm_id'], idempotency_key, row['custody_id'], request_digest, canonical_json(result)))
             self._event(row, 'task.custody_armed')
+            self._boundary('before_create_commit')
+        self._boundary('create_committed')
         # The readback happens after the only authorizing commit.
         return self.public(self.row(row['custody_id']))
 
     def _capacity(self):
-        return self.db.execute('SELECT COALESCE(SUM(size),0) FROM custody_evidence').fetchone()[0] + self.db.execute("SELECT COALESCE(SUM(evidence_budget),0) FROM attempt_custody WHERE custody_state<>'released'").fetchone()[0]
+        return self.db.execute('SELECT COALESCE(SUM(size),0) FROM custody_evidence WHERE refcount>0').fetchone()[0] + self.db.execute("SELECT COALESCE(SUM(evidence_budget),0) FROM attempt_custody WHERE custody_state<>'released'").fetchone()[0]
 
     def hold(self, task_id, reason, *, pending=None):
         """Caller owns the transaction; never erase lineage or pending bytes."""
         row = self.blocking(task_id)
         if not row:
             return False
+        if pending is not None and row['pending_publication_json'] is not None:
+            previous = json.loads(row['pending_publication_json'])
+            if previous != pending:
+                if previous.get('kind') == pending.get('kind'):
+                    raise ConflictError('conflicting pending publication identity or bytes')
+                pending = previous
         if pending is not None and len(encoded(pending)) > MAX_METADATA:
             raise ValidationError('pending custody metadata exceeds 64 KiB; stage evidence first')
         if row['custody_state'] not in {'unresolved', 'lost_fenced'} or pending is not None:
@@ -317,8 +383,11 @@ class Custody:
                 opaque(dispatch_intent_id, 'dispatch_intent_id')
                 if row['dispatch_intent_id'] not in {None, dispatch_intent_id}:
                     raise ConflictError('dispatch ACK differs from exact intent')
+            if len(encoded(json.loads(row['install_binding_json']))) + len(encoded(request)) > MAX_METADATA:
+                raise ValidationError('total custody metadata exceeds 64 KiB')
             self.db.execute('UPDATE attempt_custody SET custody_state=?, custody_version=custody_version+1, custody_seq=?, metadata_json=?, pending_publication_json=COALESCE(?,pending_publication_json), dispatch_intent_id=COALESCE(dispatch_intent_id,?), updated_at=? WHERE custody_id=? AND custody_version=?', (state, custody_seq, canonical_json(metadata or {}), canonical_json(pending_publication) if pending_publication is not None else None, dispatch_intent_id, now(), custody_id, expected_version))
             row = self.row(custody_id)
+            self._bounded_row(row)
             self._event(row, 'task.custody_updated')
             return self._record(row, 'update', custody_seq, rd)
 
@@ -335,12 +404,13 @@ class Custody:
                 return replay
             if row['custody_state'] in {'released','lost_fenced'} or row['custody_version'] != expected_version or custody_seq <= row['custody_seq']:
                 raise ConflictError('stale evidence CAS')
+            self._validate_binding(row)
             refs = json.loads(row['evidence_refs_json'])
-            if len(refs) >= MAX_REFS or any(e['ref'] == ref for e in refs):
+            if len(refs) >= MAX_REFS - 1 or any(e['ref'] == ref for e in refs):
                 raise ConflictError('custody evidence reference bound exhausted or reused')
             existing = self.db.execute('SELECT size FROM custody_evidence WHERE digest=?', (object_digest,)).fetchone()
             needed = 0 if existing else len(data)
-            budget = max(0, row['evidence_budget'] - needed)
+            budget = max(min(PROOF_BUDGET, row['evidence_budget']), row['evidence_budget'] - needed)
             if self._capacity() + needed - (row['evidence_budget'] - budget) > MAX_EVIDENCE:
                 raise ConflictError('custody evidence quota full')
             # Durable immutable bytes precede any database reference.
@@ -361,6 +431,7 @@ class Custody:
                 refs.append({'ref': ref, 'digest': object_digest})
                 self.db.execute('UPDATE attempt_custody SET custody_version=custody_version+1, custody_seq=?, evidence_seq=evidence_seq+1, evidence_refs_json=?, evidence_budget=?, updated_at=? WHERE custody_id=?', (custody_seq, canonical_json(refs), budget, now(), custody_id))
                 row = self.row(custody_id)
+                self._bounded_row(row)
                 self._event(row, 'task.custody_evidence_staged', {'digest': object_digest})
                 return self._record(row, 'evidence', custody_seq, rd)
 
@@ -380,13 +451,15 @@ class Custody:
             raise ValidationError('unsupported or incomplete custody proof envelope')
         if any(e[k] != row[k] or type(e[k]) is not type(row[k]) for k in IDENTITY):
             raise ConflictError('proof old realm/installation/attempt identity differs')
+        integer(e['expected_custody_version'], 'proof expected version', 1)
+        integer(e['target_recovery_generation'], 'proof target generation', 1)
         if (e['dispatch_intent_id'] != row['dispatch_intent_id'] or e['launch_permit_id'] != row['launch_permit_id']
                 or e['expected_custody_version'] != expected_version
                 or e['target_recovery_generation'] != target_generation
                 or e['supervisor_identity'] != json.loads(row['supervisor_identity_json'])):
             raise ConflictError('proof dispatch, supervisor, version or generation differs')
         opaque(e['key_id']); opaque(e['nonce']); timestamp(e['timestamp'])
-        refs = json.loads(row['evidence_refs_json'])
+        refs = [r for r in json.loads(row['evidence_refs_json']) if r['digest'] != digest(proof)]
         if not isinstance(e['evidence_digests'], list) or e['evidence_digests'] != sorted({r['digest'] for r in refs}):
             raise ConflictError('proof evidence inventory differs')
         for value in e['evidence_digests']:
@@ -405,6 +478,8 @@ class Custody:
             if not isinstance(evidence, dict) or evidence.get('kind') not in {'external_absence','isolated_replacement'}:
                 raise ConflictError('repair requires independent fencing evidence')
             sha(evidence.get('evidence_digest'))
+            if evidence['evidence_digest'] not in e['evidence_digests']:
+                raise ConflictError('independent repair fencing evidence must be durably staged')
             if evidence['kind'] == 'isolated_replacement':
                 if set(evidence) != {'kind','evidence_digest','replacement_installation_id'}:
                     raise ValidationError('incomplete replacement fencing evidence')
@@ -427,6 +502,8 @@ class Custody:
                    or not isinstance(b['boot_id'], str) or not b['boot_id']
                    or not isinstance(b['pid_start_time'], str) or not b['pid_start_time'] for b in births):
                 raise ValidationError('proof child births require exact process identities')
+            for callback in e['pending_callbacks']:
+                opaque(callback, 'pending_callback')
             if e['observed_stops'] != births or e['callbacks_revoked'] != e['pending_callbacks']:
                 raise ConflictError('proof does not establish stop and revocation of the full inventory')
         key = self.db.execute('SELECT * FROM custody_keys WHERE installation_id=? AND key_id=?', (row['installation_id'], e['key_id'])).fetchone()
@@ -460,6 +537,8 @@ class Custody:
             if replay is not None:
                 return replay
             stage = self._receipt(row, 'reconcile_stage', idempotency_key, rd)
+            if row['disposition'] == 'lost_fenced' and body['mode'] != 'repair':
+                raise ConflictError('lost custody exits only through authenticated repair')
             if row['custody_state'] == 'released' or target != row['recovery_generation'] + 1:
                 raise ConflictError('stale reconciliation generation')
             if stage is None and row['custody_version'] != expected:

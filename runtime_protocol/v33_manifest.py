@@ -16,6 +16,7 @@ from .errors import ValidationError
 _FORMAT = "astrid-runtime-sqlite-v1"
 # Approved I-RT-01c Appendix A.2; C24-C27 each permit both spec profiles.
 _FINGERPRINTS = {
+    "V34": "8198adec85559f9208729c41b359c407d82fa68846f60888838eb243247ee51f",
     "C24": "d91108a71b88326707421fa36420f9f0c1a1067a5c36ff10889066c244bdb80a",
     "C24-nullable": "ed80756a94630bb4359496008578bd51436164107ba2d9caeee2b5b4fd168bac",
     "C25": "15eda06ce52e720a83629760f6c613170425beab0dd431445cec33f68d5e62f1",
