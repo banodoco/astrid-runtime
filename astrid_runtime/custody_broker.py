@@ -1265,9 +1265,14 @@ class RoleBoundCustodyBroker:
                 if pre["pid"] != frame["pid"] or pre["uid"] != platform.current_user():
                     raise CustodyError("custody registration kernel identity differs")
                 return connection, frame
-            except (CustodyError, OSError, ValueError, UnicodeDecodeError):
+            except (CustodyError, OSError, ValueError, UnicodeDecodeError, linux_process_binding.LinuxBindingError):
+                # Expected peer refusals (including a peer that exited before its identity was read)
+                # reject only this connection; the broker keeps accepting until the deadline.
                 connection.close()
                 continue
+            except BaseException:
+                connection.close()
+                raise
 
     def _serve(self) -> None:
         connection: socket.socket | None = None
