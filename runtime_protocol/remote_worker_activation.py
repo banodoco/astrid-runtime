@@ -192,7 +192,7 @@ class QualifiedRemoteWorkerLauncher:
         for field in ("runtime_instance_id", "runtime_session_id", "session_ref"):
             if not isinstance(value[field], str) or not value[field].strip():
                 raise ConflictError("remote observation has an invalid Runtime or session identity")
-        if (type(value["capacity"]) is not int or value["capacity"] != 1
+        if (type(value["capacity"]) is not int or value["capacity"] not in (1, 2)
                 or type(value["runtime_epoch"]) is not int or value["runtime_epoch"] <= 0
                 or not isinstance(process["birth_id"], str)):
             raise ConflictError("remote observation has an invalid host incarnation or capacity")

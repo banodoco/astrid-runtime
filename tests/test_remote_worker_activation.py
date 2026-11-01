@@ -36,13 +36,13 @@ MACHINE = {"kind": "machine", "id": "machine-a"}
 OWNER = {"actor": "owner", "scopes": ["admin"]}
 
 
-def _service(tmp_path: Path, *, child_delegation: bool = False, target=OLD):
+def _service(tmp_path: Path, *, child_delegation: bool = False, target=OLD, capacity=2):
     root = tmp_path / "realm"
     RealmStore.initialize(root).close()
     service = RuntimeService(root)
     service.register_capability({"capability_id": CAPABILITY, "definition_digest": CAPABILITY_DIGEST})
     service.register_executor(
-        {"executor_id": "host", "capabilities": [CAPABILITY], "max_concurrency": 2},
+        {"executor_id": "host", "capabilities": [CAPABILITY], "max_concurrency": capacity},
         idempotency_key="host-register",
     )
     project = service.create_project(
@@ -132,7 +132,7 @@ def _observation(ref: DeploymentReference, service: RuntimeService):
         "model_root": str(ref.model_root), "session_ref": ref.session_ref,
         "data_root": str(ref.data_root), "support_root": str(ref.support_root),
         "output_root": str(ref.output_root),
-        "capacity": 1, "model_inventory_digest": "sha256:" + "8" * 64,
+        "capacity": ref.capacity, "model_inventory_digest": "sha256:" + "8" * 64,
         "session_config_digest": ref.session_config_digest,
     }
     if ref.effective_target["kind"] == "runpod":
@@ -1344,6 +1344,103 @@ def test_expired_qualification_remains_authoritative_for_bound_attempt(tmp_path,
                 idempotency_key="expired-fail", identity=identity,
             )
             assert result["data"]["task_id"] == task_id
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("capacity", [1, 2])
+def test_qualified_machine_parent_and_exact_child_obey_registered_slots(tmp_path, capacity):
+    service, task_id = _service(tmp_path, child_delegation=True, target=MACHINE, capacity=capacity)
+    try:
+        ref = replace(_reference(tmp_path, service, task_id), capacity=capacity)
+        credentials = CredentialStore(tmp_path / "credentials")
+        launcher = QualifiedRemoteWorkerLauncher(
+            runtime=service, credentials=credentials, preparer=Preparer(),
+            inspector=Inspector(_observation(ref, service)),
+        )
+        parked = launcher.park(ref, target=MACHINE)
+        qualification = launcher.activate(service._task_resource(service.store.get_task(task_id)), ref, parked)
+        identity = _identity(credentials)
+        parent = _claim(service, MACHINE, identity, "slot-parent")
+        authority = service.issue_child_authority(
+            parent["attempt_id"],
+            {key: parent[key] for key in ("lease_id", "fence", "runtime_epoch")},
+            identity=identity,
+        )["authority"]
+
+        def admit_child(key):
+            return service.admit_delegated_child({
+                "authority": authority,
+                "task": {
+                    "capability_id": CAPABILITY, "capability_digest": CAPABILITY_DIGEST,
+                    "input_object_ids": [], "spec": {},
+                    "execution_request": {"schema_version": 1, "target": MACHINE, "inputs": []},
+                },
+            }, idempotency_key=key, identity=identity)["task"]["id"]
+
+        def claim_child(child, key):
+            return service.claim_delegated_child(child, {
+                "executor_id": "host", "capability_ids": [CAPABILITY],
+                "runtime_epoch": parent["runtime_epoch"], "target": MACHINE, "authority": authority,
+            }, idempotency_key=key, identity=identity)
+
+        child = admit_child("slot-child")
+        blocked = child
+        if capacity == 2:
+            claimed = claim_child(child, "slot-child-claim")
+            assert claim_child(child, "slot-child-claim")["attempt_id"] == claimed["attempt_id"]
+            for attempt in (parent, claimed):
+                binding = attempt["execution_binding"]
+                assert binding["actual_target"] == MACHINE
+                assert binding["executor_incarnation"] == qualification["executor_incarnation"]
+                assert binding["verification"] == {
+                    "method": "credential_claim", "verified": True,
+                    "evidence_digest": qualification["evidence_digest"],
+                }
+            blocked = admit_child("slot-third")
+        before = service.store.conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
+        with pytest.raises(ConflictError, match="preflight") as error:
+            claim_child(blocked, "slot-over-limit")
+        assert error.value.details["waiting_reason"] == "waiting_for_worker"
+        assert service.store.conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == before == capacity
+        assert service.store.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE executor_id='host' AND status='running'",
+        ).fetchone()[0] == capacity
+        assert service.store.conn.execute(
+            "SELECT max_concurrency FROM executors WHERE id='host'",
+        ).fetchone()[0] == capacity
+        assert service.store.get_task(blocked)["task"]["status"] == "queued"
+        assert service.store.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE task_id=?", (blocked,),
+        ).fetchone()[0] == 0
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("capacity,observed", [(1, 2), (2, 1)])
+def test_initial_observation_capacity_must_equal_deployment(tmp_path, capacity, observed):
+    service, task_id, ref, credentials, preparer, inspector, launcher = _fixture(tmp_path)
+    try:
+        ref = replace(ref, capacity=capacity)
+        inspector.current["capacity"] = observed
+        parked = launcher.park(ref, target=OLD)
+        with pytest.raises(ConflictError, match="capacity evidence changed"):
+            launcher.activate(service._task_resource(service.store.get_task(task_id)), ref, parked)
+        assert credentials.actor_metadata("host") is None
+        assert service._latest_remote_activation(task_id) is None
+        assert "private_ack" not in preparer.calls
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("capacity", [0, 3, -1, True, 2.0, "2"])
+def test_observation_rejects_unsupported_slot_counts(tmp_path, capacity):
+    service, _task_id, _ref, _credentials, preparer, inspector, launcher = _fixture(tmp_path)
+    try:
+        inspector.current["capacity"] = capacity
+        with pytest.raises(ConflictError, match="capacity"):
+            launcher.park(_ref, target=OLD)
+        assert preparer.calls == ["prepare", "abort"]
     finally:
         service.close()
 
