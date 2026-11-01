@@ -88,8 +88,7 @@ def canonical_manifest(connection: sqlite3.Connection, *, expected_realm_id: str
     """Classify the exact canonical schema on a caller-owned observation.
 
     Raises ValidationError for unknown inventories and hybrids. This function is
-    intentionally not used by the upgrader until lifecycle and legacy handling
-    are implemented and verified together.
+    The caller must supply detached observation and lifecycle fencing.
     """
     try:
         schema_rows = connection.execute("SELECT id, format_id, version FROM runtime_schema").fetchall()
@@ -189,6 +188,8 @@ def legacy_manifest(connection: sqlite3.Connection, *, expected_realm_id: str | 
                     manifest = {"format_id": _FORMAT, "version": 23, "objects": objects}
                     return {"format_id": _FORMAT, "version": 23, "kind": family, "realm_id": realm_id,
                             "components": selected, "fingerprint": digest(manifest)}
+        if "workers" in objects:
+            raise ValidationError("legacy workers definition is not supported by the existing rebuild; preserve the source and use an inspect/export or backup-recovery route")
         raise ValidationError("unsupported legacy v23 manifest")
     except sqlite3.DatabaseError as exc:
         raise ValidationError("cannot inspect legacy SQLite manifest") from exc

@@ -799,6 +799,7 @@ def restore_backup(
     key_path: str | Path | None = None,
     destination_identity: Mapping[str, Any] | None = None,
     source_identity: Mapping[str, Any] | None = None,
+    older_schema: bool = False,
 ) -> dict:
     """Restore an authenticated backup into a new inactive realm.
 
@@ -806,6 +807,10 @@ def restore_backup(
     operator key in a stable support root. When omitted, the authenticated
     manifest's recorded key path is used. Every path still goes through the
     manifest key-id and HMAC checks in :func:`verify_backup`.
+
+    ``older_schema`` permits a supported, fully checked historical schema to
+    be restored as an inactive migration input. It does not authorize normal
+    activation: :func:`verify_restore_candidate` remains current-schema only.
     """
     source = absolute_path(backup_dir)
     destination = absolute_path(destination)
@@ -827,7 +832,7 @@ def restore_backup(
                 # A caller may provide the retained source parent but not the root
                 # fd; open the root once, with O_NOFOLLOW, before material reads.
                 source_fd = os.open(source.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=int(source_identity["_parent_fd"]))
-        verified = verify_backup(source, key=key, key_path=key_path, directory_identity=source_identity)
+        verified = verify_backup(source, key=key, key_path=key_path, directory_identity=source_identity, older_schema=older_schema)
         destination_identity = destination_identity or capture_parent(destination, require_fresh_target=True)
         parent_fd, destination_name = ensure_parent_at(destination, destination_identity)
     except Exception:
@@ -844,7 +849,11 @@ def restore_backup(
         copy_tree_at(source_fd, "cas", temporary_fd, "cas")
         staging_fd = mkdir_chain_at(temporary_fd, "staging")
         os.close(staging_fd)
-        report, realm = _inspect_consolidated_realm(temporary_fd)
+        # Source verification precedes the copy. Check the actual private
+        # candidate against that authenticated evidence before publishing it,
+        # including unreferenced CAS objects and unexpected entries.
+        _verify_manifested_realm(temporary_fd, verified["manifest"], verified["cas_manifest"])
+        report, realm = _inspect_consolidated_realm(temporary_fd, older_schema=older_schema)
         if not realm or realm["id"] != verified["manifest"].get("realm", {}).get("id"):
             raise ConflictError("restored realm identity mismatch", details=report)
         source_manifest_sha256, _ = _sha256_at(source_fd, "manifest.json")

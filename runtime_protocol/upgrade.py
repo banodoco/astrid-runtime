@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -489,20 +489,22 @@ def _owner_fence(root: Path):
     if lock_path.is_symlink():
         raise ValidationError("owner lock must not be a symlink")
     handle = None
-    try:
+    with ExitStack() as custody:
         try:
             # Replacement can temporarily close owner.lock on Windows while
             # retaining directory custody. Maintenance must join that fence
             # before acquiring the lifetime owner lock, just like startup.
-            with realm_admission_fence(root, blocking=False):
-                handle = lock_path.open("a+")
-                platform.owner_only(lock_path)
-                platform.lock_file(handle.fileno(), blocking=False)
+            custody.enter_context(realm_admission_fence(root, blocking=False))
+            handle = lock_path.open("a+")
+            platform.owner_only(lock_path)
+            platform.lock_file(handle.fileno(), blocking=False)
         except (BlockingIOError, OSError) as exc:
+            if handle is not None:
+                handle.close()
             raise OwnerBusyError("another runtime daemon owns this realm") from exc
-        yield
-    finally:
-        if handle is not None:
+        try:
+            yield
+        finally:
             try:
                 platform.unlock_file(handle.fileno())
             except OSError:
@@ -1269,12 +1271,11 @@ def upgrade_realm(
     timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
     confirmation: str | None = None,
 ) -> dict:
-    """Upgrade one stopped v23 realm with a temporary rollback snapshot.
+    """Upgrade one stopped v23 realm with a retained external archive.
 
-    A durable source archive is created only when ``retain_backup`` is
-    explicitly requested. The transaction always takes a same-filesystem
-    temporary copy so it can verify and roll back the swap; that copy is
-    removed after success or successful rollback.
+    The existing rebuild requires ``retain_backup=True`` and an archive root
+    outside the realm. The archive alone is not the complete update recovery
+    envelope required for activation.
     """
     root = _safe_realm_root(root)
     if not root.exists() or not root.is_dir() or root.is_symlink():
@@ -1305,6 +1306,7 @@ def upgrade_realm(
     with _owner_fence(root):
         source_db = root / "realm.sqlite3"
         source = None
+        locked_source = None
         stage_dir = None
         target = None
         restore_required = False
@@ -1312,6 +1314,21 @@ def upgrade_realm(
         temporary_archive_parent = None
         preserve_temporary_archive = False
         try:
+            # Recheck the actual source while holding the SQLite writer fence,
+            # before creating an archive or staging directory.
+            from .v33_manifest import legacy_manifest
+            locked_source = sqlite3.connect(source_db, timeout=float(timeout_seconds), isolation_level=None)
+            locked_source.execute("BEGIN IMMEDIATE")
+            locked = legacy_manifest(locked_source, expected_realm_id=identity["realm_id"])
+            stat_now = source_db.stat()
+            if (locked["fingerprint"] != identity["fingerprint"] or
+                    (stat_now.st_dev, stat_now.st_ino) != identity["source_file_identity"][:2]):
+                raise ConflictError("legacy realm changed before upgrade")
+            if locked_source.execute("SELECT COUNT(*) FROM generations").fetchone()[0]:
+                raise ConflictError("generations changed before upgrade; durable backfill is required")
+            if any(locked_source.execute(f"SELECT COUNT(*) FROM {_quote(table)}").fetchone()[0]
+                   for table in identity["additive_row_counts"]):
+                raise ConflictError("legacy additive tables changed before upgrade; the rebuild cannot preserve them")
             operation_id = uuid.uuid4().hex
             if archive_parent is None:
                 temporary_archive_parent = Path(
@@ -1333,7 +1350,6 @@ def upgrade_realm(
             for name in archive_meta["components"]:
                 shutil.copy2(archive / name, source_copy / name)
             source = _open_readonly(source_copy / "realm.sqlite3")
-            from .v33_manifest import legacy_manifest
             current = legacy_manifest(source, expected_realm_id=identity["realm_id"])
             stat_now = source_db.stat()
             if current["fingerprint"] != identity["fingerprint"] or (stat_now.st_dev, stat_now.st_ino) != identity["source_file_identity"][:2]:
@@ -1376,6 +1392,9 @@ def upgrade_realm(
             source.close()
             source = None
             _assert_snapshot_unchanged(root, archive_meta)
+            locked_source.rollback()
+            locked_source.close()
+            locked_source = None
             # The source WAL is part of the archived evidence.  Checkpoint it
             # before replacing the DB so a crash cannot make SQLite apply an
             # old WAL to the newly activated canonical file.
@@ -1464,6 +1483,8 @@ def upgrade_realm(
                 shutil.rmtree(temporary_archive_parent, ignore_errors=True)
             raise
         finally:
+            if locked_source is not None:
+                locked_source.close()
             if source is not None:
                 source.close()
             if stage_dir is not None:

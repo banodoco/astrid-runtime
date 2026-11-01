@@ -29,6 +29,7 @@ from runtime_protocol.upgrade import (
     DEFAULT_UPGRADE_TIMEOUT_SECONDS,
     _open_readonly,
     inspect_canonical_schema,
+    inspect_realm_schema,
     migrate_canonical_to_current,
     upgrade_realm,
 )
@@ -59,33 +60,11 @@ def _realm_from_catalog(paths: RuntimePaths) -> tuple[str, Path]:
 
 
 def _schema_kind(root: Path, *, expected_realm_id: str) -> str:
-    connection = _open_readonly(root / "realm.sqlite3")
     try:
-        tables = {
-            str(row[0]) for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            )
-        }
-        if "runtime_schema" in tables:
-            try:
-                return str(
-                    inspect_canonical_schema(
-                        root, expected_realm_id=expected_realm_id
-                    )["kind"]
-                )
-            except Exception as exc:
-                raise OperatorUpgradeError(str(exc)) from exc
-        if "schema_migrations" in tables:
-            version = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
-            if version == 23:
-                realm_rows = connection.execute("SELECT id FROM realm ORDER BY id").fetchall()
-                if len(realm_rows) != 1 or str(realm_rows[0][0]) != expected_realm_id:
-                    raise OperatorUpgradeError("legacy realm identity does not match the selected workspace")
-                return "v23"
-            raise OperatorUpgradeError(f"realm has unsupported legacy schema version {version}")
-        raise OperatorUpgradeError("realm is neither canonical v24/v25/v26/v27 nor the supported v23 format")
-    finally:
-        connection.close()
+        result = inspect_realm_schema(root, expected_realm_id=expected_realm_id)
+        return "v23" if result["version"] == 23 else str(result["kind"])
+    except Exception as exc:
+        raise OperatorUpgradeError(str(exc)) from exc
 
 
 def _assert_idle(root: Path) -> dict[str, Any]:
@@ -231,7 +210,7 @@ def upgrade_workspace(
     from .bootstrap import _validate_support_paths
     _validate_support_paths(paths)
     prior_journal = _read_support_json(paths.runtime_support / "upgrade-journal.json")
-    if prior_journal and prior_journal.get("state") in {"planned", "stopping", "stopped", "activated", "restarted", "relocating"}:
+    if prior_journal and prior_journal.get("state") in {"planned", "stopping", "stopped", "activated", "restarted", "relocating", "recovery_required"}:
         raise OperatorUpgradeError(
             "an upgrade operation is already in progress or needs recovery: "
             + str(prior_journal.get("operation_id") or "unknown")
@@ -243,6 +222,10 @@ def upgrade_workspace(
     # Unknown/newer/alternate layouts therefore retain byte-identical source
     # and support state on refusal.
     kind = _schema_kind(realm_root, expected_realm_id=realm_id)
+    if kind != "U33":
+        raise OperatorUpgradeError(
+            "upgrade requires the durable recovery and generation-tag backfill coordinator; preserve the realm and retry when it is available"
+        )
     idle = _assert_idle(realm_root)
     operation_id = uuid.uuid4().hex
     source_support = paths.app_support

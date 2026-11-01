@@ -57,6 +57,43 @@ def test_journal_refuses_changed_transaction_identity(tmp_path):
     assert journal.read_bytes() == before
 
 
+def test_recovery_required_journal_refuses_new_upgrade_without_mutation(tmp_path):
+    from astrid_runtime.bootstrap import BootstrapConfig
+
+    paths, profile, realm = _fixture(tmp_path, version=SCHEMA_VERSION)
+    journal = operator_upgrade._journal(
+        paths, operation_id="a" * 32, state="recovery_required", realm_id="realm-1",
+        realm_root=str(realm), source_support_root=str(paths.app_support), schema_before="U33",
+    )
+    before_journal = journal.read_bytes()
+    before_database = (realm / "realm.sqlite3").read_bytes()
+    boundary = _Boundary(paths)
+    with pytest.raises(operator_upgrade.OperatorUpgradeError, match="needs recovery"):
+        operator_upgrade.upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
+    assert journal.read_bytes() == before_journal
+    assert (realm / "realm.sqlite3").read_bytes() == before_database
+    assert boundary.calls == []
+
+
+def test_historical_upgrade_refuses_before_journal_or_stop_without_coordinator(tmp_path):
+    from astrid_runtime.bootstrap import BootstrapConfig
+
+    paths, profile, realm = _fixture(tmp_path, version=SCHEMA_VERSION)
+    with sqlite3.connect(realm / "realm.sqlite3") as connection:
+        walk_back_to_v30(connection)
+        connection.execute("ALTER TABLE timelines DROP COLUMN name")
+        connection.execute("DROP TABLE user_app_state")
+        connection.execute("DROP INDEX idx_generations_gen")
+        connection.execute("UPDATE runtime_schema SET version=29 WHERE id=1")
+    before = (realm / "realm.sqlite3").read_bytes()
+    boundary = _Boundary(paths)
+    with pytest.raises(operator_upgrade.OperatorUpgradeError, match="durable recovery and generation-tag backfill coordinator"):
+        operator_upgrade.upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
+    assert (realm / "realm.sqlite3").read_bytes() == before
+    assert not (paths.runtime_support / "upgrade-journal.json").exists()
+    assert boundary.calls == []
+
+
 if __name__ == "__main__":
     from types import SimpleNamespace
     from astrid_runtime.bootstrap import BootstrapConfig

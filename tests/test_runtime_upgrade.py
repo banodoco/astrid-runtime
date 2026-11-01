@@ -24,10 +24,20 @@ from runtime_protocol.upgrade import (
 )
 
 
+def _remove_timeline_commit_schema(connection):
+    # C24-C31 predate the complete Timeline v32 bundle.
+    for table in ("timeline_document_input_links", "timeline_document_input_bindings",
+                  "timeline_document_input_contents", "timeline_commit_history"):
+        connection.execute(f"DROP TABLE {table}")
+    connection.execute("ALTER TABLE parent_composition_heads DROP COLUMN publication_id")
+    connection.execute("ALTER TABLE parent_composition_revisions DROP COLUMN commit_manifest_json")
+
+
 def _walk_back_to_v27(connection):
     # A fresh realm is the current schema; v31 -> v30 drops user_app_state, v30 -> v29 drops timelines.name
     # (the only v30 change), and v28 -> v27 restores inline specs and drops task_specs.
     connection.execute("PRAGMA foreign_keys=OFF")
+    _remove_timeline_commit_schema(connection)
     connection.execute("DROP INDEX IF EXISTS idx_generations_gen")
     connection.execute("DROP TABLE user_app_state")
     connection.execute("ALTER TABLE timelines DROP COLUMN name")
@@ -178,23 +188,8 @@ def test_canonical_v24_variant_state_migration_is_additive_and_refuses_repeat(tm
     try:
         _walk_back_to_v27(connection)
         connection.execute("PRAGMA foreign_keys=OFF")
-        connection.execute("ALTER TABLE generation_variants RENAME TO generation_variants_v25")
-        connection.execute(
-            """
-            CREATE TABLE generation_variants (
-                id TEXT PRIMARY KEY,
-                generation_id TEXT NOT NULL REFERENCES generations(id),
-                object_id TEXT REFERENCES objects(digest),
-                variant_type TEXT NOT NULL,
-                metadata_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) SELECT id, generation_id, object_id, variant_type, metadata_json, created_at FROM generation_variants_v25"
-        )
-        connection.execute("DROP TABLE generation_variants_v25")
+        for column in ("thumbnail_object_id", "thumbnail_source_object_id", "thumbnail_recipe_version", "viewed_at"):
+            connection.execute(f"ALTER TABLE generation_variants DROP COLUMN {column}")
         connection.execute("ALTER TABLE tasks DROP COLUMN execution_request_json")
         connection.execute("DROP TABLE execution_bindings")
         connection.execute("DROP TABLE user_preferences")
@@ -203,7 +198,7 @@ def test_canonical_v24_variant_state_migration_is_additive_and_refuses_repeat(tm
     finally:
         connection.close()
 
-    assert inspect_canonical_schema(root, expected_realm_id="realm-v24")["kind"] == "v24"
+    assert inspect_canonical_schema(root, expected_realm_id="realm-v24")["kind"] == "C24-nullable"
     result = migrate_canonical_v24_to_v25(
         root,
         confirmation="MIGRATE VARIANT STATE realm-v24",
@@ -240,8 +235,9 @@ def test_upgrade_refuses_unknown_shape_without_touching_source(tmp_path):
         if (root / name).exists()
     }
 
-    with pytest.raises(ValidationError, match="unknown source tables"):
-        upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    with pytest.raises(ValidationError, match="unsupported legacy v23 manifest"):
+        upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}",
+                      retain_backup=True, archive_root=tmp_path / "backups")
     after = {
         name: hashlib.sha256((root / name).read_bytes()).hexdigest()
         for name in ("realm.sqlite3", "realm.sqlite3-wal", "realm.sqlite3-shm", "realm.sqlite3-journal")
@@ -265,7 +261,7 @@ def test_execution_binding_migration_adds_only_the_targeted_contract(tmp_path):
     finally:
         connection.close()
 
-    assert inspect_canonical_schema(root, expected_realm_id=realm_id)["kind"] == "v25"
+    assert inspect_canonical_schema(root, expected_realm_id=realm_id)["kind"] == "C25-nullable"
     result = migrate_canonical_v25_to_v26(
         root,
         confirmation=f"MIGRATE EXECUTION BINDING {realm_id}",
@@ -299,6 +295,8 @@ def _canonical_fixture(root, version):
         if version < 28:
             _walk_back_to_v27(connection)  # also drops user_app_state and timelines.name
         else:
+            if version < 32:
+                _remove_timeline_commit_schema(connection)
             if version < 31:
                 connection.execute("DROP TABLE user_app_state")
             if version < 30:
@@ -309,34 +307,22 @@ def _canonical_fixture(root, version):
             connection.execute("ALTER TABLE tasks DROP COLUMN execution_request_json")
             connection.execute("DROP TABLE execution_bindings")
         if version == 24:
-            connection.execute("PRAGMA foreign_keys=OFF")
-            connection.execute("ALTER TABLE generation_variants RENAME TO generation_variants_current")
-            connection.execute(
-                """
-                CREATE TABLE generation_variants (
-                    id TEXT PRIMARY KEY,
-                    generation_id TEXT NOT NULL REFERENCES generations(id),
-                    object_id TEXT REFERENCES objects(digest),
-                    variant_type TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute("DROP TABLE generation_variants_current")
+            for column in ("thumbnail_object_id", "thumbnail_source_object_id", "thumbnail_recipe_version", "viewed_at"):
+                connection.execute(f"ALTER TABLE generation_variants DROP COLUMN {column}")
         connection.execute("UPDATE runtime_schema SET version=? WHERE id=1", (version,))
         connection.commit()
     finally:
         connection.close()
-    assert inspect_canonical_schema(root, expected_realm_id=f"realm-v{version}")["kind"] == f"v{version}"
+    family = "U33" if version == 33 else f"C{version}" + ("-nullable" if version < 28 else "")
+    assert inspect_canonical_schema(root, expected_realm_id=f"realm-v{version}")["kind"] == family
     return f"realm-v{version}"
 
 
-@pytest.mark.parametrize("source_version, expected_steps", [(24, 8), (25, 7), (26, 6), (29, 3), (30, 2), (31, 1)])
+@pytest.mark.parametrize("source_version, expected_steps", [(24, 9), (25, 8), (26, 7), (29, 4), (30, 3), (31, 2)])
 def test_complete_canonical_migration_chain_reaches_current_schema(tmp_path, source_version, expected_steps):
     root = tmp_path / f"realm-{source_version}"
     realm_id = _canonical_fixture(root, source_version)
-    assert inspect_canonical_schema(root)["kind"] == f"v{source_version}"
+    assert inspect_canonical_schema(root)["kind"] == f"C{source_version}" + ("-nullable" if source_version < 28 else "")
     with sqlite3.connect(root / "realm.sqlite3") as connection:
         projects_before = connection.execute("SELECT * FROM projects ORDER BY id").fetchall()
         documents_before = connection.execute("SELECT * FROM project_documents ORDER BY id").fetchall()
@@ -388,7 +374,7 @@ def test_current_canonical_migration_is_read_only_idempotent(tmp_path):
     assert not (root / ".runtime-owner.lock").exists()
 
 
-@pytest.mark.parametrize("mutation, message", [("newer", "newer than supported"), ("alternate", "layout")])
+@pytest.mark.parametrize("mutation, message", [("newer", "unsupported canonical v34 manifest"), ("alternate", "unsupported canonical v33 manifest")])
 def test_unknown_canonical_layout_is_rejected_without_mutation(tmp_path, mutation, message):
     root = tmp_path / mutation
     realm_id = _canonical_fixture(root, SCHEMA_VERSION)
@@ -420,7 +406,7 @@ def test_historical_canonical_version_rejects_preferences_table(tmp_path, source
     with sqlite3.connect(root / "realm.sqlite3") as connection:
         connection.execute("CREATE TABLE user_preferences(actor_id TEXT PRIMARY KEY, content TEXT)")
     before = (root / "realm.sqlite3").read_bytes()
-    with pytest.raises(ValidationError, match="unexpected tables: user_preferences"):
+    with pytest.raises(ValidationError, match=f"unsupported canonical v{source_version} manifest"):
         migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {realm_id}")
     assert (root / "realm.sqlite3").read_bytes() == before
 

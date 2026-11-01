@@ -132,3 +132,48 @@ def test_legacy_rejects_newer_migration_identity():
     connection.execute("INSERT INTO schema_migrations VALUES (24, 't')")
     with pytest.raises(ValidationError, match="migration identity"):
         legacy_manifest(connection)
+
+
+@pytest.mark.parametrize("version", [30, 31, 32, 33])
+@pytest.mark.parametrize("app_state", [False, True])
+@pytest.mark.parametrize("timeline_bundle", [False, True])
+@pytest.mark.parametrize("generation_index", [False, True])
+def test_canonical_component_matrix(version, app_state, timeline_bundle, generation_index):
+    """Only the approved complete A/T/G combinations may classify."""
+    connection = database("U33")
+    if not app_state:
+        connection.execute("DROP TABLE user_app_state")
+    if not timeline_bundle:
+        for table in ("timeline_document_input_links", "timeline_document_input_bindings", "timeline_document_input_contents", "timeline_commit_history"):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute("ALTER TABLE parent_composition_heads DROP COLUMN publication_id")
+        connection.execute("ALTER TABLE parent_composition_revisions DROP COLUMN commit_manifest_json")
+    if not generation_index:
+        connection.execute("DROP INDEX idx_generations_gen")
+    connection.execute("UPDATE runtime_schema SET version=?", (version,))
+    expected = {
+        (30, False, False, False): "C30",
+        (31, True, False, False): "C31",
+        (31, False, True, False): "H31",
+        (32, True, False, True): "M32",
+        (32, True, True, False): "TL32",
+        (33, True, True, True): "U33",
+    }.get((version, app_state, timeline_bundle, generation_index))
+    if expected:
+        assert canonical_manifest(connection)["kind"] == expected
+    else:
+        with pytest.raises(ValidationError):
+            canonical_manifest(connection)
+
+
+@pytest.mark.parametrize("mutation", [
+    "DROP TABLE timeline_document_input_links",
+    "DROP INDEX timeline_document_input_links_pin_idx",
+    "ALTER TABLE parent_composition_heads DROP COLUMN publication_id",
+    "DROP INDEX idx_generations_gen; CREATE INDEX idx_generations_gen ON generations(id)",
+])
+def test_partial_or_wrong_definition_components_are_rejected(mutation):
+    connection = database("U33")
+    connection.executescript(mutation)
+    with pytest.raises(ValidationError):
+        canonical_manifest(connection)
