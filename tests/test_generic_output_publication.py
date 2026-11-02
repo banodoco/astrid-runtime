@@ -329,6 +329,7 @@ def test_equal_content_does_not_bypass_output_association_protections(tmp_path: 
 
 
 def test_inline_equal_content_rejects_conflicting_object_metadata(tmp_path: Path) -> None:
+    # A claimed digest must still refuse different bytes, regardless of MIME annotations.
     service = _new_service(tmp_path / "realm")
     try:
         project = service.create_project({"slug": "metadata", "name": "Metadata"})
@@ -338,11 +339,11 @@ def test_inline_equal_content_rejects_conflicting_object_metadata(tmp_path: Path
             {
                 **_descriptor(payload, name=f"output-{index}", filename=f"output-{index}.bin",
                               output_port=f"output-{index}", primary=True, media_type=media_type),
-                "data_base64": base64.b64encode(payload).decode(),
+                "data_base64": base64.b64encode(payload if index == 0 else b"x" * len(payload)).decode(),
             }
             for index, media_type in enumerate(("audio/wav", "application/octet-stream"))
         ]
-        with pytest.raises(ConflictError, match="output metadata does not match existing object"):
+        with pytest.raises(ConflictError, match="output content hash does not match declared digest"):
             service.settle_attempt(
                 attempt["attempt_id"], _settle_body(attempt, outputs), idempotency_key="metadata-settle",
             )

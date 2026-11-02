@@ -182,7 +182,7 @@ def test_foreign_worker_project_and_unregistered_object_rejected(runtime):
         admit(service, authority(service, attempt), refs=[ref])
 
 
-@pytest.mark.parametrize("change", ["capability", "digest", "child_id", "filename", "bytes", "association", "metadata", "project_association", "registry"])
+@pytest.mark.parametrize("change", ["capability", "digest", "child_id", "filename", "media_type", "bytes", "association", "metadata", "project_association", "registry"])
 def test_wrong_child_receipt_or_changed_object_rejected(runtime, change):
     service, project = runtime
     attempt = parent(runtime)
@@ -193,7 +193,7 @@ def test_wrong_child_receipt_or_changed_object_rejected(runtime, change):
     elif change == "association":
         service.store.conn.execute("UPDATE managed_output_associations SET role='output' WHERE association_id=?", (receipt["derived_inputs"][0]["association_id"],))
     elif change == "metadata":
-        service.store.conn.execute("UPDATE objects SET media_type='image/png' WHERE digest=?", (ref["object_id"][7:],))
+        service.store.conn.execute("UPDATE objects SET size=size+1 WHERE digest=?", (ref["object_id"][7:],))
     elif change == "project_association":
         service.store.conn.execute("DELETE FROM project_objects WHERE project_id=? AND digest=?", (project, ref["object_id"][7:]))
     elif change == "registry":
@@ -202,6 +202,8 @@ def test_wrong_child_receipt_or_changed_object_rejected(runtime, change):
         store_task_spec(service, attempt["task_id"], spec)
     elif change == "filename":
         ref["filename"] = "changed.bin"
+    elif change == "media_type":
+        service.store.conn.execute("UPDATE managed_output_associations SET media_type='image/png' WHERE association_id=?", (receipt["derived_inputs"][0]["association_id"],))
     elif change == "digest":
         payload = service._decode_child_authority(receipt["authority"])
         payload["child"]["capability_digest"] = digest("wrong")
@@ -783,7 +785,7 @@ def test_snapshot_authentication_upload_and_custody_rejections(runtime, change):
     elif change == "filename":
         output["filename"] = "wrong.json"
     elif change == "object_metadata":
-        service.store.conn.execute("UPDATE objects SET media_type='image/png' WHERE digest=?", (output["object_id"][7:],))
+        service.store.conn.execute("UPDATE objects SET size=size+1 WHERE digest=?", (output["object_id"][7:],))
     elif change in ("size", "media_type", "port"):
         output["size" if change == "size" else "media_type" if change == "media_type" else "output_port"] = len(b'{"draft":1}') + 1 if change == "size" else "image/png" if change == "media_type" else "other"
     elif change == "project":
