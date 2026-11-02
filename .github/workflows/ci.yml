@@ -317,8 +317,18 @@ jobs:
       INPUT_WORKFLOW_HEAD_SHA: ${{ inputs.workflow_head_sha }}
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     steps:
-      # Keep this directory through the Runtime checkout. The receipt must
-      # survive a checkout/setup/install failure in order to fail closed.
+      - name: Checkout immutable Runtime product
+        id: checkout-runtime
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.runtime_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: false
+
+      # actions/checkout initializes a fresh workspace, so create the receipt
+      # directory only after checkout and before any receipt write.
       - name: Initialize catalog-selector receipt
         id: initialize-receipt
         shell: bash
@@ -359,16 +369,6 @@ jobs:
           cat catalog-receipt/request-validation.log
           printf '%s\n' "$rc" > catalog-receipt/request-validation.exit_code
           exit "$rc"
-
-      - name: Checkout immutable Runtime product
-        id: checkout-runtime
-        continue-on-error: true
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.runtime_sha }}
-          fetch-depth: 1
-          persist-credentials: false
-          clean: false
 
       - name: Set up Python
         id: setup-python
