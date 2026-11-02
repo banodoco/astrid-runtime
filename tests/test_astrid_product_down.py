@@ -59,7 +59,7 @@ def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys
         for _ in range(2):
             command("up")
             client = AstridClient.open_from_launcher()
-            client.close()
+            assert client.projects.list().ok
             support = data / "runtime"
             registration = json.loads((support / "generic-host.json").read_text())
             host_states.append(registration)
