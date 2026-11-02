@@ -130,6 +130,10 @@ def restore_provider(astrid_importable):
 def _select_restore_provider(service, project_id, provider):
     # Historical source capture or host acceptance is complete before Agent startup.
     service.register_timeline_commit_provider(provider)
+    return _restore_guards(service, project_id)
+
+
+def _restore_guards(service, project_id):
     head = service.get_project_timeline(project_id, "main")
     return {"expected_head": head["head_revision_id"],
             "expected_publication_id": head["head_publication_id"]}
@@ -1096,7 +1100,9 @@ def test_missing_selected_media_rejects_publication_without_identity_leak(tmp_pa
 def test_parent_composition_history_paginates_and_restores_exact_closure_over_http(tmp_path, restore_provider):
     fixture = load_restore_history_fixture(tmp_path)
     project_id = fixture.project_id
-    daemon = RuntimeDaemon(fixture.root, support_root=tmp_path / "support").start()
+    daemon = RuntimeDaemon(
+        fixture.root, support_root=tmp_path / "support", authoring_profile="astrid",
+    ).start()
     try:
         service = daemon.service
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -1113,7 +1119,7 @@ def test_parent_composition_history_paginates_and_restores_exact_closure_over_ht
         assert page_one[0]["is_current_head"] is True
         assert page_two[0]["is_current_head"] is False
 
-        guards = _select_restore_provider(service, project_id, restore_provider)
+        guards = _restore_guards(service, project_id)
         assert guards["expected_head"] == second["new_head"]
         before = {table: service.store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                   for table in ("shot_revisions", "internal_timeline_revisions", "timeline_commit_history")}
@@ -1205,6 +1211,7 @@ def test_parent_composition_restore_preserves_payload_and_declared_media_depende
     service, fixture = _restore_history_service(tmp_path)
     project_id = fixture.project_id
     try:
+        service.register_timeline_commit_provider(restore_provider)
         payload_media = service.ingest(
             project_id, b"history-payload-media", media_type="audio/wav",
             idempotency_key="history-payload-media",
@@ -1243,7 +1250,7 @@ def test_parent_composition_restore_preserves_payload_and_declared_media_depende
             service, project_id, later, idempotency_key="history-publish-after-media"
         )
 
-        guards = _select_restore_provider(service, project_id, restore_provider)
+        guards = _restore_guards(service, project_id)
         restored = _restore(
             service, project_id, "parent-with-media", guards,
             idempotency_key="history-restore-media",
@@ -1330,11 +1337,13 @@ def test_stale_head_conflict_carries_machine_readable_reason_over_http(tmp_path,
     """Clients classify a lost head race by details.reason, never by message text."""
     fixture = load_restore_history_fixture(tmp_path)
     project_id = fixture.project_id
-    daemon = RuntimeDaemon(fixture.root, support_root=tmp_path / "support").start()
+    daemon = RuntimeDaemon(
+        fixture.root, support_root=tmp_path / "support", authoring_profile="astrid",
+    ).start()
     try:
         service = daemon.service
         client = WorkspaceClient(daemon.endpoint, daemon.token)
-        guards = _select_restore_provider(service, project_id, restore_provider)
+        guards = _restore_guards(service, project_id)
         current = fixture.head
         source_publication = fixture.first["receipt"]["receipt_id"]
         # The retired publish CAS (expected_head/actual_head) is now the restore
