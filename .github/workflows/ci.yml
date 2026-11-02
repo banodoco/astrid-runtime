@@ -25,8 +25,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Checkout published Agent alongside Runtime
+        shell: bash
+        env:
+          AGENT_SHA: e425903f7a9fa5b82973281d15054c0716b46e2d
+        run: |
+          agent_dir="$GITHUB_WORKSPACE/../astrid-agent"
+          git init --quiet "$agent_dir"
+          git -C "$agent_dir" remote add origin https://github.com/banodoco/astrid-agent
+          git -C "$agent_dir" fetch --depth=1 origin "$AGENT_SHA"
+          git -C "$agent_dir" checkout --detach --quiet FETCH_HEAD
+          test "$(git -C "$agent_dir" rev-parse HEAD)" = "$AGENT_SHA"
+      - name: Record effective Runtime and Agent checkouts
+        shell: bash
+        run: |
+          runtime_sha=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
+          agent_sha=$(git -C "$GITHUB_WORKSPACE/../astrid-agent" rev-parse HEAD)
+          echo "Runtime: $runtime_sha"
+          echo "Agent: $agent_sha"
+          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
       - run: python -m pip install -e '.[test]'
       - run: python -m pip install -e packages/python
+      - name: Install published Agent from sibling checkout
+        shell: bash
+        run: python -m pip install -e "$GITHUB_WORKSPACE/../astrid-agent"
       - name: Verify Windows update backup daemon from a selected venv
         run: python -m pytest -q -rP -m "" tests/test_windows_runtime_launch.py
       - name: Verify native realm creation, ownership, and rollback

@@ -327,6 +327,19 @@ class LocalRuntimeBoundary:
                     f"{candidate}"
                 )
             python = str(candidate)
+        environment = None
+        if sys.platform == "win32":
+            from runtime_protocol.windows_handoff import python_executable
+
+            # The Windows venv redirector starts a second process.  Invoke the
+            # actual interpreter directly so the creation command has the same
+            # selected-venv identity and custody boundary as daemon startup.
+            executable = python_executable(python)
+            environment = dict(os.environ)
+            environment.pop("__PYVENV_LAUNCHER__", None)
+            if executable != python:
+                environment["__PYVENV_LAUNCHER__"] = str(python)
+            python = executable
         argv = [
             python, "-X", "utf8", "-m", "runtime_protocol", "create",
             "--root", str(realm_root),
@@ -337,21 +350,28 @@ class LocalRuntimeBoundary:
             result = subprocess.run(
                 argv,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                env=environment,
             )
         except OSError as exc:
             raise BootstrapError("Runtime realm creation could not start.") from exc
         output = result.stdout.strip()
+        errors = (getattr(result, "stderr", "") or "").strip()
         if result.returncode != 0:
+            diagnostic = "\n".join(value for value in (output, errors) if value)
             raise BootstrapError(
-                "Runtime realm creation failed: " + (output or "no diagnostic")
+                "Runtime realm creation failed: " + (diagnostic or "no diagnostic")
             )
         try:
             created = json.loads(output)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise BootstrapError("Runtime realm creation returned invalid metadata.") from exc
+            diagnostic = "\n".join(value for value in (output, errors) if value)
+            diagnostic = diagnostic if len(diagnostic) <= 4096 else diagnostic[:4096] + "... [truncated]"
+            raise BootstrapError(
+                "Runtime realm creation returned invalid metadata: " + repr(diagnostic)
+            ) from exc
         if not isinstance(created, Mapping):
             raise BootstrapError("Runtime realm creation returned invalid metadata.")
         return created
@@ -368,14 +388,20 @@ class LocalRuntimeBoundary:
                 "--admission-timeout", str(self.admission_timeout_seconds),
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             text=True,
             check=False,
         )
+        output = result.stdout.strip()
+        errors = (getattr(result, "stderr", "") or "").strip()
         try:
-            report = json.loads(result.stdout.strip())
+            report = json.loads(output)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise BootstrapError("Runtime realm inspection returned invalid metadata.") from exc
+            diagnostic = "\n".join(value for value in (output, errors) if value)
+            diagnostic = diagnostic if len(diagnostic) <= 4096 else diagnostic[:4096] + "... [truncated]"
+            raise BootstrapError(
+                "Runtime realm inspection returned invalid metadata: " + repr(diagnostic)
+            ) from exc
         if not isinstance(report, Mapping):
             raise BootstrapError("Runtime realm inspection returned invalid metadata.")
         return report
