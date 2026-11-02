@@ -156,7 +156,7 @@ def test_down_cli_json_preserves_complete_bootstrap_refusal_details(monkeypatch,
         "message": "Astrid is busy (1 tasks running). Try again when they finish.\ntask-17 [running_task; test; running; age 12s]",
     }
     monkeypatch.setattr(cli, "LocalRuntimeBoundary", Boundary)
-    monkeypatch.setattr(cli, "down", lambda *_args: (_ for _ in ()).throw(
+    monkeypatch.setattr(cli, "down", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         BootstrapError(details["message"], details=details)
     ))
     assert cli.main(["down", "--data-root", str(paths.app_support), "--json"]) == 1
