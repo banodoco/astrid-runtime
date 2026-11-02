@@ -144,7 +144,8 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         self.timeout_seconds = float(timeout_seconds)
         self.cleanup_timeout_seconds = max(0.05, float(cleanup_timeout_seconds))
         if _host_only(profile):
-            self.shutdown_timeout_seconds = self.cleanup_timeout_seconds * 2 + 0.5
+            # Private cleanup ACK, orderly host exit, then retained escalation.
+            self.shutdown_timeout_seconds = max(1.0, self.cleanup_timeout_seconds) * 3 + 0.5
         self._active: _PreparedWorker | None = None
         self._activation_binding = None
         self._generation_verifier = None
@@ -441,6 +442,8 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             "profile_binding_digest": _digest(_selected_profile_payload(self.profile))}
 
     def _host_only_abort(self, handle):
+        from .local_execution_supervisor import RetainedWaitTimeout
+
         with handle.cleanup_lock:
             if handle.closed: return
             bound = {k: handle.preparation[k] for k in ("version", "operation_id", "channel_id", "owner_epoch")}
@@ -458,7 +461,17 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             # Full owned child cleanup was acknowledged, then reap original host.
             if handle.retained.poll() is None:
                 handle.broker.signal(runtime_platform.TERM, expected_pid=handle.worker.pid)
-            handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
+            try:
+                handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
+            except RetainedWaitTimeout:
+                # The exact original host has acknowledged owned-child absence.
+                # Its serving loop can still be unwinding (e.g. constructing
+                # full-pack claim slots). Reap it under the same retained role
+                # custody as TERM; neither PID absence nor an ACK alone closes
+                # the cleanup obligation. A failed signal/reap stays fenced.
+                if handle.retained.poll() is None:
+                    handle.broker.signal(runtime_platform.KILL, expected_pid=handle.worker.pid)
+                handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
             handle.control.close(); handle.activation.close(); handle.closed = True
             if self._active is handle: self._active = None
 

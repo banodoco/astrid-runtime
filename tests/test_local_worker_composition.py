@@ -731,6 +731,59 @@ def test_host_only_abort_missing_ack_retains_handle_and_does_not_signal(tmp_path
     assert preparer._active is handle and not handle.closed and preparer.cleanup_uncertain
 
 
+@pytest.mark.parametrize('outcome', ['reaped', 'signal_refused', 'reap_timeout'])
+def test_host_only_abort_escalates_only_acknowledged_retained_host(tmp_path, monkeypatch, outcome):
+    from test_local_worker import host_only_profile_case
+    from runtime_protocol.local_execution_supervisor import RetainedWaitTimeout
+
+    preparer = CrossProcessWorkerPreparer(profile=host_only_profile_case(), config={}, environment={},
+                                         cleanup_timeout_seconds=2)
+    events = []
+    bound = {'version': 'runtime.local-execution-preparation/v1', 'operation_id': 'op',
+             'channel_id': 'ch', 'owner_epoch': 'epoch'}
+
+    def wait(timeout):
+        events.append(('wait', timeout))
+        if events.count(('wait', timeout)) == 1 or outcome == 'reap_timeout':
+            raise RetainedWaitTimeout('retained child exit remains unresolved')
+        return -runtime_platform.KILL
+
+    def signal_host(signum, *, expected_pid):
+        events.append(('signal', signum, expected_pid))
+        if signum == runtime_platform.KILL and outcome == 'signal_refused':
+            raise ConflictError('original host custody changed')
+
+    retained = SimpleNamespace(verify=lambda: events.append('verify'), poll=lambda: None, wait=wait)
+    channel = SimpleNamespace(settimeout=lambda value: None, close=lambda: events.append('close'))
+    handle = _PreparedWorker(SimpleNamespace(pid=42), 'b', channel, {}, tmp_path/'config.json',
+        retained=retained, host_only=True, owner_epoch='epoch', custody_scope=str(tmp_path),
+        preparation=bound, broker=SimpleNamespace(signal=signal_host), activation=channel)
+    preparer._active = handle
+    report = {'profile_binding_digest': _digest('1'), 'custody_capabilities': {'host': {'pid': 42}}}
+    monkeypatch.setattr(preparer, '_host_only_report', lambda h: report)
+    request = {}
+    monkeypatch.setattr('runtime_protocol.local_worker_composition._frame_send',
+                        lambda channel, value: request.update(value))
+
+    def acknowledge(channel):
+        events.append('ack')
+        return {**{k: v for k, v in request.items() if k != 'command'},
+                'status': 'cleaned', 'cleanup': {'host_children': 'absent'}}
+
+    monkeypatch.setattr('runtime_protocol.local_worker_composition._frame_receive', acknowledge)
+    if outcome == 'reaped':
+        preparer.abort(handle)
+        assert handle.closed and preparer._active is None
+        assert events[-2:] == ['close', 'close']
+    else:
+        with pytest.raises((ConflictError, RetainedWaitTimeout)):
+            preparer.abort(handle)
+        assert not handle.closed and preparer._active is handle and 'close' not in events
+    assert events[:5] == ['verify', 'ack', ('signal', runtime_platform.TERM, 42), ('wait', 2),
+                         ('signal', runtime_platform.KILL, 42)]
+    assert preparer.shutdown_timeout_seconds == 6.5
+
+
 def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_without_engine(tmp_path,monkeypatch):
     """Offline transport contract only; fake handles grant no native custody proof."""
     import threading
