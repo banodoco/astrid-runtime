@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from astrid_runtime.identity import StartupIdentityError, validate_live_owner_identity
 from runtime_protocol.daemon import RuntimeDaemon
 
 
@@ -73,6 +74,34 @@ def test_direct_neutral_daemon_uses_legacy_identity(monkeypatch):
     monkeypatch.delenv("ASTRID_INSTALL_MANAGED_BY", raising=False)
     owner._bind_startup_identity()
     assert owner.startup_identity == {"release": 0, "managed_by": None}
+
+
+def test_r0_owner_identity_probe_accepts_only_the_absent_identity_predecessor_shape():
+    # R0 health was the service health plus this instance binding and service
+    # report; it did not publish an ``identity`` key.
+    r0_health = {
+        "status": "ok",
+        "protocol": "workspace.v1",
+        "schema_digest": "a" * 64,
+        "runtime_epoch": 1,
+        "runtime_session_id": "r0-session",
+        "runtime_instance_id": "r0-owner",
+        "services": {},
+    }
+    assert validate_live_owner_identity(r0_health, instance_id="r0-owner") == {
+        "release": 0,
+        "managed_by": None,
+    }
+
+    for response in (
+        # Current R1 low-level health makes the missing daemon identity
+        # explicit; this is not the R0 wire shape.
+        {**r0_health, "identity": None},
+        {**r0_health, "identity": {"release": -1, "managed_by": None}},
+        {**r0_health, "runtime_instance_id": "different-owner"},
+    ):
+        with pytest.raises(StartupIdentityError):
+            validate_live_owner_identity(response, instance_id="r0-owner")
 
 
 def test_actual_owner_restart_captures_new_snapshot_without_publication(tmp_path, monkeypatch):

@@ -75,6 +75,12 @@ def validate_live_owner_identity(
         raise StartupIdentityError("live health is unavailable")
     if health.get("runtime_instance_id") != instance_id or not instance_id:
         raise StartupIdentityError("live health belongs to a different owner instance")
+    # R0 attached its owner instance to health but predated startup identity
+    # publication altogether.  Preserve that one predecessor wire shape only:
+    # current low-level R1 health explicitly says ``identity: null`` and must
+    # continue to fail closed through normalize_startup_identity.
+    if "identity" not in health:
+        return {"release": 0, "managed_by": None}
     return normalize_startup_identity(health.get("identity"))
 
 
