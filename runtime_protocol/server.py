@@ -1189,6 +1189,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     # Both routes own short store sections. Transfer, hashing,
                     # and daemon actor ownership must stay outside this lock.
                     self._route()
+                elif getattr(self, "command", None) == "POST" and urlsplit(getattr(self, "path", "")).path == "/v1/replace":
+                    # Replacement owns its admission fences and stops this
+                    # listener. Its reaper must drain without waiting for a
+                    # SQLite mutex held by the request that is joining it.
+                    self._prefetch_body()
+                    self._route()
                 else:
                     self._prefetch_body()
                     with self.runtime.store._mutex:
