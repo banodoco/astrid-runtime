@@ -8,6 +8,10 @@ from .store import (
     GENERATION_INTENT_STORAGE_KEY,
     OBJECT_ID_RE,
     RealmStore,
+    read_pack_admissions,
+    pack_asset_path,
+    PACK_ID_RE,
+    PACK_DIGEST_RE,
     execution_placement_matches,
     normalize_execution_facts,
     normalize_verified_execution_placement,
@@ -485,7 +489,10 @@ def _durable_mutation(function=None, *, reap_task_lifetimes=False):
 class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
-    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None, _admission_fd=None):
+    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None, _admission_fd=None, pack_admissions=None):
+        if pack_admissions is not None and not callable(pack_admissions):
+            raise ValidationError("pack_admissions must be an installed admission snapshot reader")
+        self._pack_admissions = pack_admissions
         configured_max = os.environ.get("RUNTIME_MAX_OBJECT_BYTES", str(OBJECT_MAX_BYTES))
         if not re.fullmatch(r"[0-9]{1,20}", configured_max):
             raise ValidationError("RUNTIME_MAX_OBJECT_BYTES must be a positive decimal integer")
@@ -5817,6 +5824,86 @@ class RuntimeService:
             from .errors import NotFoundError
             raise NotFoundError("object not found")
         return dict(row), self.cas.read(digest)
+
+    @staticmethod
+    def _open_pack_file(root_fd, item):
+        """Walk only a manifest-selected file, retaining every parent handle."""
+        directory_fd = os.dup(root_fd)
+        file_fd = None
+        try:
+            parts = item["disk"].split("/")
+            for part in parts[:-1]:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+            file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory_fd)
+            RuntimeService._verify_open_file(file_fd, item["sha256"], item["size"], label=f'pack asset {item["path"]}')
+            stream = os.fdopen(file_fd, "rb")
+            file_fd = None
+            stream.seek(0)
+            return stream
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            os.close(directory_fd)
+
+    def _pack_asset(self, record, path, *, verify_all=False):
+        root_fd = None
+        entry_stream = None
+        try:
+            root_fd = _open_directory_chain(record["root"])
+            entry_stream = self._open_pack_file(root_fd, record["files"]["index.js"])
+            prelude = f'/* astrid-graph-index-sha256:{record["artifactManifest"]["graphIndexDigest"]} */\n'.encode()
+            if entry_stream.read(len(prelude)) != prelude:
+                raise ConflictError("pack entry does not commit the admitted graph index")
+            if verify_all:
+                for name, item in record["files"].items():
+                    if name != "index.js":
+                        self._open_pack_file(root_fd, item).close()
+            if path == "index.js":
+                entry_stream.seek(0)
+                result, entry_stream = entry_stream, None
+                return result
+            return self._open_pack_file(root_fd, record["files"][path])
+        except FileNotFoundError as exc:
+            raise ConflictError("installed pack artifact bytes are missing; reinstall the admitted bundle", details={"packId": record["packId"], "path": path}) from exc
+        except OSError as exc:
+            raise ConflictError("installed pack artifact must be an accessible regular file in its admitted folder", details={"packId": record["packId"], "path": path}) from exc
+        finally:
+            if entry_stream is not None:
+                entry_stream.close()
+            if root_fd is not None:
+                os.close(root_fd)
+
+    def pack_inventory(self):
+        """Expose only committed, enabled browser admissions, with no roots."""
+        revision, records = read_pack_admissions(self._pack_admissions)
+        packs = []
+        for record in records:
+            # Verify exactly the admitted file set before advertising it.
+            # Asset reads verify only entry + requested file; no source scan.
+            self._pack_asset(record, "index.js", verify_all=True).close()
+            item = {key: record[key] for key in ("packId", "sourceDigest", "digest", "artifactManifestDigest", "enabled")}
+            item["url"] = f'/api/runtime/packs/assets/{record["packId"]}/{record["digest"]}/index.js'
+            packs.append(item)
+        return {"version": 1, "revision": revision, "packs": packs}
+
+    def open_pack_asset(self, pack_id, digest, path):
+        """Serve only listed bytes from an installed, enabled admitted bundle."""
+        if not isinstance(pack_id, str) or not PACK_ID_RE.fullmatch(pack_id):
+            raise ValidationError("pack asset packId is invalid")
+        if not isinstance(digest, str) or not PACK_DIGEST_RE.fullmatch(digest):
+            raise ValidationError("pack asset bundle digest must be a full lowercase SHA-256")
+        pack_asset_path(path)
+        _revision, records = read_pack_admissions(self._pack_admissions, pack_id=pack_id)
+        record = next((item for item in records if item["packId"] == pack_id and item["digest"] == digest), None)
+        if record is None:
+            raise NotFoundError("pack bundle is not installed and admitted")
+        item = record["files"].get(path)
+        if item is None:
+            raise NotFoundError("pack asset is not listed in the admitted manifest")
+        stream = self._pack_asset(record, path)
+        return {"digest": item["sha256"], "size": item["size"], "media_type": item["mime"]}, stream
 
     def open_object(self, digest):
         normalized = str(digest).removeprefix("sha256:")
