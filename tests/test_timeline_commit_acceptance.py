@@ -773,8 +773,15 @@ def test_original_retry_ignores_corrupt_later_acceptance(realm, column, replacem
         pytest.fail("accepted retry constructed semantic port")
     allowed = {"projects", "timelines", "command_idempotency", "timeline_commit_history", "timeline_events", "project_sequences"}
     denied = []
-    def replay_reads_only(action, table, *_):
+    def replay_reads_only(action, table, argument, *_):
         if action == sqlite3.SQLITE_SELECT or (action == sqlite3.SQLITE_READ and table in allowed):
+            return sqlite3.SQLITE_OK
+        # Replay pins a read snapshot and checks SQLite's change counter.
+        # Permit only that read-only bookkeeping, never PRAGMA setters or
+        # arbitrary transaction/DDL/data mutations.
+        if action == sqlite3.SQLITE_PRAGMA and table == "data_version" and argument is None:
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_TRANSACTION and table in {"BEGIN", "ROLLBACK"}:
             return sqlite3.SQLITE_OK
         denied.append((action, table))
         return sqlite3.SQLITE_DENY
@@ -844,8 +851,10 @@ def test_upstream_v31_schema_migration_installs_empty_history_without_invented_b
     finally:
         connection.close()
     result = migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {realm_id}")
-    assert result["target_schema_version"] == 32
-    assert len(result["steps"]) == 1
+    assert result["source_schema_version"] == 31
+    assert result["target_schema_version"] == 33
+    assert [(step["source_schema_version"], step["target_schema_version"])
+            for step in result["steps"]] == [(31, 32), (32, 33)]
     reopened = RealmStore(root)
     try:
         assert reopened.integrity_report()["ok"]
@@ -855,27 +864,40 @@ def test_upstream_v31_schema_migration_installs_empty_history_without_invented_b
 
 
 def test_legacy_timeline_v31_fixture_remains_a_distinct_migration_source(tmp_path):
+    from precut_realm_fixture import FIXTURE_BACKUP_KEY, _extract_archive
+    from runtime_protocol.backup import restore_backup, verify_backup
     from runtime_protocol.upgrade import (
         _canonical_schema_identity,
         migrate_canonical_to_current,
     )
 
-    fixture = load_precut_realm_fixture(tmp_path)
-    root = fixture.copy_roots[0]
+    # The ordinary loader already migrates both copies. Inspect the actual
+    # historical backup here, then measure its explicit migration ourselves.
+    backup = _extract_archive(tmp_path / "legacy-archive")
+    verified = verify_backup(backup, key=FIXTURE_BACKUP_KEY, older_schema=True)
+    assert verified["manifest"]["schema"]["version"] == 31
+    root = tmp_path / "legacy-realm"
+    restore_backup(backup, root, key=FIXTURE_BACKUP_KEY, older_schema=True)
     with sqlite3.connect(root / "realm.sqlite3") as connection:
         assert connection.execute("SELECT version FROM runtime_schema WHERE id=1").fetchone()[0] == 31
         assert connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='timeline_commit_history'").fetchone()
         assert connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_app_state'").fetchone() is None
-        assert _canonical_schema_identity(connection)["version"] == 31
+        identity = _canonical_schema_identity(connection)
+        assert identity["version"] == 31
+        assert identity["kind"] == "H31"
     result = migrate_canonical_to_current(
         root,
-        confirmation=f"MIGRATE CANONICAL {fixture.manifest['realm']['id']}",
+        confirmation=f"MIGRATE CANONICAL {verified['manifest']['realm']['id']}",
     )
-    assert result["target_schema_version"] == 32
-    assert result["steps"][-1]["target_schema_version"] == 32
+    assert result["source_schema_version"] == 31
+    assert result["target_schema_version"] == 33
+    assert [(step["source_schema_version"], step["target_schema_version"])
+            for step in result["steps"]] == [(31, 32), (32, 33)]
     with sqlite3.connect(root / "realm.sqlite3") as connection:
-        assert connection.execute("SELECT version FROM runtime_schema WHERE id=1").fetchone()[0] == 32
+        connection.row_factory = sqlite3.Row
+        assert connection.execute("SELECT version FROM runtime_schema WHERE id=1").fetchone()[0] == 33
         assert connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_app_state'").fetchone()
+        assert _canonical_schema_identity(connection)["kind"] == "U33"
 
 
 @pytest.mark.parametrize("kind", ["config", "transcript"])
@@ -1017,6 +1039,30 @@ def film(tmp_path):
     from project_isolation_fixture import load_project_isolation_fixture
 
     return load_project_isolation_fixture(tmp_path)
+
+
+def test_two_project_fixture_migrates_original_publications_without_provider(film):
+    from runtime_protocol.timeline_commit_baseline import verify_baseline
+    from runtime_protocol.upgrade import _canonical_schema_identity
+
+    service = RuntimeService(film.fixture.duplicate_root)
+    try:
+        assert _canonical_schema_identity(service.store.conn)["kind"] == "U33"
+        assert service.store.integrity_report()["ok"]
+        assert film.fixture.project_id != film.isolated.fixture.project_id
+        for captured in (film, film.isolated):
+            facts = verify_baseline(
+                service.store.conn, captured.fixture.project_id, captured.fixture.timeline_id,
+                read_object=service.cas.read,
+            )
+            assert facts["entries"][-1]["receipt"] == captured.publication["receipt"]
+            assert facts["head"] == {
+                "revision_id": captured.publication["data"]["new_head"],
+                "publication_id": captured.publication["receipt"]["receipt_id"],
+            }
+        assert service._timeline_commit_provider is None
+    finally:
+        service.close()
 
 
 @pytest.mark.integration
