@@ -29,6 +29,7 @@ ERROR = "common.json#/$defs/Error"
 SCHEMA_FOR = {
     "retired_route_410": (ERROR, None),
     "commit_conflict_409": (ERROR, None),
+    "commit_user_editing_409": (ERROR, None),
     "task_admission_201": ("task.json", "data"),
     "task_read_200": ("task.json", None),
     "managed_outputs_200": ("managed-output.json", "items"),
@@ -127,3 +128,14 @@ def test_product_client_preserves_recorded_errors(recorded, case):
     assert caught.value.status == response["status"]
     assert caught.value.code == response["body"]["code"]
     assert caught.value.details == response["body"]["details"]
+
+
+def test_recorded_editing_refusal_has_complete_commit_details(recorded):
+    _, raw = recorded
+    refusal = raw["commit_user_editing_409"]
+    assert refusal["status"] == 409 and refusal["body"]["code"] == "conflict"
+    details = refusal["body"]["details"]
+    assert details["status"] == "refused" and details["reason"] == "user_editing"
+    assert details["base"] == details["current"]
+    assert details["conflicts"] == [] and details["hint"]
+    _validator("timeline-commit.json#/$defs/CommitFailureDetails").validate(details)

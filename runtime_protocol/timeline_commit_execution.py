@@ -543,6 +543,7 @@ class CommitExecutionCoordinator:
                 return replay
             if not acquired:
                 reject("idempotency_mismatch")
+            self.commit_store.check_editing(context, authorize=authorize)
             outcome = error = port = None
             try:
                 if timing is not None:

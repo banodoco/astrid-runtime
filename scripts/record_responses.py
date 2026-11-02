@@ -186,6 +186,14 @@ def drive(recorder: Recorder) -> None:
                                             "before": {"state": "absent"}, "value": "Recorded"}]}}],
         "label": "Recorded title", "merge": "fields",
     }
+    editing = f"/v1/projects/{project_id}/timelines/main/editing"
+    status, lease = call("PUT", editing, {"tab_session_id": "recording-tab", "sequence": 1})
+    assert status == 200 and lease["data"]["active"]
+    status, refused = call("POST", commit, request, key="commit-title", case="commit_user_editing_409")
+    assert status == 409 and refused["details"]["reason"] == "user_editing"
+    recorder.keep()
+    status, lease = call("DELETE", editing, {"tab_session_id": "recording-tab", "sequence": 2})
+    assert status == 200 and not lease["data"]["active"]
     status, accepted = call("POST", commit, request, key="commit-title")
     assert status == 200, accepted
     norm.learn(accepted["data"]["accepted_revision_id"], "current_revision_id")

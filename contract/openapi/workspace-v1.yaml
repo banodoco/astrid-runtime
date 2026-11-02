@@ -344,6 +344,23 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: false, content: { application/json: { schema: { $ref: './schemas/timeline-inspection.json' } } } }
       responses: { '200': { description: Deterministic metadata-only Markdown/PNG view, content: { application/json: { schema: { $ref: './schemas/timeline-view.json' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/editing:
+    put:
+      description: Acknowledge an actor/tab editing lease before beginning local edits. Requires projects:write. Server monotonic TTL is capped at 10 seconds. Increase sequence for every renewal or release; duplicate/stale messages do not extend the lease. Cooperative App attribution on commits is not authenticated authority.
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineEditingRequest' } } } }
+      responses:
+        '200': { description: Current state of this actor/tab lease, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineEditingResponse' } } } }
+        '401': { description: Authenticated projects write scope required }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      description: Release only this authenticated actor/tab lease. A higher sequence fences delayed renewals for the lifetime of this Runtime process.
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineEditingRelease' } } } }
+      responses:
+        '200': { description: Current state of this actor/tab lease, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineEditingResponse' } } } }
+        '401': { description: Authenticated projects write scope required }
+        '404': { $ref: '#/components/responses/NotFound' }
   /v1/projects/{project_id}/timelines/{timeline_id}/commit:
     post:
       operationId: commitTimeline
@@ -1525,6 +1542,35 @@ components:
       $ref: './schemas/timeline-commit.json#/$defs/CommitAccepted'
     CommitPreviewResponse:
       $ref: './schemas/timeline-commit.json#/$defs/CommitPreviewResponse'
+    TimelineEditingRelease:
+      type: object
+      additionalProperties: false
+      required: [tab_session_id, sequence]
+      properties:
+        tab_session_id: { type: string, minLength: 1, maxLength: 128 }
+        sequence: { type: integer, minimum: 1, maximum: 9007199254740991 }
+    TimelineEditingRequest:
+      type: object
+      additionalProperties: false
+      required: [tab_session_id, sequence]
+      properties:
+        tab_session_id: { type: string, minLength: 1, maxLength: 128 }
+        sequence: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        ttl_seconds: { type: number, exclusiveMinimum: 0, default: 10, description: Capped by the server at 10 seconds. }
+    TimelineEditingResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [tab_session_id, sequence, active, expires_in_seconds]
+          properties:
+            tab_session_id: { type: string, minLength: 1, maxLength: 128 }
+            sequence: { type: integer, minimum: 1, maximum: 9007199254740991 }
+            active: { type: boolean }
+            expires_in_seconds: { type: number, minimum: 0, maximum: 10 }
     TimelineCommitPage:
       $ref: './schemas/timeline-commit.json#/$defs/TimelineCommitPage'
     CommitAcceptedMutation:

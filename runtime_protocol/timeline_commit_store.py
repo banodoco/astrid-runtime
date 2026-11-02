@@ -244,8 +244,16 @@ class _HistoryReadInputs:
 
 
 class TimelineCommitStore:
-    def __init__(self, store, *, validate_prepared, validate_event=None):
+    def __init__(self, store, *, validate_prepared, validate_event=None, publication_exempt=None):
         self.store = store
+        # All adapters for the owning realm share one process-local registry.
+        # Offline inspectors and fresh-realm builders also construct adapters.
+        with store._mutex:
+            if not hasattr(store, "_timeline_editing"):
+                from .timeline_editing import TimelineEditingLeases
+                store._timeline_editing = TimelineEditingLeases(store._mutex)
+            self.editing = store._timeline_editing
+        self._publication_exempt = publication_exempt or (lambda request: False)
         # Validation uses the wire worker's authoritative schema, including
         # Agent-owned leaves. It must raise on invalid data, never normalize it.
         self.validate_prepared = validate_prepared
@@ -1831,6 +1839,29 @@ class TimelineCommitStore:
         if any(c["op"] == "timeline.restore" for c in request["commands"]) and expected != base:
             reject("stale_head")
 
+    def check_editing(self, context, *, authorize, initializing=False):
+        """Admission hint and definitive acceptance fence use the same owner."""
+        from .timeline_commit import CommitRejected
+
+        with self.store._mutex:
+            authorize()
+            request = context["request"]
+            if (request.get("dry_run", False) or self._publication_exempt(request)
+                    or not self.editing.live(request["project_id"], request["timeline_id"])):
+                return
+            raise CommitRejected({
+                "http_status": 409, "code": "conflict",
+                "message": "The user is editing this timeline. Retry the same change after they finish.",
+                "details": {
+                    "status": "refused", "reason": "user_editing",
+                    "base": None if initializing else {"revision_id": request["base_revision_id"],
+                                                       "publication_id": request["base_publication_id"]},
+                    "current": None if initializing else self.head(request["project_id"], request["timeline_id"]),
+                    "conflicts": [],
+                    "hint": "Retry the same body, key and base after editing ends. Preserve user changes if the retry conflicts.",
+                },
+            })
+
     @_evaluation
     def accept(self, context, prepared, *, authorize, inputs=None):
         context, prepared = detached(context), detached(prepared)
@@ -1844,6 +1875,7 @@ class TimelineCommitStore:
                     return replay
                 if context["request"].get("dry_run", False):
                     reject("dry_run_accept", status=422)
+                self.check_editing(context, authorize=authorize)
                 self._check_context(context)
                 self._check_head(context, prepared["expected_head"])
                 self._check_shot_destinations(context, prepared, inputs)
@@ -2153,6 +2185,8 @@ class TimelineCommitStore:
                 reject("history_unavailable", diagnostic_reason="store_adopt_existing_head")
             if not timeline_scope_is_empty(self.conn, timeline_id, project_id=project_id):
                 reject("history_unavailable", diagnostic_reason="store_adopt_nonempty_scope")
+            self.check_editing({"request": {"project_id": project_id, "timeline_id": timeline_id}},
+                               authorize=authorize, initializing=True)
             if current is None or current["revision_id"] is None:
                 if self.conn.execute("SELECT 1 FROM parent_composition_revisions WHERE timeline_id=? LIMIT 1", (timeline_id,)).fetchone():
                     reject("history_unavailable", diagnostic_reason="store_adopt_existing_parent")
@@ -2201,6 +2235,8 @@ class TimelineCommitStore:
                 or ("detail" in source and not isinstance(source["detail"], str))
             ):
                 raise ValidationError("source must be a supported timeline provenance object")
+            self.check_editing({"request": {"project_id": project_id, "timeline_id": timeline_id,
+                                           "source": source or {}}}, authorize=authorize, initializing=True)
             imported = document is not None
             if document is None:
                 document = default_bootstrap_document(project_id, timeline_id, "bootstrap-" + new_id())

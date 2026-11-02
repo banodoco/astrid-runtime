@@ -738,6 +738,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             project_id = value["project"]["project_id"]
             aggregate_id = f"{identity['actor']}:{value['scope']}"
             return self._send(200, {"data": value, "receipt": self.runtime.committed_receipt("project.select", aggregate_id, key, project_id=project_id)})
+        if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "editing" and method in {"PUT", "DELETE"}:
+            identity = self._identity("projects:write")
+            if urlsplit(self.path).query:
+                raise ProtocolError("timeline editing does not accept a query string")
+            body = self._commit_body()
+            publisher = identity["actor"]
+            return self._send(200, self.runtime.update_timeline_editing(
+                path[2], path[4], body, publisher=publisher,
+                authorize=lambda: self._authorize_timeline_commit(publisher), release=method == "DELETE",
+            ))
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "commit" and method == "POST":
             return self._timeline_commit(path[2], path[4], path)
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timelines":

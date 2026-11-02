@@ -399,3 +399,12 @@ def test_new_door_routes_are_exact():
     assert classify("/api/runtime/v1/projects/project-1/timelines/timeline-1/commits", "GET")
     assert classify("/api/runtime/v1/projects/project-1/media-selection?asset=a&generation_id=g&variant_id=v", "GET")
     assert classify("/api/runtime/v1/projects/project-1/timelines/timeline-1/commit/extra", "POST") is None
+
+
+@pytest.mark.parametrize("prefix", ["runtime", "astrid"])
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
+def test_hosted_door_serves_editing_lease_route(prefix, method):
+    path = f"/api/{prefix}/v1/projects/{PROJECT}/timelines/{TIMELINE}/editing"
+    route = classify(path, method)
+    assert route is not None and route.path == path.removeprefix(f"/api/{prefix}")
+    assert classify(path, "POST") is None

@@ -5273,3 +5273,58 @@ qualification implied) and whitespace gate:
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/user/work/venv-runtime/bin/python -m pytest -q tests/test_timeline_commit_contract.py tests/test_timeline_commit_type_generator.py
 git diff --check
 ```
+
+
+## Timeline editing leases
+
+`PUT /v1/projects/{project_id}/timelines/{timeline_id}/editing` requires
+`projects:write` authentication and `{tab_session_id, sequence, ttl_seconds?}`.
+The client must await the acknowledgement before relying on protection or
+starting its local edit. TTL defaults to 10 seconds and is capped at 10, using
+the server monotonic clock. No wall-clock deadline is accepted. Responses have
+`data: {tab_session_id, sequence, active, expires_in_seconds}`.
+`DELETE` takes `{tab_session_id, sequence}`. Each edit, renewal and release uses a
+strictly increasing positive safe-integer sequence for that tab-session. Repeated
+or older sequences report the current state without extending or clearing it.
+A new tab-session ID must be unique for the lifetime of the Runtime process.
+
+The owner key is project, timeline, authenticated actor, and tab-session. Any
+live lease gates publication, regardless of which user/tab owns it. A release
+cannot clear another actor or tab. Sequence fences survive release and expiry
+in memory, preventing delayed heartbeats from resurrecting a released lease;
+they disappear together with leases when Runtime restarts. Expiry, suspension,
+failed requests, and the interval before acknowledgement leave unsaved work
+unprotected. This mechanism supports one owning Runtime process, not strict
+offline priority or restart persistence.
+
+A fresh publishing commit under a lease returns the normal soft HTTP 409 error:
+`code=conflict`, `details.status=refused`, `reason=user_editing`, with the original
+`base`, current head pair `current`, empty `conflicts`, and an actionable `hint`.
+No timeline revision, history edge, event, receipt or terminal idempotency result
+is written. Retry the identical body/key/base after release or expiry; existing
+field/atomic guards then decide compatibility with saved user changes. A conflict
+requires preserving those user values and re-deriving compatible work.
+
+Authenticated durable replay precedes the admission gate. A second definitive
+check runs after replay lookup inside serialized store acceptance, under the same
+mutex as lease acknowledgement. Thus an acknowledged lease also stops work
+already preparing a publication. Dry runs are exempt. Both the canonical
+`timeline.restore` command and the restore HTTP adapter use these checks; an
+unattributed restore is gated too. Existing headed bootstrap calls return the
+head; fresh timeline creation/import initialize new storage only. Bootstrap and
+empty-shell adoption also check the lease before creating a first publication
+on an existing leased headless shell, with null `base` and `current` (no prior
+publication). The create adapter preserves this soft refusal and its key remains
+retryable. Verified-baseline installation attests retained, checked facts without
+changing authored content. These paths cannot replace an editable publication.
+Retired direct writers stay retired.
+
+The default App and Agent may share a product bearer. Credentials authenticate
+actor/scopes, without a trusted App/Agent distinction. This deployment therefore
+uses the approved **cooperative attribution policy**: a valid commit with
+`source.via=app` is exempt so existing App saves continue, including another user's
+save. All other or absent sources are gated. This is not authenticated App
+authority: any bearer holder can spoof `app` to bypass this courtesy gate. Restore
+HTTP requests have no source attribution and wait for lease release, including
+App history restores. Source attribution never bypasses authentication, existing
+conflict checks, history validation, or acceptance integrity checks.

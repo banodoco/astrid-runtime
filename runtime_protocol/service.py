@@ -1900,6 +1900,9 @@ class RuntimeService:
         try:
             publication_event_id = commits.adopt_empty_shell(project_id, timeline_id, authorize=self._assert_mutation_admitted)
         except CommitRejected as exc:
+            if exc.failure.get("details", {}).get("reason") == "user_editing":
+                from .timeline_commit_port import public_failure
+                raise public_failure(exc.failure) from exc
             from .timeline_commit_execution import (
                 _emit_redacted_diagnostic,
                 _history_diagnostic_reason,
@@ -3113,6 +3116,9 @@ class RuntimeService:
             if self._timeline_commit_store is None:
                 self._timeline_commit_store = TimelineCommitStore(
                     self.store, validate_prepared=lambda value: validate_commit_value(value, "PreparedCommit"),
+                    # Shared product bearers cannot authenticate App vs Agent.
+                    # This is cooperative attribution, not an authority grant.
+                    publication_exempt=lambda request: request.get("source", {}).get("via") == "app",
                 )
                 self._timeline_commit_coordinator = CommitExecutionCoordinator(self._timeline_commit_store)
             return self._timeline_commit_store, self._timeline_commit_coordinator
@@ -3138,6 +3144,21 @@ class RuntimeService:
         with self.store._mutex:
             check()
         return check
+
+    def update_timeline_editing(self, project_id, timeline_id, body, *, publisher, authorize, release=False):
+        """Bind each tab lease to the currently authenticated actor."""
+        if not callable(authorize):
+            raise AuthorizationError("authenticated editing authority callback is required")
+        def authenticated():
+            identity = authorize()
+            if not isinstance(identity, dict) or identity.get("actor") != publisher or not publisher:
+                raise AuthorizationError("authenticated editing actor changed")
+
+        check = self._timeline_authorize(project_id, timeline_id, authenticated)
+        with self.store._mutex:
+            check()
+            commits, _ = self._timeline_commits()
+            return {"data": commits.editing.update(project_id, timeline_id, publisher, body, release=release)}
 
     @_clear_replay_on_refusal
     @timed_timeline_commit
@@ -3232,6 +3253,7 @@ class RuntimeService:
                 if replay is not None:
                     return replay
                 require_active()
+                commits.check_editing(context, authorize=check)
                 _emit_redacted_diagnostic(
                     request_id, reason="provider_none", public_request_id=public_request_id,
                     idempotency_key=idempotency_key,

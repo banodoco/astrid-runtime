@@ -1,0 +1,63 @@
+{
+  "body": {
+    "code": "conflict",
+    "details": {
+      "base": {
+        "publication_id": "<base_publication_id>",
+        "revision_id": "<base_revision_id>"
+      },
+      "conflicts": [],
+      "current": {
+        "publication_id": "<base_publication_id>",
+        "revision_id": "<base_revision_id>"
+      },
+      "hint": "Retry the same body, key and base after editing ends. Preserve user changes if the retry conflicts.",
+      "reason": "user_editing",
+      "status": "refused"
+    },
+    "message": "The user is editing this timeline. Retry the same change after they finish.",
+    "request_id": "<request_id>"
+  },
+  "case": "commit_user_editing_409",
+  "headers": {
+    "content-type": "application/json"
+  },
+  "request": {
+    "body": {
+      "api_version": 1,
+      "base_publication_id": "<base_publication_id>",
+      "base_revision_id": "<base_revision_id>",
+      "commands": [
+        {
+          "args": {
+            "changes": [
+              {
+                "before": {
+                  "state": "absent"
+                },
+                "op": "set",
+                "path": [
+                  "config",
+                  "title"
+                ],
+                "ref": "parent",
+                "value": "Recorded"
+              }
+            ]
+          },
+          "op": "doc.patch",
+          "schema_version": 1,
+          "select": null,
+          "version": "1"
+        }
+      ],
+      "label": "Recorded title",
+      "merge": "fields",
+      "project_id": "<project_id>",
+      "timeline_id": "main"
+    },
+    "method": "POST",
+    "path": "/v1/projects/<project_id>/timelines/main/commit"
+  },
+  "status": 409
+}
