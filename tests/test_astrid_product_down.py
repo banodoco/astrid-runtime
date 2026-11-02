@@ -88,10 +88,18 @@ def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys
                 "owner": owner, "discovery": discovery}})
             command("down")
             # These are synchronous postconditions of down, with no wait here.
-            assert LocalRuntimeBoundary.process_birth_identity(registration["pid"]) != host_kernel_birth
-            assert LocalRuntimeBoundary.process_birth_identity(owner["pid"]) != owner["process_birth_id"]
-            assert not (support / "generic-host.json").exists()
-            assert not (support / "discovery.json").exists()
+            after = {"host_pid": registration["pid"], "host_before_birth": host_kernel_birth,
+                "host_after_birth": LocalRuntimeBoundary.process_birth_identity(registration["pid"]),
+                "runtime_pid": owner["pid"], "runtime_before_birth": owner["process_birth_id"],
+                "runtime_after_birth": LocalRuntimeBoundary.process_birth_identity(owner["pid"]),
+                "registration_exists": (support / "generic-host.json").exists(),
+                "discovery_exists": (support / "discovery.json").exists()}
+            observations.append({"after_down": after})
+            (tmp_path / "runtime-host-lifecycle.json").write_text(json.dumps(observations, indent=2))
+            assert after["host_after_birth"] != host_kernel_birth
+            assert after["runtime_after_birth"] != owner["process_birth_id"]
+            assert not after["registration_exists"]
+            assert not after["discovery_exists"]
     finally:
         for state in host_states:
             if host_bootstrap._registered_host_status(state) == "ours":
