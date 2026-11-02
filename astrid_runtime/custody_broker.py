@@ -316,12 +316,29 @@ def _mkdir_owner_only(path: Path, *, parents: bool = False, exist_ok: bool = Fal
         platform.owner_only(directory, directory=True)
 
 
+def _validate_private_directory(path: Path, *, label: str = "custody directory") -> None:
+    """Reject unsafe existing parents without changing permissions we do not own."""
+    try:
+        observed = os.lstat(path)
+    except OSError as exc:
+        raise CustodyError(f"{label} is unavailable") from exc
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+        raise CustodyError(f"{label} is not a real directory")
+    if os.name == "nt":
+        if not platform.is_owner_only(path):
+            raise CustodyError(f"{label} is not owner-only")
+        return
+    if observed.st_uid != platform.current_user() or observed.st_mode & 0o022:
+        raise CustodyError(f"{label} is not privately owned")
+
+
 def _atomic_owner_json(path: Path, value: Mapping[str, object]) -> None:
     if platform.sys.platform == "win32":
         from .io import atomic_write_json
         atomic_write_json(path, dict(value))
         return
     _mkdir_owner_only(path.parent, parents=True, exist_ok=True)
+    _validate_private_directory(path.parent, label="custody file parent")
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(name)
     try:
@@ -983,6 +1000,9 @@ class RoleBoundCustodyBroker:
             _mkdir_owner_only(ledger_root.parent, parents=True, exist_ok=True)
             if not platform.is_owner_only(ledger_root.parent):
                 raise CustodyError("custody ledger parent is not owner-only")
+        else:
+            _mkdir_owner_only(ledger_root.parent, parents=True, exist_ok=True)
+            _validate_private_directory(ledger_root.parent, label="custody ledger parent")
         _mkdir_owner_only(ledger_root, parents=True, exist_ok=False)
         platform.owner_only(ledger_root)
         self.root = ledger_root
@@ -1773,6 +1793,7 @@ class NativeProcessCustody:
                 raise CustodyError(str(exc)) from exc
         elif sys.platform == "darwin":
             record["audit_token_words"] = current_process_audit_token(int(self.identity["pid"]))["words"]
+        _validate_private_directory(self.path.parent, label="native custody parent")
         with platform.file_lock(self.lock):
             _atomic_owner_json(self.path, record)
 
@@ -1785,6 +1806,7 @@ class NativeProcessCustody:
         return record
 
     def release(self):
+        _validate_private_directory(self.path.parent, label="native custody parent")
         with platform.file_lock(self.lock):
             record = self._read()
             actor = _native_controller_incarnation(default_process_identity(os.getpid()))
@@ -1797,6 +1819,7 @@ class NativeProcessCustody:
     def signal(self, signum, *, validate=None):
         if signum not in (platform.TERM, platform.KILL):
             raise CustodyError("native Runtime signal is outside the admitted set")
+        _validate_private_directory(self.path.parent, label="native custody parent")
         # This may run in a separate controller process; it follows the
         # setting in the same Runtime support folder.
         process_control.configure_from(self.path.parent)
