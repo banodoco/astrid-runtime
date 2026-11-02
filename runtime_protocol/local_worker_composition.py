@@ -73,6 +73,37 @@ def _frame_send(channel: socket.socket, value: Mapping[str, Any]) -> None:
     channel.sendall(encoded + b"\n")
 
 
+def _custody_fd_diag(point):
+    """Diagnostic only (lane/M-GPU/p1-runtime-custody-diag): fd numbers and socket state, never contents."""
+    try:
+        import json as _json, os as _os, select as _select, socket as _socket, stat as _stat, sys as _sys, time as _time
+        fds = []
+        for fd in range(32):
+            try:
+                st = _os.fstat(fd)
+            except OSError:
+                continue
+            entry = {"fd": fd, "sock": _stat.S_ISSOCK(st.st_mode), "ino": st.st_ino}
+            if entry["sock"]:
+                peer = _socket.socket(fileno=_os.dup(fd))
+                try:
+                    entry["type"] = peer.getsockopt(_socket.SOL_SOCKET, _socket.SO_TYPE)
+                    entry["err"] = peer.getsockopt(_socket.SOL_SOCKET, _socket.SO_ERROR)
+                    ready, _, _ = _select.select([peer], [], [], 0)
+                    entry["readable"] = bool(ready)
+                    if ready:
+                        entry["eof"] = peer.recv(1, _socket.MSG_PEEK) == b""
+                finally:
+                    peer.close()
+            fds.append(entry)
+        record = {"point": point, "monotonic": _time.monotonic(), "pid": _os.getpid(), "fds": fds}
+        _sys.stderr.write("astrid.custody_fd_diag " + _json.dumps(record, sort_keys=True) + "\n")
+        _sys.stderr.flush()
+    except Exception as exc:
+        import sys as _sys2
+        _sys2.stderr.write("astrid.custody_fd_diag error " + type(exc).__name__ + "\n")
+
+
 def _frame_receive(channel: socket.socket) -> dict[str, Any]:
     frame = bytearray()
     while b"\n" not in frame:
@@ -388,6 +419,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     ledger_root=scope / "host-admission", authority_scope_root=scope,
                     authority_journal=scope / "admissions.jsonl", owner_epoch=epoch, timeout=min(self.timeout_seconds, 60))
                 environment.update(broker.child_environment(mapped_argv, start_new_session=True))
+                _custody_fd_diag("runtime_before_spawn")
                 process = runtime_platform.spawn_tree(custody_wrapper_argv(str(profile.host_executable)), start_new_session=False, cwd=str(profile.support_root),
                     env=environment, stdin=subprocess.DEVNULL, close_fds=True,
                     pass_fds=(control_child.fileno(), activation_child.fileno(), binding_child.fileno()))
@@ -406,7 +438,9 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             from astrid_runtime.custody_broker import _atomic_owner_json
             _atomic_owner_json(handle.owner_session_config_path, profile.host_launch)
             # The private preparation channel reports no engine allocation.
+            _custody_fd_diag("runtime_after_spawn_before_request")
             _frame_send(parent, request)
+            _custody_fd_diag("runtime_waiting_prepared")
             prepared = _frame_receive(parent)
             expected = {"version": request["version"], "status": "prepared", "operation_id": operation_id,
                 "channel_id": channel_id, "owner_epoch": epoch, "execution_mode": "host_only_cpu",

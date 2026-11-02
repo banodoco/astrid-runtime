@@ -1487,6 +1487,37 @@ def custody_wrapper_argv(executable: str) -> list[str]:
     return [executable, "-X", "utf8", "-I", "-m", "astrid_runtime.custody_broker", "--custody-exec"]
 
 
+def _custody_fd_diag(point):
+    """Diagnostic only (lane/M-GPU/p1-runtime-custody-diag): fd numbers and socket state, never contents."""
+    try:
+        import json as _json, os as _os, select as _select, socket as _socket, stat as _stat, sys as _sys, time as _time
+        fds = []
+        for fd in range(32):
+            try:
+                st = _os.fstat(fd)
+            except OSError:
+                continue
+            entry = {"fd": fd, "sock": _stat.S_ISSOCK(st.st_mode), "ino": st.st_ino}
+            if entry["sock"]:
+                peer = _socket.socket(fileno=_os.dup(fd))
+                try:
+                    entry["type"] = peer.getsockopt(_socket.SOL_SOCKET, _socket.SO_TYPE)
+                    entry["err"] = peer.getsockopt(_socket.SOL_SOCKET, _socket.SO_ERROR)
+                    ready, _, _ = _select.select([peer], [], [], 0)
+                    entry["readable"] = bool(ready)
+                    if ready:
+                        entry["eof"] = peer.recv(1, _socket.MSG_PEEK) == b""
+                finally:
+                    peer.close()
+            fds.append(entry)
+        record = {"point": point, "monotonic": _time.monotonic(), "pid": _os.getpid(), "fds": fds}
+        _sys.stderr.write("astrid.custody_fd_diag " + _json.dumps(record, sort_keys=True) + "\n")
+        _sys.stderr.flush()
+    except Exception as exc:
+        import sys as _sys2
+        _sys2.stderr.write("astrid.custody_fd_diag error " + type(exc).__name__ + "\n")
+
+
 def child_exec_from_environment() -> int:
     encoded = os.environ.get("ASTRID_RUNTIME_CUSTODY_TARGET_B64", "")
     try:
@@ -1547,6 +1578,7 @@ def child_exec_from_environment() -> int:
         return enter_module(argv)
     descriptor = connection.detach()
     os.set_inheritable(descriptor, True)
+    _custody_fd_diag("wrapper_before_execve")
     os.execve(argv[0], argv, dict(os.environ))
     raise AssertionError("execve returned")
 

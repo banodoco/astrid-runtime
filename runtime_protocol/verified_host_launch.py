@@ -683,6 +683,37 @@ class MappedImports(importlib.abc.MetaPathFinder):
             submodule_search_locations=[str(Path(item["path"]).parent)] if item["package"] else None)
 
 
+def _custody_fd_diag(point):
+    """Diagnostic only (lane/M-GPU/p1-runtime-custody-diag): fd numbers and socket state, never contents."""
+    try:
+        import json as _json, os as _os, select as _select, socket as _socket, stat as _stat, sys as _sys, time as _time
+        fds = []
+        for fd in range(32):
+            try:
+                st = _os.fstat(fd)
+            except OSError:
+                continue
+            entry = {"fd": fd, "sock": _stat.S_ISSOCK(st.st_mode), "ino": st.st_ino}
+            if entry["sock"]:
+                peer = _socket.socket(fileno=_os.dup(fd))
+                try:
+                    entry["type"] = peer.getsockopt(_socket.SOL_SOCKET, _socket.SO_TYPE)
+                    entry["err"] = peer.getsockopt(_socket.SOL_SOCKET, _socket.SO_ERROR)
+                    ready, _, _ = _select.select([peer], [], [], 0)
+                    entry["readable"] = bool(ready)
+                    if ready:
+                        entry["eof"] = peer.recv(1, _socket.MSG_PEEK) == b""
+                finally:
+                    peer.close()
+            fds.append(entry)
+        record = {"point": point, "monotonic": _time.monotonic(), "pid": _os.getpid(), "fds": fds}
+        _sys.stderr.write("astrid.custody_fd_diag " + _json.dumps(record, sort_keys=True) + "\n")
+        _sys.stderr.flush()
+    except Exception as exc:
+        import sys as _sys2
+        _sys2.stderr.write("astrid.custody_fd_diag error " + type(exc).__name__ + "\n")
+
+
 def launch_from_binding(payload):
     fields = {"schema_version", "mode", "module", "mapping", "host_argv"}
     if isinstance(payload, dict) and payload.get("mode") == TRUSTED_LOCAL_MODE:
@@ -712,6 +743,7 @@ def launch_from_binding(payload):
     module.__spec__ = importlib.util.spec_from_file_location(HOST_MODULE, item["path"], loader=_SourceLoader(item))
     sys.modules['__main__'] = module
     sys.argv[:] = [item["path"], *payload["host_argv"]]
+    _custody_fd_diag("launcher_before_exec_module")
     _SourceLoader(item, trusted_local=payload["mode"] == TRUSTED_LOCAL_MODE).exec_module(module)
 
 
