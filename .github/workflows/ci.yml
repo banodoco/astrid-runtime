@@ -135,6 +135,7 @@ jobs:
           # the workflow-only lane commit that hosts this retry workflow.
           ref: ${{ inputs.runtime_sha || github.sha }}
           persist-credentials: false
+          clean: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
       - name: Restore pip cache (C-08)
         id: c08-runtime-ci-4
         uses: actions/cache/restore@v4
