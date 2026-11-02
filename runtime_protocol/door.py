@@ -325,7 +325,9 @@ def classify(path: str, method: str) -> DoorRoute | None:
     # Reuse the direct listener's decoder and retain the encoded URL so the
     # handler decodes exactly once; no generic wildcard route is admitted.
     if path.startswith("/api/runtime/packs/"):
-        if len(path) <= _MAX_PATH_LENGTH and method.upper() in ("GET", "HEAD") and pack_http_route(path) is not None:
+        pack_route = pack_http_route(path)
+        allowed = {"lease": ("POST",), "release": ("DELETE",)}.get(pack_route[0], ("GET", "HEAD")) if pack_route else ()
+        if len(path) <= _MAX_PATH_LENGTH and method.upper() in allowed:
             return DoorRoute("runtime", path)
         return None
     canonical = _canonical(path)

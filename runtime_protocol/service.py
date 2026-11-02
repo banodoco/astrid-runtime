@@ -493,6 +493,7 @@ class RuntimeService:
         if pack_admissions is not None and not callable(pack_admissions):
             raise ValidationError("pack_admissions must be an installed admission snapshot reader")
         self._pack_admissions = pack_admissions
+        self._pack_leases = {}
         configured_max = os.environ.get("RUNTIME_MAX_OBJECT_BYTES", str(OBJECT_MAX_BYTES))
         if not re.fullmatch(r"[0-9]{1,20}", configured_max):
             raise ValidationError("RUNTIME_MAX_OBJECT_BYTES must be a positive decimal integer")
@@ -583,6 +584,9 @@ class RuntimeService:
                 os.close(fd)
 
     def close(self):
+        for _record, fd in self._pack_leases.values():
+            os.close(fd)
+        self._pack_leases.clear()
         self.store.close()
 
     def _local_claim_fence_path(self):
@@ -5847,11 +5851,12 @@ class RuntimeService:
                 os.close(file_fd)
             os.close(directory_fd)
 
-    def _pack_asset(self, record, path, *, verify_all=False):
+    def _pack_asset(self, record, path, *, verify_all=False, retained_fd=None):
         root_fd = None
         entry_stream = None
         try:
-            root_fd = _open_directory_chain(record["root"])
+            root_fd = (os.dup(retained_fd) if retained_fd is not None
+                       else _open_directory_chain(record["root"]))
             held = os.fstat(root_fd)
             if "rootIdentity" in record and record["rootIdentity"] != (held.st_dev, held.st_ino):
                 raise ConflictError("installed pack folder changed after admission; retry against the committed folder")
@@ -5881,6 +5886,7 @@ class RuntimeService:
     def pack_inventory(self):
         """Expose only committed, enabled browser admissions, with no roots."""
         revision, records = read_pack_admissions(self._pack_admissions)
+        self._prune_pack_leases(records)
         packs = []
         for record in records:
             # Verify exactly the admitted file set before advertising it.
@@ -5888,8 +5894,49 @@ class RuntimeService:
             self._pack_asset(record, "index.js", verify_all=True).close()
             item = {key: record[key] for key in ("packId", "sourceDigest", "digest", "artifactManifestDigest", "enabled")}
             item["url"] = f'/api/runtime/packs/assets/{record["packId"]}/{record["digest"]}/index.js'
+            item["artifactManifest"] = record["artifactManifest"]
             packs.append(item)
         return {"version": 1, "revision": revision, "packs": packs}
+
+    def _prune_pack_leases(self, records):
+        """Disable/uninstall revokes retention, including not-yet-imported chunks."""
+        enabled = {record["packId"] for record in records}
+        with self.store._mutex:
+            for token, (record, fd) in list(self._pack_leases.items()):
+                if record["packId"] not in enabled:
+                    os.close(fd)
+                    del self._pack_leases[token]
+
+    def acquire_pack_lease(self, pack_id, digest):
+        """Only a current admission grants a lease; retained revisions cannot."""
+        if not isinstance(pack_id, str) or not PACK_ID_RE.fullmatch(pack_id):
+            raise ValidationError("packId must identify one installed pack")
+        if not isinstance(digest, str) or not PACK_DIGEST_RE.fullmatch(digest):
+            raise ValidationError("pack digest must be a lowercase SHA-256")
+        _revision, records = read_pack_admissions(self._pack_admissions, pack_id=pack_id)
+        record = next((r for r in records if r["packId"] == pack_id and r["digest"] == digest), None)
+        if record is None:
+            raise NotFoundError("only an installed admitted revision can acquire a lease")
+        fd = _open_directory_chain(record["root"])
+        try:
+            self._pack_asset(record, "index.js", verify_all=True, retained_fd=fd).close()
+            token = secrets.token_hex(32)
+            with self.store._mutex:
+                self._pack_leases[token] = (record, fd)
+            fd = None
+            return {"version": 1, "lease": token}
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def release_pack_lease(self, token):
+        if not isinstance(token, str) or not PACK_DIGEST_RE.fullmatch(token):
+            raise ValidationError("pack lease must be a lowercase SHA-256 token")
+        with self.store._mutex:
+            retained = self._pack_leases.pop(token, None)
+            if retained is not None:
+                os.close(retained[1])
+        return {"version": 1, "released": True}
 
     def open_pack_asset(self, pack_id, digest, path):
         """Serve only listed bytes from an installed, enabled admitted bundle."""
@@ -5900,13 +5947,31 @@ class RuntimeService:
         pack_asset_path(path)
         _revision, records = read_pack_admissions(self._pack_admissions, pack_id=pack_id)
         record = next((item for item in records if item["packId"] == pack_id and item["digest"] == digest), None)
+        # Presence still comes from the current installed authority. A lease only
+        # retains bytes of a revision admitted before a committed replacement.
+        retained_fd = None
+        with self.store._mutex:
+            if not records:
+                for token, (old, fd) in list(self._pack_leases.items()):
+                    if old["packId"] == pack_id:
+                        os.close(fd)
+                        del self._pack_leases[token]
+            if record is None and records:
+                for old, fd in self._pack_leases.values():
+                    if old["packId"] == pack_id and old["digest"] == digest:
+                        record, retained_fd = old, os.dup(fd)
+                        break
         if record is None:
             raise NotFoundError("pack bundle is not installed and admitted")
         item = record["files"].get(path)
-        if item is None:
-            raise NotFoundError("pack asset is not listed in the admitted manifest")
-        stream = self._pack_asset(record, path, verify_all=True)
-        return {"digest": item["sha256"], "size": item["size"], "media_type": item["mime"]}, stream
+        try:
+            if item is None:
+                raise NotFoundError("pack asset is not listed in the admitted manifest")
+            stream = self._pack_asset(record, path, verify_all=True, retained_fd=retained_fd)
+            return {"digest": item["sha256"], "size": item["size"], "media_type": item["mime"]}, stream
+        finally:
+            if retained_fd is not None:
+                os.close(retained_fd)
 
     def open_object(self, digest):
         normalized = str(digest).removeprefix("sha256:")

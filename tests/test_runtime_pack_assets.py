@@ -146,13 +146,14 @@ def test_inventory_is_public_frozen_projection_and_assets_stream_exact_bytes(adm
                 "sourceDigest": SOURCE_DIGEST,
                 "digest": admission["digest"],
                 "artifactManifestDigest": admission["artifactManifestDigest"],
+                "artifactManifest": admission["artifactManifest"],
                 "url": f"/api/runtime/packs/assets/{PACK_ID}/{admission['digest']}/index.js",
                 "enabled": True,
             }
         ],
     }
     assert "root" not in inventory["packs"][0]
-    assert "artifactManifest" not in inventory["packs"][0]
+    assert _sha(_canonical(inventory["packs"][0]["artifactManifest"])) == admission["artifactManifestDigest"]
 
     for path, (expected_bytes, media_type) in expected.items():
         metadata, stream = service.open_pack_asset(PACK_ID, admission["digest"], path)

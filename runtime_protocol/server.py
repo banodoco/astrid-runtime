@@ -28,6 +28,14 @@ def pack_http_route(target):
         return None
     if target == "/api/runtime/packs/inventory":
         return ("inventory",)
+    lease_prefix = "/api/runtime/packs/leases/"
+    if target.startswith(lease_prefix):
+        parts = target[len(lease_prefix):].split("/")
+        if len(parts) == 1 and PACK_DIGEST_RE.fullmatch(parts[0]):
+            return ("release", parts[0])
+        if len(parts) == 2 and PACK_ID_RE.fullmatch(parts[0]) and PACK_DIGEST_RE.fullmatch(parts[1]):
+            return ("lease", *parts)
+        return None
     prefix = "/api/runtime/packs/assets/"
     if not target.startswith(prefix):
         return None
@@ -429,8 +437,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/runtime/packs/"):
             self._identity("objects:read")
             route = pack_http_route(self.path)
-            if route is None or method not in ("GET", "HEAD"):
+            if route is None or method not in ({"lease": ("POST",), "release": ("DELETE",)}.get(route[0], ("GET", "HEAD"))):
                 raise NotFoundError("pack route requires an exact inventory or confined asset URL and GET/HEAD")
+            if route[0] == "lease":
+                return self._send(201, self.runtime.acquire_pack_lease(*route[1:]))
+            if route[0] == "release":
+                return self._send(200, self.runtime.release_pack_lease(route[1]))
             if route[0] == "inventory":
                 return self._send(200, self.runtime.pack_inventory())
             metadata, stream = self.runtime.open_pack_asset(*route[1:])

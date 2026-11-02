@@ -145,6 +145,7 @@ def test_runtime_daemon_composes_admissions_and_serves_inventory_and_assets(runn
         "sourceDigest": admission["sourceDigest"],
         "digest": admission["digest"],
         "artifactManifestDigest": admission["artifactManifestDigest"],
+        "artifactManifest": admission["artifactManifest"],
         "url": _asset_path(admission),
         "enabled": True,
     }]
@@ -420,3 +421,68 @@ def test_snapshot_disable_uninstall_and_daemon_restart_are_live(running_runtime)
         daemon.endpoint, "/api/runtime/packs/inventory", token=daemon.token,
     )
     assert status == 200 and json.loads(body)["revision"] == 4
+
+
+def test_browser_lease_retains_verified_lazy_bytes_and_release_revokes(running_runtime, tmp_path):
+    daemon, state, admission, expected, _token = running_runtime
+    lease_url = f"/api/runtime/packs/leases/{PACK_ID}/{admission['digest']}"
+    # Exact POST route, same door/auth admission as the inventory and assets.
+    status, _, body = _request(daemon.door_endpoint, lease_url, "POST", origin=HOSTED)
+    assert status == 201, body
+    lease = json.loads(body)["lease"]
+    root = Path(admission["root"])
+    retained = root.with_name("retained-old")
+    root.rename(retained)
+    replacement, _ = _write_pack(root)
+    # A valid new admission with a distinct entry identity, as after M1 commit.
+    entry_row = next(r for r in replacement["artifactManifest"]["files"] if r["path"] == ENTRY_PATH)
+    entry = root / entry_row["disk"]
+    entry.write_bytes(entry.read_bytes() + b"// replacement\n")
+    entry_row.update(sha256=hashlib.sha256(entry.read_bytes()).hexdigest(), size=entry.stat().st_size)
+    replacement["digest"] = replacement["artifactManifest"]["digest"] = entry_row["sha256"]
+    replacement["artifactManifestDigest"] = hashlib.sha256(json.dumps(
+        replacement["artifactManifest"], sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()).hexdigest()
+    state["snapshot"] = _snapshot(replacement, revision=2)
+    assert _request(daemon.endpoint, lease_url, "POST", token=daemon.token)[0] == 404
+    old_chunk = _asset_path(admission, "chunks/lazy.js")
+    status, _, body = _request(daemon.door_endpoint, old_chunk, origin=HOSTED)
+    assert status == 200 and body == expected["chunks/lazy.js"][0]
+    # Retention never admits unlisted files or hides old-byte tampering.
+    assert _request(daemon.endpoint, _asset_path(admission, "unlisted.js"), token=daemon.token)[0] == 404
+    chunk = retained / f".build/{admission['sourceDigest']}/chunks/lazy.js"
+    chunk.write_bytes(chunk.read_bytes() + b"tampered")
+    assert _request(daemon.endpoint, old_chunk, token=daemon.token)[0] == 409
+    chunk.write_bytes(expected["chunks/lazy.js"][0])
+    release = f"/api/runtime/packs/leases/{lease}"
+    assert _request(daemon.door_endpoint, release, "DELETE", origin=HOSTED)[0] == 200
+    assert _request(daemon.endpoint, release, "DELETE", token=daemon.token)[0] == 200
+    assert _request(daemon.endpoint, old_chunk, token=daemon.token)[0] == 404
+    assert daemon.service._pack_leases == {}
+
+
+def test_lease_refusals_disable_and_shutdown_cleanup(running_runtime):
+    daemon, state, admission, _expected, _token = running_runtime
+    base = "/api/runtime/packs/leases/"
+    for url in (base + f"unknown/{admission['digest']}", base + f"{PACK_ID}/{'f' * 64}"):
+        assert _request(daemon.endpoint, url, "POST", token=daemon.token)[0] == 404
+    for suffix in (f"../{admission['digest']}", f"{PACK_ID}/%2e%2e", f"{PACK_ID}/{admission['digest']}?x=1"):
+        assert _request(daemon.door_endpoint, base + suffix, "POST", origin=HOSTED)[0] in (400, 404)
+    url = base + f"{PACK_ID}/{admission['digest']}"
+    assert _request(daemon.endpoint, url, "POST")[0] == 401
+    assert _request(daemon.door_endpoint, url, "GET", origin=HOSTED)[0] == 404
+    assert _request(daemon.door_endpoint, url, "POST", origin="https://foreign.example")[0] == 403
+    assert _request(daemon.endpoint, url, "POST", token=daemon.token)[0] == 201
+    retained_fd = next(iter(daemon.service._pack_leases.values()))[1]
+    state["snapshot"] = _snapshot({**admission, "enabled": False}, revision=3)
+    assert _request(daemon.endpoint, _asset_path(admission), token=daemon.token)[0] == 404
+    import os
+    with pytest.raises(OSError):
+        os.fstat(retained_fd)
+    assert daemon.service._pack_leases == {}
+    state["snapshot"] = _snapshot(admission, revision=4)
+    assert _request(daemon.endpoint, url, "POST", token=daemon.token)[0] == 201
+    retained_fd = next(iter(daemon.service._pack_leases.values()))[1]
+    daemon.stop()
+    with pytest.raises(OSError):
+        os.fstat(retained_fd)
