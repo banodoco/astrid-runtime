@@ -664,7 +664,7 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
     remains non-authorizing to the ordinary matcher.  The interruption path
     may use this narrower bridge for its already selected PID: require a
     second native observation with the exact supplied R1 value, the current
-    boot ID, and the host PID namespace before accepting the legacy value.
+    boot ID, and the observer's PID namespace before accepting the legacy value.
     """
     if not is_legacy_linux_birth_id(expected):
         return None
@@ -696,7 +696,7 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
         return False
     try:
         boot = (Path("/proc") / "sys/kernel/random/boot_id").read_text().strip()
-        host_pidns = (Path("/proc") / "1/ns/pid").stat().st_ino
+        observer_pidns = (Path("/proc") / "self/ns/pid").stat().st_ino
         fresh = process_identity(pid)
     except OSError:
         return None
@@ -711,7 +711,7 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
             or not observed_scope["pidns"].isascii()
             or not observed_scope["pidns"].isdigit()
             or observed_scope["boot"] != current_boot
-            or observed_scope["pidns"] != str(host_pidns)):
+            or observed_scope["pidns"] != str(observer_pidns)):
         return None
     return True
 

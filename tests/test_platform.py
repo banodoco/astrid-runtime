@@ -654,7 +654,7 @@ def test_process_birth_comparison_handles_reboot_namespace_and_legacy(expected, 
     assert platform.process_birth_matches(expected, actual) is result
 
 
-def test_legacy_linux_birth_bridge_accepts_only_fresh_current_host_owner(monkeypatch):
+def test_legacy_linux_birth_bridge_accepts_only_fresh_current_namespace_owner(monkeypatch):
     boot = "b38142f7-84c5-487d-95a4-8180cbff3972"
     observed = f"proc-start-ticks:42;boot:{boot};pidns:77"
 
@@ -665,7 +665,7 @@ def test_legacy_linux_birth_bridge_accepts_only_fresh_current_host_owner(monkeyp
             assert self.value == "/proc/sys/kernel/random/boot_id"
             return boot
         def stat(self):
-            assert self.value == "/proc/1/ns/pid"
+            assert self.value == "/proc/self/ns/pid"
             return SimpleNamespace(st_ino=77)
 
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
@@ -691,7 +691,7 @@ def test_legacy_linux_birth_bridge_rejects_malformed_or_partial_values(monkeypat
     assert platform.legacy_linux_birth_matches_live_owner(expected, actual, pid=123) is result
 
 
-@pytest.mark.parametrize("kind", ["pid-replacement", "foreign-boot", "foreign-namespace", "unreadable", "unknown"])
+@pytest.mark.parametrize("kind", ["pid-replacement", "birth-replacement", "foreign-boot", "foreign-namespace", "unreadable-boot", "unreadable-namespace", "unknown"])
 def test_legacy_linux_birth_bridge_refuses_untrusted_live_observations(monkeypatch, kind):
     boot = "b38142f7-84c5-487d-95a4-8180cbff3972"
     foreign_boot = "de2e05aa-6956-451e-9dd9-521955212d27"
@@ -703,10 +703,14 @@ def test_legacy_linux_birth_bridge_refuses_untrusted_live_observations(monkeypat
         def __init__(self, value): self.value = str(value)
         def __truediv__(self, part): return FakePath(self.value.rstrip("/") + "/" + str(part))
         def read_text(self):
-            if kind == "unreadable":
+            if kind == "unreadable-boot":
                 raise PermissionError("restricted proc mount")
             return boot
-        def stat(self): return SimpleNamespace(st_ino=77)
+        def stat(self):
+            assert self.value == "/proc/self/ns/pid"
+            if kind == "unreadable-namespace":
+                raise PermissionError("restricted namespace")
+            return SimpleNamespace(st_ino=77)
 
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(platform, "Path", FakePath)
@@ -716,10 +720,22 @@ def test_legacy_linux_birth_bridge_refuses_untrusted_live_observations(monkeypat
         monkeypatch.setattr(platform, "process_identity", lambda pid: {
             "pid": pid + 1 if kind == "pid-replacement" else pid,
             "uid": 501,
-            "birth_id": actual,
+            "birth_id": actual if kind != "birth-replacement" else actual.replace("ticks:42", "ticks:43"),
         })
 
     assert platform.legacy_linux_birth_matches_live_owner("proc-start-ticks:42", actual, pid=123) is None
+
+
+@pytest.mark.skipif(sys.platform != "linux" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="requires Linux and a non-root caller")
+def test_legacy_linux_birth_bridge_uses_real_nonroot_kernel_namespace():
+    pid = os.getpid()
+    identity = platform.process_identity(pid)
+    assert identity is not None
+    actual = identity["birth_id"]
+    assert f";pidns:{Path('/proc/self/ns/pid').stat().st_ino}" in actual
+    legacy = actual.split(";", 1)[0]
+    assert platform.legacy_linux_birth_matches_live_owner(legacy, actual, pid=pid) is True
 
 
 def test_linux_identity_includes_incarnation_scope():
