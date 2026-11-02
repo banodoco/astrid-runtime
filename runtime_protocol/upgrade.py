@@ -1813,7 +1813,7 @@ def _collect_historical_candidates(
                 skip(task, "missing_verified_filename_or_media_type", ordinal=ordinal)
                 continue
             object_row = connection.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
-            if object_row and (int(object_row["size"]) != raw_size or object_row["media_type"] != media_type):
+            if object_row and (int(object_row["size"]) != raw_size):
                 skip(task, "object_metadata_conflict", ordinal=ordinal)
                 continue
             project_object = connection.execute(
@@ -1851,7 +1851,7 @@ def _insert_historical_candidates(connection: sqlite3.Connection, candidates: li
             existing = connection.execute(
                 "SELECT size, media_type FROM objects WHERE digest=?", (item["object_digest"],)
             ).fetchone()
-            if existing and (int(existing["size"]) != int(item["size"]) or existing["media_type"] != item["media_type"]):
+            if existing and (int(existing["size"]) != int(item["size"])):
                 raise ConflictError(f"historical object metadata conflicts: {item['object_digest']}")
             if existing is None:
                 connection.execute(

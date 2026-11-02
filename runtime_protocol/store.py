@@ -6570,7 +6570,7 @@ class RealmStore:
                     "SELECT size, media_type FROM objects WHERE digest=?",
                     (association["object_digest"],),
                 ).fetchone()
-                if not object_row or int(object_row["size"]) != int(association["size"]) or object_row["media_type"] != association["media_type"]:
+                if not object_row or int(object_row["size"]) != int(association["size"]):
                     relational_errors.append({"association_id": association["association_id"], "reason": "object_metadata"})
                 attempt = self.conn.execute(
                     "SELECT task_id FROM attempts WHERE id=?", (association["attempt_id"],)

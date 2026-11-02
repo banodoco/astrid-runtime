@@ -220,7 +220,9 @@ def test_project_media_permission_and_size_rejections_have_no_catalog_side_effec
             expected_digest="sha256:" + "0" * 64,
             actor_id="owner", idempotency_key="bad-digest",
         )
-    with pytest.raises(ConflictError, match="metadata does not match existing object"):
+    # MIME is per import; corrupt the shared byte size to exercise a real refusal.
+    service.store.conn.execute("UPDATE objects SET size=size+1 WHERE digest=?", (imported["asset_id"][7:],))
+    with pytest.raises(ValidationError, match="output size does not match CAS bytes"):
         service.import_media(
             owner["id"], b"owned", media_type="video/mp4",
             original_name="same-bytes.mp4", actor_id="owner",
