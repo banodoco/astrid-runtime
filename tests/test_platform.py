@@ -342,6 +342,30 @@ def test_linux_signal_refuses_mismatched_birth_before_kernel_signal(monkeypatch,
     assert closed == [99]
 
 
+def test_linux_signal_accepts_only_the_validated_r0_live_owner_bridge(monkeypatch):
+    pid = 77
+    boot = "b38142f7-84c5-487d-95a4-8180cbff3972"
+    observed = {"pid": pid, "uid": 501, "birth_id": f"proc-start-ticks:42;boot:{boot};pidns:77"}
+    sent, closed = [], []
+
+    class FakePath:
+        def __init__(self, value): self.value = str(value)
+        def __truediv__(self, part): return FakePath(self.value.rstrip("/") + "/" + str(part))
+        def read_text(self): return boot
+        def stat(self): return SimpleNamespace(st_ino=77)
+
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(platform, "Path", FakePath)
+    monkeypatch.setattr(platform, "pidfd_open", lambda candidate: 99 if candidate == pid else pytest.fail("wrong PID"))
+    monkeypatch.setattr(platform, "pidfd_send_signal", lambda fd, signum: sent.append((fd, signum)))
+    monkeypatch.setattr(platform.os, "close", closed.append)
+    monkeypatch.setattr(platform, "process_identity", lambda candidate: dict(observed) if candidate == pid else None)
+
+    platform.signal_process({"pid": pid, "uid": 501, "birth_id": "proc-start-ticks:42"}, platform.TERM)
+    assert sent == [(99, platform.TERM)]
+    assert closed == [99]
+
+
 def test_darwin_identity_keeps_legacy_birth_marker_and_brackets_native_observation(monkeypatch):
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="darwin"))
     seconds = int(time.mktime((2026, 10, 9, 18, 21, 21, 0, 0, -1)))
@@ -628,6 +652,74 @@ def test_windows_tree_drained_preserves_query_errors(monkeypatch):
 ])
 def test_process_birth_comparison_handles_reboot_namespace_and_legacy(expected, actual, result):
     assert platform.process_birth_matches(expected, actual) is result
+
+
+def test_legacy_linux_birth_bridge_accepts_only_fresh_current_host_owner(monkeypatch):
+    boot = "b38142f7-84c5-487d-95a4-8180cbff3972"
+    observed = f"proc-start-ticks:42;boot:{boot};pidns:77"
+
+    class FakePath:
+        def __init__(self, value): self.value = str(value)
+        def __truediv__(self, part): return FakePath(self.value.rstrip("/") + "/" + str(part))
+        def read_text(self):
+            assert self.value == "/proc/sys/kernel/random/boot_id"
+            return boot
+        def stat(self):
+            assert self.value == "/proc/1/ns/pid"
+            return SimpleNamespace(st_ino=77)
+
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(platform, "Path", FakePath)
+    monkeypatch.setattr(platform, "process_identity", lambda pid: {
+        "pid": pid, "uid": 501, "birth_id": observed,
+    })
+
+    assert platform.legacy_linux_birth_matches_live_owner(
+        "proc-start-ticks:42", observed, pid=123,
+    ) is True
+
+
+@pytest.mark.parametrize("expected,actual,result", [
+    ("proc-start-ticks:43", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77", False),
+    ("proc-start-ticks:bad", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77", None),
+    ("proc-start-ticks:42;boot:x", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42;boot:not-a-uuid;pidns:77", None),
+])
+def test_legacy_linux_birth_bridge_rejects_malformed_or_partial_values(monkeypatch, expected, actual, result):
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
+    assert platform.legacy_linux_birth_matches_live_owner(expected, actual, pid=123) is result
+
+
+@pytest.mark.parametrize("kind", ["pid-replacement", "foreign-boot", "foreign-namespace", "unreadable", "unknown"])
+def test_legacy_linux_birth_bridge_refuses_untrusted_live_observations(monkeypatch, kind):
+    boot = "b38142f7-84c5-487d-95a4-8180cbff3972"
+    foreign_boot = "de2e05aa-6956-451e-9dd9-521955212d27"
+    namespace = "77" if kind != "foreign-namespace" else "78"
+    actual_boot = foreign_boot if kind == "foreign-boot" else boot
+    actual = f"proc-start-ticks:42;boot:{actual_boot};pidns:{namespace}"
+
+    class FakePath:
+        def __init__(self, value): self.value = str(value)
+        def __truediv__(self, part): return FakePath(self.value.rstrip("/") + "/" + str(part))
+        def read_text(self):
+            if kind == "unreadable":
+                raise PermissionError("restricted proc mount")
+            return boot
+        def stat(self): return SimpleNamespace(st_ino=77)
+
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(platform, "Path", FakePath)
+    if kind == "unknown":
+        monkeypatch.setattr(platform, "process_identity", lambda _pid: (_ for _ in ()).throw(OSError("denied")))
+    else:
+        monkeypatch.setattr(platform, "process_identity", lambda pid: {
+            "pid": pid + 1 if kind == "pid-replacement" else pid,
+            "uid": 501,
+            "birth_id": actual,
+        })
+
+    assert platform.legacy_linux_birth_matches_live_owner("proc-start-ticks:42", actual, pid=123) is None
 
 
 def test_linux_identity_includes_incarnation_scope():

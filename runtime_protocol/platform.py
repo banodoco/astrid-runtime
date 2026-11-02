@@ -648,6 +648,74 @@ def process_birth_matches(expected: str, actual: str) -> bool | None:
     return True
 
 
+def is_legacy_linux_birth_id(value: str) -> bool:
+    """Whether ``value`` is the unscoped Linux form emitted by Runtime R0."""
+    if sys.platform != "linux" or not isinstance(value, str):
+        return False
+    tick = value.removeprefix("proc-start-ticks:")
+    return value.startswith("proc-start-ticks:") and tick.isascii() and tick.isdigit()
+
+
+def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: int) -> bool | None:
+    """Bridge an R0 Linux birth ID only to a freshly observed local owner.
+
+    R0 persisted only ``proc-start-ticks:<ticks>``.  That value cannot by
+    itself identify a process after a reboot or across PID namespaces, so it
+    remains non-authorizing to the ordinary matcher.  The interruption path
+    may use this narrower bridge for its already selected PID: require a
+    second native observation with the exact supplied R1 value, the current
+    boot ID, and the host PID namespace before accepting the legacy value.
+    """
+    if not is_legacy_linux_birth_id(expected):
+        return None
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if not isinstance(actual, str):
+        return None
+
+    def parse(value: str):
+        if not value.startswith("proc-start-ticks:"):
+            return None
+        tick, *parts = value[len("proc-start-ticks:"):].split(";")
+        if not tick.isascii() or not tick.isdigit():
+            return None
+        scope = {}
+        for part in parts:
+            key, separator, item = part.partition(":")
+            if not separator or key not in {"boot", "pidns"} or not item or key in scope:
+                return None
+            scope[key] = item
+        return tick, scope
+
+    recorded, observed = parse(expected), parse(actual)
+    if (recorded is None or observed is None or recorded[1]
+            or set(observed[1]) != {"boot", "pidns"}):
+        return None
+    observed_tick, observed_scope = observed
+    if recorded[0] != observed_tick:
+        return False
+    try:
+        boot = (Path("/proc") / "sys/kernel/random/boot_id").read_text().strip()
+        host_pidns = (Path("/proc") / "1/ns/pid").stat().st_ino
+        fresh = process_identity(pid)
+    except OSError:
+        return None
+    if (fresh is None or fresh.get("pid") != pid
+            or fresh.get("birth_id") != actual):
+        return None
+    try:
+        current_boot = str(uuid.UUID(boot))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if (current_boot != boot
+            or not observed_scope["pidns"].isascii()
+            or not observed_scope["pidns"].isdigit()
+            or observed_scope["boot"] != current_boot
+            or observed_scope["pidns"] != str(host_pidns)):
+        return None
+    return True
+
+
 def process_executable(pid: int) -> str:
     if sys.platform == "darwin":
         library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
@@ -1341,7 +1409,15 @@ def _signal_checked_pid(expected, signum) -> None:
     _note_fallback("pidfd", "pidfd_open is unavailable (ENOSYS); signalling by PID after a /proc start-time check")
     pid = int(expected["pid"])
     observed = process_identity(pid)
-    if observed is None or any(observed.get(k) != expected.get(k) for k in ("pid", "uid", "birth_id")):
+    if (observed is None
+            or observed.get("pid") != expected.get("pid")
+            or observed.get("uid") != expected.get("uid")
+            or (process_birth_matches(
+                str(expected.get("birth_id") or ""), str(observed.get("birth_id") or ""),
+            ) is not True
+                and legacy_linux_birth_matches_live_owner(
+                    str(expected.get("birth_id") or ""), str(observed.get("birth_id") or ""), pid=pid,
+                ) is not True)):
         raise OSError("process incarnation changed")
     os.kill(pid, signum)
 
@@ -1472,7 +1548,15 @@ def signal_process(expected, signum):
         return
     try:
         observed = process_identity(pid)
-        if observed is None or any(observed.get(k) != expected.get(k) for k in ("pid", "uid", "birth_id")):
+        if (observed is None
+                or observed.get("pid") != expected.get("pid")
+                or observed.get("uid") != expected.get("uid")
+                or (process_birth_matches(
+                    str(expected.get("birth_id") or ""), str(observed.get("birth_id") or ""),
+                ) is not True
+                    and legacy_linux_birth_matches_live_owner(
+                        str(expected.get("birth_id") or ""), str(observed.get("birth_id") or ""), pid=pid,
+                    ) is not True)):
             raise OSError("process incarnation changed")
         pidfd_send_signal(fd, signum)
     finally:

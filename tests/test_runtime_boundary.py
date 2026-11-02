@@ -229,6 +229,128 @@ def test_validate_owner_uses_daemon_identity_when_birth_probe_is_unavailable(tmp
     )
 
 
+def test_validate_owner_accepts_live_r0_linux_birth_bridge(tmp_path, monkeypatch):
+    from astrid_runtime import runtime_boundary as module
+
+    pid = 12345
+    recorded = "proc-start-ticks:42"
+    observed = "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77"
+    realm = tmp_path / "realm"
+    realm.mkdir()
+    owner = tmp_path / "instance.lock"
+    owner.write_text(json.dumps({
+        "pid": pid, "process_birth_id": recorded, "runtime_instance_id": "instance",
+        "realm_id": "realm", "realm_root": str(realm.resolve()),
+    }))
+    boundary = LocalRuntimeBoundary()
+    bridge_calls = []
+    monkeypatch.setattr(boundary, "is_pid_alive", lambda candidate: candidate == pid)
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda candidate: observed if candidate == pid else None)
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda _endpoint: {
+        "status": "ok", "protocol": "workspace.v1", "runtime_instance_id": "instance",
+    })
+    monkeypatch.setattr(module.platform, "legacy_linux_birth_matches_live_owner", lambda expected, actual, *, pid: (
+        bridge_calls.append((expected, actual, pid)) or (expected, actual, pid) == (recorded, observed, 12345)
+    ))
+
+    assert boundary.validate_owner(
+        endpoint="http://127.0.0.1:61217", pid=pid, instance_id="instance", owner_lock=owner,
+        process_birth_id=recorded, expected_realm_id="realm", expected_realm_root=realm,
+    ) is True
+    assert bridge_calls == [(recorded, observed, pid)]
+
+
+def test_validate_owner_refuses_r0_linux_birth_without_a_live_scoped_observation(tmp_path, monkeypatch):
+    from astrid_runtime import runtime_boundary as module
+
+    pid = 12345
+    recorded = "proc-start-ticks:42"
+    owner = tmp_path / "instance.lock"
+    owner.write_text(json.dumps({
+        "pid": pid, "process_birth_id": recorded, "runtime_instance_id": "instance",
+    }))
+    boundary = LocalRuntimeBoundary()
+    monkeypatch.setattr(boundary, "is_pid_alive", lambda candidate: candidate == pid)
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda _candidate: None)
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda _endpoint: {
+        "status": "ok", "protocol": "workspace.v1", "runtime_instance_id": "instance",
+    })
+    monkeypatch.setattr(module.platform, "is_legacy_linux_birth_id", lambda value: value == recorded)
+
+    assert boundary.validate_owner(
+        endpoint="http://127.0.0.1:61217", pid=pid, instance_id="instance", owner_lock=owner,
+        process_birth_id=recorded,
+    ) is False
+
+
+@pytest.mark.parametrize("mismatch", ["endpoint-instance", "lock-instance", "realm"])
+def test_r0_linux_birth_bridge_keeps_instance_and_realm_owner_fences(tmp_path, monkeypatch, mismatch):
+    from astrid_runtime import runtime_boundary as module
+
+    pid = 12345
+    recorded = "proc-start-ticks:42"
+    observed = "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77"
+    realm = tmp_path / "realm"
+    other_realm = tmp_path / "other-realm"
+    realm.mkdir()
+    other_realm.mkdir()
+    owner = tmp_path / "instance.lock"
+    owner.write_text(json.dumps({
+        "pid": pid, "process_birth_id": recorded,
+        "runtime_instance_id": "other-instance" if mismatch == "lock-instance" else "instance",
+        "realm_id": "other-realm" if mismatch == "realm" else "realm",
+        "realm_root": str((other_realm if mismatch == "realm" else realm).resolve()),
+    }))
+    boundary = LocalRuntimeBoundary()
+    monkeypatch.setattr(boundary, "is_pid_alive", lambda candidate: candidate == pid)
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda candidate: observed if candidate == pid else None)
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda _endpoint: {
+        "status": "ok", "protocol": "workspace.v1",
+        "runtime_instance_id": "other-instance" if mismatch == "endpoint-instance" else "instance",
+    })
+    monkeypatch.setattr(module.platform, "legacy_linux_birth_matches_live_owner", lambda *_args, **_kwargs: True)
+
+    assert boundary.validate_owner(
+        endpoint="http://127.0.0.1:61217", pid=pid, instance_id="instance", owner_lock=owner,
+        process_birth_id=recorded, expected_realm_id="realm", expected_realm_root=realm,
+    ) is False
+
+
+@pytest.mark.parametrize("endpoint_identity", [
+    {},
+    {"runtime_instance_id": "other-instance", "realm_id": "realm"},
+    {"runtime_instance_id": "instance", "realm_id": "other-realm"},
+])
+def test_stop_endpoint_retains_authenticated_instance_and_realm_binding(tmp_path, endpoint_identity):
+    from astrid_runtime.bootstrap import _validate_stop_endpoint
+    from astrid_runtime.paths import RuntimePaths
+
+    paths = RuntimePaths.sandbox(tmp_path)
+    paths.ensure_support_dirs()
+    realm = tmp_path / "realm"
+    realm.mkdir()
+    calls = []
+
+    class Boundary:
+        def validate_owner(self, **kwargs):
+            calls.append(kwargs)
+            return True
+
+        def endpoint_metadata(self, **_kwargs):
+            return endpoint_identity
+
+    with pytest.raises(BootstrapError, match="endpoint identity does not match"):
+        _validate_stop_endpoint(
+            paths, Boundary(), owner=(12345, "proc-start-ticks:42", "instance", "http://127.0.0.1:61217"),
+            realm_id="realm", realm_root=realm,
+        )
+    assert calls == [{
+        "endpoint": "http://127.0.0.1:61217", "pid": 12345, "instance_id": "instance",
+        "owner_lock": paths.instance_lock_path, "process_birth_id": "proc-start-ticks:42",
+        "expected_realm_id": "realm", "expected_realm_root": realm,
+    }]
+
+
 def test_slow_healthy_runtime_and_degraded_owner(tmp_path):
     class Handler(BaseHTTPRequestHandler):
         status = "ok"
