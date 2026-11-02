@@ -59,7 +59,7 @@ def test_inventory_verifiers_accept_posix_keys_with_windows_native_paths(tmp_pat
     if validator == "_inventory":
         monkeypatch.setattr(gate, "read_source", lambda *_args: b"module")
     else:
-        monkeypatch.setattr(gate, "_local_read", lambda *_args: b"module")
+        monkeypatch.setattr(gate, "_local_member_digest", lambda *_args: b"module")
         monkeypatch.setattr(gate, "installed_inventory", lambda _root: value)
     assert getattr(gate, validator)(value) == value
 
@@ -668,3 +668,46 @@ def test_host_only_environment_validates_selected_release_before_accepting_roots
     with pytest.raises(gate.HostLaunchError,match='release differs'):
         f.verifier.verify(**f.args)
     assert observed==[]
+
+
+def _write_sized(path, size, fill=b"\x5a"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as handle:
+        block = fill * (1024 * 1024)
+        for _ in range(size // len(block)):
+            handle.write(block)
+        handle.write(fill * (size % len(block)))
+
+
+def test_inventory_member_over_import_bound_passes_when_digest_matches(tmp_path):
+    root = tmp_path / "site"
+    big = root / "cv2" / "cv2.abi3.so"
+    _write_sized(big, gate.LIMIT + 1024 * 1024)
+    inventory = gate.installed_inventory(root)
+    assert inventory["files"]["cv2/cv2.abi3.so"] == hashlib.sha256(big.read_bytes()).hexdigest()
+    assert gate._local_inventory(inventory)["files"] == inventory["files"]
+
+
+def test_inventory_member_digest_mismatch_still_fails_closed(tmp_path):
+    root = tmp_path / "site"
+    _write_sized(root / "cv2" / "cv2.abi3.so", gate.LIMIT + 1024 * 1024)
+    inventory = gate.installed_inventory(root)
+    inventory["files"]["cv2/cv2.abi3.so"] = "0" * 64
+    with pytest.raises(gate.HostLaunchError):
+        gate._local_inventory(inventory)
+
+
+def test_inventory_member_over_sanity_bound_fails_closed(tmp_path, monkeypatch):
+    root = tmp_path / "site"
+    _write_sized(root / "pathological.bin", 2 * 1024 * 1024)
+    inventory = gate.installed_inventory(root)
+    monkeypatch.setattr(gate, "INVENTORY_MEMBER_LIMIT", 1024 * 1024)
+    with pytest.raises(gate.HostLaunchError):
+        gate._local_inventory(inventory)
+
+
+def test_read_source_still_rejects_over_import_bound(tmp_path):
+    big = tmp_path / "import_source.so"
+    _write_sized(big, gate.LIMIT + 1024 * 1024)
+    with pytest.raises(gate.HostLaunchError):
+        gate.read_source(big, hashlib.sha256(big.read_bytes()).hexdigest())

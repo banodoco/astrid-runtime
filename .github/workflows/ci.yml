@@ -28,7 +28,7 @@ jobs:
       - name: Checkout published Agent alongside Runtime
         shell: bash
         env:
-          AGENT_SHA: dd6b48192c720c5346e6f140184e313b2cf84f31
+          AGENT_SHA: e425903f7a9f5b82973281d15054c0716b46e2d
         run: |
           agent_dir="$GITHUB_WORKSPACE/../astrid-agent"
           git init --quiet "$agent_dir"
