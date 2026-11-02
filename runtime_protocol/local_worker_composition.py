@@ -535,6 +535,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             return self._relay_abort_locked(handle)
 
     def _relay_abort_locked(self, handle):
+        from .local_execution_supervisor import RetainedWaitTimeout
         if handle.closed:
             return
         response = self._rpc(handle, {"version": "runtime.local-execution-control/v1", "command": "abort"})
@@ -544,7 +545,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             handle.broker.signal(runtime_platform.TERM, expected_pid=handle.worker.pid)
             try:
                 handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
-            except BaseException:
+            except RetainedWaitTimeout:
                 handle.broker.signal(runtime_platform.KILL, expected_pid=handle.worker.pid)
                 handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
         handle.control.close()

@@ -131,8 +131,7 @@ def test_real_site_seals_binds_and_signals(site, tmp_path, monkeypatch, launch):
         assert retained.actor.verify()['pid'] == retained.child.pid
         assert broker.role_authority.reference()['target'] == retained.actor.verify()
         broker.signal(signal.SIGTERM, expected_pid=retained.child.pid)
-        with retained.guard:
-            assert retained.child.wait(timeout=10) == -15
+        assert retained.wait(timeout=10) == -15
         assert retained.child.returncode == -15
     finally:
         _close(site, owner or get_owner())
