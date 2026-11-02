@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
+import shutil
 
 import pytest
 
@@ -17,7 +19,7 @@ from runtime_protocol.store import RealmStore
 pytestmark = pytest.mark.integration
 
 
-def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys, astrid_importable):
+def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, astrid_importable):
     from astrid.sdk import AstridClient
     from astrid.sdk import host_bootstrap
     import astrid.services
@@ -45,14 +47,29 @@ def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys
     observations = []
     host_states = []
 
-    def command(*words):
+    def command(*words, preload=None, selected_manifest=None, expected_error=None):
         argv = [*words, "--profile", "astrid", "--data-root", str(data),
-                "--source-manifest", str(manifest), "--hosted-origin", "off", "--json"]
-        result = cli.main(argv)
-        output = capsys.readouterr().out
-        observations.append({"argv": argv, "exit": result, "stdout": output})
+                "--source-manifest", str(selected_manifest or manifest), "--hosted-origin", "off", "--json"]
+        # Select Runtime only; isolated Python still sees the environment's
+        # installed Agent. Production CLI must select the manifest's Agent.
+        preimport = (f"sys.path.insert(0,{str(preload)!r}); import astrid.services; sys.path.pop(0); "
+                     if preload else "")
+        launch = [sys.executable, "-I", "-B", "-c",
+                  "import runpy,sys; " + preimport + "sys.path.insert(0,sys.argv.pop(1)); "
+                  "runpy.run_module('astrid_runtime',run_name='__main__')",
+                  str(runtime), *argv]
+        environment = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG") if key in os.environ}
+        result = subprocess.run(launch, env=environment, capture_output=True, text=True, timeout=90)
+        output = result.stdout
+        observations.append({"argv": launch, "exit": result.returncode, "stdout": output,
+                             "stderr": result.stderr})
         (tmp_path / "runtime-host-lifecycle.json").write_text(json.dumps(observations, indent=2))
-        assert result == 0, output
+        if expected_error is None:
+            assert result.returncode == 0, (output, result.stderr)
+        else:
+            assert result.returncode == 1, (output, result.stderr)
+            payload = json.loads(output)
+            assert payload["ok"] is False and expected_error in str(payload["error"])
         assert hashlib.sha256(manifest.read_bytes()).hexdigest() == manifest_sha
 
     command("workspace", "attach", "--realm-root", str(realm), "--realm-id", realm_id,
@@ -86,6 +103,32 @@ def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys
             observations.append({"before_down": {"manifest_sha256": manifest_sha,
                 "registration": registration, "host_kernel_birth_id": host_kernel_birth,
                 "owner": owner, "discovery": discovery}})
+            # A real second source was imported before CLI dispatch. Refuse
+            # its cached owner even though it has the shutdown helper.
+            foreign = tmp_path / "foreign-agent"
+            foreign_package = foreign / "astrid"
+            foreign_package.mkdir(parents=True, exist_ok=True)
+            for name in ("__init__.py", "version.py", "services.py"):
+                shutil.copyfile(source / "astrid" / name, foreign_package / name)
+            command("down", preload=foreign, expected_error="unselected origin")
+            assert LocalRuntimeBoundary.process_birth_identity(owner["pid"]) == owner["process_birth_id"]
+            assert json.loads((support / "generic-host.json").read_text()) == registration
+
+            # Declared source paths and registration custody are checked at
+            # the same real CLI boundary, before any stop effect.
+            invalid = json.loads(manifest.read_text())
+            invalid["source_checkout"] = str(tmp_path / "missing-agent")
+            bad_manifest = data / "invalid-source.json"
+            bad_manifest.write_text(json.dumps(invalid))
+            command("down", selected_manifest=bad_manifest, expected_error="Selected Agent checkout")
+            replaced = {**registration, "runtime_instance_id": "foreign-incarnation"}
+            (support / "generic-host.json").write_text(json.dumps(replaced))
+            try:
+                command("down", expected_error="differs from the selected Runtime owner")
+                assert LocalRuntimeBoundary.process_birth_identity(owner["pid"]) == owner["process_birth_id"]
+                assert json.loads((support / "generic-host.json").read_text()) == replaced
+            finally:
+                (support / "generic-host.json").write_text(json.dumps(registration))
             command("down")
             # These are synchronous postconditions of down, with no wait here.
             after = {"host_pid": registration["pid"], "host_before_birth": host_kernel_birth,
@@ -104,4 +147,6 @@ def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys
         for state in host_states:
             if host_bootstrap._registered_host_status(state) == "ours":
                 host_bootstrap._stop_registered_host(state)
-        command("down")
+        # Preserve the production-boundary failure while cleaning its owner.
+        assert cli.main(["down", "--profile", "astrid", "--data-root", str(data),
+                         "--source-manifest", str(manifest), "--hosted-origin", "off", "--json"]) == 0
