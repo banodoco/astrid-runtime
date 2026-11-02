@@ -10,8 +10,73 @@ on:
         description: Full immutable Agent commit SHA (empty uses fixture pin)
         required: false
         type: string
+      runtime_sha:
+        description: Full immutable Runtime commit SHA for a focused selector
+        required: false
+        type: string
+      selector:
+        description: Exact focused pytest module selector
+        required: false
+        type: string
 
 jobs:
+  windows-focused-collection:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.selector == 'tests/test_local_execution_supervisor.py tests/test_local_worker_composition.py' }}
+    runs-on: windows-latest
+    steps:
+      - name: Check out requested Runtime revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.runtime_sha || github.sha }}
+          fetch-depth: 1
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Record effective checkouts
+        shell: bash
+        env:
+          REQUESTED_RUNTIME_SHA: ${{ inputs.runtime_sha || github.sha }}
+        run: |
+          runtime_sha=$(git rev-parse HEAD)
+          test "$runtime_sha" = "$REQUESTED_RUNTIME_SHA"
+          {
+            echo "Runtime: $runtime_sha"
+            echo "Agent: not checked out (collection-only selector needs Runtime only)"
+          } | tee effective-checkouts.txt
+          {
+            echo "Runtime: $runtime_sha"
+            echo 'Agent: not checked out (collection-only selector needs Runtime only)'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Runtime test dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Run exact focused collection selector
+        id: focused-collection
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p .ci-evidence
+          python -m pytest -q -p no:cacheprovider --collect-only tests/test_local_execution_supervisor.py tests/test_local_worker_composition.py > .ci-evidence/collection.log 2>&1
+          pytest_exit=$?
+          printf '%s\n' "$pytest_exit" > .ci-evidence/pytest-exit-code.txt
+          echo "Inner pytest exit code: $pytest_exit"
+          exit "$pytest_exit"
+      - name: Upload focused collection evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-focused-collection-${{ github.run_id }}
+          path: |
+            .ci-evidence/collection.log
+            .ci-evidence/pytest-exit-code.txt
+            effective-checkouts.txt
+          if-no-files-found: error
+      - name: Enforce inner pytest result
+        if: ${{ always() }}
+        shell: bash
+        run: exit "$(cat .ci-evidence/pytest-exit-code.txt)"
+
   windows-realm-publication:
     runs-on: windows-latest
     steps:
