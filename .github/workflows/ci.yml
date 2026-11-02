@@ -572,7 +572,7 @@ jobs:
           junit = directory / "pytest.xml"
           if junit.exists():
               try:
-                  root = ET.parse(junit).getroot()
+                  root = ET.parse(junit).getroot().find("testsuite")
                   for key in counts:
                       value = root.attrib.get(key)
                       counts[key] = int(value) if value is not None else 0
