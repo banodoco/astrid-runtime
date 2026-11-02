@@ -48,7 +48,7 @@ from urllib.parse import unquote, urlsplit
 
 from .auth import CredentialStore
 from .errors import AuthorizationError, BodyTooLargeError, ConflictError
-from .server import RuntimeHTTPServer, RuntimeHandler
+from .server import RuntimeHTTPServer, RuntimeHandler, pack_http_route
 
 DEFAULT_DOOR_PORT = 17340
 DEFAULT_HOSTED_ORIGIN = "https://astrid.haus"
@@ -59,9 +59,9 @@ PRODUCT_SCOPES = tuple(sorted((*LEGACY_PRODUCT_SCOPES, "installer:update")))
 NON_PRODUCT_ACTORS = frozenset({"owner", "astrid-pack-host"})
 
 # What a browser may send and read. Credentials, cookies and Runtime-internal
-# headers (X-Output-Binding, X-Request-ID, If-Range) never cross the door.
+# headers (X-Output-Binding, X-Request-ID) never cross the door.
 REQUEST_HEADERS = frozenset({
-    "accept", "content-type", "content-length", "range", "if-match", "if-none-match", "idempotency-key",
+    "accept", "content-type", "content-length", "range", "if-range", "if-match", "if-none-match", "idempotency-key",
     "x-filename", "x-original-name", "x-expected-digest", "x-media-width", "x-media-height",
     "x-media-duration-seconds",
 })
@@ -321,6 +321,13 @@ def _canonical(path: str) -> tuple[list[str], str] | None:
 
 def classify(path: str, method: str) -> DoorRoute | None:
     """The route for a browser request, or None when the door does not serve it."""
+    # Pack assets have normalized UTF-8 names, broader than workspace ids.
+    # Reuse the direct listener's decoder and retain the encoded URL so the
+    # handler decodes exactly once; no generic wildcard route is admitted.
+    if path.startswith("/api/runtime/packs/"):
+        if len(path) <= _MAX_PATH_LENGTH and method.upper() in ("GET", "HEAD") and pack_http_route(path) is not None:
+            return DoorRoute("runtime", path)
+        return None
     canonical = _canonical(path)
     if canonical is None:
         return None

@@ -55,7 +55,7 @@ def _authority_path(value, label):
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, services=None, log_directory=None, runtime_checkout=None, agent_checkout=None):
+    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, services=None, log_directory=None, runtime_checkout=None, agent_checkout=None, pack_admissions=None):
         if ":" in host:
             raise ValueError("runtime daemon requires IPv4 loopback; IPv6 is not supported yet")
         if host not in ("127.0.0.1", "localhost"):
@@ -73,6 +73,8 @@ class RuntimeDaemon:
         self.reboot_executor = reboot_executor
         self.reboot_allowlist = reboot_allowlist
         self.admission_timeout = admission_timeout
+        # The installer owns committed presence; all startup paths retain its reader.
+        self.pack_admissions = pack_admissions
         self.instance_id = uuid.uuid4().hex
         self._identity_runtime_checkout = runtime_checkout
         self._identity_agent_checkout = agent_checkout
@@ -267,7 +269,7 @@ class RuntimeDaemon:
         self.process_signalling = platform.process_control_probe()
         process_control.announce(self.process_signalling)
         epoch_floor = self._read_epoch_floor()
-        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor, admission_timeout=self.admission_timeout, _admission_fd=self._replacement_admission_fd)
+        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor, admission_timeout=self.admission_timeout, _admission_fd=self._replacement_admission_fd, pack_admissions=self.pack_admissions)
         cancellation.check()
         self.service.set_readiness_callback(self._revoke_readiness)
         self.service.set_local_claim_generation_verifier(self._verify_local_claim_generation, actor=WORKER_ACTOR)

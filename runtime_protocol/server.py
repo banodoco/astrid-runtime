@@ -13,6 +13,42 @@ from urllib.parse import unquote, urlsplit, parse_qs
 from .errors import RuntimeErrorBase, AuthorizationError, BodyTooLargeError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError, RetiredRouteError
 from .service import validate_idempotency_key
 from .cas import IO_CHUNK_BYTES
+from .store import PACK_ID_RE, PACK_DIGEST_RE, pack_asset_path
+
+
+def pack_http_route(target):
+    """Decode a frozen pack URL once, preserving its component boundaries.
+
+    The browser door and the direct listener judge the same selected path.
+    No query, fragment, empty component or encoded separator is an alias.
+    """
+    if not isinstance(target, str) or any(c in target for c in "?#\\"):
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in target):
+        return None
+    if target == "/api/runtime/packs/inventory":
+        return ("inventory",)
+    prefix = "/api/runtime/packs/assets/"
+    if not target.startswith(prefix):
+        return None
+    parts = []
+    for raw in target[len(prefix):].split("/"):
+        if not raw or re.search(r"%(?![0-9a-fA-F]{2})", raw):
+            return None
+        try:
+            value = unquote(raw, errors="strict")
+        except UnicodeError:
+            return None
+        if "/" in value:
+            return None
+        parts.append(value)
+    if len(parts) < 3 or not PACK_ID_RE.fullmatch(parts[0]) or not PACK_DIGEST_RE.fullmatch(parts[1]):
+        return None
+    try:
+        asset = pack_asset_path("/".join(parts[2:]))
+    except RuntimeErrorBase:
+        return None
+    return ("asset", parts[0], parts[1], asset)
 
 
 class RuntimeHTTPServer(ThreadingHTTPServer):
@@ -290,9 +326,53 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         finally:
             stream.close()
 
+    def _serve_verified_file(self, metadata, stream):
+        """Use the object range/HEAD contract for an already verified stream."""
+        try:
+            total = int(metadata["size"])
+            start, end = 0, total - 1
+            etag_value = "sha256:" + str(metadata["digest"]).removeprefix("sha256:")
+            etag = f'"{etag_value}"'
+            range_header = self.headers.get("Range")
+            if self.headers.get("If-Range") not in (None, etag):
+                range_header = None
+            status = 200
+            if range_header:
+                match = re.fullmatch(r"bytes=([0-9]{0,20})-([0-9]{0,20})", range_header)
+                try:
+                    if not match:
+                        raise ValueError
+                    left, right = match.groups()
+                    if not left:
+                        suffix_length = int(right)
+                        if suffix_length <= 0:
+                            raise ValueError
+                        start = max(0, total - suffix_length)
+                    else:
+                        start = int(left)
+                        end = min(int(right), total - 1) if right else total - 1
+                    if start >= total or end < start:
+                        raise ValueError
+                    status = 206
+                except ValueError:
+                    return self._send(416, {"code": "invalid_range", "message": "invalid byte range"},
+                        headers={"Content-Range": f"bytes */{total}", "Accept-Ranges": "bytes"})
+            headers = {"Content-Type": metadata["media_type"], "ETag": etag,
+                       "Accept-Ranges": "bytes", "X-Content-Digest": etag_value}
+            if status == 206:
+                headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            self._send_file(status, stream, start, max(0, end - start + 1), headers)
+            stream = None  # The deferred response or sender owns the open file.
+            return
+        finally:
+            if stream is not None:
+                stream.close()
+
     def _is_binary_io(self):
         if not hasattr(self, "path"):
             return False
+        if pack_http_route(self.path) is not None and self.command in ("GET", "HEAD"):
+            return True
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         if path == ["v1", "objects"] and self.command == "POST":
             return True
@@ -346,6 +426,15 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
+        if self.path.startswith("/api/runtime/packs/"):
+            self._identity("objects:read")
+            route = pack_http_route(self.path)
+            if route is None or method not in ("GET", "HEAD"):
+                raise NotFoundError("pack route requires an exact inventory or confined asset URL and GET/HEAD")
+            if route[0] == "inventory":
+                return self._send(200, self.runtime.pack_inventory())
+            metadata, stream = self.runtime.open_pack_asset(*route[1:])
+            return self._serve_verified_file(metadata, stream)
         if method == "POST" and len(path) == 5 and path[:3] == ["v1", "control", "tasks"] and path[4] == "abandon":
             identity = self._identity("admin")
             if identity.get("actor") != "owner":
@@ -812,46 +901,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 3 and path[:2] == ["v1", "objects"] and method in ("GET", "HEAD"):
             self._identity("objects:read")
             metadata, stream = self.runtime.open_object(path[2])
-            try:
-                total = int(metadata["size"])
-                start, end = 0, total - 1
-                digest = path[2].removeprefix("sha256:")
-                etag_value = "sha256:" + digest
-                etag = f'"{etag_value}"'
-                range_header = self.headers.get("Range")
-                if self.headers.get("If-Range") not in (None, etag):
-                    range_header = None
-                status = 200
-                if range_header:
-                    match = re.fullmatch(r"bytes=([0-9]{0,20})-([0-9]{0,20})", range_header)
-                    try:
-                        if not match:
-                            raise ValueError
-                        left, right = match.groups()
-                        if not left:
-                            suffix_length = int(right)
-                            if suffix_length <= 0:
-                                raise ValueError
-                            start = max(0, total - suffix_length)
-                        else:
-                            start = int(left)
-                            end = min(int(right), total - 1) if right else total - 1
-                        if start >= total or end < start:
-                            raise ValueError
-                        status = 206
-                    except ValueError:
-                        return self._send(416, {"code": "invalid_range", "message": "invalid byte range"},
-                            headers={"Content-Range": f"bytes */{total}", "Accept-Ranges": "bytes"})
-                headers = {"Content-Type": metadata["media_type"], "ETag": etag,
-                           "Accept-Ranges": "bytes", "X-Content-Digest": etag_value}
-                if status == 206:
-                    headers["Content-Range"] = f"bytes {start}-{end}/{total}"
-                self._send_file(status, stream, start, max(0, end - start + 1), headers)
-                stream = None  # The deferred response or sender owns the open file.
-                return
-            finally:
-                if stream is not None:
-                    stream.close()
+            return self._serve_verified_file(metadata, stream)
         if path == ["v1", "tasks"] and method == "POST":
             self._identity("tasks:write")
             body = self._project_mutation_body()
