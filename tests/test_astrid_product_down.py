@@ -17,12 +17,13 @@ from runtime_protocol.store import RealmStore
 pytestmark = pytest.mark.integration
 
 
-def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys):
+def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys, astrid_importable):
     from astrid.sdk import AstridClient
     from astrid.sdk import host_bootstrap
     import astrid.services
 
-    source = Path(astrid.services.__file__).resolve().parents[1]
+    source = astrid_importable
+    assert Path(astrid.services.__file__).resolve().is_relative_to(source)
     runtime = Path(__file__).resolve().parents[1]
     data = tmp_path / "launcher"
     data.mkdir()
