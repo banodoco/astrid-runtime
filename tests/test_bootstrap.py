@@ -955,20 +955,21 @@ class BootstrapTests(unittest.TestCase):
                     bad_instance_id="different-owner",
                 )
 
-    def test_start_and_reconnect_validate_identity_once_after_successful_health(self):
+    def test_start_and_reconnect_validate_identity_after_each_successful_health(self):
         self._configure()
         with patch.object(bootstrap_module, "validate_live_owner_identity",
                           wraps=bootstrap_module.validate_live_owner_identity) as validate:
             bootstrap(self.paths, self.boundary, self.config)
-            self.assertEqual(self.boundary.identity_observations, ["health", "identity"])
-            self.assertEqual(validate.call_count, 1)
+            self.assertGreater(validate.call_count, 1)
+            self.assertEqual(self.boundary.identity_observations, ["health", "identity"] * validate.call_count)
             for caller in (bootstrap, connect):
                 with self.subTest(caller=caller.__name__):
                     validate.reset_mock()
                     self.boundary.identity_observations.clear()
                     caller(self.paths, self.boundary, self.config)
-                    self.assertEqual(self.boundary.identity_observations, ["health", "identity"])
-                    self.assertEqual(validate.call_count, 1)
+                    observations = self.boundary.identity_observations
+                    self.assertGreater(validate.call_count, 1)
+                    self.assertEqual(observations, ["health", "identity"] * validate.call_count)
 
     def test_unhealthy_owner_refuses_before_identity_read_or_writes(self):
         self._configure()

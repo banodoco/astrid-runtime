@@ -98,5 +98,100 @@ def test_connect_refusal_and_observation_counts_match(monkeypatch, capfd):
         ("admission", "connect_realm_present", "pass"),
         ("admission", "connect_discovery_present", "pass"),
         ("admission", "connect_pid_alive", "fail"),
+        ("admission", "connect_owner_valid", "unavailable"),
     ]
+    assert result[-1]["depends_on"] == "connect_pid_alive"
     assert "private" not in json.dumps(result) and "123" not in json.dumps(result)
+
+
+def test_reconnect_revalidates_between_provision_and_selection_with_parity(monkeypatch, capfd):
+    import pytest
+    from tests.test_bootstrap import BootstrapTests, FakeConnection
+    from astrid_runtime.bootstrap import BootstrapError, bootstrap
+
+    results = []
+    for enabled in (False, True):
+        case = BootstrapTests()
+        case.setUp()
+        try:
+            case._configure()
+            bootstrap(case.paths, case.boundary, case.config)
+            calls = []
+            original_validate = case.boundary.validate_owner
+            def validate(**kwargs):
+                calls.append("validate")
+                return original_validate(**kwargs)
+            case.boundary.validate_owner = validate
+            class ReplacingConnection(FakeConnection):
+                def provision_actor(self, **kwargs):
+                    calls.append("provision")
+                    case.boundary.valid_owner = False
+                    return {"scope": "astrid"}
+                def select_realm(self, **kwargs):
+                    calls.append("select")
+            case.boundary.connect = lambda **kwargs: ReplacingConnection(case.boundary)
+            if enabled:
+                monkeypatch.setenv("ASTRID_INSTALLER_ALL_PREDICATES_DIAGNOSTICS", "1")
+            else:
+                monkeypatch.delenv("ASTRID_INSTALLER_ALL_PREDICATES_DIAGNOSTICS", raising=False)
+            with pytest.raises(BootstrapError, match="owner changed during reconnect"):
+                bootstrap(case.paths, case.boundary, case.config)
+            results.append(calls)
+            stderr = capfd.readouterr().err
+            if enabled:
+                assert "[astrid installer all-predicates v1]" in stderr
+                assert str(case.paths.app_support) not in stderr
+            else:
+                assert stderr == ""
+        finally:
+            case.tearDown()
+            case.doCleanups()
+    assert results[0] == results[1]
+    assert "provision" in results[0] and "select" not in results[0]
+    assert results[0][results[0].index("provision") + 1] == "validate"
+
+
+def test_stop_diagnostics_preserve_fence_and_stop_order(monkeypatch, capfd):
+    import importlib
+    from contextlib import contextmanager
+    from tests.test_bootstrap import BootstrapTests
+    bootstrap_module = importlib.import_module("astrid_runtime.bootstrap")
+    results = []
+    for enabled in (False, True):
+        case = BootstrapTests()
+        case.setUp()
+        try:
+            case._configure()
+            bootstrap_module.bootstrap(case.paths, case.boundary, case.config)
+            events = []
+            original_fence = bootstrap_module.interruption_fence
+            original_stop = case.boundary.stop_owner
+            @contextmanager
+            def counted_fence(root):
+                events.append("fence")
+                with original_fence(root) as report:
+                    yield report
+            def stop_owner(**kwargs):
+                events.append("stop_owner")
+                return original_stop(**kwargs)
+            case.boundary.stop_owner = stop_owner
+            with monkeypatch.context() as patcher:
+                patcher.setattr(bootstrap_module, "interruption_fence", counted_fence)
+                if enabled:
+                    patcher.setenv("ASTRID_INSTALLER_ALL_PREDICATES_DIAGNOSTICS", "1")
+                else:
+                    patcher.delenv("ASTRID_INSTALLER_ALL_PREDICATES_DIAGNOSTICS", raising=False)
+                result = bootstrap_module.down(case.paths, case.boundary,
+                                               stop_manager=lambda: events.append("manager"))
+            assert result["status"] == "stopped"
+            results.append(events)
+            stderr = capfd.readouterr().err
+            if enabled:
+                assert "[astrid installer all-predicates v1]" in stderr
+                assert str(case.paths.app_support) not in stderr
+            else:
+                assert stderr == ""
+        finally:
+            case.tearDown()
+            case.doCleanups()
+    assert results == [["fence", "stop_owner", "manager"]] * 2

@@ -8,6 +8,7 @@ that boundary and legacy roots are always rejected.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import wraps
 import errno
 import hashlib
 import json
@@ -24,7 +25,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from .io import atomic_write_json, owner_only, read_json, remove_file
-from .owner_diagnostics import instrument, outcome, phase_instrument
+from .owner_diagnostics import instrument, outcome, phase_instrument, unavailable
 from runtime_protocol import platform as runtime_platform
 from runtime_protocol import cancellation
 from runtime_protocol import process_control
@@ -606,6 +607,26 @@ def _actor_id(token: str) -> str:
     return "astrid-" + hashlib.sha256(token.encode()).hexdigest()[:24]
 
 
+def _observe_validation(name):
+    """Report the outcome of an existing validator without reading its inputs."""
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            try:
+                result = function(*args, **kwargs)
+            except BootstrapError:
+                outcome(name, False)
+                raise
+            except Exception:
+                outcome(name, None, error=True)
+                raise
+            outcome(name, True)
+            return result
+        return wrapped
+    return decorate
+
+
+@_observe_validation("compatibility")
 def _compatible(discovery: Mapping[str, Any], config: BootstrapConfig, source: SourceProfile) -> None:
     if discovery.get("protocol_version") != config.protocol_version or discovery.get("schema_version") != config.schema_version:
         raise CompatibilityError(
@@ -764,15 +785,19 @@ def _bootstrap_mutex(paths: RuntimePaths):
         handle.close()
 
 
-def _provision_connection(connection: Any, actor_id: str, token: str, realm_id: str) -> None:
+def _provision_connection(connection: Any, actor_id: str, token: str, realm_id: str, *, validate_owner=None) -> None:
     """Call only generated-client-shaped methods; never inspect runtime state."""
     provision = getattr(connection, "provision_actor", None)
     if provision is not None:
+        if validate_owner is not None:
+            validate_owner()
         result = cancellation.wait_for(provision, scope="astrid", actor_id=actor_id, credential=token)
         if isinstance(result, Mapping) and result.get("scope") not in (None, "astrid"):
             raise BootstrapError("Runtime refused the Astrid-scoped credential.")
     select = getattr(connection, "select_realm", None)
     if select is not None:
+        if validate_owner is not None:
+            validate_owner()
         cancellation.wait_for(select, actor_id=actor_id, realm_id=realm_id)
     handshake = getattr(connection, "handshake", None)
     if handshake is not None:
@@ -876,6 +901,7 @@ def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *
         )
 
 
+@phase_instrument
 def _reattest_aborted_launch_stop(
     paths: RuntimePaths, boundary: RuntimeBoundary,
     marker: Mapping[str, Any], *, realm_root: Path,
@@ -902,15 +928,15 @@ def _reattest_aborted_launch_stop(
         with interruption_fence(realm_root) as report:
             if not report.get("safe", False):
                 return False
-            if (_read_support_json(paths.discovery_path) is not None
-                    or _read_support_json(paths.instance_lock_path) is not None):
+            if not outcome("recovery_reattest_publications_absent", _read_support_json(paths.discovery_path) is None
+                    and _read_support_json(paths.instance_lock_path) is None):
                 return False
             _require_owner_absent(
                 boundary, int(owner["pid"]), str(owner["process_birth_id"]),
                 context="inside the aborted-launch fence",
             )
             current_binding = _pinokio_stop_binding(paths, realm)
-            if current_binding != binding or current_binding != marker["completed_stop"]["binding"]:
+            if not outcome("recovery_reattest_binding", current_binding == binding and current_binding == marker["completed_stop"]["binding"]):
                 return False
             atomic_write_json(paths.instance_lock_path, dict(marker))
         return True
@@ -948,9 +974,13 @@ def bootstrap(
         return _bootstrap_locked(paths, boundary, config)
 
 
-def _commit_bootstrap_metadata(paths: RuntimePaths, source: SourceProfile, catalog: Mapping[str, Any], discovery: Mapping[str, Any]) -> None:
+def _commit_bootstrap_metadata(paths: RuntimePaths, source: SourceProfile, catalog: Mapping[str, Any], discovery: Mapping[str, Any], *, validate_owner=None) -> None:
     """Commit catalog, source provenance, and ephemeral discovery in order."""
+    if validate_owner is not None:
+        validate_owner()
     atomic_write_json(paths.catalog_path, dict(catalog))
+    if validate_owner is not None:
+        validate_owner()
     atomic_write_json(paths.source_profiles_dir / f"{source.profile}.json", source.as_dict())
     marker = _read_support_json(paths.instance_lock_path)
     if marker is None or not _owner_record_matches(
@@ -962,11 +992,15 @@ def _commit_bootstrap_metadata(paths: RuntimePaths, source: SourceProfile, catal
     # Keep the owner's public advertisement with its existing identity marker.
     # No bearer bytes are stored here. Up can repair a lost ephemeral file only
     # after revalidating this exact owner through the ordinary boundary.
+    if validate_owner is not None:
+        validate_owner()
     atomic_write_json(paths.instance_lock_path, {**marker, "discovery": dict(discovery)})
+    if validate_owner is not None:
+        validate_owner()
     atomic_write_json(paths.discovery_path, dict(discovery))
 
 
-def _commit_source_profile_metadata(paths: RuntimePaths, source: SourceProfile, catalog: Mapping[str, Any]) -> None:
+def _commit_source_profile_metadata(paths: RuntimePaths, source: SourceProfile, catalog: Mapping[str, Any], *, validate_owner=None) -> None:
     """Persist an explicitly selected source profile without rewriting discovery."""
     catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
     source_path = paths.source_profiles_dir / f"{source.profile}.json"
@@ -978,7 +1012,11 @@ def _commit_source_profile_metadata(paths: RuntimePaths, source: SourceProfile, 
         except (ValueError, UnicodeDecodeError):
             pass
     try:
+        if validate_owner is not None:
+            validate_owner()
         atomic_write_json(paths.catalog_path, dict(catalog))
+        if validate_owner is not None:
+            validate_owner()
         atomic_write_json(source_path, source.as_dict())
     except Exception:
         try:
@@ -1004,6 +1042,7 @@ def _capture_requested_identity(source: SourceProfile) -> dict[str, Any]:
         raise BootstrapError("Requested Runtime identity could not be verified.") from exc
 
 
+@_observe_validation("startup_identity")
 def _validated_matching_owner_identity(
     owner_health: Any,
     *,
@@ -1063,12 +1102,12 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         )
         if _owner_may_be_alive(boundary, marker):
             _compatible(recovery, config, source)
-            if (not _lock_matches(paths, pid, instance_id, str(realm["realm_id"]), birth, realm_root)
-                    or not boundary.validate_owner(
+            if (not outcome("recovery_lock_matches", _lock_matches(paths, pid, instance_id, str(realm["realm_id"]), birth, realm_root))
+                    or not outcome("recovery_owner_valid", boundary.validate_owner(
                         endpoint=endpoint, pid=pid, instance_id=instance_id,
                         owner_lock=paths.instance_lock_path, process_birth_id=birth,
-                        expected_realm_id=str(realm["realm_id"]), expected_realm_root=realm_root)
-                    or not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id)):
+                        expected_realm_id=str(realm["realm_id"]), expected_realm_root=realm_root))
+                    or not outcome("recovery_health", boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id))):
                 raise DuplicateOwnerError("Runtime discovery recovery refused: live owner identity is unverified.")
             _validated_matching_owner_identity(
                 boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
@@ -1080,6 +1119,13 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             )
             if (not outcome("recovery_marker_unchanged", _read_support_json(paths.instance_lock_path) == marker)
                     or not outcome("recovery_discovery_absent", _read_support_json(paths.discovery_path) is None)):
+                raise BootstrapError("Runtime owner changed during discovery recovery.")
+            _validate_stop_endpoint(
+                paths, boundary, owner=(pid, birth, instance_id, endpoint),
+                realm_id=str(realm["realm_id"]), realm_root=realm_root,
+            )
+            if (_read_support_json(paths.instance_lock_path) != marker
+                    or _read_support_json(paths.discovery_path) is not None):
                 raise BootstrapError("Runtime owner changed during discovery recovery.")
             atomic_write_json(paths.discovery_path, dict(recovery))
     if marker is None or marker.get("state") is None:
@@ -1122,16 +1168,42 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             )
             if not outcome("discovery_selected_realm", realm is not None and str(realm.get("realm_id")) == str(discovery["active_realm"])):
                 raise BootstrapError("Discovery does not match the selected catalog realm; run astrid-runtime doctor.")
+            def validate_reconnect_owner() -> None:
+                # Re-run the strict admission checks at each owner-authorized
+                # mutation. The diagnostic stream is never used as a fence.
+                if (_read_support_json(paths.discovery_path) != discovery
+                        or not _owner_may_be_alive(boundary, discovery)
+                        or not boundary.validate_owner(
+                            endpoint=endpoint, pid=int(pid), instance_id=instance_id,
+                            owner_lock=paths.instance_lock_path,
+                            process_birth_id=str(discovery.get("process_birth_id") or ""),
+                            expected_realm_id=str(discovery["active_realm"]),
+                            expected_realm_root=selected_root)
+                        or not _lock_matches(paths, int(pid), instance_id,
+                                             str(discovery["active_realm"]),
+                                             str(discovery.get("process_birth_id")), selected_root)
+                        or not boundary.health(endpoint=endpoint, pid=int(pid), instance_id=instance_id)):
+                    raise DuplicateOwnerError("Runtime owner changed during reconnect; refusing mutation.")
+                _validated_matching_owner_identity(
+                    boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
+                    instance_id=instance_id, requested_identity=requested_identity,
+                )
+                current_realm = _selected_realm(_read_catalog(paths))
+                if current_realm is None or str(current_realm.get("realm_id")) != str(discovery["active_realm"]):
+                    raise BootstrapError("Runtime selected realm changed during reconnect; refusing mutation.")
+
             configure = getattr(boundary, "configure_source", None)
             if configure is not None:
+                validate_reconnect_owner()
                 configure(source)
+            validate_reconnect_owner()
             actor_id, token = _credential(paths)
             connection = boundary.connect(endpoint=endpoint, credential=token)
             realm_id = str(discovery["active_realm"])
-            _provision_connection(connection, actor_id, token, realm_id)
+            _provision_connection(connection, actor_id, token, realm_id, validate_owner=validate_reconnect_owner)
             realm["source_profile"] = source.profile
             catalog["source_profiles"][source.profile] = source.as_dict()
-            _commit_source_profile_metadata(paths, source, catalog)
+            _commit_source_profile_metadata(paths, source, catalog, validate_owner=validate_reconnect_owner)
             diagnostics.append("runtime checkout differences are provenance only")
             if config.door is not None and discovery.get("door_origin") != config.door.origin:
                 diagnostics.append(
@@ -1139,6 +1211,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                     f"restart it to serve {config.door.origin}"
                 )
             worker = _worker_handoff(discovery)
+            validate_reconnect_owner()
             _restore_admitted_live_lock(paths)
             return BootstrapResult(
                 "reconnected", realm_id,
@@ -1237,12 +1310,32 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     worker = _worker_handoff(handle)
-    # The marker contains ownership metadata only and never a credential.
+    def validate_started_owner() -> None:
+        if (not boundary.validate_owner(
+                endpoint=endpoint, pid=pid, instance_id=instance_id,
+                owner_lock=paths.instance_lock_path, process_birth_id=process_birth_id,
+                expected_realm_id=realm_id, expected_realm_root=realm_root)
+                or not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id)):
+            raise BootstrapError("Runtime owner changed during startup; refusing mutation.")
+        _validated_matching_owner_identity(
+            boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
+            instance_id=instance_id, requested_identity=requested_identity,
+        )
+
+    # The first lock publication precedes the lock-based strict check, so
+    # recheck the already admitted health and startup identity at that boundary.
     try:
+        if not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id):
+            raise BootstrapError("Runtime owner changed during startup; refusing mutation.")
+        _validated_matching_owner_identity(
+            boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
+            instance_id=instance_id, requested_identity=requested_identity,
+        )
         atomic_write_json(paths.instance_lock_path, {"pid": pid, "process_birth_id": process_birth_id, "runtime_instance_id": instance_id, "realm_id": realm_id, "realm_root": str(realm_root)})
+        validate_started_owner()
         actor_id, token = _credential(paths)
         connection = boundary.connect(endpoint=endpoint, credential=token)
-        _provision_connection(connection, actor_id, token, realm_id)
+        _provision_connection(connection, actor_id, token, realm_id, validate_owner=validate_started_owner)
     except Exception:
         rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
@@ -1277,7 +1370,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         **({"door_endpoint": handle["door_endpoint"], "door_origin": handle["door_origin"]} if handle.get("door_endpoint") else {}),
     }
     try:
-        _commit_bootstrap_metadata(paths, source, catalog, discovery_value)
+        _commit_bootstrap_metadata(paths, source, catalog, discovery_value, validate_owner=validate_started_owner)
     except Exception:
         rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
@@ -1324,7 +1417,10 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
         instance_id = str(discovery["runtime_instance_id"])
     except (KeyError, TypeError, ValueError) as exc:
         raise BootstrapError("Runtime discovery is incomplete; run astrid-runtime restart --profile astrid.") from exc
-    if not outcome("connect_pid_alive", _pid_alive(boundary, pid)) or not outcome("connect_owner_valid", boundary.validate_owner(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path)):
+    if not outcome("connect_pid_alive", _pid_alive(boundary, pid)):
+        unavailable("connect_owner_valid", depends_on="connect_pid_alive")
+        raise BootstrapError("Runtime discovery is stale or owned by another process; run astrid-runtime up --profile astrid.")
+    if not outcome("connect_owner_valid", boundary.validate_owner(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path)):
         raise BootstrapError("Runtime discovery is stale or owned by another process; run astrid-runtime up --profile astrid.")
     if not outcome("connect_health", boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id)):
         raise BootstrapError("The selected runtime is unhealthy; run astrid-runtime restart --profile astrid.")
@@ -1334,9 +1430,25 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     )
     if not outcome("connect_selected_realm", str(realm.get("realm_id")) == str(discovery.get("active_realm"))):
         raise BootstrapError("Discovery does not match the selected catalog realm; run astrid-runtime doctor.")
+    def validate_connect_owner() -> None:
+        if (_read_support_json(paths.discovery_path) != discovery
+                or not _pid_alive(boundary, pid)
+                or not boundary.validate_owner(endpoint=endpoint, pid=pid, instance_id=instance_id,
+                                               owner_lock=paths.instance_lock_path)
+                or not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id)):
+            raise BootstrapError("Runtime owner changed during connection; refusing mutation.")
+        _validated_matching_owner_identity(
+            boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
+            instance_id=instance_id, requested_identity=requested_identity,
+        )
+        current_realm = _selected_realm(_read_catalog(paths))
+        if current_realm is None or str(current_realm.get("realm_id")) != str(discovery.get("active_realm")):
+            raise BootstrapError("Runtime selected realm changed during connection; refusing mutation.")
+
+    validate_connect_owner()
     actor_id, token = _credential(paths)
     connection = boundary.connect(endpoint=endpoint, credential=token)
-    _provision_connection(connection, actor_id, token, str(realm["realm_id"]))
+    _provision_connection(connection, actor_id, token, str(realm["realm_id"]), validate_owner=validate_connect_owner)
     worker = _worker_handoff(discovery)
     return BootstrapResult(
         "reconnected", str(realm["realm_id"]),
@@ -1647,12 +1759,12 @@ def _durable_remove(path: Path) -> None:
 
 def _require_owner_absent(boundary: RuntimeBoundary, pid: int, birth: str, *, context: str) -> None:
     try:
-        if _pid_alive(boundary, pid):
+        if not outcome("owner_absent_pid", not _pid_alive(boundary, pid)):
             raise BootstrapError(f"Runtime Pinokio stopped owner is still present {context}.")
         observe_birth = getattr(boundary, "process_birth_identity", None)
         if callable(observe_birth):
             observed_birth = observe_birth(pid)
-            if observed_birth is not None:
+            if not outcome("owner_absent_birth", observed_birth is None):
                 raise BootstrapError(f"Runtime Pinokio stopped owner identity changed {context}.")
     except BootstrapError:
         raise
@@ -1679,6 +1791,7 @@ def _completed_stop_record(
     return {**owner, "binding": dict(binding)}
 
 
+@_observe_validation("completed_stop_marker")
 def _validate_completed_stop_marker(marker: Mapping[str, Any]) -> dict[str, Any]:
     receipt = marker.get("completed_stop")
     if (set(marker) != {"pid", "process_birth_id", "runtime_instance_id", "realm_id",
@@ -1714,6 +1827,7 @@ def _validate_completed_stop_marker(marker: Mapping[str, Any]) -> dict[str, Any]
     return owner
 
 
+@_observe_validation("binding_fields")
 def _validate_binding_fields(binding: Mapping[str, Any]) -> None:
     for key, value in binding.items():
         if key.endswith("_sha256"):
@@ -1726,6 +1840,7 @@ def _validate_binding_fields(binding: Mapping[str, Any]) -> None:
             raise BootstrapError("Runtime Pinokio completed-stop binding field is malformed.")
 
 
+@_observe_validation("stopping_marker")
 def _validate_stopping_marker(marker: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the Runtime-written intent form of instance.lock.
 
@@ -1949,6 +2064,13 @@ def _fenced_stop_and_manager(
                     if final_marker is not None and "discovery" in final_marker:
                         intent["discovery"] = final_marker["discovery"]
                     if final_marker != intent:
+                        _validate_stop_endpoint(
+                            paths, boundary, owner=owner, realm_id=realm_id,
+                            realm_root=realm_root,
+                        )
+                        if (_read_support_json(paths.discovery_path) != discovery
+                                or _read_support_json(paths.instance_lock_path) != final_marker):
+                            raise BootstrapError("Runtime owner changed before stop intent publication.")
                         atomic_write_json(paths.instance_lock_path, intent)
                     marker = intent
                     # First destructive operation: Runtime's existing validated stop.
@@ -2295,6 +2417,7 @@ def _inspect_restore_realm(snapshot: Mapping[str, Any]) -> None:
         raise BootstrapError("Restore selection does not match the readable Runtime realm identity.") from exc
 
 
+@phase_instrument
 def _interrupt_owner_locked(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
     stop_foreground=None, restore_selection: RestoreSelection | None = None,

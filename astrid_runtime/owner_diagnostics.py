@@ -49,6 +49,10 @@ _V1_FIELDS = _FIELDS + (
     "connect_pid_alive", "connect_owner_valid", "connect_health", "connect_selected_realm",
     "reclaim_records_present", "reclaim_no_live_owner", "reclaim_snapshots_unchanged",
     "stop_discovery_unchanged", "stop_marker_unchanged",
+    "compatibility", "startup_identity", "completed_stop_marker", "stopping_marker",
+    "binding_fields", "owner_absent_pid", "owner_absent_birth", "recovery_lock_matches",
+    "recovery_owner_valid", "recovery_health", "recovery_reattest_publications_absent",
+    "recovery_reattest_binding", "stop_cleanup_discovery_matches", "stop_cleanup_marker_matches",
 )
 _V1_SWITCH = "ASTRID_INSTALLER_ALL_PREDICATES_DIAGNOSTICS"
 _phase = ContextVar("owner_validation_phase", default="owner_validation")
@@ -160,6 +164,7 @@ def _instrument(function, *, legacy_capture):
         "_bootstrap_locked": "discovery", "connect": "admission",
         "_reclaim_stale_owner_locked": "recovery", "_fenced_stop_and_manager": "stop",
         "_validate_published_stop_owner": "stop", "stop_owner": "stop",
+        "_interrupt_owner_locked": "stop", "_reattest_aborted_launch_stop": "recovery",
     }
     @wraps(function)
     def wrapped(*args, **kwargs):
