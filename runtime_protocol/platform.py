@@ -602,13 +602,13 @@ def process_identity(pid: int, *, timeout: float = 1.0):
         raise OSError("process identity observation was malformed") from exc
 
 
-def _owner_birth_outcome(name: str, value: bool) -> bool:
+def _owner_birth_outcome(name: str, value: bool, *, error: bool = False) -> bool:
     # The protocol remains usable without importing the bootstrap package.  When
     # its collector is already active, record only the comparison result.
     try:
         collector = sys.modules.get("astrid_runtime.owner_diagnostics")
         if collector is not None:
-            collector.outcome(name, value)
+            collector.outcome(name, value, error=error)
     except Exception:
         pass
     return value
@@ -706,12 +706,19 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
     observed_tick, observed_scope = observed
     if not _owner_birth_outcome("birth_bridge_tick", recorded[0] == observed_tick):
         return False
+    stage = "birth_bridge_boot_read"
     try:
         boot = (Path("/proc") / "sys/kernel/random/boot_id").read_text().strip()
+        _owner_birth_outcome(stage, True)
+        stage = "birth_bridge_pidns_read"
         host_pidns = (Path("/proc") / "1/ns/pid").stat().st_ino
+        _owner_birth_outcome(stage, True)
+        stage = "birth_bridge_identity_read"
         fresh = process_identity(pid)
+        _owner_birth_outcome(stage, True)
     except OSError:
-        _owner_birth_outcome("birth_bridge_native_readable", False)
+        _owner_birth_outcome(stage, False, error=True)
+        _owner_birth_outcome("birth_bridge_native_readable", False, error=True)
         return None
     _owner_birth_outcome("birth_bridge_native_readable", True)
     if (not _owner_birth_outcome("birth_bridge_fresh_present", fresh is not None)

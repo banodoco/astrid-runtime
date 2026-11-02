@@ -986,6 +986,7 @@ class LocalRuntimeBoundary:
         self._support_root = self._validate_path(Path(support_root), "runtime support root").resolve()
         self._detached_pid = int(pid)
 
+    @instrument
     def restart(self, **kwargs) -> Mapping[str, Any]:
         if not self._source or not self._realm_root or not self._support_root or not self._realm_id:
             raise BootstrapError("No runtime process is available to restart.")
@@ -1037,25 +1038,25 @@ class LocalRuntimeBoundary:
                 credential_file=support / "credentials" / "owner.token",
             )
             checks = (
-                str(discovery.get("pid")) == str(expected_pid),
-                str(discovery.get("endpoint")) == endpoint,
-                str(discovery.get("runtime_instance_id")) == expected_instance,
-                str(discovery.get("process_birth_id")) == expected_birth,
-                str(discovery.get("active_realm")) == expected_realm,
-                discovery_root == expected_root,
-                str(marker.get("pid")) == str(expected_pid),
-                str(marker.get("runtime_instance_id")) == expected_instance,
-                str(marker.get("process_birth_id")) == expected_birth,
-                str(marker.get("realm_id")) == expected_realm,
-                marker_root == expected_root,
-                self.is_pid_alive(expected_pid),
-                _selected_owner_birth_matches(
+                outcome("signal_discovery_pid", str(discovery.get("pid")) == str(expected_pid)),
+                outcome("signal_discovery_endpoint", str(discovery.get("endpoint")) == endpoint),
+                outcome("signal_discovery_instance", str(discovery.get("runtime_instance_id")) == expected_instance),
+                outcome("signal_discovery_birth", str(discovery.get("process_birth_id")) == expected_birth),
+                outcome("signal_discovery_realm", str(discovery.get("active_realm")) == expected_realm),
+                outcome("signal_discovery_root", discovery_root == expected_root),
+                outcome("signal_lock_pid", str(marker.get("pid")) == str(expected_pid)),
+                outcome("signal_lock_instance", str(marker.get("runtime_instance_id")) == expected_instance),
+                outcome("signal_lock_birth", str(marker.get("process_birth_id")) == expected_birth),
+                outcome("signal_lock_realm", str(marker.get("realm_id")) == expected_realm),
+                outcome("signal_lock_root", marker_root == expected_root),
+                outcome("signal_pid_alive", self.is_pid_alive(expected_pid)),
+                outcome("signal_birth", _selected_owner_birth_matches(
                     expected_birth, self.process_birth_identity(expected_pid) or "", pid=expected_pid,
-                ),
-                bool(health and health.get("runtime_instance_id") == expected_instance),
-                bool(endpoint_identity and endpoint_identity.get("runtime_instance_id") == expected_instance),
-                bool(endpoint_identity and endpoint_identity.get("realm_id") == expected_realm),
-                (bool(health and health.get("status") == "ok") if require_health else True),
+                )),
+                outcome("signal_health_instance", bool(health and health.get("runtime_instance_id") == expected_instance)),
+                outcome("signal_endpoint_instance", bool(endpoint_identity and endpoint_identity.get("runtime_instance_id") == expected_instance)),
+                outcome("signal_endpoint_realm", bool(endpoint_identity and endpoint_identity.get("realm_id") == expected_realm)),
+                outcome("signal_health", (bool(health and health.get("status") == "ok") if require_health else True)),
             )
             if not all(checks):
                 raise BootstrapError("Runtime restart refused: owner identity changed or is stale.")

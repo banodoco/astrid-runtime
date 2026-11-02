@@ -1347,22 +1347,25 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     )
 
 
+@instrument
 def _owner_record_matches(
     value: Mapping[str, Any] | None, *, pid: int, instance_id: str,
     process_birth_id: str, realm_id: str, realm_root: Path,
 ) -> bool:
-    if not value:
+    if not outcome("owner_record_present", bool(value)):
         return False
     try:
         recorded_root = _canonical_realm_root(str(value.get("realm_root") or ""))
+        outcome("owner_record_root_readable", True)
     except BootstrapError:
+        outcome("owner_record_root_readable", False)
         return False
     return bool(
-        str(value.get("pid")) == str(pid)
-        and str(value.get("runtime_instance_id")) == instance_id
-        and str(value.get("process_birth_id")) == process_birth_id
-        and str(value.get("active_realm") or value.get("realm_id")) == realm_id
-        and recorded_root == realm_root
+        outcome("owner_record_pid", str(value.get("pid")) == str(pid))
+        and outcome("owner_record_instance", str(value.get("runtime_instance_id")) == instance_id)
+        and outcome("owner_record_birth", str(value.get("process_birth_id")) == process_birth_id)
+        and outcome("owner_record_realm", str(value.get("active_realm") or value.get("realm_id")) == realm_id)
+        and outcome("owner_record_root", recorded_root == realm_root)
     )
 
 
@@ -2650,6 +2653,7 @@ def preflight_stop(
         raise BootstrapError(str(exc)) from exc
 
 
+@instrument
 def _recorded_owner_identity(
     value: Mapping[str, Any], *, realm_id: str, realm_root: Path,
 ) -> tuple[int, str, str, str]:
@@ -2660,9 +2664,15 @@ def _recorded_owner_identity(
         endpoint = _validate_loopback_endpoint(str(value["endpoint"]))
         observed_realm = str(value.get("active_realm") or value.get("realm_id") or "")
         observed_root = _canonical_realm_root(str(value.get("realm_root") or ""))
+        outcome("recorded_identity_readable", True)
     except (KeyError, TypeError, ValueError, BootstrapError) as exc:
+        outcome("recorded_identity_readable", False)
         raise BootstrapError("Runtime interruption refused: discovery or owner identity is incomplete.") from exc
-    if pid <= 0 or not birth or not instance or observed_realm != realm_id or observed_root != realm_root:
+    if (not outcome("recorded_pid_positive", pid > 0)
+            or not outcome("recorded_birth_present", bool(birth))
+            or not outcome("recorded_instance_present", bool(instance))
+            or not outcome("recorded_realm_matches", observed_realm == realm_id)
+            or not outcome("recorded_root_matches", observed_root == realm_root)):
         raise BootstrapError("Runtime interruption refused: discovery realm root does not match the selected workspace.")
     return pid, birth, instance, endpoint
 
@@ -2695,6 +2705,7 @@ def _validate_stop_endpoint(
     return identity
 
 
+@instrument
 def _validate_published_stop_owner(
     paths: RuntimePaths, boundary: RuntimeBoundary | None, realm: Mapping[str, Any],
     realm_root: Path, discovery: Mapping[str, Any], marker: Mapping[str, Any] | None,
@@ -2703,19 +2714,24 @@ def _validate_published_stop_owner(
     realm_id = str(realm.get("realm_id") or "")
     if marker is not None and marker.get("state") == "stopping":
         _validate_stopping_marker(marker)
+        outcome("published_marker_state", True)
     elif marker is not None and marker.get("state") is not None:
+        outcome("published_marker_state", False)
         raise BootstrapError("Runtime interruption refused: owner lock has an unknown state.")
+    else:
+        outcome("published_marker_state", True)
     pid, birth, instance_id, endpoint = _recorded_owner_identity(
         discovery, realm_id=realm_id, realm_root=realm_root,
     )
-    if (marker is None or str(marker.get("realm_id") or "") != realm_id
-            or not _owner_record_matches(
+    if (not outcome("published_marker_present", marker is not None)
+            or not outcome("published_marker_realm", str(marker.get("realm_id") or "") == realm_id)
+            or not outcome("published_marker_matches", _owner_record_matches(
         marker, pid=pid, instance_id=instance_id, process_birth_id=birth,
         realm_id=realm_id, realm_root=realm_root,
-    )):
+    ))):
         raise BootstrapError("Runtime interruption refused: owner lock changed or does not match discovery.")
     alive = _pid_alive(boundary, pid) if observed_alive is None else observed_alive
-    if not alive:
+    if not outcome("published_pid_alive", alive):
         try:
             if boundary is None:
                 # _pid_alive used the platform identity API and returned only
@@ -2726,7 +2742,7 @@ def _validate_published_stop_owner(
                 # of the selected process identity. False is positive absence;
                 # uncertainty must be raised by the boundary, not collapsed.
                 return None
-            if boundary.process_birth_identity(pid) is None:
+            if outcome("published_absence_observed", boundary.process_birth_identity(pid) is None):
                 return None
         except Exception as exc:
             raise BootstrapError("Runtime interruption refused: owner absence could not be established.") from exc
