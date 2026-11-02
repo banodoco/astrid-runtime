@@ -602,6 +602,18 @@ def process_identity(pid: int, *, timeout: float = 1.0):
         raise OSError("process identity observation was malformed") from exc
 
 
+def _owner_birth_outcome(name: str, value: bool) -> bool:
+    # The protocol remains usable without importing the bootstrap package.  When
+    # its collector is already active, record only the comparison result.
+    try:
+        collector = sys.modules.get("astrid_runtime.owner_diagnostics")
+        if collector is not None:
+            collector.outcome(name, value)
+    except Exception:
+        pass
+    return value
+
+
 def process_birth_matches(expected: str, actual: str) -> bool | None:
     """Compare Linux birth encodings; missing scope is not proof of death."""
     def linux_birth(value):
@@ -637,13 +649,13 @@ def process_birth_matches(expected: str, actual: str) -> bool | None:
     # In particular, Timeline's boot:tick encoding carries no namespace.
     if not all(scope.get("boot") and scope.get("pidns") for scope in (old_scope, new_scope)):
         return None
-    if old_scope.get("pidns") and new_scope.get("pidns") and old_scope["pidns"] != new_scope["pidns"]:
+    if old_scope.get("pidns") and new_scope.get("pidns") and not _owner_birth_outcome("birth_direct_pidns", old_scope["pidns"] == new_scope["pidns"]):
         return None
-    if old_scope.get("boot") and new_scope.get("boot") and old_scope["boot"] != new_scope["boot"]:
+    if old_scope.get("boot") and new_scope.get("boot") and not _owner_birth_outcome("birth_direct_boot", old_scope["boot"] == new_scope["boot"]):
         return False
     if not old_scope.get("boot") or not new_scope.get("boot"):
         return None
-    if old_tick != new_tick:
+    if not _owner_birth_outcome("birth_direct_tick", old_tick == new_tick):
         return False
     return True
 
@@ -692,7 +704,7 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
             or set(observed[1]) != {"boot", "pidns"}):
         return None
     observed_tick, observed_scope = observed
-    if recorded[0] != observed_tick:
+    if not _owner_birth_outcome("birth_bridge_tick", recorded[0] == observed_tick):
         return False
     try:
         boot = (Path("/proc") / "sys/kernel/random/boot_id").read_text().strip()
@@ -701,17 +713,17 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
     except OSError:
         return None
     if (fresh is None or fresh.get("pid") != pid
-            or fresh.get("birth_id") != actual):
+            or not _owner_birth_outcome("birth_bridge_fresh_birth", fresh.get("birth_id") == actual)):
         return None
     try:
         current_boot = str(uuid.UUID(boot))
     except (TypeError, ValueError, AttributeError):
         return None
-    if (current_boot != boot
-            or not observed_scope["pidns"].isascii()
-            or not observed_scope["pidns"].isdigit()
-            or observed_scope["boot"] != current_boot
-            or observed_scope["pidns"] != str(host_pidns)):
+    if (not _owner_birth_outcome("birth_bridge_boot_valid", current_boot == boot)
+            or not _owner_birth_outcome("birth_bridge_pidns_ascii", observed_scope["pidns"].isascii())
+            or not _owner_birth_outcome("birth_bridge_pidns_numeric", observed_scope["pidns"].isdigit())
+            or not _owner_birth_outcome("birth_bridge_boot", observed_scope["boot"] == current_boot)
+            or not _owner_birth_outcome("birth_bridge_pidns", observed_scope["pidns"] == str(host_pidns))):
         return None
     return True
 
