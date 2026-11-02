@@ -76,12 +76,18 @@ def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys
             for key in ("pid", "process_birth_id", "runtime_instance_id"):
                 assert registration[key] == ready[key]
             assert host_bootstrap._registered_host_status(registration) == "ours"
-            assert LocalRuntimeBoundary.process_birth_identity(registration["pid"]) == registration["process_birth_id"]
+            assert host_bootstrap._host_birth_identity(registration["pid"]) == registration["process_birth_id"]
+            # Agent's registration uses boot:tick; Runtime's kernel identity
+            # additionally includes PID-namespace scope. Retain both encodings
+            # and compare each only through its own observation boundary.
+            host_kernel_birth = LocalRuntimeBoundary.process_birth_identity(registration["pid"])
+            assert host_kernel_birth
             observations.append({"before_down": {"manifest_sha256": manifest_sha,
-                "registration": registration, "owner": owner, "discovery": discovery}})
+                "registration": registration, "host_kernel_birth_id": host_kernel_birth,
+                "owner": owner, "discovery": discovery}})
             command("down")
             # These are synchronous postconditions of down, with no wait here.
-            assert LocalRuntimeBoundary.process_birth_identity(registration["pid"]) != registration["process_birth_id"]
+            assert LocalRuntimeBoundary.process_birth_identity(registration["pid"]) != host_kernel_birth
             assert LocalRuntimeBoundary.process_birth_identity(owner["pid"]) != owner["process_birth_id"]
             assert not (support / "generic-host.json").exists()
             assert not (support / "discovery.json").exists()
