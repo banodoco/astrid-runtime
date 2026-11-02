@@ -20,6 +20,7 @@ from runtime_protocol import platform
 
 def processes():
     if sys.platform != "linux":
+        yield None  # portable tests do not use this fixture; yield so the setup completes
         return
     children = []
 

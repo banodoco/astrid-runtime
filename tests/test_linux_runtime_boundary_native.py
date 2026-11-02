@@ -18,7 +18,8 @@ from astrid_runtime.custody_broker import (
 from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
 from runtime_protocol import platform
 
-pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux native Runtime custody")
+from tests.lanes import requires_linux_tree_custody
+pytestmark = requires_linux_tree_custody
 
 # Stand-in for the Runtime service only: it publishes its own real process
 # identity and serves the health endpoint expected by LocalRuntimeBoundary.

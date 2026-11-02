@@ -13,7 +13,8 @@ import pytest
 from astrid_runtime import custody_broker as custody
 from runtime_protocol import platform, process_binding
 
-pytestmark = pytest.mark.skipif(not process_binding.LINUX, reason="Linux custody")
+from tests.lanes import requires_linux_tree_custody
+pytestmark = requires_linux_tree_custody
 
 
 @pytest.fixture

@@ -12,7 +12,8 @@ import pytest
 from runtime_protocol import linux_process_binding as lpb
 from runtime_protocol import platform
 
-pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux provider")
+from tests.lanes import requires_linux_tree_custody
+pytestmark = requires_linux_tree_custody
 
 
 def _sleeper():

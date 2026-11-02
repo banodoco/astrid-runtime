@@ -8,9 +8,10 @@ import sys
 import pytest
 
 from astrid_runtime import custody_broker as custody
+from tests.lanes import requires_posix_file_modes_native_custody
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="native POSIX directory modes")
+@requires_posix_file_modes_native_custody
 def test_public_native_scope_is_refused_without_publishing_custody(tmp_path: Path):
     scope = tmp_path / "PUBLIC_NATIVE"
     scope.mkdir(mode=0o700)
