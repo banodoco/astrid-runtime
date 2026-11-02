@@ -3,6 +3,10 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
+      - release-1
+      - int/**
   pull_request:
   workflow_dispatch:
     inputs:
@@ -10,9 +14,22 @@ on:
         description: Full immutable Agent commit SHA (empty uses fixture pin)
         required: false
         type: string
+      runtime_sha:
+        description: Full immutable Runtime product commit SHA (required for catalog selector)
+        required: false
+        type: string
+      catalog_selector:
+        description: Exact approved catalog selector (empty runs the normal CI graph)
+        required: false
+        type: string
+      workflow_head_sha:
+        description: Full immutable carrier commit SHA (required for catalog selector)
+        required: false
+        type: string
 
 jobs:
   windows-realm-publication:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -87,6 +104,7 @@ jobs:
           key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
 
   unit:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -123,6 +141,7 @@ jobs:
   darwin-native:
     # The darwin_native lane is deselected by default and skipped off macOS; this
     # is the job where it runs (tests/lanes.py SKIP_REGISTRY).
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -147,6 +166,7 @@ jobs:
           key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
 
   typescript-client:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -159,6 +179,7 @@ jobs:
         working-directory: packages/typescript
 
   boundary:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -187,12 +208,14 @@ jobs:
   sandbox-process-control:
     # Sandbox mode under a seccomp profile that denies what NVIDIA OpenShell's
     # does: pidfd_open (ENOSYS), pidfd_send_signal and process-group kill (EPERM).
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: sh tests/seccomp/run-suite.sh
 
   portability-lifecycle:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     env:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     defaults:
@@ -271,3 +294,389 @@ jobs:
         with:
           path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
           key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
+
+  catalog-selector:
+    # This is an evidence-only dispatch path. It deliberately replaces the
+    # ordinary graph only when the explicit selector input is non-empty.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.catalog_selector != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EXPECTED_SELECTOR: tests/test_project_reference_catalog.py::test_catalog_scope_and_worker_renderer_authority_are_unchanged[create_project_reference]
+      EXPECTED_RUNTIME_SHA: 2776ba973b6c8f3555b5629b0840d9691a98d3c2
+      EXPECTED_RUNTIME_TREE: f8647c2ab71d923df670eea1ec7824a06344a51b
+      EXPECTED_WORKFLOW_SHA: bf57f35d4b53058b1298cf01f67ee715eeb98581
+      EXPECTED_WORKFLOW_TREE: 66c2712685d709e7985155aa255464bb559fd4b7
+      EXPECTED_AGENT_SHA: 999d3046321456d0ede1ceb86d564bf549ccfdda
+      EXPECTED_APP_SHA: 8948f0dad225cb8588ede98ec0ca240ac7a547c9
+      EXPECTED_PINOKIO_SHA: 3a6a98ae251ca126505245286e2d3e760f4348e9
+      INPUT_RUNTIME_SHA: ${{ inputs.runtime_sha }}
+      INPUT_AGENT_SHA: ${{ inputs.agent_sha }}
+      INPUT_SELECTOR: ${{ inputs.catalog_selector }}
+      INPUT_WORKFLOW_HEAD_SHA: ${{ inputs.workflow_head_sha }}
+      ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
+    steps:
+      # Keep this directory through the Runtime checkout. The receipt must
+      # survive a checkout/setup/install failure in order to fail closed.
+      - name: Initialize catalog-selector receipt
+        id: initialize-receipt
+        shell: bash
+        run: |
+          mkdir -p catalog-receipt
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          keys = (
+              "EXPECTED_RUNTIME_SHA", "EXPECTED_RUNTIME_TREE",
+              "EXPECTED_WORKFLOW_SHA", "EXPECTED_WORKFLOW_TREE",
+              "EXPECTED_AGENT_SHA", "EXPECTED_APP_SHA", "EXPECTED_PINOKIO_SHA",
+              "EXPECTED_SELECTOR", "INPUT_RUNTIME_SHA", "INPUT_AGENT_SHA",
+              "INPUT_SELECTOR", "INPUT_WORKFLOW_HEAD_SHA", "GITHUB_EVENT_NAME", "GITHUB_REF", "GITHUB_SHA",
+              "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "RUNNER_OS",
+          )
+          Path("catalog-receipt/requested-tuple.json").write_text(
+              json.dumps({key.lower(): os.environ.get(key, "") for key in keys}, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+
+      - name: Validate immutable selector request
+        id: validate-request
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          {
+            test "$INPUT_SELECTOR" = "$EXPECTED_SELECTOR"
+            test "$INPUT_RUNTIME_SHA" = "$EXPECTED_RUNTIME_SHA"
+            test "$INPUT_AGENT_SHA" = "$EXPECTED_AGENT_SHA"
+            [[ "$INPUT_WORKFLOW_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$INPUT_WORKFLOW_HEAD_SHA" = "$GITHUB_SHA"
+          } >catalog-receipt/request-validation.log 2>&1
+          rc=$?
+          cat catalog-receipt/request-validation.log
+          printf '%s\n' "$rc" > catalog-receipt/request-validation.exit_code
+          exit "$rc"
+
+      - name: Checkout immutable Runtime product
+        id: checkout-runtime
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.runtime_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: false
+
+      - name: Set up Python
+        id: setup-python
+        continue-on-error: true
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system media tools
+        id: install-media-tools
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg >catalog-receipt/media-tools.log 2>&1
+          rc=$?
+          cat catalog-receipt/media-tools.log
+          printf '%s\n' "$rc" > catalog-receipt/media-tools.exit_code
+          exit "$rc"
+
+      - name: Checkout immutable Agent
+        id: checkout-agent
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-agent
+          ref: ${{ inputs.agent_sha }}
+          path: astrid-agent
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve checkouts and compare Runtime trees
+        id: resolve-identities
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          runtime_sha=$(git rev-parse HEAD 2>catalog-receipt/runtime-rev-parse.err)
+          runtime_rc=$?
+          runtime_tree=$(git rev-parse HEAD^{tree} 2>>catalog-receipt/runtime-rev-parse.err)
+          runtime_tree_rc=$?
+          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD 2>catalog-receipt/agent-rev-parse.err)
+          agent_rc=$?
+          agent_tree=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD^{tree} 2>>catalog-receipt/agent-rev-parse.err)
+          agent_tree_rc=$?
+          lock_source=$(python3 -c 'import json; print(json.load(open("astrid-agent/runtime.lock.json"))["source_commit"])' 2>catalog-receipt/agent-lock.err)
+          lock_rc=$?
+          git fetch --no-tags --depth=2 origin "$EXPECTED_WORKFLOW_SHA" >catalog-receipt/workflow-fetch.log 2>&1
+          workflow_fetch_rc=$?
+          workflow_tree=$(git rev-parse "$EXPECTED_WORKFLOW_SHA^{tree}" 2>catalog-receipt/workflow-rev-parse.err)
+          workflow_tree_rc=$?
+          git merge-base --is-ancestor "$EXPECTED_RUNTIME_SHA" "$EXPECTED_WORKFLOW_SHA" >catalog-receipt/workflow-ancestry.log 2>&1
+          workflow_ancestry_rc=$?
+          if [ "$runtime_tree" = "$workflow_tree" ]; then tree_relation=identical; else tree_relation=different; fi
+          python3 - \
+            "$runtime_sha" "$runtime_tree" "$runtime_rc" "$runtime_tree_rc" \
+            "$agent_sha" "$agent_tree" "$agent_rc" "$agent_tree_rc" \
+            "$lock_source" "$lock_rc" "$workflow_tree" "$workflow_fetch_rc" \
+            "$workflow_tree_rc" "$workflow_ancestry_rc" "$tree_relation" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          fields = (
+              "runtime_sha", "runtime_tree", "runtime_rev_parse_exit", "runtime_tree_exit",
+              "agent_sha", "agent_tree", "agent_rev_parse_exit", "agent_tree_exit",
+              "agent_runtime_lock_source_commit", "agent_runtime_lock_exit",
+              "workflow_tree", "workflow_fetch_exit", "workflow_tree_exit",
+              "workflow_product_ancestry_exit", "workflow_product_tree_relation",
+          )
+          values = list(sys.argv[1:])
+          record = dict(zip(fields, values))
+          for key in tuple(record):
+              if key.endswith("_exit"):
+                  record[key] = int(record[key])
+          Path("catalog-receipt/resolved-identities.json").write_text(
+              json.dumps(record, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+          wrong=0
+          test "$runtime_rc" -eq 0 && test "$runtime_tree_rc" -eq 0 && test "$runtime_sha" = "$EXPECTED_RUNTIME_SHA" && test "$runtime_tree" = "$EXPECTED_RUNTIME_TREE" || wrong=1
+          test "$agent_rc" -eq 0 && test "$agent_tree_rc" -eq 0 && test "$agent_sha" = "$EXPECTED_AGENT_SHA" || wrong=1
+          test "$workflow_fetch_rc" -eq 0 && test "$workflow_tree_rc" -eq 0 && test "$workflow_ancestry_rc" -eq 0 && test "$workflow_tree" = "$EXPECTED_WORKFLOW_TREE" || wrong=1
+          test "$tree_relation" = different || wrong=1
+          exit "$wrong"
+
+      - name: Install Runtime test dependencies
+        id: install-runtime-test
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python -m pip install -e '.[test]' >catalog-receipt/install-runtime-test.log 2>&1
+          rc=$?
+          cat catalog-receipt/install-runtime-test.log
+          printf '%s\n' "$rc" > catalog-receipt/install-runtime-test.exit_code
+          exit "$rc"
+
+      - name: Install Runtime Python package
+        id: install-runtime-python
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python -m pip install -e packages/python >catalog-receipt/install-runtime-python.log 2>&1
+          rc=$?
+          cat catalog-receipt/install-runtime-python.log
+          printf '%s\n' "$rc" > catalog-receipt/install-runtime-python.exit_code
+          exit "$rc"
+
+      - name: Install catalog Agent package
+        id: install-agent
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python -m pip install -e "$ASTRID_CHECKOUT" >catalog-receipt/install-agent.log 2>&1
+          rc=$?
+          cat catalog-receipt/install-agent.log
+          printf '%s\n' "$rc" > catalog-receipt/install-agent.exit_code
+          exit "$rc"
+
+      - name: Verify catalog Agent provider import
+        id: provider-import
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python -c "from astrid.sdk.timeline.commit import create_runtime_commit_service; assert callable(create_runtime_commit_service)" >catalog-receipt/provider-import.log 2>&1
+          rc=$?
+          cat catalog-receipt/provider-import.log
+          printf '%s\n' "$rc" > catalog-receipt/provider-import.exit_code
+          exit "$rc"
+
+      - name: Collect exact catalog selector
+        id: collect-selector
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python -m pytest --collect-only -q "$INPUT_SELECTOR" >catalog-receipt/collection.log 2>&1
+          rc=$?
+          cat catalog-receipt/collection.log
+          printf '%s\n' "$rc" > catalog-receipt/collection.exit_code
+          grep -Fxc "$EXPECTED_SELECTOR" catalog-receipt/collection.log > catalog-receipt/collection.node_count
+          count_rc=$?
+          if [ "$count_rc" -eq 1 ]; then printf '0\n' > catalog-receipt/collection.node_count; fi
+          exit "$rc"
+
+      - name: Run exact catalog selector
+        id: run-selector
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --junitxml=catalog-receipt/pytest.xml "$INPUT_SELECTOR" >catalog-receipt/pytest.log 2>&1
+          rc=$?
+          cat catalog-receipt/pytest.log
+          printf '%s\n' "$rc" > catalog-receipt/pytest.exit_code
+          exit "$rc"
+
+      - name: Finalize catalog-selector receipt
+        id: finalize-receipt
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          INITIALIZE_RECEIPT_OUTCOME: ${{ steps.initialize-receipt.outcome }}
+          VALIDATE_REQUEST_OUTCOME: ${{ steps.validate-request.outcome }}
+          CHECKOUT_RUNTIME_OUTCOME: ${{ steps.checkout-runtime.outcome }}
+          SETUP_PYTHON_OUTCOME: ${{ steps.setup-python.outcome }}
+          INSTALL_MEDIA_TOOLS_OUTCOME: ${{ steps.install-media-tools.outcome }}
+          CHECKOUT_AGENT_OUTCOME: ${{ steps.checkout-agent.outcome }}
+          RESOLVE_IDENTITIES_OUTCOME: ${{ steps.resolve-identities.outcome }}
+          INSTALL_RUNTIME_TEST_OUTCOME: ${{ steps.install-runtime-test.outcome }}
+          INSTALL_RUNTIME_PYTHON_OUTCOME: ${{ steps.install-runtime-python.outcome }}
+          INSTALL_AGENT_OUTCOME: ${{ steps.install-agent.outcome }}
+          PROVIDER_IMPORT_OUTCOME: ${{ steps.provider-import.outcome }}
+          COLLECT_SELECTOR_OUTCOME: ${{ steps.collect-selector.outcome }}
+          RUN_SELECTOR_OUTCOME: ${{ steps.run-selector.outcome }}
+        run: |
+          mkdir -p catalog-receipt
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          directory = Path("catalog-receipt")
+          def text(name, default="not_recorded"):
+              path = directory / name
+              return path.read_text(errors="replace").strip() if path.exists() else default
+
+          requested_path = directory / "requested-tuple.json"
+          requested = json.loads(requested_path.read_text()) if requested_path.exists() else {"missing": True}
+          resolved_path = directory / "resolved-identities.json"
+          resolved = json.loads(resolved_path.read_text()) if resolved_path.exists() else {"missing": True}
+          counts = {"tests": None, "failures": None, "errors": None, "skipped": None}
+          junit_error = "not_emitted"
+          junit = directory / "pytest.xml"
+          if junit.exists():
+              try:
+                  root = ET.parse(junit).getroot()
+                  for key in counts:
+                      value = root.attrib.get(key)
+                      counts[key] = int(value) if value is not None else 0
+                  junit_error = None
+              except Exception as error:
+                  junit_error = f"{type(error).__name__}: {error}"
+          pytest_log = text("pytest.log", "")
+          collection_log = text("collection.log", "")
+          outcomes = {
+              key.lower(): os.environ.get(key, "")
+              for key in (
+                  "INITIALIZE_RECEIPT_OUTCOME", "VALIDATE_REQUEST_OUTCOME",
+                  "CHECKOUT_RUNTIME_OUTCOME", "SETUP_PYTHON_OUTCOME",
+                  "INSTALL_MEDIA_TOOLS_OUTCOME", "CHECKOUT_AGENT_OUTCOME",
+                  "RESOLVE_IDENTITIES_OUTCOME", "INSTALL_RUNTIME_TEST_OUTCOME",
+                  "INSTALL_RUNTIME_PYTHON_OUTCOME", "INSTALL_AGENT_OUTCOME",
+                  "PROVIDER_IMPORT_OUTCOME", "COLLECT_SELECTOR_OUTCOME",
+                  "RUN_SELECTOR_OUTCOME",
+              )
+          }
+          receipt = {
+              "schema": "catalog-selector-receipt/v2",
+              "requested_tuple": requested,
+              "resolved_identities": resolved,
+              "step_outcomes": outcomes,
+              "agent_runtime_lock_matches_requested_product": (
+                  resolved.get("agent_runtime_lock_source_commit") == requested.get("expected_runtime_sha")
+              ),
+              "collection": {
+                  "command": "python -m pytest --collect-only -q $INPUT_SELECTOR",
+                  "inner_exit_code": text("collection.exit_code"),
+                  "selected_node_count": text("collection.node_count"),
+                  "summary_lines": [line for line in collection_log.splitlines() if "collected" in line][-5:],
+              },
+              "pytest": {
+                  "command": "python -m pytest -q --junitxml=catalog-receipt/pytest.xml $INPUT_SELECTOR",
+                  "inner_exit_code": text("pytest.exit_code"),
+                  "counts": counts,
+                  "junit_parse_error": junit_error,
+                  "summary_lines": [line for line in pytest_log.splitlines() if re.search(r"\\b(?:passed|failed|error|skipped)\\b", line)][-5:],
+              },
+          }
+          (directory / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          PY
+          (
+            cd catalog-receipt
+            find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS
+          )
+
+      - name: Upload catalog-selector receipt and logs
+        id: upload-receipt
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: catalog-selector-receipt-${{ github.run_id }}
+          path: catalog-receipt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fail closed on incomplete catalog-selector receipt
+        if: ${{ always() }}
+        shell: bash
+        env:
+          INITIALIZE_RECEIPT_OUTCOME: ${{ steps.initialize-receipt.outcome }}
+          VALIDATE_REQUEST_OUTCOME: ${{ steps.validate-request.outcome }}
+          CHECKOUT_RUNTIME_OUTCOME: ${{ steps.checkout-runtime.outcome }}
+          SETUP_PYTHON_OUTCOME: ${{ steps.setup-python.outcome }}
+          INSTALL_MEDIA_TOOLS_OUTCOME: ${{ steps.install-media-tools.outcome }}
+          CHECKOUT_AGENT_OUTCOME: ${{ steps.checkout-agent.outcome }}
+          RESOLVE_IDENTITIES_OUTCOME: ${{ steps.resolve-identities.outcome }}
+          INSTALL_RUNTIME_TEST_OUTCOME: ${{ steps.install-runtime-test.outcome }}
+          INSTALL_RUNTIME_PYTHON_OUTCOME: ${{ steps.install-runtime-python.outcome }}
+          INSTALL_AGENT_OUTCOME: ${{ steps.install-agent.outcome }}
+          PROVIDER_IMPORT_OUTCOME: ${{ steps.provider-import.outcome }}
+          COLLECT_SELECTOR_OUTCOME: ${{ steps.collect-selector.outcome }}
+          RUN_SELECTOR_OUTCOME: ${{ steps.run-selector.outcome }}
+          FINALIZE_RECEIPT_OUTCOME: ${{ steps.finalize-receipt.outcome }}
+          UPLOAD_RECEIPT_OUTCOME: ${{ steps.upload-receipt.outcome }}
+        run: |
+          failed=0
+          for outcome in \
+            "$INITIALIZE_RECEIPT_OUTCOME" "$VALIDATE_REQUEST_OUTCOME" \
+            "$CHECKOUT_RUNTIME_OUTCOME" "$SETUP_PYTHON_OUTCOME" \
+            "$INSTALL_MEDIA_TOOLS_OUTCOME" "$CHECKOUT_AGENT_OUTCOME" \
+            "$RESOLVE_IDENTITIES_OUTCOME" "$INSTALL_RUNTIME_TEST_OUTCOME" \
+            "$INSTALL_RUNTIME_PYTHON_OUTCOME" "$INSTALL_AGENT_OUTCOME" \
+            "$PROVIDER_IMPORT_OUTCOME" "$COLLECT_SELECTOR_OUTCOME" \
+            "$RUN_SELECTOR_OUTCOME" "$FINALIZE_RECEIPT_OUTCOME" "$UPLOAD_RECEIPT_OUTCOME"; do
+            if [ "$outcome" != success ]; then
+              echo "catalog receipt observed non-success outcome: $outcome" >&2
+              failed=1
+            fi
+          done
+          test -s catalog-receipt/receipt.json || failed=1
+          test -s catalog-receipt/SHA256SUMS || failed=1
+          test "$(cat catalog-receipt/collection.exit_code 2>/dev/null || true)" = 0 || failed=1
+          test "$(cat catalog-receipt/collection.node_count 2>/dev/null || true)" = 1 || failed=1
+          test "$(cat catalog-receipt/pytest.exit_code 2>/dev/null || true)" = 0 || failed=1
+          python3 - <<'PY' || failed=1
+          import json
+          receipt = json.load(open("catalog-receipt/receipt.json"))
+          assert receipt["pytest"]["counts"] == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}
+          assert receipt["pytest"]["junit_parse_error"] is None
+          assert receipt["resolved_identities"]["workflow_product_tree_relation"] == "different"
+          PY
+          exit "$failed"
