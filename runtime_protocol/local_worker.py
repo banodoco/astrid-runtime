@@ -378,6 +378,7 @@ class LocalWorkerLauncher:
         self._orderly_handoff: _OrderlyHandoff | None = None
         self._cleanup_uncertain: str | None = None
         self._startup_receipt_rejection: str | None = None
+        self._shutdown_host_only: tuple[object, dict[str, Any], str] | None = None
         if any(_secure_profile(profile) for profile in self.profiles.values()):
             marker = self.support_root / "orderly-handoff-cleanup-uncertain.json"
             if marker.exists():
@@ -392,7 +393,15 @@ class LocalWorkerLauncher:
             set_cancel(self._prepare_cancel)
         existing = credentials.actor_metadata(actor)
         if existing and isinstance(existing.get("local_launch_receipt"), Mapping) and existing["local_launch_receipt"].get("execution_mode") == "host_only_cpu":
-            self._latch_cleanup_uncertain("host-only departed owner recovery is unsupported")
+            with credentials._lock:
+                if self._host_only_stop_completed(existing):
+                    # This exact generation was cleaned by its original owner.
+                    # Retire any files left by an interrupted credential revoke;
+                    # this is not authority to adopt or signal a departed graph.
+                    credentials.revoke(actor)
+                    existing = None
+                else:
+                    self._latch_cleanup_uncertain("host-only departed owner recovery is unsupported")
         if existing:
             # Every durable bearer is unusable after owner restart until the
             # surviving process identity is independently revalidated. A
@@ -425,6 +434,34 @@ class LocalWorkerLauncher:
             self.credentials.revoke(self.actor)
         except OSError:
             pass
+
+    def _host_only_stop_record(self, receipt: Mapping[str, Any], generation: str) -> dict[str, Any]:
+        return {
+            "version": "runtime.host-only-orderly-stop/v1",
+            "state": "complete",
+            "actor": self.actor,
+            "workspace_uuid": self.workspace_uuid,
+            "realm_root": str(self.realm_root),
+            "support_root": str(self.support_root),
+            "receipt_digest": _digest(receipt),
+            "credential_generation": generation,
+        }
+
+    def _host_only_stop_completed(self, metadata: Mapping[str, Any]) -> bool:
+        from astrid_runtime.custody_broker import CustodyError, _read_owner_file
+
+        try:
+            if self._cleanup_uncertain is not None or not self._receipt_shape_valid(metadata):
+                return False
+            with self.credentials._lock:
+                generation = _credential_commit_generation(self.credentials, self.actor)
+                value = json.loads(_read_owner_file(self.support_root / "host-only-orderly-stop.json")[0])
+                return (
+                    self.credentials.actor_metadata(self.actor) == metadata
+                    and value == self._host_only_stop_record(metadata["local_launch_receipt"], generation)
+                )
+        except (CustodyError, OSError, ValueError, TypeError):
+            return False
 
     def _latch_cleanup_uncertain(self, reason: BaseException | str) -> None:
         """Persist a fail-closed replacement fence at the first cleanup failure."""
@@ -1533,7 +1570,20 @@ class LocalWorkerLauncher:
                 preparing_before_fence,
                 self.preparer.current_handle(),
             )
-            self._revoke_actor()
+            metadata = self.credentials.actor_metadata(self.actor)
+            receipt = metadata.get("local_launch_receipt") if metadata else None
+            if isinstance(receipt, Mapping) and receipt.get("execution_mode") == "host_only_cpu":
+                # Disable immediately, but keep the durable graph obligation
+                # until the original retained handle acknowledges cleanup.
+                # A crash during shutdown must still take the departed fence.
+                self.credentials.disable_actor(self.actor)
+                if (active_before_fence is not None and self._active_receipt == receipt
+                        and self._active_profile is not None and _host_only(self._active_profile)
+                        and self._receipt_shape_valid(metadata)):
+                    generation = _credential_commit_generation(self.credentials, self.actor)
+                    self._shutdown_host_only = (active_before_fence, dict(receipt), generation)
+            else:
+                self._revoke_actor()
             self._active_handle = None
             self._active_profile = None
             self._active_identity = None
@@ -1624,10 +1674,28 @@ class LocalWorkerLauncher:
                 if entry not in details:
                     details.append(entry)
             detail = ";".join(details)[:768]
+            self._latch_cleanup_uncertain(detail)
             raise ConflictError(
                 "local Worker graph cleanup is uncertain"
                 + (f" [{detail}]" if detail else "")
             )
+        pending = self._shutdown_host_only
+        if pending is not None and self._cleanup_uncertain is None:
+            handle, receipt, generation = pending
+            if not self._shutdown.is_set() or not any(handle is value for value in handles):
+                raise ConflictError("host-only orderly stop lacks its original cleanup handle")
+            from astrid_runtime.custody_broker import _atomic_owner_json
+            with self.credentials._lock:
+                metadata = self.credentials.actor_metadata(self.actor)
+                if (metadata is None or metadata.get("local_launch_receipt") != receipt
+                        or _credential_commit_generation(self.credentials, self.actor) != generation):
+                    raise ConflictError("host-only credential generation changed during orderly stop")
+                # abort() has acknowledged host-child absence and reaped the
+                # original host. Publish only now, before best-effort revoke.
+                _atomic_owner_json(self.support_root / "host-only-orderly-stop.json",
+                                   self._host_only_stop_record(receipt, generation))
+                self._revoke_actor()
+                self._shutdown_host_only = None
 
     def _try_reconnect(self, profile: LocalWorkerProfile, metadata: Mapping[str, Any]) -> dict[str, Any] | None:
         if _host_only(profile):
