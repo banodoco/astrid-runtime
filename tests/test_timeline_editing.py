@@ -115,6 +115,19 @@ def submit(runtime, body, key):
 
 
 @pytest.mark.integration
+def test_source_via_app_is_cooperative_and_caller_spoofable(editing_runtime):
+    runtime = editing_runtime
+    app_claim = patch(runtime, "claimed-app", via="app")
+    lease(runtime, 1)
+    # The frozen T1 contract deliberately exempts by source attribution. This
+    # proves that an agent caller able to submit the enum can claim the exemption.
+    accepted = submit(runtime, app_claim, "spoofed-app-source")
+    assert accepted["data"]["status"] == "accepted"
+    document = accepted["data"]["canonical_document"]
+    assert document["parent_revision"]["payload"]["config"]["title"] == "claimed-app"
+
+
+@pytest.mark.integration
 def test_app_preview_retry_and_saved_user_conflict(editing_runtime):
     runtime = editing_runtime
     agent = patch(runtime, "agent")
@@ -218,6 +231,38 @@ def test_expiry_allows_original_flight(editing_runtime):
         submit(runtime, body, "expired-flight")
     clock[0] = 11.0
     assert submit(runtime, body, "expired-flight")["data"]["status"] == "accepted"
+
+
+@pytest.mark.integration
+def test_runtime_restart_drops_memory_lease_and_preserves_best_effort_boundary(tmp_path, real_provider):
+    root = tmp_path / "restart-realm"
+    RealmStore.initialize(root).close()
+    runtime = RuntimeService(root)
+    runtime.register_timeline_commit_provider(real_provider)
+    project = runtime.create_project({"slug": "restart-editing", "name": "Restart editing"})["id"]
+    runtime.create_timeline(project, "main", idempotency_key="create")
+    runtime.test_project = project
+    body = patch(runtime, "agent")
+    runtime.update_timeline_editing(
+        project, "main", {"tab_session_id": "tab", "sequence": 1},
+        publisher="user", authorize=lambda: {"actor": "user"},
+    )
+    with pytest.raises(RuntimeErrorBase) as blocked:
+        submit(runtime, body, "restart-flight")
+    assert blocked.value.details["reason"] == "user_editing"
+    runtime.close()
+
+    restarted = RuntimeService(root)
+    restarted.register_timeline_commit_provider(real_provider)
+    restarted.test_project = project
+    try:
+        assert not restarted._timeline_commits()[0].editing.live(project, "main")
+        # Presence is process memory. The stale flight can now land after restart;
+        # user priority across an unobserved restart is a documented best-effort limit.
+        result = submit(restarted, body, "restart-flight")
+        assert result["data"]["status"] == "accepted"
+    finally:
+        restarted.close()
 
 
 def test_editing_service_authenticates_actor_before_mutation(realm):
