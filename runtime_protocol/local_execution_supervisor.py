@@ -42,6 +42,10 @@ class RelayError(RuntimeError):
     """A bounded delegated transition lacks exact identity or custody."""
 
 
+class RetainedWaitTimeout(RelayError):
+    """A retained child has not exited within the wait budget."""
+
+
 def runtime_owner_record(native_observation: Mapping[str, Any], epoch: str) -> dict[str, Any]:
     """Project a native Runtime observation into the exact owner contract."""
     return {
@@ -929,21 +933,29 @@ class RetainedProcess:
         return self.actor
 
     def poll(self):
-        # Popen.poll() manages its own waitpid lock; holding it here prevents
-        # the non-reentrant lock from being acquired and the child from reaping.
         with self.guard:
             if self.exit_code is not None:
                 return self.exit_code
-            if self.child.returncode is not None:
-                raise RelayError("child was reaped outside retained launch ownership")
-            try:
-                result = self.child.poll()
-            except (ChildProcessError, OSError) as exc:
-                raise RelayError("retained child wait ownership is unknown") from exc
-            if result is None:
+            # Coordinate with Popen.wait/poll, but perform waitpid ourselves:
+            # Popen treats ECHILD as a successful exit with status zero.
+            # A concurrent Popen.wait may hold this lock while the child is
+            # running; never let it defeat our caller's wait deadline.
+            if not self.child._waitpid_lock.acquire(False):
                 return None
-            self.exit_code = result
-            return self.exit_code
+            try:
+                if self.child.returncode is not None:
+                    raise RelayError("child was reaped outside retained launch ownership")
+                try:
+                    pid, status = os.waitpid(self.child.pid, os.WNOHANG)
+                except OSError as exc:
+                    raise RelayError("retained child wait ownership is unknown") from exc
+                if pid == 0:
+                    return None
+                self.exit_code = os.waitstatus_to_exitcode(status)
+                self.child.returncode = self.exit_code
+                return self.exit_code
+            finally:
+                self.child._waitpid_lock.release()
 
     def verify(self):
         with self.guard:
@@ -959,7 +971,7 @@ class RetainedProcess:
             if result is not None:
                 return result
             if time.monotonic() >= deadline:
-                raise RelayError("retained child exit remains unresolved")
+                raise RetainedWaitTimeout("retained child exit remains unresolved")
             time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
 
@@ -1134,7 +1146,7 @@ class NativeHostSession:
             self.broker.signal(runtime_platform.TERM, expected_pid=self.retained.child.pid)
             try:
                 result = self.retained.wait(min(self.timeout, 5.0))
-            except RelayError:
+            except RetainedWaitTimeout:
                 self.broker.signal(runtime_platform.KILL, expected_pid=self.retained.child.pid)
                 result = self.retained.wait(min(self.timeout, 5.0))
         self.control.close()

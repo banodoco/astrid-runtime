@@ -531,15 +531,14 @@ def test_prepare_replay_changed_profile_never_spawns_or_rebinds():
     assert len(calls) == 1
 
 
-def test_retained_process_echild_is_not_successful_exit(monkeypatch):
-    import threading
-    from types import SimpleNamespace
+def test_retained_process_echild_is_not_successful_exit():
+    import os
+    import subprocess
+    import sys
     from runtime_protocol.local_execution_supervisor import RetainedProcess
-    child = SimpleNamespace(pid=123, returncode=None, _waitpid_lock=threading.Lock())
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
     retained = RetainedProcess(child)
-    def unavailable():
-        raise ChildProcessError("not ours")
-    child.poll = unavailable
+    os.waitpid(child.pid, 0)
     with pytest.raises(RelayError, match="ownership is unknown"):
         retained.poll()
     assert retained.exit_code is None
