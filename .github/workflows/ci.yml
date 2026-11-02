@@ -25,8 +25,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Checkout published Agent
+        uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-agent
+          ref: dd6b48192c720c5346e6f140184e313b2cf84f31
+          path: astrid-agent
+      - name: Record effective Runtime and Agent checkouts
+        shell: bash
+        run: |
+          runtime_sha=$(git rev-parse HEAD)
+          agent_sha=$(git -C astrid-agent rev-parse HEAD)
+          echo "Runtime: $runtime_sha"
+          echo "Agent: $agent_sha"
+          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
       - run: python -m pip install -e '.[test]'
       - run: python -m pip install -e packages/python
+      - run: python -m pip install -e astrid-agent
       - name: Verify Windows update backup daemon from a selected venv
         run: python -m pytest -q -rP -m "" tests/test_windows_runtime_launch.py
       - name: Verify native realm creation, ownership, and rollback
