@@ -3,6 +3,10 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
+      - release-1
+      - int/**
   pull_request:
   workflow_dispatch:
     inputs:
@@ -10,9 +14,18 @@ on:
         description: Full immutable Agent commit SHA (empty uses fixture pin)
         required: false
         type: string
+      runtime_sha:
+        description: Full immutable Runtime commit SHA (required for catalog selector)
+        required: false
+        type: string
+      catalog_selector:
+        description: Exact approved catalog selector (empty runs the normal unit suite)
+        required: false
+        type: string
 
 jobs:
   windows-realm-publication:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,13 +78,25 @@ jobs:
           key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
 
   unit:
+    # A selector dispatch is intentionally Ubuntu-only: the original failed
+    # node was unit (ubuntu-latest), and its exact retry must execute once.
     runs-on: ${{ matrix.os }}
+    env:
+      ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
+      AGENT_OVERRIDE: ${{ inputs.agent_sha }}
+      CATALOG_RUNTIME_SHA: ${{ inputs.runtime_sha }}
+      CATALOG_SELECTOR: ${{ inputs.catalog_selector }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.catalog_selector != '' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A catalog dispatch must test the supplied immutable Runtime, not
+          # the workflow-only lane commit that hosts this retry workflow.
+          ref: ${{ inputs.runtime_sha || github.sha }}
+          persist-credentials: false
       - name: Restore pip cache (C-08)
         id: c08-runtime-ci-4
         uses: actions/cache/restore@v4
@@ -88,8 +113,77 @@ jobs:
       - name: Install system media tools (macOS)
         if: runner.os == 'macOS'
         run: brew install ffmpeg
+      - name: Select Agent revision
+        id: astrid-pin
+        shell: bash
+        run: |
+          expected_selector='tests/test_project_reference_catalog.py::test_catalog_scope_and_worker_renderer_authority_are_unchanged[create_project_reference]'
+          expected_runtime='8d3e3af4ede6e3579ac673ae77794464f693bf1b'
+          expected_agent='e425903f7a9fa5b82973281d15054c0716b46e2d'
+          if [[ -n "$CATALOG_SELECTOR" ]]; then
+            [[ "$CATALOG_SELECTOR" == "$expected_selector" ]] || {
+              echo "unsupported catalog selector: $CATALOG_SELECTOR" >&2
+              exit 1
+            }
+            [[ "$CATALOG_RUNTIME_SHA" == "$expected_runtime" ]] || {
+              echo "catalog Runtime SHA must be $expected_runtime" >&2
+              exit 1
+            }
+            [[ "$AGENT_OVERRIDE" == "$expected_agent" ]] || {
+              echo "catalog Agent SHA must be $expected_agent" >&2
+              exit 1
+            }
+          fi
+          sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
+          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Agent revision must be a full 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-agent
+          ref: ${{ steps.astrid-pin.outputs.sha }}
+          path: astrid-agent
+          persist-credentials: false
+      - name: Record and assert effective checkouts
+        shell: bash
+        run: |
+          runtime_sha=$(git rev-parse HEAD)
+          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
+          if [[ -n "$CATALOG_SELECTOR" ]]; then
+            [[ "$runtime_sha" == "$CATALOG_RUNTIME_SHA" ]] || {
+              echo "Runtime checkout did not resolve the requested SHA" >&2
+              exit 1
+            }
+            [[ "$agent_sha" == "$AGENT_OVERRIDE" ]] || {
+              echo "Agent checkout did not resolve the requested SHA" >&2
+              exit 1
+            }
+            [[ "$(python -c 'import json; print(json.load(open("astrid-agent/runtime.lock.json"))["source_commit"])')" == "5453366458f7b4ee874c94d15ae7952e3e82d3c3" ]] || {
+              echo "Agent runtime.lock.json does not consume the approved Runtime product identity" >&2
+              exit 1
+            }
+          fi
+          echo "Runtime: $runtime_sha"
+          echo "Agent: $agent_sha"
+          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
       - run: python -m pip install -e '.[test]'
-      - run: python -m pytest -q -n 2
+      - run: python -m pip install -e packages/python
+      - run: python -m pip install -e "$ASTRID_CHECKOUT"
+      - name: Assert catalog Agent provider import
+        if: ${{ inputs.catalog_selector != '' }}
+        run: >-
+          python -c "from astrid.sdk.timeline.commit import create_runtime_commit_service;
+          assert callable(create_runtime_commit_service)"
+      - name: Run unit suite or exact catalog selector
+        shell: bash
+        run: |
+          if [[ -n "$CATALOG_SELECTOR" ]]; then
+            python -m pytest -q -n 2 "$CATALOG_SELECTOR"
+          else
+            python -m pytest -q -n 2
+          fi
 
       - name: Save pip cache on main or int branches (C-08)
         if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/')) && steps.c08-runtime-ci-4.outputs.cache-hit != 'true' }}
@@ -101,6 +195,7 @@ jobs:
   darwin-native:
     # The darwin_native lane is deselected by default and skipped off macOS; this
     # is the job where it runs (tests/lanes.py SKIP_REGISTRY).
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +220,7 @@ jobs:
           key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
 
   typescript-client:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -137,6 +233,7 @@ jobs:
         working-directory: packages/typescript
 
   boundary:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -165,12 +262,14 @@ jobs:
   sandbox-process-control:
     # Sandbox mode under a seccomp profile that denies what NVIDIA OpenShell's
     # does: pidfd_open (ENOSYS), pidfd_send_signal and process-group kill (EPERM).
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: sh tests/seccomp/run-suite.sh
 
   portability-lifecycle:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.catalog_selector == '' }}
     env:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     defaults:
