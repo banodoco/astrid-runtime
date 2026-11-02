@@ -661,21 +661,23 @@ def _realm_owner_present(root: Path) -> bool:
         os.close(fd)
 
 
+@instrument
 def _owner_may_be_alive(boundary: RuntimeBoundary, record: Mapping[str, Any]) -> bool:
     """Only proven absence or a different birth permits stale-record cleanup."""
-    if record.get("realm_root") and _realm_owner_present(
+    if outcome("liveness_realm_root", bool(record.get("realm_root"))) and outcome("liveness_realm_lock", _realm_owner_present(
         _canonical_realm_root(str(record["realm_root"]))
-    ):
+    )):
         return True
     pid = record.get("pid")
-    if not _pid_alive(boundary, pid):
+    if not outcome("liveness_pid_alive", _pid_alive(boundary, pid)):
         return False
     observe = getattr(boundary, "process_birth_identity", None)
     expected = record.get("process_birth_id")
-    if not callable(observe) or not expected:
+    if not outcome("liveness_observer_callable", callable(observe)) or not outcome("liveness_birth_expected", bool(expected)):
         return True
     actual = observe(int(pid))
-    return actual is None or runtime_platform.process_birth_matches(str(expected), actual) is not False
+    return (not outcome("liveness_birth_observed", actual is not None)
+            or outcome("liveness_birth_compatible", runtime_platform.process_birth_matches(str(expected), actual)) is not False)
 
 
 def _reclaim_stale_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> bool:

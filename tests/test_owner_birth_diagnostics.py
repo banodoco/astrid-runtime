@@ -126,3 +126,43 @@ def test_direct_missing_scope_is_distinct_from_malformed_birth(monkeypatch, capf
         assert predicates["birth_direct_scope"] == scope
         assert predicates["birth_direct_pidns"] == "unobserved"
         assert "secret" not in output
+
+
+@pytest.mark.parametrize("alive,birth,match,result", [
+    (False, "private", True, False),
+    (True, None, True, True),
+    (True, "private", None, True),
+    (True, "private", False, False),
+    (True, "private", True, True),
+])
+def test_discovery_liveness_observation_does_not_change_decision(
+    monkeypatch, capfd, alive, birth, match, result,
+):
+    from astrid_runtime.bootstrap import _owner_may_be_alive
+
+    calls = []
+    boundary = SimpleNamespace(
+        is_pid_alive=lambda pid: calls.append("pid") or alive,
+        process_birth_identity=lambda pid: calls.append("birth") or birth,
+    )
+    monkeypatch.setattr(platform, "process_birth_matches",
+                        lambda expected, actual: calls.append("compare") or match)
+    record = {"pid": 123, "process_birth_id": "private-expected"}
+    monkeypatch.delenv("ASTRID_RUNTIME_OWNER_DIAGNOSTICS", raising=False)
+    assert _owner_may_be_alive(boundary, record) is result
+    baseline_calls = calls[:]
+    assert capfd.readouterr().err == ""
+    calls.clear()
+    monkeypatch.setenv("ASTRID_RUNTIME_OWNER_DIAGNOSTICS", "1")
+    assert _owner_may_be_alive(boundary, record) is result
+    assert calls == baseline_calls
+    output = capfd.readouterr().err
+    assert "private" not in output and "123" not in output
+    predicates = json.loads(output.split(" ", 1)[1])["predicates"]
+    assert predicates["liveness_pid_alive"] == ("matched" if alive else "false")
+    if alive and birth is not None:
+        assert predicates["liveness_birth_compatible"] == (
+            "unobserved" if match is None else "matched" if match else "false"
+        )
+    else:
+        assert predicates["liveness_birth_compatible"] == "unobserved"
