@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from .io import atomic_write_json, owner_only, read_json, remove_file
+from .owner_diagnostics import instrument, outcome
 from runtime_protocol import platform as runtime_platform
 from runtime_protocol import cancellation
 from runtime_protocol import process_control
@@ -2664,6 +2665,7 @@ def _recorded_owner_identity(
     return pid, birth, instance, endpoint
 
 
+@instrument
 def _validate_stop_endpoint(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, owner: tuple[int, str, str, str],
     realm_id: str, realm_root: Path,
@@ -2671,22 +2673,22 @@ def _validate_stop_endpoint(
     """Validate the process/lock handoff and authenticated published endpoint."""
     pid, birth, instance_id, endpoint = owner
     validate = getattr(boundary, "validate_owner", None)
-    if not callable(validate) or not validate(
+    if not outcome("owner_validator_callable", callable(validate)) or not outcome("owner_valid", bool(validate(
         endpoint=endpoint, pid=pid, instance_id=instance_id,
         owner_lock=paths.instance_lock_path, process_birth_id=birth,
         expected_realm_id=realm_id, expected_realm_root=realm_root,
-    ):
+    ))):
         raise BootstrapError("Runtime interruption refused: owner endpoint or process identity failed validation.")
     endpoint_metadata = getattr(boundary, "endpoint_metadata", None)
-    if not callable(endpoint_metadata):
+    if not outcome("metadata_callable", callable(endpoint_metadata)):
         raise BootstrapError("Runtime interruption refused: boundary cannot verify the selected endpoint.")
     identity = endpoint_metadata(
         endpoint=endpoint,
         credential_file=paths.runtime_support / "credentials" / "owner.token",
     )
-    if (not identity
-            or str(identity.get("runtime_instance_id") or "") != instance_id
-            or str(identity.get("realm_id") or "") != realm_id):
+    if (not outcome("endpoint_metadata", bool(identity))
+            or not outcome("endpoint_instance", str(identity.get("runtime_instance_id") or "") == instance_id)
+            or not outcome("endpoint_realm", str(identity.get("realm_id") or "") == realm_id)):
         raise BootstrapError("Runtime interruption refused: endpoint identity does not match the selected owner.")
     return identity
 

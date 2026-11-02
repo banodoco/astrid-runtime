@@ -24,6 +24,7 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from .bootstrap import BootstrapCustodyUncertain, BootstrapError, SourceProfile
+from .owner_diagnostics import instrument, outcome
 from .loopback_http import urlopen_loopback
 from .custody_broker import (
     ACTIVE_CAPABILITY_NAME,
@@ -56,8 +57,8 @@ SERVICE_OWNER_STOP_GRACE_SECONDS = 20.0
 def _selected_owner_birth_matches(expected: str, observed: str, *, pid: int) -> bool:
     """Accept an exact birth ID or the narrow live R0 Linux bridge."""
     return (
-        platform.process_birth_matches(expected, observed) is True
-        or platform.legacy_linux_birth_matches_live_owner(expected, observed, pid=pid) is True
+        outcome("birth_direct", platform.process_birth_matches(expected, observed)) is True
+        or outcome("birth_legacy_bridge", platform.legacy_linux_birth_matches_live_owner(expected, observed, pid=pid)) is True
     )
 
 
@@ -723,7 +724,7 @@ class LocalRuntimeBoundary:
     def endpoint_metadata(self, *, endpoint: str, credential_file: Path) -> Mapping[str, Any]:
         """Read endpoint instance and authenticated realm identity without mutation."""
         health = self._http_health_payload(endpoint)
-        if not health:
+        if not outcome("metadata_health", bool(health)):
             return {}
         try:
             credential_path = self._validate_path(Path(credential_file), "runtime credential")
@@ -732,7 +733,7 @@ class LocalRuntimeBoundary:
             else:
                 fd = os.open(credential_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
                 try:
-                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    if not outcome("credential_regular", stat.S_ISREG(os.fstat(fd).st_mode)):
                         return {}
                     raw = bytearray()
                     while True:
@@ -742,8 +743,9 @@ class LocalRuntimeBoundary:
                         raw.extend(chunk)
                 finally:
                     os.close(fd)
+            outcome("credential_readable", True)
             token = bytes(raw).decode("utf-8").strip()
-            if not token:
+            if not outcome("credential_present", bool(token)):
                 return {}
             request = urllib.request.Request(
                 str(endpoint).rstrip("/") + "/v1/realm",
@@ -752,7 +754,7 @@ class LocalRuntimeBoundary:
             )
             with urlopen_loopback(request, timeout=self.HEALTH_TIMEOUT_SECONDS) as response:
                 realm = json.loads(response.read().decode("utf-8"))
-            if not isinstance(realm, Mapping) or not realm.get("realm_id"):
+            if not outcome("realm_response", isinstance(realm, Mapping) and bool(realm.get("realm_id"))):
                 return {}
             # Older supported Runtime releases authenticated `/v1/realm` but
             # did not include the optional instance id on that resource. The
@@ -760,8 +762,8 @@ class LocalRuntimeBoundary:
             # when realm supplies its own instance id, require it to agree.
             realm_instance_id = realm.get("runtime_instance_id")
             if (realm_instance_id is not None
-                    and (health.get("runtime_instance_id") is None
-                         or str(realm_instance_id) != str(health["runtime_instance_id"]))):
+                    and not outcome("realm_instance", health.get("runtime_instance_id") is not None
+                         and str(realm_instance_id) == str(health["runtime_instance_id"]))):
                 return {}
             return {**health, "realm_id": str(realm["realm_id"])}
         except (BootstrapError, OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
@@ -769,18 +771,19 @@ class LocalRuntimeBoundary:
                 raise BootstrapError(f"Runtime credential access refused: {exc}") from exc
             return {}
 
+    @instrument
     def validate_owner(
         self, *, endpoint: str, pid: int, instance_id: str, owner_lock: Path,
         process_birth_id: str | None = None, expected_realm_id: str | None = None,
         expected_realm_root: Path | None = None,
     ) -> bool:
-        if not self.is_pid_alive(pid):
+        if not outcome("pid_alive", self.is_pid_alive(pid)):
             return False
         try:
             path = self._validate_path(Path(owner_lock), "owner lock")
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             try:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                if not outcome("lock_regular", stat.S_ISREG(os.fstat(fd).st_mode)):
                     return False
                 chunks = []
                 while True:
@@ -788,41 +791,52 @@ class LocalRuntimeBoundary:
                     if not chunk:
                         break
                     chunks.append(chunk)
+                outcome("lock_readable", True)
                 marker = json.loads(b"".join(chunks).decode("utf-8"))
+                outcome("lock_json", True)
             finally:
                 os.close(fd)
-        except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            outcome("lock_json", False)
             return False
-        if not isinstance(marker, dict):
+        except (FileNotFoundError, OSError):
+            outcome("lock_readable", False)
             return False
-        if str(marker.get("pid")) != str(pid) or str(marker.get("runtime_instance_id")) != instance_id:
+        if not outcome("lock_object", isinstance(marker, dict)):
             return False
-        if expected_realm_id is not None and str(marker.get("realm_id")) != str(expected_realm_id):
+        if (not outcome("lock_pid", str(marker.get("pid")) == str(pid))
+                or not outcome("lock_instance", str(marker.get("runtime_instance_id")) == instance_id)):
+            return False
+        if expected_realm_id is not None and not outcome("lock_realm", str(marker.get("realm_id")) == str(expected_realm_id)):
             return False
         if expected_realm_root is not None:
             try:
                 expected_root = self._validate_path(Path(expected_realm_root), "expected realm root").resolve()
                 marker_root = self._validate_path(Path(str(marker.get("realm_root") or "")), "owner realm root").resolve()
+                outcome("lock_root_readable", True)
             except (BootstrapError, OSError):
+                outcome("lock_root_readable", False)
                 return False
-            if marker_root != expected_root:
+            if not outcome("lock_root", marker_root == expected_root):
                 return False
         expected_birth = process_birth_id or marker.get("process_birth_id")
-        if not expected_birth:
+        if not outcome("birth_present", bool(expected_birth)):
             return False
         actual_birth = self.process_birth_identity(pid)
+        outcome("birth_observed", actual_birth is not None)
         health = self._http_health_payload(endpoint)
-        if not health or health.get("runtime_instance_id") != instance_id:
+        if (not outcome("health_present", bool(health))
+                or not outcome("health_instance", health.get("runtime_instance_id") == instance_id)):
             return False
         if actual_birth is None:
-            if platform.is_legacy_linux_birth_id(str(expected_birth)):
+            if outcome("birth_legacy", platform.is_legacy_linux_birth_id(str(expected_birth))):
                 return False
             # Restricted clients may be able to prove that a PID exists but
             # not inspect its birth marker. Require the daemon itself to
             # attest the durable runtime instance over its loopback health
             # endpoint; health alone is never an identity proof.
             pass
-        elif not _selected_owner_birth_matches(str(expected_birth), actual_birth, pid=pid):
+        elif not outcome("birth_selected", _selected_owner_birth_matches(str(expected_birth), actual_birth, pid=pid)):
             return False
         # A degraded runtime can still be the correct owner. Keep health
         # admission separate so database failures are not called PID conflicts.

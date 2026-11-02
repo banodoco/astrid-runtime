@@ -945,3 +945,98 @@ def test_failed_candidate_pid_alias_cannot_retire_live_publication(live_bootstra
     )
     assert {path: path.read_bytes() for path in before} == before
     assert owner._http_health_payload(result.endpoint)["status"] == "ok"
+
+@pytest.mark.parametrize("case", ["accepted", "pid", "health", "birth_unknown", "birth_mismatch", "endpoint"])
+def test_stop_owner_diagnostics_are_opt_in_sanitized_and_preserve_decisions(tmp_path, monkeypatch, capfd, case):
+    from astrid_runtime.bootstrap import _validate_stop_endpoint
+    from astrid_runtime.paths import RuntimePaths
+    from astrid_runtime import runtime_boundary as module
+
+    paths = RuntimePaths.sandbox(tmp_path)
+    paths.ensure_support_dirs()
+    realm = tmp_path / "sensitive-realm-path"
+    realm.mkdir()
+    marker = {"pid": 12, "runtime_instance_id": "sensitive-instance", "realm_id": "sensitive-realm",
+              "realm_root": str(realm), "process_birth_id": "sensitive-birth"}
+    paths.instance_lock_path.write_text(json.dumps(marker))
+    boundary = LocalRuntimeBoundary()
+    monkeypatch.setattr(boundary, "is_pid_alive", lambda pid: case != "pid")
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda pid: None if case == "birth_unknown" else "observed-secret")
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda endpoint: {
+        "runtime_instance_id": "wrong" if case == "health" else "sensitive-instance", "token": "secret-token"})
+    monkeypatch.setattr(module.platform, "is_legacy_linux_birth_id", lambda birth: case == "birth_unknown")
+    monkeypatch.setattr(module.platform, "process_birth_matches", lambda expected, actual: None if case == "birth_mismatch" else True)
+    monkeypatch.setattr(module.platform, "legacy_linux_birth_matches_live_owner", lambda *args, **kwargs: None)
+    monkeypatch.setattr(boundary, "endpoint_metadata", lambda **kwargs: {
+        "runtime_instance_id": "wrong" if case == "endpoint" else "sensitive-instance", "realm_id": "sensitive-realm"})
+
+    def run():
+        try:
+            return ("accepted", _validate_stop_endpoint(paths, boundary,
+                owner=(12, "sensitive-birth", "sensitive-instance", "http://127.0.0.1:1234"),
+                realm_id="sensitive-realm", realm_root=realm))
+        except BootstrapError as exc:
+            return ("refused", str(exc))
+
+    monkeypatch.delenv("ASTRID_RUNTIME_OWNER_DIAGNOSTICS", raising=False)
+    baseline = run()
+    assert capfd.readouterr().err == ""
+    monkeypatch.setenv("ASTRID_RUNTIME_OWNER_DIAGNOSTICS", "1")
+    assert run() == baseline
+    output = capfd.readouterr().err
+    assert output.count("ASTRID_OWNER_DIAGNOSTICS ") == 1
+    assert all(secret not in output for secret in ("sensitive", "secret", str(tmp_path), "127.0.0.1"))
+    record = json.loads(output.split(" ", 1)[1])
+    assert record["schema"] == 1
+    predicates = record["predicates"]
+    assert set(predicates.values()) <= {"matched", "false", "unobserved"}
+    assert baseline[0] == ("accepted" if case == "accepted" else "refused")
+    if case == "pid":
+        assert predicates["pid_alive"] == "false" and predicates["lock_pid"] == "unobserved"
+    if case == "health":
+        assert predicates["health_instance"] == "false" and predicates["birth_direct"] == "unobserved"
+    if case == "birth_unknown":
+        assert predicates["birth_observed"] == "false" and predicates["birth_direct"] == "unobserved"
+    if case == "birth_mismatch":
+        assert predicates["birth_direct"] == predicates["birth_legacy_bridge"] == "unobserved"
+        assert predicates["birth_selected"] == "false"
+    if case == "endpoint":
+        assert predicates["endpoint_instance"] == "false" and predicates["endpoint_realm"] == "unobserved"
+
+
+def test_stop_diagnostics_capture_authenticated_metadata_reads(tmp_path, monkeypatch, capfd):
+    from astrid_runtime.bootstrap import _validate_stop_endpoint
+    from astrid_runtime.paths import RuntimePaths
+    from astrid_runtime import runtime_boundary as module
+    from astrid_runtime import owner_diagnostics
+    import io
+
+    paths = RuntimePaths.sandbox(tmp_path)
+    paths.ensure_support_dirs()
+    realm = tmp_path / "realm"
+    realm.mkdir()
+    paths.instance_lock_path.write_text(json.dumps({"pid": 12, "runtime_instance_id": "instance",
+        "realm_id": "realm", "realm_root": str(realm), "process_birth_id": "birth"}))
+    credential = paths.runtime_support / "credentials" / "owner.token"
+    credential.parent.mkdir(parents=True, exist_ok=True)
+    credential.write_text("private-token")
+    boundary = LocalRuntimeBoundary()
+    monkeypatch.setattr(boundary, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda pid: "birth")
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda endpoint: {"runtime_instance_id": "instance"})
+    monkeypatch.setattr(module, "urlopen_loopback", lambda *args, **kwargs: io.BytesIO(
+        b'{"runtime_instance_id":"different", "realm_id":"realm", "token":"private-token"}'))
+    monkeypatch.setenv("ASTRID_RUNTIME_OWNER_DIAGNOSTICS", "1")
+    records = []
+    monkeypatch.setattr(owner_diagnostics.os, "write", lambda fd, data: records.append((fd, data)))
+    with pytest.raises(BootstrapError, match="endpoint identity does not match"):
+        _validate_stop_endpoint(paths, boundary, owner=(12, "birth", "instance", "http://127.0.0.1:1"),
+                                realm_id="realm", realm_root=realm)
+    assert len(records) == 1 and records[0][0] == 2 and len(records[0][1]) < 4096
+    output = records[0][1].decode()
+    assert "private-token" not in output and str(tmp_path) not in output
+    predicates = json.loads(output.split(" ", 1)[1])["predicates"]
+    assert predicates["credential_present"] == "matched"
+    assert predicates["realm_instance"] == "false"
+    assert predicates["endpoint_metadata"] == "false"
+    assert predicates["endpoint_instance"] == "unobserved"
