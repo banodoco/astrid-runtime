@@ -11,6 +11,10 @@ on:
         required: false
         type: string
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/int/r1' }}
+
 jobs:
   windows-realm-publication:
     runs-on: windows-latest
