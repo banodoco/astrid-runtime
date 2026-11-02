@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import stat
-import fcntl
 import importlib.metadata
 from pathlib import Path
 import platform
@@ -16,6 +15,9 @@ from pathlib import PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
+
+if os.name == "posix":
+    import fcntl
 
 from tests.lanes import requires_posix_uid_metadata
 
@@ -950,7 +952,8 @@ def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_withou
         assert env['ASTRID_TIMELINE_OBSERVER_FD'] != 'unadmitted-ambient' and observer in captures['pass_fds']
         assert stat.S_ISFIFO(os.fstat(captures['observer']).st_mode)
         assert not os.get_blocking(captures['observer'])
-        assert fcntl.fcntl(captures['observer'], fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
+        if os.name == "posix":
+            assert fcntl.fcntl(captures['observer'], fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
         assert handle.observer_read_fd is not None and stat.S_ISFIFO(os.fstat(handle.observer_read_fd).st_mode)
         assert not set(env)&{'PYTHONPATH','PYTHONHOME','PYTHONDONTWRITEBYTECODE','ASTRID_RUNTIME_OWNER_TOKEN','ASTRID_EXECUTION_TARGET_JSON'}
     finally:

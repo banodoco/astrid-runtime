@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import fcntl
 import hashlib
 import json
 import os
@@ -9,6 +8,9 @@ import socket
 import stat
 
 import pytest
+
+if os.name == "posix":
+    import fcntl
 
 from runtime_protocol.local_execution_supervisor import (
     HOST_PREPARATION_VERSION, RelayError, host_prepare_request,
@@ -783,7 +785,8 @@ def test_g1b_native_session_fake_launch_preserves_v1_or_consumes_closed_gate(tmp
         observer=int(captured['pass_fds'][-1])
         assert stat.S_ISFIFO(os.fstat(captured['observer']).st_mode)
         assert not os.get_blocking(captured['observer'])
-        assert fcntl.fcntl(captured['observer'], fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
+        if os.name == "posix":
+            assert fcntl.fcntl(captured['observer'], fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
         assert session.observer_read_fd is not None and observer != session.observer_read_fd
     finally:
         session.control.close();session.activation.close()
