@@ -74,3 +74,55 @@ def test_bridge_members(monkeypatch, capfd, case, result, fields):
     assert all(value not in output for value in (boot, other, "secret", "123", "77", "42"))
     predicates = json.loads(output.split(" ", 1)[1])["predicates"]
     assert tuple(predicates["birth_bridge_" + name] for name in ("tick", "fresh_birth", "boot_valid", "pidns_numeric", "boot", "pidns")) == fields
+
+
+def test_native_bridge_reports_missing_prerequisites_without_extra_reads(monkeypatch, capfd):
+    monkeypatch.setenv("ASTRID_RUNTIME_OWNER_DIAGNOSTICS", "1")
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux", modules=__import__('sys').modules))
+    calls = []
+
+    class FakePath:
+        def __init__(self, value): pass
+        def __truediv__(self, value): return self
+        def read_text(self):
+            calls.append("boot")
+            return "b38142f7-84c5-487d-95a4-8180cbff3972"
+        def stat(self):
+            calls.append("namespace")
+            return SimpleNamespace(st_ino=77)
+
+    monkeypatch.setattr(platform, "Path", FakePath)
+    def identity(pid):
+        calls.append("identity")
+        return {"pid": pid + 1, "birth_id": "private"}
+    monkeypatch.setattr(platform, "process_identity", identity)
+    with capture():
+        assert platform.legacy_linux_birth_matches_live_owner(
+            "proc-start-ticks:42",
+            "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77",
+            pid=123,
+        ) is None
+    output = capfd.readouterr().err
+    predicates = json.loads(output.split(" ", 1)[1])["predicates"]
+    assert calls == ["boot", "namespace", "identity"]
+    assert predicates["birth_bridge_native_readable"] == "matched"
+    assert predicates["birth_bridge_fresh_present"] == "matched"
+    assert predicates["birth_bridge_fresh_pid"] == "false"
+    assert predicates["birth_bridge_fresh_birth"] == "unobserved"
+    assert predicates["birth_bridge_boot_parseable"] == "unobserved"
+    assert "private" not in output and "123" not in output
+
+
+def test_direct_missing_scope_is_distinct_from_malformed_birth(monkeypatch, capfd):
+    monkeypatch.setenv("ASTRID_RUNTIME_OWNER_DIAGNOSTICS", "1")
+    for expected, parsed, scope in [("proc-start-ticks:bad", "false", "unobserved"),
+                                    ("proc-start-ticks:42", "matched", "false")]:
+        with capture():
+            assert platform.process_birth_matches(expected, "proc-start-ticks:42;boot:secret;pidns:77") is None
+        output = capfd.readouterr().err
+        predicates = json.loads(output.split(" ", 1)[1])["predicates"]
+        assert predicates["birth_direct_inputs"] == "matched"
+        assert predicates["birth_direct_parsed"] == parsed
+        assert predicates["birth_direct_scope"] == scope
+        assert predicates["birth_direct_pidns"] == "unobserved"
+        assert "secret" not in output

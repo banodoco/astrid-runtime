@@ -637,17 +637,17 @@ def process_birth_matches(expected: str, actual: str) -> bool | None:
                 pass
         return None
 
-    if not expected or not actual:
+    if not _owner_birth_outcome("birth_direct_inputs", bool(expected and actual)):
         return None
     left, right = linux_birth(expected), linux_birth(actual)
     linux_like = lambda value: value.startswith("proc-start-ticks:") or bool(re.match(r"^[0-9a-fA-F-]{36}:", value))
-    if left is None or right is None:
+    if not _owner_birth_outcome("birth_direct_parsed", not (left is None or right is None)):
         return None if linux_like(expected) or linux_like(actual) else expected == actual
     old_tick, old_scope = left
     new_tick, new_scope = right
     # Birth strings alone cannot establish missing PID-coordinate scope.
     # In particular, Timeline's boot:tick encoding carries no namespace.
-    if not all(scope.get("boot") and scope.get("pidns") for scope in (old_scope, new_scope)):
+    if not _owner_birth_outcome("birth_direct_scope", all(scope.get("boot") and scope.get("pidns") for scope in (old_scope, new_scope))):
         return None
     if old_scope.get("pidns") and new_scope.get("pidns") and not _owner_birth_outcome("birth_direct_pidns", old_scope["pidns"] == new_scope["pidns"]):
         return None
@@ -678,11 +678,11 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
     second native observation with the exact supplied R1 value, the current
     boot ID, and the host PID namespace before accepting the legacy value.
     """
-    if not is_legacy_linux_birth_id(expected):
+    if not _owner_birth_outcome("birth_bridge_legacy", is_legacy_linux_birth_id(expected)):
         return None
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+    if not _owner_birth_outcome("birth_bridge_pid_valid", not (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0)):
         return None
-    if not isinstance(actual, str):
+    if not _owner_birth_outcome("birth_bridge_actual_string", isinstance(actual, str)):
         return None
 
     def parse(value: str):
@@ -700,8 +700,8 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
         return tick, scope
 
     recorded, observed = parse(expected), parse(actual)
-    if (recorded is None or observed is None or recorded[1]
-            or set(observed[1]) != {"boot", "pidns"}):
+    if not _owner_birth_outcome("birth_bridge_parsed", not (recorded is None or observed is None or recorded[1]
+            or set(observed[1]) != {"boot", "pidns"})):
         return None
     observed_tick, observed_scope = observed
     if not _owner_birth_outcome("birth_bridge_tick", recorded[0] == observed_tick):
@@ -711,14 +711,19 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
         host_pidns = (Path("/proc") / "1/ns/pid").stat().st_ino
         fresh = process_identity(pid)
     except OSError:
+        _owner_birth_outcome("birth_bridge_native_readable", False)
         return None
-    if (fresh is None or fresh.get("pid") != pid
+    _owner_birth_outcome("birth_bridge_native_readable", True)
+    if (not _owner_birth_outcome("birth_bridge_fresh_present", fresh is not None)
+            or not _owner_birth_outcome("birth_bridge_fresh_pid", not (fresh.get("pid") != pid))
             or not _owner_birth_outcome("birth_bridge_fresh_birth", fresh.get("birth_id") == actual)):
         return None
     try:
         current_boot = str(uuid.UUID(boot))
     except (TypeError, ValueError, AttributeError):
+        _owner_birth_outcome("birth_bridge_boot_parseable", False)
         return None
+    _owner_birth_outcome("birth_bridge_boot_parseable", True)
     if (not _owner_birth_outcome("birth_bridge_boot_valid", current_boot == boot)
             or not _owner_birth_outcome("birth_bridge_pidns_ascii", observed_scope["pidns"].isascii())
             or not _owner_birth_outcome("birth_bridge_pidns_numeric", observed_scope["pidns"].isdigit())
