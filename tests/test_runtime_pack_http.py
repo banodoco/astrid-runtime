@@ -470,6 +470,8 @@ def test_lease_refusals_disable_and_shutdown_cleanup(running_runtime):
         assert _request(daemon.door_endpoint, base + suffix, "POST", origin=HOSTED)[0] in (400, 404)
     url = base + f"{PACK_ID}/{admission['digest']}"
     assert _request(daemon.endpoint, url, "POST")[0] == 401
+    limited, _ = daemon.credentials.provision("pack-lease-insufficient", ["tasks:read"])
+    assert _request(daemon.endpoint, url, "POST", token=limited)[0] == 401
     assert _request(daemon.door_endpoint, url, "GET", origin=HOSTED)[0] == 404
     assert _request(daemon.door_endpoint, url, "POST", origin="https://foreign.example")[0] == 403
     assert _request(daemon.endpoint, url, "POST", token=daemon.token)[0] == 201
@@ -481,6 +483,20 @@ def test_lease_refusals_disable_and_shutdown_cleanup(running_runtime):
         os.fstat(retained_fd)
     assert daemon.service._pack_leases == {}
     state["snapshot"] = _snapshot(admission, revision=4)
+    entry = Path(admission["root"]) / f".build/{admission['sourceDigest']}.js"
+    original = entry.read_bytes()
+    entry.write_bytes(original + b"tampered")
+    assert _request(daemon.endpoint, url, "POST", token=daemon.token)[0] == 409
+    assert daemon.service._pack_leases == {}
+    entry.write_bytes(original)
+    assert _request(daemon.endpoint, url, "POST", token=daemon.token)[0] == 201
+    retained_fd = next(iter(daemon.service._pack_leases.values()))[1]
+    state["snapshot"] = _snapshot(revision=5)
+    assert _request(daemon.endpoint, "/api/runtime/packs/inventory", token=daemon.token)[0] == 200
+    with pytest.raises(OSError):
+        os.fstat(retained_fd)
+    assert daemon.service._pack_leases == {}
+    state["snapshot"] = _snapshot(admission, revision=6)
     assert _request(daemon.endpoint, url, "POST", token=daemon.token)[0] == 201
     retained_fd = next(iter(daemon.service._pack_leases.values()))[1]
     daemon.stop()

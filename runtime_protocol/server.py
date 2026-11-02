@@ -438,7 +438,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("objects:read")
             route = pack_http_route(self.path)
             if route is None or method not in ({"lease": ("POST",), "release": ("DELETE",)}.get(route[0], ("GET", "HEAD"))):
-                raise NotFoundError("pack route requires an exact inventory or confined asset URL and GET/HEAD")
+                raise NotFoundError("pack route requires an exact admitted path and method")
             if route[0] == "lease":
                 return self._send(201, self.runtime.acquire_pack_lease(*route[1:]))
             if route[0] == "release":
