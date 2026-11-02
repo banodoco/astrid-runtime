@@ -12,6 +12,7 @@ import pytest
 from astrid_runtime import cli
 from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 
 pytestmark = pytest.mark.integration
 
@@ -28,6 +29,7 @@ def test_down_waits_for_selected_generic_host_exit(tmp_path, monkeypatch, capsys
     # Existing Runtime fixture realm; workspace attach below is the supported
     # owner operation. No installer, venv or application workspace is built.
     realm = tmp_path / "realm"
+    RealmStore.initialize(realm, display_name="RunPod CPU shutdown fixture").close()
     fixture = RuntimeDaemon(realm, support_root=tmp_path / "fixture-support").start()
     realm_id = fixture.service.realm["id"]
     fixture.stop()
