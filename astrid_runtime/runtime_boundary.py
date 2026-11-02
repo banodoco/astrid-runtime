@@ -796,11 +796,12 @@ class LocalRuntimeBoundary:
                 outcome("lock_json", True)
             finally:
                 os.close(fd)
+            outcome("lock_io", True)
         except (json.JSONDecodeError, UnicodeDecodeError):
             outcome("lock_json", False)
             return False
         except (FileNotFoundError, OSError):
-            outcome("lock_readable", False)
+            outcome("lock_io", False)
             return False
         if not outcome("lock_object", isinstance(marker, dict)):
             return False

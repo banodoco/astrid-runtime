@@ -8,7 +8,7 @@ import os
 
 _SWITCH = "ASTRID_RUNTIME_OWNER_DIAGNOSTICS"
 _FIELDS = (
-    "owner_validator_callable", "pid_alive", "lock_readable", "lock_regular",
+    "owner_validator_callable", "pid_alive", "lock_io", "lock_readable", "lock_regular",
     "lock_json", "lock_object", "lock_pid", "lock_instance", "lock_realm",
     "lock_root_readable", "lock_root", "birth_present", "birth_observed",
     "health_present", "health_instance", "birth_legacy", "birth_direct",
