@@ -326,37 +326,60 @@ def test_registration_frame_pid_must_match_the_kernel_peer_pid(tmp_path):
         broker.abort_before_spawn()
 
 
-def test_exited_peer_is_rejected_per_connection_and_the_real_child_still_seals(tmp_path, monkeypatch):
-    """G1 (probe EXITED_PEER): a peer that connects, hands its FD over and exits is rejected alone.
+def test_exited_peer_is_rejected_per_connection_and_the_real_child_still_seals(monkeypatch):
+    """G1 (probe EXITED_PEER + recovery): a peer that connects, hands its FD over and exits is rejected alone.
 
-    Expected: the accepted connection is closed, the broker keeps accepting (thread alive, no error), and a
-    real child registered afterwards still seals.
+    Expected: the accepted connection is closed and the broker keeps accepting (no error, thread alive). Then a
+    real wrapper child registers through the same broker, seals, is bound, and a broker TERM ends it with -15.
+    The socket directory is short and task-local to stay under the AF_UNIX path limit.
     """
     import array
     import os
+    import shutil
     import socket
     import subprocess
+    import tempfile
     import threading
+    from pathlib import Path
     from astrid_runtime import custody_broker as cb
+    from runtime_protocol.local_execution_supervisor import RetainedProcess
 
-    scope = tmp_path / "exit-peer"
-    platform.private_directory(scope)
-    monkeypatch.setattr(platform, "handoff_socket_parent", lambda: tmp_path)
-    b = cb.RoleBoundCustodyBroker(role="host", identity_provider=cb.default_process_identity,
-        ledger_root=scope / "admission", authority_scope_root=scope, authority_journal=scope / "journal", timeout=6)
-    a, z = socket.socketpair()
-    code = """import array, os, socket, sys
+    short_root = Path(tempfile.mkdtemp(prefix="ep-", dir="/tmp"))
+    try:
+        scope = short_root / "s"
+        platform.private_directory(scope)
+        monkeypatch.setattr(platform, "handoff_socket_parent", lambda: short_root)
+        b = cb.RoleBoundCustodyBroker(role="host", identity_provider=cb.default_process_identity,
+            ledger_root=scope / "admission", authority_scope_root=scope, authority_journal=scope / "journal", timeout=20)
+        a, z = socket.socketpair()
+        code = """import array, os, socket, sys
 c=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); c.connect(sys.argv[1])
 s=socket.socket(fileno=int(sys.argv[2])); s.sendmsg([b"x"],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array("i",[c.fileno()]))])
 """
-    p = subprocess.Popen([sys.executable, "-I", "-c", code, str(b.socket_path), str(z.fileno())], pass_fds=(z.fileno(),))
-    z.close()
-    _msg, anc, _flags, _addr = a.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
-    fds = array.array("i"); fds.frombytes(anc[0][2]); s = socket.socket(fileno=fds[0]); a.close(); p.wait(timeout=5)
-    cb._send_frame(s, {"version": cb.PROTOCOL_VERSION, "command": "register_pre_exec", "run_id": b.run_id,
-                       "role": b.role, "pid": p.pid, "ppid": os.getpid(), "argv_digest": "sha256:" + "0" * 64})
-    s.settimeout(2)
-    assert s.recv(1) == b""  # the broker closed the exited peer's connection (no leak, no timeout)
-    s.close()
-    assert b._thread.is_alive() and b.error is None  # still accepting; the stray did not end admission
-    b._thread.join(10)
+        p = subprocess.Popen([sys.executable, "-I", "-c", code, str(b.socket_path), str(z.fileno())], pass_fds=(z.fileno(),))
+        z.close()
+        _msg, anc, _flags, _addr = a.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
+        fds = array.array("i"); fds.frombytes(anc[0][2]); s = socket.socket(fileno=fds[0]); a.close(); p.wait(timeout=5)
+        cb._send_frame(s, {"version": cb.PROTOCOL_VERSION, "command": "register_pre_exec", "run_id": b.run_id,
+                           "role": b.role, "pid": p.pid, "ppid": os.getpid(), "argv_digest": "sha256:" + "0" * 64})
+        s.settimeout(2)
+        assert s.recv(1) == b""  # the broker closed the exited peer's connection (no leak, no timeout)
+        s.close()
+        assert b._thread.is_alive() and b.error is None  # still accepting; the stray did not end admission
+
+        # Recovery: a real wrapper child registers through the same broker, seals, binds and is signalled.
+        target = [sys.executable, "-I", "-c", "import time; time.sleep(20)"]
+        child = subprocess.Popen(cb.custody_wrapper_argv(sys.executable),
+                                 env={**os.environ, **b.child_environment(target, start_new_session=True)})
+        retained = RetainedProcess(child)
+        try:
+            b.wait_until_sealed()
+            retained.bind_actor()
+            assert b.registration["pid"] == child.pid
+            b.signal(platform.TERM, expected_pid=child.pid)
+            assert retained.wait(10) == -platform.TERM
+        finally:
+            if child.poll() is None:
+                child.kill(); child.wait()
+    finally:
+        shutil.rmtree(short_root, ignore_errors=True)
