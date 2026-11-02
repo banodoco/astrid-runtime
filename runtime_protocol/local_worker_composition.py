@@ -420,6 +420,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     authority_journal=scope / "admissions.jsonl", owner_epoch=epoch, timeout=min(self.timeout_seconds, 60))
                 environment.update(broker.child_environment(mapped_argv, start_new_session=True))
                 _custody_fd_diag("runtime_before_spawn")
+                _custody_fd_diag("runtime_channel_numbers:parent=%d control_child=%d activation=%d activation_child=%d binding_parent=%d binding_child=%d" % (parent.fileno(), control_child.fileno(), activation.fileno(), activation_child.fileno(), binding_parent.fileno(), binding_child.fileno()))
                 process = runtime_platform.spawn_tree(custody_wrapper_argv(str(profile.host_executable)), start_new_session=False, cwd=str(profile.support_root),
                     env=environment, stdin=subprocess.DEVNULL, close_fds=True,
                     pass_fds=(control_child.fileno(), activation_child.fileno(), binding_child.fileno()))
@@ -431,10 +432,13 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 for channel in (control_child, activation_child, binding_child):
                     channel.close()
                 parent.settimeout(self.timeout_seconds); activation.settimeout(self.timeout_seconds)
+            _custody_fd_diag("runtime_before_wait_sealed")
             broker.wait_until_sealed(); retained.bind_actor()
+            _custody_fd_diag("runtime_after_sealed_bind")
             identity = retained.verify(); handle.birth_id = identity["birth_id"]
             verifier.bind_child(verified, child=process, identity=identity)
             binding_parent.sendall(binding); binding_parent.close()
+            _custody_fd_diag("runtime_after_binding_sent")
             from astrid_runtime.custody_broker import _atomic_owner_json
             _atomic_owner_json(handle.owner_session_config_path, profile.host_launch)
             # The private preparation channel reports no engine allocation.
