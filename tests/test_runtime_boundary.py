@@ -706,3 +706,114 @@ def test_local_boundary_stop_attests_only_successful_exact_child_cleanup():
     boundary._terminate = lambda _process: None
     assert boundary.stop() == {"children_stopped": True}
     assert boundary._process is None
+
+
+@pytest.fixture
+def live_bootstrap(tmp_path, monkeypatch, owned_process_groups, astrid_importable):
+    from pathlib import Path
+    from astrid_runtime import BootstrapConfig, RuntimePaths, bootstrap, configure_workspace
+    from runtime_protocol import process_control
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("ASTRID_INSTALL_RELEASE", "0")
+    monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "")
+    paths = RuntimePaths.current(tmp_path / "home", data_root=tmp_path / "data")
+    paths.ensure_support_dirs()
+    process_control.write_setting(paths.runtime_support, "sandbox")
+    source = SourceProfile(profile="astrid", runtime_checkout=str(Path(__file__).parents[1]),
+                           source_checkout=str(astrid_importable))
+    config = BootstrapConfig(source_profile=source)
+    boundary = LocalRuntimeBoundary()
+    owned_process_groups.add_cleanup(boundary.stop)
+    configure_workspace(paths, boundary, config, mode="create",
+                        realm_root=paths.realms_dir / "live-owner", realm_id="live-owner")
+    result = bootstrap(paths, boundary, config)
+    return paths, boundary, config, result
+
+
+@pytest.mark.integration
+def test_separate_failed_start_preserves_live_discovery(live_bootstrap):
+    paths, owner, config, result = live_bootstrap
+    before = {path: path.read_bytes() for path in (paths.discovery_path, paths.instance_lock_path)}
+    # A fresh interpreter owns its own candidate and cleanup, as a second tool
+    # context would. It must reach the real realm's owner_busy refusal.
+    contender = subprocess.run([
+        sys.executable, "-c", """
+import json, sys
+from pathlib import Path
+from astrid_runtime import LocalRuntimeBoundary, SourceProfile, BootstrapError
+boundary = LocalRuntimeBoundary()
+try:
+    boundary.start(realm_id='live-owner', realm_root=Path(sys.argv[1]),
+                   owner_lock=Path(sys.argv[2]),
+                   source_profile=SourceProfile('astrid', sys.argv[3], sys.argv[4]))
+except BootstrapError as exc:
+    assert 'another runtime daemon owns this realm' in str(exc), str(exc)
+    log = boundary._log_path(Path(sys.argv[2]).parent).read_text()
+    assert any(json.loads(line).get('error', {}).get('code') == 'owner_busy'
+               for line in log.splitlines() if line.startswith('{'))
+    print('owner_busy')
+else:
+    raise AssertionError('competing candidate started')
+finally:
+    boundary.stop()
+""", str(paths.realms_dir / "live-owner"), str(paths.instance_lock_path),
+        config.source_profile.runtime_checkout, config.source_profile.source_checkout,
+    ], capture_output=True, text=True, timeout=30)
+    assert contender.returncode == 0, contender.stdout + contender.stderr
+    assert contender.stdout.strip() == "owner_busy"
+    assert {path: path.read_bytes() for path in before} == before
+    assert owner._http_health_payload(result.endpoint)["status"] == "ok"
+
+
+@pytest.mark.integration
+def test_foreign_pid_observation_cannot_reclaim_live_publication(live_bootstrap, monkeypatch):
+    from astrid_runtime import bootstrap
+    from astrid_runtime.bootstrap import DuplicateOwnerError
+
+    paths, owner, config, result = live_bootstrap
+    before = {path: path.read_bytes() for path in (paths.discovery_path, paths.instance_lock_path)}
+    observer = LocalRuntimeBoundary()
+    # PID absence in the observer's namespace is weaker than the shared realm
+    # lock held by the real owner. No signal is authorized by this observation.
+    monkeypatch.setattr(observer, "is_pid_alive", lambda _pid: False)
+    with pytest.raises(DuplicateOwnerError):
+        bootstrap(paths, observer, config)
+    assert {path: path.read_bytes() for path in before} == before
+    assert observer._process is None
+    assert owner._http_health_payload(result.endpoint)["status"] == "ok"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("remove_marker", [False, True])
+def test_down_without_discovery_cannot_report_live_owner_stopped(live_bootstrap, remove_marker):
+    from astrid_runtime import down
+
+    paths, owner, _config, result = live_bootstrap
+    paths.discovery_path.unlink()
+    if remove_marker:
+        paths.instance_lock_path.unlink()
+    with pytest.raises(BootstrapError, match="owner.*(active|discovery)"):
+        down(paths, LocalRuntimeBoundary())
+    assert owner._http_health_payload(result.endpoint)["status"] == "ok"
+
+
+@pytest.mark.integration
+def test_failed_candidate_pid_alias_cannot_retire_live_publication(live_bootstrap):
+    from astrid_runtime.bootstrap import _rollback_failed_bootstrap
+
+    paths, owner, config, result = live_bootstrap
+    before = {path: path.read_bytes() for path in (paths.discovery_path, paths.instance_lock_path)}
+    # A foreign namespace may reuse the same numeric PID for its failed child.
+    # Candidate cleanup must still respect the incumbent's lifetime lock.
+    candidate = SimpleNamespace(_process=SimpleNamespace(pid=owner._process.pid), stop=lambda: None)
+    _rollback_failed_bootstrap(
+        paths, candidate, realm_root=paths.realms_dir / "live-owner", new_realm=False,
+        credential_before=(paths.credentials_dir / "astrid.json").read_bytes(),
+        catalog_before=paths.catalog_path.read_bytes(),
+        source_before=(paths.source_profiles_dir / "astrid.json").read_bytes(),
+    )
+    assert {path: path.read_bytes() for path in before} == before
+    assert owner._http_health_payload(result.endpoint)["status"] == "ok"
