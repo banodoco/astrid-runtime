@@ -614,6 +614,15 @@ def _owner_birth_outcome(name: str, value: bool, *, error: bool = False) -> bool
     return value
 
 
+def _owner_birth_unavailable(name: str, depends_on: str) -> None:
+    try:
+        collector = sys.modules.get("astrid_runtime.owner_diagnostics")
+        if collector is not None:
+            collector.unavailable(name, depends_on=depends_on)
+    except Exception:
+        pass
+
+
 def process_birth_matches(expected: str, actual: str) -> bool | None:
     """Compare Linux birth encodings; missing scope is not proof of death."""
     def linux_birth(value):
@@ -719,6 +728,9 @@ def legacy_linux_birth_matches_live_owner(expected: str, actual: str, *, pid: in
     except OSError:
         _owner_birth_outcome(stage, False, error=True)
         _owner_birth_outcome("birth_bridge_native_readable", False, error=True)
+        stages = ("birth_bridge_boot_read", "birth_bridge_pidns_read", "birth_bridge_identity_read")
+        for unavailable in stages[stages.index(stage) + 1:]:
+            _owner_birth_unavailable(unavailable, stage)
         return None
     _owner_birth_outcome("birth_bridge_native_readable", True)
     if (not _owner_birth_outcome("birth_bridge_fresh_present", fresh is not None)

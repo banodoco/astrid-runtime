@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from .io import atomic_write_json, owner_only, read_json, remove_file
-from .owner_diagnostics import instrument, outcome
+from .owner_diagnostics import instrument, outcome, phase_instrument
 from runtime_protocol import platform as runtime_platform
 from runtime_protocol import cancellation
 from runtime_protocol import process_control
@@ -680,6 +680,7 @@ def _owner_may_be_alive(boundary: RuntimeBoundary, record: Mapping[str, Any]) ->
             or outcome("liveness_birth_compatible", runtime_platform.process_birth_matches(str(expected), actual)) is not False)
 
 
+@phase_instrument
 def _reclaim_stale_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> bool:
     """Reclaim only stale advertisements under the launcher mutex; never signal.
 
@@ -690,9 +691,9 @@ def _reclaim_stale_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) 
     records = [(path, _read_support_json(path))
                for path in (paths.discovery_path, paths.instance_lock_path)]
     present = [(path, record) for path, record in records if record is not None]
-    if not present or any(_owner_may_be_alive(boundary, record) for _, record in present):
+    if not outcome("reclaim_records_present", bool(present)) or not outcome("reclaim_no_live_owner", not any(_owner_may_be_alive(boundary, record) for _, record in present)):
         return False
-    if any(_read_support_json(path) != record for path, record in records):
+    if not outcome("reclaim_snapshots_unchanged", not any(_read_support_json(path) != record for path, record in records)):
         raise BootstrapError("Runtime owner changed during stale-owner cleanup.")
     for path, _ in present:
         remove_file(path)
@@ -1019,6 +1020,7 @@ def _validated_matching_owner_identity(
     return observed
 
 
+@phase_instrument
 def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig) -> BootstrapResult:
     upgrade_journal = _read_support_json(paths.runtime_support / "upgrade-journal.json")
     if (upgrade_journal and upgrade_journal.get("operation") == "astrid-runtime-upgrade/v1"
@@ -1038,7 +1040,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     catalog = _read_catalog(paths)
     catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
     realm = _selected_realm(catalog)
-    if realm is None:
+    if not outcome("discovery_realm_present", realm is not None):
         raise BootstrapError("No workspace is configured; explicit create or attach is required before up.")
     completed_stop_before_launch = _revoke_completed_stop_before_launch(paths, boundary, realm)
 
@@ -1076,8 +1078,8 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                 paths, boundary, owner=(pid, birth, instance_id, endpoint),
                 realm_id=str(realm["realm_id"]), realm_root=realm_root,
             )
-            if (_read_support_json(paths.instance_lock_path) != marker
-                    or _read_support_json(paths.discovery_path) is not None):
+            if (not outcome("recovery_marker_unchanged", _read_support_json(paths.instance_lock_path) == marker)
+                    or not outcome("recovery_discovery_absent", _read_support_json(paths.discovery_path) is None)):
                 raise BootstrapError("Runtime owner changed during discovery recovery.")
             atomic_write_json(paths.discovery_path, dict(recovery))
     if marker is None or marker.get("state") is None:
@@ -1088,8 +1090,8 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         pid = discovery.get("pid")
         endpoint = str(discovery.get("endpoint", ""))
         instance_id = str(discovery.get("runtime_instance_id", ""))
-        if _owner_may_be_alive(boundary, discovery):
-            if not endpoint or not instance_id:
+        if outcome("discovery_owner_alive", _owner_may_be_alive(boundary, discovery)):
+            if not outcome("discovery_endpoint_present", bool(endpoint)) or not outcome("discovery_instance_present", bool(instance_id)):
                 raise DuplicateOwnerError(
                     "A runtime owner is active but its discovery record is incomplete; "
                     "stop that owner, then run astrid-runtime restart --profile astrid."
@@ -1107,18 +1109,18 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                 expected_realm_id=str(discovery["active_realm"]),
                 expected_realm_root=selected_root,
             )
-            if not valid_owner or selected_root is None or discovered_root != selected_root or not discovery.get("process_birth_id") or not _lock_matches(paths, int(pid), instance_id, str(discovery["active_realm"]), str(discovery.get("process_birth_id")), selected_root):
+            if (not outcome("discovery_owner_valid", valid_owner) or not outcome("discovery_root_present", selected_root is not None) or not outcome("discovery_root_matches", discovered_root == selected_root) or not outcome("discovery_birth_present", bool(discovery.get("process_birth_id"))) or not outcome("discovery_lock_matches", _lock_matches(paths, int(pid), instance_id, str(discovery["active_realm"]), str(discovery.get("process_birth_id")), selected_root))):
                 raise DuplicateOwnerError(
                     "A different runtime owner is active for the selected realm; "
                     "stop it before retrying astrid-runtime up --profile astrid."
                 )
-            if not boundary.health(endpoint=endpoint, pid=int(pid), instance_id=instance_id):
+            if not outcome("discovery_health", boundary.health(endpoint=endpoint, pid=int(pid), instance_id=instance_id)):
                 raise BootstrapError("The selected runtime owner is unhealthy; next action: " + RECONFIGURE_NEXT_ACTION)
             _validated_matching_owner_identity(
                 boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
                 instance_id=instance_id, requested_identity=requested_identity,
             )
-            if realm is None or str(realm.get("realm_id")) != str(discovery["active_realm"]):
+            if not outcome("discovery_selected_realm", realm is not None and str(realm.get("realm_id")) == str(discovery["active_realm"])):
                 raise BootstrapError("Discovery does not match the selected catalog realm; run astrid-runtime doctor.")
             configure = getattr(boundary, "configure_source", None)
             if configure is not None:
@@ -1303,6 +1305,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     )
 
 
+@phase_instrument
 def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
     """Connect without creating a realm or starting authority."""
     config = config or BootstrapConfig()
@@ -1310,7 +1313,7 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     catalog = _read_catalog(paths)
     realm = _selected_realm(catalog)
     discovery = _read_support_json(paths.discovery_path)
-    if realm is None or not discovery:
+    if not outcome("connect_realm_present", realm is not None) or not outcome("connect_discovery_present", bool(discovery)):
         raise BootstrapError("No healthy selected runtime. Next action: astrid-runtime up --profile astrid")
     source = config.resolve_source_profile(paths)
     _compatible(discovery, config, source)
@@ -1321,15 +1324,15 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
         instance_id = str(discovery["runtime_instance_id"])
     except (KeyError, TypeError, ValueError) as exc:
         raise BootstrapError("Runtime discovery is incomplete; run astrid-runtime restart --profile astrid.") from exc
-    if not _pid_alive(boundary, pid) or not boundary.validate_owner(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path):
+    if not outcome("connect_pid_alive", _pid_alive(boundary, pid)) or not outcome("connect_owner_valid", boundary.validate_owner(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path)):
         raise BootstrapError("Runtime discovery is stale or owned by another process; run astrid-runtime up --profile astrid.")
-    if not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id):
+    if not outcome("connect_health", boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id)):
         raise BootstrapError("The selected runtime is unhealthy; run astrid-runtime restart --profile astrid.")
     _validated_matching_owner_identity(
         boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
         instance_id=instance_id, requested_identity=requested_identity,
     )
-    if str(realm.get("realm_id")) != str(discovery.get("active_realm")):
+    if not outcome("connect_selected_realm", str(realm.get("realm_id")) == str(discovery.get("active_realm"))):
         raise BootstrapError("Discovery does not match the selected catalog realm; run astrid-runtime doctor.")
     actor_id, token = _credential(paths)
     connection = boundary.connect(endpoint=endpoint, credential=token)
@@ -1867,6 +1870,7 @@ def _downstream_stop_errors():
         ) from exc
 
 
+@phase_instrument
 def _fenced_stop_and_manager(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_id: str, realm_root: Path,
     discovery: Mapping[str, Any] | None, marker: Mapping[str, Any] | None,
@@ -1891,9 +1895,9 @@ def _fenced_stop_and_manager(
                 final_marker = _read_support_json(paths.instance_lock_path)
             except Exception:
                 raise
-            if final_discovery != discovery:
+            if not outcome("stop_discovery_unchanged", final_discovery == discovery):
                 raise BootstrapError("Runtime discovery changed before stop; refusing interruption.")
-            if final_marker != marker:
+            if not outcome("stop_marker_unchanged", final_marker == marker):
                 raise BootstrapError("Runtime owner lock changed before stop; refusing interruption.")
             if validate_stop is not None:
                 validate_stop()

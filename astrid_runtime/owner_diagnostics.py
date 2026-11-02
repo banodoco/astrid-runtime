@@ -40,20 +40,61 @@ _FIELDS = (
     "signal_lock_root", "signal_pid_alive", "signal_birth", "signal_health_instance",
     "signal_endpoint_instance", "signal_endpoint_realm", "signal_health",
 )
+_V1_FIELDS = _FIELDS + (
+    "discovery_realm_present", "discovery_owner_alive", "discovery_endpoint_present",
+    "discovery_instance_present", "discovery_owner_valid", "discovery_root_present",
+    "discovery_root_matches", "discovery_birth_present", "discovery_lock_matches",
+    "discovery_health", "discovery_selected_realm", "recovery_marker_unchanged",
+    "recovery_discovery_absent", "connect_realm_present", "connect_discovery_present",
+    "connect_pid_alive", "connect_owner_valid", "connect_health", "connect_selected_realm",
+    "reclaim_records_present", "reclaim_no_live_owner", "reclaim_snapshots_unchanged",
+    "stop_discovery_unchanged", "stop_marker_unchanged",
+)
+_V1_SWITCH = "ASTRID_INSTALLER_ALL_PREDICATES_DIAGNOSTICS"
+_phase = ContextVar("owner_validation_phase", default="owner_validation")
 _current = ContextVar("owner_validation_diagnostics", default=None)
+
+
+def _v1_enabled():
+    return os.environ.get(_V1_SWITCH, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _emit_v1(name, status, *, depends_on=None):
+    if not _v1_enabled() or name not in _V1_FIELDS:
+        return
+    try:
+        item = {"format": "astrid-installer-all-predicates/v1", "phase": _phase.get(),
+                "predicate": name, "expected": True,
+                "observed": True if status == "pass" else False if status == "fail" else None,
+                "provenance": _provenance(name), "result": status}
+        if depends_on is not None:
+            item["depends_on"] = depends_on
+        payload = "[astrid installer all-predicates v1] " + json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n"
+        os.write(2, payload.encode("ascii"))
+    except Exception:
+        pass
 
 
 def outcome(name, value, *, error=False):
     """Record an already evaluated predicate, without retaining its inputs."""
+    status = ("unknown" if error or value is None else "pass" if value else "fail")
+    _emit_v1(name, status)
     record = _current.get()
     if record is not None and name in _FIELDS:
-        record[name] = ("error" if error else "unknown" if value is None
-                        else "pass" if value else "fail")
+        record[name] = ("error" if error else status)
     return value
 
 
-def skipped(name):
+def unavailable(name, *, depends_on):
+    """Record a predicate skipped because a named prerequisite failed."""
+    if depends_on in _V1_FIELDS:
+        _emit_v1(name, "unavailable", depends_on=depends_on)
+
+
+def skipped(name, *, depends_on=None):
     """Mark a known predicate as not evaluated on this authority path."""
+    if depends_on is not None:
+        unavailable(name, depends_on=depends_on)
     record = _current.get()
     if record is not None and name in _FIELDS and name not in record:
         record[name] = "skipped"
@@ -107,8 +148,29 @@ def capture():
 
 
 def instrument(function):
+    return _instrument(function, legacy_capture=True)
+
+
+def phase_instrument(function):
+    return _instrument(function, legacy_capture=False)
+
+
+def _instrument(function, *, legacy_capture):
+    phases = {
+        "_bootstrap_locked": "discovery", "connect": "admission",
+        "_reclaim_stale_owner_locked": "recovery", "_fenced_stop_and_manager": "stop",
+        "_validate_published_stop_owner": "stop", "stop_owner": "stop",
+    }
     @wraps(function)
     def wrapped(*args, **kwargs):
-        with capture():
+        phase = phases.get(function.__name__)
+        token = _phase.set(phase) if phase else None
+        try:
+            if legacy_capture:
+                with capture():
+                    return function(*args, **kwargs)
             return function(*args, **kwargs)
+        finally:
+            if token is not None:
+                _phase.reset(token)
     return wrapped
