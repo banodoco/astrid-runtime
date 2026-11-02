@@ -6275,6 +6275,42 @@ class RealmStore:
         continuation_events = self._refresh_continuations_for_predecessor(task_id)
         return disposition, [event_id, *continuation_events]
 
+    def _write_task_cancellation(self, task, result, *, stop_pending, timestamp):
+        """Compare stored state, attempt and lifetime at the cancellation write."""
+        clear_lease = "" if stop_pending else (
+            ", lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL"
+        )
+        failure = self._task_lifetime_failure(task, datetime.now(timezone.utc))
+        changed = self.conn.execute(
+            "UPDATE tasks SET status=?, result_json=?, waiting_reason=?, updated_at=?"
+            + clear_lease
+            + " WHERE id=? AND status=? AND attempt=? AND lease_fence=?"
+              " AND attempt_id IS ? AND lease_token IS ? AND runtime_epoch IS ? AND ?",
+            ("cancel_requested" if stop_pending else "cancelled", canonical_json(result),
+             "provider_state_unknown" if stop_pending else None, timestamp,
+             task["id"], task["status"], task["attempt"], task["lease_fence"],
+             task["attempt_id"], task["lease_token"], task["runtime_epoch"], failure is None),
+        ).rowcount
+        if changed != 1:
+            current = self.conn.execute(
+                "SELECT status, attempt_id, lease_fence FROM tasks WHERE id=?", (task["id"],),
+            ).fetchone()
+            if (failure is not None and current is not None
+                    and current["status"] == task["status"]
+                    and current["attempt_id"] == task["attempt_id"]
+                    and current["lease_fence"] == task["lease_fence"]):
+                raise LeaseError(
+                    "task lifetime expired before cancellation; read the current task",
+                    details={"task_id": task["id"], "failure": failure},
+                )
+            raise ConflictError(
+                "task changed during cancellation; read the current task before retrying",
+                details={"task_id": task["id"], "expected_status": task["status"],
+                         "expected_attempt_id": task["attempt_id"],
+                         "expected_fence": task["lease_fence"],
+                         "actual": dict(current) if current is not None else None},
+            )
+
     def cancel_task(self, task_id, *, record=None, attempt_id=None, lease_id=None,
                     fence=None, runtime_epoch=None, result=None, publish=None, stop_observed=False):
         with self._mutex:
@@ -6345,9 +6381,8 @@ class RealmStore:
                 # distinguishes an unknown producer stop, even without a binding.
                 if (unresolved_external or (outstanding and attempt_id is not None)) and not stop_observed:
                     timestamp = now()
-                    self.conn.execute(
-                        "UPDATE tasks SET status='cancel_requested', result_json=?, waiting_reason='provider_state_unknown', updated_at=? WHERE id=?",
-                        (canonical_json(terminal_result), timestamp, task_id),
+                    self._write_task_cancellation(
+                        task, terminal_result, stop_pending=True, timestamp=timestamp,
                     )
                     self.release_execution_attempt(task_id, status="stale")
                     event_id = self._append_event(
@@ -6371,7 +6406,7 @@ class RealmStore:
                         )
                     return value
                 self._reconcile_runtime_attempt(task_id, task["attempt_id"])
-                self.conn.execute("UPDATE tasks SET status='cancelled', result_json=?, lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(terminal_result), now(), task_id))
+                self._write_task_cancellation(task, terminal_result, stop_pending=False, timestamp=now())
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (now(), task["run_id"]))
                 self._release_reservations(task_id, task["lease_token"])
                 if binding is not None:

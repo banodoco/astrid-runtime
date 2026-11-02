@@ -7861,7 +7861,7 @@ class RuntimeService:
     def cancel(self, task_id):
         return self.store.cancel_task(task_id)
 
-    @_durable_mutation
+    @_durable_mutation(reap_task_lifetimes=True)
     def cancel_task_canonical(self, task_id, body=None, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = {} if body is None else body
