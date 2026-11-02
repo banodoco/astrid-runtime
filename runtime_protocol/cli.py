@@ -55,6 +55,7 @@ def _parser():
     start.add_argument("--owner-lock")
     start.add_argument("--runtime-checkout")
     start.add_argument("--agent-checkout")
+    start.add_argument("--installed-pack-root", help="absolute installed pack collection; defaults to the declared Agent's astrid/packs")
     start.add_argument("--bootstrap-token-file")
     start.add_argument("--admission-timeout", type=float, help="bounded startup integrity budget in seconds")
     start.add_argument("--worker-profile", help="absolute installed local Worker composition profile")
@@ -400,6 +401,7 @@ def _main(args):
             log_directory=Path(args.log_file).parent if args.log_file else None,
             runtime_checkout=runtime_checkout,
             agent_checkout=agent_checkout,
+            installed_pack_root=args.installed_pack_root,
         ).start()
     except KeyboardInterrupt:
         raise

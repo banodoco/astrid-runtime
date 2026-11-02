@@ -5852,6 +5852,9 @@ class RuntimeService:
         entry_stream = None
         try:
             root_fd = _open_directory_chain(record["root"])
+            held = os.fstat(root_fd)
+            if "rootIdentity" in record and record["rootIdentity"] != (held.st_dev, held.st_ino):
+                raise ConflictError("installed pack folder changed after admission; retry against the committed folder")
             entry_stream = self._open_pack_file(root_fd, record["files"]["index.js"])
             prelude = f'/* astrid-graph-index-sha256:{record["artifactManifest"]["graphIndexDigest"]} */\n'.encode()
             if entry_stream.read(len(prelude)) != prelude:
@@ -5881,7 +5884,7 @@ class RuntimeService:
         packs = []
         for record in records:
             # Verify exactly the admitted file set before advertising it.
-            # Asset reads verify only entry + requested file; no source scan.
+            # Asset reads also verify the full admitted set; no source scan/cache.
             self._pack_asset(record, "index.js", verify_all=True).close()
             item = {key: record[key] for key in ("packId", "sourceDigest", "digest", "artifactManifestDigest", "enabled")}
             item["url"] = f'/api/runtime/packs/assets/{record["packId"]}/{record["digest"]}/index.js'
@@ -5902,7 +5905,7 @@ class RuntimeService:
         item = record["files"].get(path)
         if item is None:
             raise NotFoundError("pack asset is not listed in the admitted manifest")
-        stream = self._pack_asset(record, path)
+        stream = self._pack_asset(record, path, verify_all=True)
         return {"digest": item["sha256"], "size": item["size"], "media_type": item["mime"]}, stream
 
     def open_object(self, digest):
