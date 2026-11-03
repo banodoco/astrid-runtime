@@ -2273,6 +2273,24 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertTrue(self.paths.instance_lock_path.exists())
 
+    def test_incomplete_lock_without_discovery_refuses_at_both_stop_guards(self):
+        # Neither bypassing preflight nor an absent process publication can
+        # turn an incomplete marker into authority for a manager stop.
+        from astrid_runtime.bootstrap import _interrupt_owner_locked
+
+        self._configure()
+        self.paths.instance_lock_path.write_text(json.dumps({"pid": 12345}))
+        original = self.paths.instance_lock_path.read_bytes()
+        calls = []
+        for stop in (down, _interrupt_owner_locked):
+            with self.subTest(stop=stop.__name__):
+                with self.assertRaises(BootstrapError):
+                    stop(self.paths, self.boundary,
+                         stop_manager=lambda: calls.append("manager"))
+                self.assertEqual(calls, [])
+                self.assertEqual(self.paths.instance_lock_path.read_bytes(), original)
+                self.assertFalse(self.paths.discovery_path.exists())
+
     def test_reused_identity_in_matching_publication_revokes_receipt(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
