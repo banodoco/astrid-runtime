@@ -660,6 +660,87 @@ def _realm_owner_present(root: Path) -> bool:
         os.close(fd)
 
 
+@contextmanager
+def _locked_realm_owner_file(root: Path):
+    """Hold the existing realm lock without creating or changing any file."""
+    root = _canonical_realm_root(root)
+    path = root / "owner.lock"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            raise BootstrapError("Runtime realm owner lock is not a regular file.")
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise BootstrapError("Runtime realm owner lock is unavailable.") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(before, opened):
+            raise BootstrapError("Runtime realm owner lock changed during observation.")
+        try:
+            runtime_platform.lock_file(fd, blocking=False)
+        except BlockingIOError:
+            yield False
+            return
+        except OSError as exc:
+            raise BootstrapError("Runtime realm ownership could not be established.") from exc
+        try:
+            if not os.path.samestat(opened, os.lstat(path)):
+                raise BootstrapError("Runtime realm owner lock changed during observation.")
+            yield True
+        finally:
+            runtime_platform.unlock_file(fd)
+    except OSError as exc:
+        raise BootstrapError("Runtime realm ownership could not be established.") from exc
+    finally:
+        os.close(fd)
+
+
+def realm_owner_lock_free(root: Path) -> bool:
+    """Return whether the existing realm lock is free; raise if unobservable.
+
+    This is an instantaneous observation, not a reservation. The actual owner
+    must still acquire the same lock before accessing the realm.
+    """
+    with _locked_realm_owner_file(root) as free:
+        return free
+
+
+def _legacy_owner_publications(paths: RuntimePaths, realm: Mapping[str, Any]):
+    """Recognize R0's ordinary owner records for the selected realm only."""
+    marker = _read_support_json(paths.instance_lock_path)
+    discovery = _read_support_json(paths.discovery_path)
+    if marker is None and discovery is None:
+        return None
+    # Runtime's stop receipts and R1 discovery/recovery records have their
+    # own stricter lifecycle; they are not R0 publications.
+    if marker is not None and (marker.get("state") is not None or "discovery" in marker):
+        return None
+    if discovery is not None and "identity" in discovery:
+        return None
+    root = _canonical_realm_root(str(realm.get("data_root") or ""))
+    realm_id = str(realm.get("realm_id") or "")
+    invalid = "Runtime interruption refused: owner lock has no matching discovery or has invalid legacy identity."
+    if marker is not None:
+        if set(marker) != {"pid", "process_birth_id", "runtime_instance_id", "realm_id", "realm_root"}:
+            raise BootstrapError(invalid)
+        if (type(marker["pid"]) is not int or marker["pid"] <= 0
+                or not isinstance(marker["process_birth_id"], str) or not marker["process_birth_id"]
+                or not isinstance(marker["runtime_instance_id"], str) or not marker["runtime_instance_id"]
+                or marker["realm_id"] != realm_id or marker["realm_root"] != str(root)):
+            raise BootstrapError(invalid)
+    if discovery is not None:
+        try:
+            pid, birth, instance, _endpoint = _recorded_owner_identity(
+                discovery, realm_id=realm_id, realm_root=root,
+            )
+        except BootstrapError as exc:
+            raise BootstrapError(invalid) from exc
+        if marker is not None and (marker["pid"], marker["process_birth_id"], marker["runtime_instance_id"]) != (pid, birth, instance):
+            raise BootstrapError(invalid)
+    return marker, discovery
+
+
 def _owner_may_be_alive(boundary: RuntimeBoundary, record: Mapping[str, Any]) -> bool:
     """Only proven absence or a different birth permits stale-record cleanup."""
     if record.get("realm_root") and _realm_owner_present(
@@ -688,6 +769,9 @@ def _reclaim_stale_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) 
                for path in (paths.discovery_path, paths.instance_lock_path)]
     present = [(path, record) for path, record in records if record is not None]
     if not present or any(_owner_may_be_alive(boundary, record) for _, record in present):
+        return False
+    _realm, selected_root = _selected_stop_realm(paths)
+    if not realm_owner_lock_free(selected_root):
         return False
     if any(_read_support_json(path) != record for path, record in records):
         raise BootstrapError("Runtime owner changed during stale-owner cleanup.")
@@ -1037,6 +1121,11 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     realm = _selected_realm(catalog)
     if realm is None:
         raise BootstrapError("No workspace is configured; explicit create or attach is required before up.")
+    legacy_publications = _legacy_owner_publications(paths, realm)
+    if legacy_publications is not None:
+        realm_root = _canonical_realm_root(str(realm["data_root"]))
+        if not realm_owner_lock_free(realm_root):
+            raise DuplicateOwnerError("A runtime owner holds the selected realm owner lock.")
     completed_stop_before_launch = _revoke_completed_stop_before_launch(paths, boundary, realm)
 
     def rollback_failed(**kwargs) -> None:
@@ -1048,7 +1137,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     diagnostics: list[str] = []
 
     marker = _read_support_json(paths.instance_lock_path)
-    if (marker is not None and marker.get("state") is None
+    if (legacy_publications is None and marker is not None and marker.get("state") is None
             and _read_support_json(paths.discovery_path) is None
             and isinstance(marker.get("discovery"), Mapping)):
         recovery = marker["discovery"]
@@ -1077,10 +1166,10 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                     or _read_support_json(paths.discovery_path) is not None):
                 raise BootstrapError("Runtime owner changed during discovery recovery.")
             atomic_write_json(paths.discovery_path, dict(recovery))
-    if marker is None or marker.get("state") is None:
+    if legacy_publications is None and (marker is None or marker.get("state") is None):
         _reclaim_stale_owner_locked(paths, boundary)
     discovery = _read_support_json(paths.discovery_path)
-    if discovery is not None and discovery.get("active_realm"):
+    if legacy_publications is None and discovery is not None and discovery.get("active_realm"):
         _compatible(discovery, config, source)
         pid = discovery.get("pid")
         endpoint = str(discovery.get("endpoint", ""))
@@ -1148,6 +1237,10 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         marker = _read_support_json(paths.instance_lock_path)
         if marker is not None and _owner_may_be_alive(boundary, marker):
             raise DuplicateOwnerError("A live runtime owner lock protects the stale discovery.")
+        # The selected realm's lock, not a foreign or incomplete record,
+        # must also permit cleanup of an advertisement.
+        if not realm_owner_lock_free(_canonical_realm_root(str(realm["data_root"]))):
+            raise DuplicateOwnerError("A runtime owner holds the selected realm owner lock.")
         # A dead advertisement is ephemeral support state.  Remove it before
         # starting so a crash cannot be mistaken for a live owner.
         remove_file(paths.discovery_path)
@@ -1157,7 +1250,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     # Never start a second owner while the durable instance lock still points
     # at a live process.
     marker = _read_support_json(paths.instance_lock_path)
-    if marker and _owner_may_be_alive(boundary, marker):
+    if legacy_publications is None and marker and _owner_may_be_alive(boundary, marker):
         raise DuplicateOwnerError(
             "A different runtime owner is active for the selected realm; "
             "stop it before retrying astrid-runtime up --profile astrid."
@@ -1178,6 +1271,9 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     credential_before = runtime_platform.read_private_file(credential_path) if credential_path.is_file() and not credential_path.is_symlink() else None
     source_manifest_path = paths.source_profiles_dir / f"{source.profile}.json"
     source_before = source_manifest_path.read_bytes() if source_manifest_path.is_file() and not source_manifest_path.is_symlink() else None
+    if legacy_publications is not None:
+        if (_read_support_json(paths.instance_lock_path), _read_support_json(paths.discovery_path)) != legacy_publications:
+            raise BootstrapError("Runtime owner publications changed before launch.")
     try:
         handle = boundary.start(
             realm_id=realm_id,
@@ -1875,7 +1971,7 @@ def _fenced_stop_and_manager(
         fence = (nullcontext({"safe": True, "realm_absent": True})
                  if allow_missing_realm else interruption_fence(realm_root))
         with fence as final_report:
-            if owner is None and not allow_missing_realm and _realm_owner_present(realm_root):
+            if owner is None and not allow_missing_realm and not realm_owner_lock_free(realm_root):
                 raise BootstrapError(
                     "Runtime interruption refused: the realm owner is still active; "
                     "run astrid-runtime up --profile astrid to recover discovery."
@@ -2360,6 +2456,24 @@ def _interrupt_owner_locked(
                 "catalog_restored": snapshot["live_catalog_bytes"] is None}
 
     realm, realm_root = _selected_stop_realm(paths)
+    legacy_publications = _legacy_owner_publications(paths, realm)
+    if legacy_publications is not None:
+        # Keep the owner lock held across the final check and manager callback.
+        # The old advertisements are never removed as a condition of stopping.
+        with _locked_realm_owner_file(realm_root) as free:
+            if not free:
+                raise BootstrapError("Runtime interruption refused: the realm owner is still active.")
+            try:
+                with interruption_fence(realm_root) as report:
+                    if (_read_support_json(paths.instance_lock_path), _read_support_json(paths.discovery_path)) != legacy_publications:
+                        raise BootstrapError("Runtime owner publications changed before stop.")
+                    if stop_foreground is not None:
+                        stop_foreground()
+                    if stop_manager is not None:
+                        stop_manager()
+            except ConflictError as exc:
+                raise _raise_conflict(exc) from exc
+        return {"status": "stopped", "realm_id": str(realm["realm_id"]), "idle": report}
     discovery = _read_support_json(paths.discovery_path)
     marker = _read_support_json(paths.instance_lock_path)
     if marker is not None and marker.get("state") == "completed_stop" and discovery is not None:
@@ -2556,6 +2670,10 @@ def _preflight_owner_interruption(
     marker = _read_support_json(paths.instance_lock_path)
     if restore_selection is not None:
         _require_restore_publications_absent(paths, expected_completed_marker=marker)
+    elif _legacy_owner_publications(paths, _selected_stop_realm(paths)[0]) is not None:
+        _realm, realm_root = _selected_stop_realm(paths)
+        if not realm_owner_lock_free(realm_root):
+            raise BootstrapError("Runtime interruption refused: the realm owner is still active.")
     elif discovery is None and marker is not None:
         if marker.get("state") not in ("completed_stop", "stopping"):
             _realm, realm_root = _selected_stop_realm(paths)

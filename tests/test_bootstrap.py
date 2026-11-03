@@ -3133,3 +3133,132 @@ def test_discovery_recovery_refuses_changed_owner_without_publication(changed):
     finally:
         case.tearDown()
         case.doCleanups()
+
+
+@pytest.mark.parametrize("condition", ["free", "busy", "missing", "directory", "symlink", "unobservable"])
+def test_realm_owner_lock_free_is_conservative_and_read_only(tmp_path, monkeypatch, condition):
+    root = tmp_path / "realm"
+    root.mkdir()
+    lock = root / "owner.lock"
+    lock.write_bytes(b"original owner lock bytes")
+    before = lock.stat()
+    held = None
+    if condition == "busy":
+        held = os.open(lock, os.O_RDONLY)
+        bootstrap_module.runtime_platform.lock_file(held, blocking=False)
+    elif condition == "missing":
+        lock.unlink()
+    elif condition == "directory":
+        lock.unlink()
+        lock.mkdir()
+    elif condition == "symlink":
+        lock.unlink()
+        lock.symlink_to(root / "elsewhere")
+    elif condition == "unobservable":
+        real_open = bootstrap_module.os.open
+        def denied(path, flags, *args, **kwargs):
+            if Path(path) == lock:
+                raise PermissionError("denied")
+            return real_open(path, flags, *args, **kwargs)
+        monkeypatch.setattr(bootstrap_module.os, "open", denied)
+    try:
+        if condition in ("free", "busy"):
+            assert bootstrap_module.realm_owner_lock_free(root) is (condition == "free")
+            after = lock.stat()
+            assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
+            assert lock.read_bytes() == b"original owner lock bytes"
+        else:
+            with pytest.raises(BootstrapError):
+                bootstrap_module.realm_owner_lock_free(root)
+            if condition == "unobservable":
+                assert lock.read_bytes() == b"original owner lock bytes"
+            else:
+                assert condition == "missing" and not lock.exists() or condition == "directory" and lock.is_dir() or condition == "symlink" and lock.is_symlink()
+    finally:
+        if held is not None:
+            bootstrap_module.runtime_platform.unlock_file(held)
+            os.close(held)
+
+
+@pytest.mark.parametrize("records", ["marker", "discovery", "both"])
+@pytest.mark.parametrize("state", ["free", "busy", "unknown"])
+@pytest.mark.parametrize("operation", ["up", "down"])
+def test_r0_publications_require_free_selected_owner_lock(records, state, operation, monkeypatch):
+    case = BootstrapTests()
+    case.setUp()
+    try:
+        root = case._configure()
+        marker = {"pid": os.getpid(), "process_birth_id": "proc-start-ticks:123", "runtime_instance_id": "r0-instance", "realm_id": "configured-realm", "realm_root": str(root)}
+        discovery = {**marker, "active_realm": marker["realm_id"], "endpoint": "http://127.0.0.1:43100"}
+        if records in ("marker", "both"):
+            case.paths.instance_lock_path.write_text(json.dumps(marker))
+        if records in ("discovery", "both"):
+            case.paths.discovery_path.write_text(json.dumps(discovery))
+        paths = (case.paths.instance_lock_path, case.paths.discovery_path, root / "owner.lock")
+        before = {p: p.read_bytes() if p.exists() else None for p in paths}
+        held = None
+        if state == "busy":
+            held = os.open(root / "owner.lock", os.O_RDONLY)
+            bootstrap_module.runtime_platform.lock_file(held, blocking=False)
+        elif state == "unknown":
+            monkeypatch.setattr(bootstrap_module, "realm_owner_lock_free", lambda _root: (_ for _ in ()).throw(BootstrapError("unobservable")))
+        calls = []
+        try:
+            if state == "free":
+                if operation == "down":
+                    assert down(case.paths, case.boundary, stop_manager=lambda: calls.append("manager"))["status"] == "stopped"
+                    assert calls == ["manager"]
+                    assert {p: p.read_bytes() if p.exists() else None for p in paths} == before
+                else:
+                    start = case.boundary.start
+                    def checked_start(**kwargs):
+                        assert {p: p.read_bytes() if p.exists() else None for p in paths} == before
+                        return start(**kwargs)
+                    case.boundary.start = checked_start
+                    assert bootstrap(case.paths, case.boundary, case.config).status == "started"
+                    assert (root / "owner.lock").read_bytes() == before[root / "owner.lock"]
+            else:
+                with pytest.raises(BootstrapError):
+                    if operation == "down":
+                        down(case.paths, case.boundary, stop_manager=lambda: calls.append("manager"))
+                    else:
+                        bootstrap(case.paths, case.boundary, case.config)
+                assert calls == [] and not case.boundary.starts
+                assert {p: p.read_bytes() if p.exists() else None for p in paths} == before
+        finally:
+            if held is not None:
+                bootstrap_module.runtime_platform.unlock_file(held)
+                os.close(held)
+    finally:
+        case.tearDown()
+
+
+@pytest.mark.parametrize("operation", ["up", "down"])
+@pytest.mark.parametrize("bad_record", ["wrong_realm", "incomplete", "mismatch"])
+def test_invalid_legacy_publications_are_never_reclaimed(operation, bad_record):
+    case = BootstrapTests()
+    case.setUp()
+    try:
+        root = case._configure()
+        marker = {"pid": 12345, "process_birth_id": "old", "runtime_instance_id": "r0", "realm_id": "configured-realm", "realm_root": str(root)}
+        discovery = {**marker, "active_realm": marker["realm_id"], "endpoint": "http://127.0.0.1:43100"}
+        if bad_record == "wrong_realm":
+            marker["realm_id"] = "other-realm"
+        elif bad_record == "incomplete":
+            marker = {"pid": 12345}
+        else:
+            discovery["runtime_instance_id"] = "other"
+        case.paths.instance_lock_path.write_text(json.dumps(marker))
+        if bad_record == "mismatch":
+            case.paths.discovery_path.write_text(json.dumps(discovery))
+        paths = (case.paths.instance_lock_path, case.paths.discovery_path, root / "owner.lock")
+        before = {p: p.read_bytes() if p.exists() else None for p in paths}
+        with pytest.raises(BootstrapError):
+            if operation == "up":
+                bootstrap(case.paths, case.boundary, case.config)
+            else:
+                down(case.paths, case.boundary)
+        assert {p: p.read_bytes() if p.exists() else None for p in paths} == before
+        assert not case.boundary.starts
+    finally:
+        case.tearDown()
