@@ -293,6 +293,19 @@ def test_preflight_allows_listed_request(tmp_path):
         world.stop()
 
 
+def test_preflight_allows_timeline_lease_credential(tmp_path):
+    world = start_door_world(tmp_path)
+    try:
+        reply = world.call(f"{API_RUNTIME}/v1/projects/p/timelines/t/commit", "OPTIONS", headers={
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type, idempotency-key, x-timeline-editing-session",
+        })
+        assert reply.status == 204
+        assert "x-timeline-editing-session" in reply.headers["access-control-allow-headers"]
+    finally:
+        world.stop()
+
+
 def test_preflight_refusals(tmp_path):
     world = start_door_world(tmp_path)
     try:
