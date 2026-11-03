@@ -1,0 +1,264 @@
+name: C5 owner-busy venue
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_sha:
+        description: Full 40-character Runtime commit SHA
+        required: true
+        type: string
+      selectors_json:
+        description: JSON array of exact pytest node IDs (same selectors on both hosts)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS owner-busy
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      REQUESTED_SHA: ${{ inputs.runtime_sha }}
+      SELECTORS_JSON: ${{ inputs.selectors_json }}
+      VENUE_OS: macos
+      ARTIFACT_NAME: c5-owner-busy-macos-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate immutable SHA and exact node IDs
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import json, os, re
+          sha = os.environ["REQUESTED_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("runtime_sha must be a full lowercase 40-character SHA")
+          try:
+              selectors = json.loads(os.environ["SELECTORS_JSON"])
+          except (ValueError, TypeError) as exc:
+              raise SystemExit(f"selectors_json must be a JSON array: {exc}")
+          if not isinstance(selectors, list) or not selectors or len(selectors) > 50:
+              raise SystemExit("selectors_json must contain 1 to 50 node IDs")
+          for node in selectors:
+              if (not isinstance(node, str) or len(node) > 2048
+                      or not re.fullmatch(r"tests/[^\r\n]+\.py::[^\r\n]+", node)
+                      or any(ord(c) < 32 or ord(c) == 127 for c in node)):
+                  raise SystemExit(f"invalid exact pytest node ID: {node!r}")
+          PYCODE
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.runtime_sha }}
+          persist-credentials: false
+      - name: Verify checkout
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import os, pathlib, subprocess
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if sha != os.environ["REQUESTED_SHA"]:
+              raise SystemExit(f"checkout SHA mismatch: {sha}")
+          pathlib.Path(os.environ["RUNNER_TEMP"], "c5-checkout-sha.txt").write_text(sha, encoding="utf-8")
+          PYCODE
+      - name: Install Runtime test dependencies
+        shell: bash
+        run: |
+          python -m pip install -e '.[test]'
+          python -m pip install -e packages/python
+      - name: Run exact selectors
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import json, os, pathlib, subprocess, sys
+          selectors = json.loads(os.environ["SELECTORS_JSON"])
+          command = [sys.executable, "-m", "pytest", "-o", "addopts=", "-m", "", "--", *selectors]
+          print("pytest argv: " + json.dumps(command), flush=True)
+          result = subprocess.run(command, check=False)
+          pathlib.Path(os.environ["RUNNER_TEMP"], "c5-inner-exit.txt").write_text(str(result.returncode), encoding="utf-8")
+          PYCODE
+      - name: Write bounded job receipt
+        if: always()
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python - <<'PYCODE'
+          import json, os, pathlib, platform, socket
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          def read(name):
+              path = temp / name
+              return path.read_text(encoding="utf-8").strip() if path.is_file() else None
+          raw_exit = read("c5-inner-exit.txt")
+          try:
+              selectors = json.loads(os.environ["SELECTORS_JSON"])
+          except (ValueError, TypeError):
+              selectors = None
+          receipt = {
+              "schema": "c5-owner-busy-venue/v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow_ref": os.environ["WORKFLOW_REF"],
+              "workflow_sha": os.environ["WORKFLOW_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "job": os.environ["GITHUB_JOB"],
+              "host": socket.gethostname(),
+              "platform": platform.platform(),
+              "os": os.environ["VENUE_OS"],
+              "requested_runtime_sha": os.environ["REQUESTED_SHA"],
+              "checkout_sha": read("c5-checkout-sha.txt"),
+              "selectors": selectors,
+              "artifact": os.environ["ARTIFACT_NAME"],
+              "inner_exit": int(raw_exit) if raw_exit is not None else None,
+              "status_before_receipt": os.environ["JOB_STATUS"],
+          }
+          directory = temp / "c5-owner-busy-receipt"
+          directory.mkdir(exist_ok=True)
+          (directory / "receipt.json").write_text(json.dumps(receipt, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+          print(json.dumps(receipt, indent=2, ensure_ascii=True))
+          PYCODE
+      - name: Upload receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/c5-owner-busy-receipt/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Enforce inner exit
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import os, pathlib
+          path = pathlib.Path(os.environ["RUNNER_TEMP"], "c5-inner-exit.txt")
+          if not path.is_file() or path.read_text(encoding="utf-8").strip() != "0":
+              raise SystemExit("pytest did not complete successfully; see receipt and job log")
+          PYCODE
+  windows:
+    name: Windows owner-busy
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      REQUESTED_SHA: ${{ inputs.runtime_sha }}
+      SELECTORS_JSON: ${{ inputs.selectors_json }}
+      VENUE_OS: windows
+      ARTIFACT_NAME: c5-owner-busy-windows-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate immutable SHA and exact node IDs
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import json, os, re
+          sha = os.environ["REQUESTED_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("runtime_sha must be a full lowercase 40-character SHA")
+          try:
+              selectors = json.loads(os.environ["SELECTORS_JSON"])
+          except (ValueError, TypeError) as exc:
+              raise SystemExit(f"selectors_json must be a JSON array: {exc}")
+          if not isinstance(selectors, list) or not selectors or len(selectors) > 50:
+              raise SystemExit("selectors_json must contain 1 to 50 node IDs")
+          for node in selectors:
+              if (not isinstance(node, str) or len(node) > 2048
+                      or not re.fullmatch(r"tests/[^\r\n]+\.py::[^\r\n]+", node)
+                      or any(ord(c) < 32 or ord(c) == 127 for c in node)):
+                  raise SystemExit(f"invalid exact pytest node ID: {node!r}")
+          PYCODE
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.runtime_sha }}
+          persist-credentials: false
+      - name: Verify checkout
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import os, pathlib, subprocess
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if sha != os.environ["REQUESTED_SHA"]:
+              raise SystemExit(f"checkout SHA mismatch: {sha}")
+          pathlib.Path(os.environ["RUNNER_TEMP"], "c5-checkout-sha.txt").write_text(sha, encoding="utf-8")
+          PYCODE
+      - name: Install Runtime test dependencies
+        shell: bash
+        run: |
+          python -m pip install -e '.[test]'
+          python -m pip install -e packages/python
+      - name: Run exact selectors
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import json, os, pathlib, subprocess, sys
+          selectors = json.loads(os.environ["SELECTORS_JSON"])
+          command = [sys.executable, "-m", "pytest", "-o", "addopts=", "-m", "", "--", *selectors]
+          print("pytest argv: " + json.dumps(command), flush=True)
+          result = subprocess.run(command, check=False)
+          pathlib.Path(os.environ["RUNNER_TEMP"], "c5-inner-exit.txt").write_text(str(result.returncode), encoding="utf-8")
+          PYCODE
+      - name: Write bounded job receipt
+        if: always()
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python - <<'PYCODE'
+          import json, os, pathlib, platform, socket
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          def read(name):
+              path = temp / name
+              return path.read_text(encoding="utf-8").strip() if path.is_file() else None
+          raw_exit = read("c5-inner-exit.txt")
+          try:
+              selectors = json.loads(os.environ["SELECTORS_JSON"])
+          except (ValueError, TypeError):
+              selectors = None
+          receipt = {
+              "schema": "c5-owner-busy-venue/v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow_ref": os.environ["WORKFLOW_REF"],
+              "workflow_sha": os.environ["WORKFLOW_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "job": os.environ["GITHUB_JOB"],
+              "host": socket.gethostname(),
+              "platform": platform.platform(),
+              "os": os.environ["VENUE_OS"],
+              "requested_runtime_sha": os.environ["REQUESTED_SHA"],
+              "checkout_sha": read("c5-checkout-sha.txt"),
+              "selectors": selectors,
+              "artifact": os.environ["ARTIFACT_NAME"],
+              "inner_exit": int(raw_exit) if raw_exit is not None else None,
+              "status_before_receipt": os.environ["JOB_STATUS"],
+          }
+          directory = temp / "c5-owner-busy-receipt"
+          directory.mkdir(exist_ok=True)
+          (directory / "receipt.json").write_text(json.dumps(receipt, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+          print(json.dumps(receipt, indent=2, ensure_ascii=True))
+          PYCODE
+      - name: Upload receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/c5-owner-busy-receipt/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Enforce inner exit
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import os, pathlib
+          path = pathlib.Path(os.environ["RUNNER_TEMP"], "c5-inner-exit.txt")
+          if not path.is_file() or path.read_text(encoding="utf-8").strip() != "0":
+              raise SystemExit("pytest did not complete successfully; see receipt and job log")
+          PYCODE
