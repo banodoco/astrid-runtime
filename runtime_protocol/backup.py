@@ -12,6 +12,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import ctypes
+import errno
+import sys
 from .dirfd import filesystem as os
 import sqlite3
 import threading
@@ -45,6 +48,43 @@ from .dirfd import (
     validate_parent,
     write_bytes_at,
 )
+
+
+def _publish_new_directory(parent_fd: int, source: str, destination: str) -> None:
+    """Atomically publish a directory only if the destination is still absent.
+
+    A separate stat followed by rename is insufficient: POSIX rename can
+    replace an empty directory created between those two calls. Fail closed on
+    platforms/filesystems without an atomic no-replace operation.
+    """
+    if os.name == "nt":
+        # The Windows descriptor-relative implementation uses
+        # FileRenameInformation with ReplaceIfExists=False.
+        try:
+            os.rename(source, destination, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        except FileExistsError as exc:
+            raise ConflictError("backup or restore destination appeared before publication") from exc
+        return
+    if sys.platform.startswith("linux"):
+        function, flag = "renameat2", 1  # RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        function, flag = "renameatx_np", 4  # RENAME_EXCL
+    else:
+        raise ConflictError("atomic no-replace directory publication is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        rename = getattr(libc, function)
+    except AttributeError as exc:
+        raise ConflictError("atomic no-replace directory publication is unavailable") from exc
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(parent_fd, os.fsencode(source), parent_fd, os.fsencode(destination), flag) != 0:
+        error = ctypes.get_errno()
+        if error in (errno.EEXIST, errno.ENOTEMPTY):
+            raise ConflictError("backup or restore destination appeared before publication")
+        if error in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+            raise ConflictError("atomic no-replace directory publication is unavailable")
+        raise OSError(error, os.strerror(error), destination)
 
 
 def _sha256_fd(fd: int) -> str:
@@ -665,7 +705,6 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
     destination_name = None
     temporary_name = None
     temporary_fd = -1
-    published = False
     source_cas_fd = -1
     try:
         parent_fd, destination_name = ensure_parent_at(destination, destination_identity)
@@ -759,8 +798,8 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
             pass
         else:
             raise ConflictError("backup destination appeared before publication")
-        os.rename(temporary_name, destination_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        published = True
+        _publish_new_directory(parent_fd, temporary_name, destination_name)
+        temporary_name = None
         os.fsync(parent_fd)
         validate_created_parent(destination, destination_identity, parent_fd)
         return verified
@@ -775,12 +814,8 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                 remove_tree_at(parent_fd, temporary_name)
             except OSError:
                 pass
-        if published and parent_fd >= 0 and destination_name is not None:
-            try:
-                remove_tree_at(parent_fd, destination_name)
-                os.fsync(parent_fd)
-            except OSError:
-                pass
+        # Once published, even a failed flush or validation leaves an
+        # uncertain outcome. Never delete by name: it may now be a replacement.
         raise
     finally:
         if source_cas_fd >= 0:
@@ -872,7 +907,8 @@ def restore_backup(
             pass
         else:
             raise ConflictError("restore destination appeared before publication")
-        os.rename(temporary_name, destination_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        _publish_new_directory(parent_fd, temporary_name, destination_name)
+        temporary_name = None
         os.fsync(parent_fd)
         validate_created_parent(destination, destination_identity, parent_fd)
         return {"destination": str(destination), "realm_id": realm["id"], "activation_handoff": str(destination / "activation-handoff.json"), "source_manifest_sha256": handoff["source_manifest_sha256"], "verification": verified["manifest"]}

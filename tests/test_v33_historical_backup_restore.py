@@ -60,3 +60,22 @@ def test_historical_restore_checks_copied_bytes_before_publishing(tmp_path, monk
     with pytest.raises(ConflictError, match="SQLite bytes differ"):
         restore_backup(backup, destination, key=FIXTURE_BACKUP_KEY, older_schema=True)
     assert not destination.exists()
+
+
+def test_restore_preserves_directory_created_at_publication_boundary(tmp_path, monkeypatch):
+    backup = _extract_archive(tmp_path / "archive")
+    destination = tmp_path / "migration-input"
+    publish = backup_module._publish_new_directory
+    observed = {}
+
+    def race(parent_fd, source, target):
+        os.mkdir(target, dir_fd=parent_fd)
+        observed["inode"] = os.stat(target, dir_fd=parent_fd).st_ino
+        publish(parent_fd, source, target)
+
+    monkeypatch.setattr(backup_module, "_publish_new_directory", race)
+    with pytest.raises(ConflictError, match="destination appeared"):
+        restore_backup(backup, destination, key=FIXTURE_BACKUP_KEY, older_schema=True)
+    assert destination.is_dir()
+    assert destination.stat().st_ino == observed["inode"]
+    assert list(destination.iterdir()) == []

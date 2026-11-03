@@ -20,11 +20,11 @@ def _service(root, **kwargs):
 
 
 def _swap_on_final_rename(monkeypatch, module, parent: Path, outside: Path, target_name: str, *, mode: str):
-    original = module.os.rename
+    original = module._publish_new_directory
     swapped = False
     real_parent = parent.with_name(parent.name + "-real")
 
-    def hostile(source, destination, **kwargs):
+    def hostile(parent_fd, source, destination):
         nonlocal swapped
         if destination == target_name and str(source).startswith(f".{target_name}.") and not swapped:
             swapped = True
@@ -33,9 +33,9 @@ def _swap_on_final_rename(monkeypatch, module, parent: Path, outside: Path, targ
                 parent.symlink_to(outside, target_is_directory=True)
             else:
                 parent.mkdir()
-        return original(source, destination, **kwargs)
+        return original(parent_fd, source, destination)
 
-    monkeypatch.setattr(module.os, "rename", hostile)
+    monkeypatch.setattr(module, "_publish_new_directory", hostile)
     return lambda: (swapped, real_parent)
 
 
@@ -51,9 +51,9 @@ def test_runtime_backup_last_rename_is_parent_pinned(tmp_path, monkeypatch, mode
         with pytest.raises(ConflictError, match="identity|symlink|parent"):
             active.backup(parent / "backup")
         swapped, real_parent = state()
-        # Publication interruption is fail-closed: the pinned old parent may
-        # have received the rename, but no accepted final backup remains.
-        assert swapped and not (real_parent / "backup").exists()
+        # Publication reached the retained parent before validation failed.
+        # Preserve the uncertain result rather than deleting by pathname.
+        assert swapped and (real_parent / "backup").is_dir()
         assert not any(outside.iterdir())
         assert active.health()["status"] == "ok"
     finally:
@@ -77,6 +77,28 @@ def test_runtime_restore_last_rename_is_parent_pinned(tmp_path, monkeypatch, mod
         assert swapped and (real_parent / "candidate").is_dir()
         assert not any(outside.iterdir())
         assert active.health()["status"] == "ok"
+    finally:
+        active.close()
+
+
+def test_backup_preserves_directory_created_at_publication_boundary(tmp_path, monkeypatch):
+    active = _service(tmp_path / "active")
+    destination = tmp_path / "backup"
+    publish = backup_module._publish_new_directory
+    observed = {}
+
+    def race(parent_fd, source, target):
+        backup_module.os.mkdir(target, dir_fd=parent_fd)
+        observed["inode"] = backup_module.os.stat(target, dir_fd=parent_fd).st_ino
+        publish(parent_fd, source, target)
+
+    monkeypatch.setattr(backup_module, "_publish_new_directory", race)
+    try:
+        with pytest.raises(ConflictError, match="destination appeared"):
+            active.backup(destination)
+        assert destination.is_dir()
+        assert destination.stat().st_ino == observed["inode"]
+        assert list(destination.iterdir()) == []
     finally:
         active.close()
 
