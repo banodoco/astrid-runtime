@@ -1,0 +1,54 @@
+name: P19 non-root focused executor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  p19:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e553f386983ed0f5f41fc8ffece3a4d80d3b4a7b
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify identity and candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          uid=$(id -u)
+          sha=$(git rev-parse HEAD)
+          {
+            echo "UID: $uid"
+            echo "Kernel: $(uname -a)"
+            echo "Runtime SHA: $sha"
+            echo 'Command: python -m pytest -q tests/test_connected_transfer_broker.py::test_connected_delivery_is_close_only_and_broker_loss_preserves_kernel_lock'
+          } | tee "$RUNNER_TEMP/p19-receipt.txt"
+          test "$uid" -ne 0
+          test "$sha" = e553f386983ed0f5f41fc8ffece3a4d80d3b4a7b
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Run exact P19 selector
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q tests/test_connected_transfer_broker.py::test_connected_delivery_is_close_only_and_broker_loss_preserves_kernel_lock 2>&1 | tee "$RUNNER_TEMP/p19-pytest.log"
+          result=${PIPESTATUS[0]}
+          echo "Inner pytest exit: $result" | tee -a "$RUNNER_TEMP/p19-receipt.txt"
+          cat "$RUNNER_TEMP/p19-receipt.txt" >> "$GITHUB_STEP_SUMMARY"
+          exit "$result"
+      - name: Upload receipt and test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p19-nonroot-evidence
+          path: |
+            ${{ runner.temp }}/p19-receipt.txt
+            ${{ runner.temp }}/p19-pytest.log
+          if-no-files-found: warn
+          retention-days: 7
