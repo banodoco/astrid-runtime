@@ -71,7 +71,8 @@ def make_handler(runtime, body, *, path=None, headers=None, command="POST", acto
 def test_authorized_requester_commit_uses_server_bound_identity_and_rechecks_authority():
     calls = []
 
-    def commit(project_id, timeline_id, body, *, idempotency_key, publisher, invocation_path, authorize):
+    def commit(project_id, timeline_id, body, *, idempotency_key, publisher, invocation_path, authorize, editing_session=None):
+        assert editing_session is None
         calls.append((project_id, timeline_id, body, idempotency_key, publisher, invocation_path))
         assert authorize()["actor"] == publisher
         handler.identity_actor = "different-requester"
@@ -88,6 +89,19 @@ def test_authorized_requester_commit_uses_server_bound_identity_and_rechecks_aut
         f"/v1/projects/{PROJECT}/timelines/{TIMELINE}/commit",
     )]
     assert handler.scopes_seen == ["projects:write", "projects:write", "projects:write"]
+
+
+def test_commit_route_forwards_lease_credential_outside_body_identity():
+    body = request_body(source={"via": "app"})
+    def commit(project_id, timeline_id, received, **kwargs):
+        assert received == body
+        assert kwargs["publisher"] == "publisher-1"
+        assert kwargs["editing_session"] == "opaque-app-tab"
+        return {"data": {"status": "accepted"}}
+    handler = make_handler(SimpleNamespace(commit_timeline=commit), body,
+                           headers={"X-Timeline-Editing-Session": "opaque-app-tab"})
+    handler._route()
+    assert handler.reply == (200, {"data": {"status": "accepted"}})
 
 
 def test_retired_writer_route_refuses_before_decode_or_legacy_publication_dispatch():
