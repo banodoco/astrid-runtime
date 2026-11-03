@@ -5295,10 +5295,14 @@ and applied against that reconciled head; it must not mutate the editable draft
 before admission completes. An Agent publication accepted before the lease
 acknowledgement is therefore included in the reconciled basis. After the lease
 acknowledgement, the serialized acceptance check below prevents a new publication
-from crossing the live edit. A client that cannot complete acquisition and
-reconciliation must keep the captured intent pending. This is an online client
-ordering rule; the Runtime lease itself does not preserve unsaved edits across a
-Runtime restart or a period without connectivity.
+from crossing the live edit. A connected acquisition still in flight must keep
+captured intent pending. If the presence channel explicitly fails at the
+transport layer, v1 may retain local editing after canonical reconciliation,
+using durable draft and guarded-save recovery without claiming lease protection.
+Authorization or compatibility failures do not admit that fallback. An input
+whose canonical reconciliation has not completed remains pending. This is an
+online client ordering rule; the Runtime lease itself does not preserve unsaved
+edits across a Runtime restart or a period without connectivity.
 
 The owner key is project, timeline, authenticated actor, and tab-session. Any
 live lease gates publication, regardless of which user/tab owns it. A release
