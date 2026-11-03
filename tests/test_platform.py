@@ -638,6 +638,73 @@ def test_linux_identity_includes_incarnation_scope():
     assert f";pidns:{Path('/proc/self/ns/pid').stat().st_ino}" in identity["birth_id"]
 
 
+@pytest.mark.parametrize("error", [PermissionError, FileNotFoundError])
+def test_linux_identity_uses_self_namespace_when_target_link_unavailable(monkeypatch, error):
+    if sys.platform != "linux":
+        return
+    pid = os.getpid()
+    namespace = Path('/proc/self/ns/pid').stat().st_ino
+    real_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        if path == Path(f'/proc/{pid}/ns/pid'):
+            raise error("target namespace unavailable")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    identity = platform.process_identity(pid)
+    assert f";pidns:{namespace}" in identity["birth_id"]
+    assert platform.process_birth_matches(identity["birth_id"], identity["birth_id"]) is True
+
+
+def test_linux_nonroot_pid1_identity_with_denied_namespace():
+    if sys.platform != "linux" or os.geteuid() == 0:
+        pytest.skip("requires Linux and a non-root observer")
+    try:
+        Path('/proc/1/ns/pid').stat()
+    except PermissionError:
+        pass
+    else:
+        pytest.skip("PID 1 namespace is accessible on this host")
+    Path('/proc/1/stat').read_text()
+    namespace = Path('/proc/self/ns/pid').stat().st_ino
+    identity = platform.process_identity(1)
+    assert identity is not None
+    assert f";pidns:{namespace}" in identity["birth_id"]
+    assert platform.process_birth_matches(identity["birth_id"], identity["birth_id"]) is True
+
+
+@pytest.mark.parametrize("failure", ["missing", "denied", "malformed"])
+def test_linux_identity_target_stat_failure_stays_unknown_or_absent(monkeypatch, failure):
+    if sys.platform != "linux":
+        return
+    pid = os.getpid()
+    real_read = Path.read_text
+    real_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        if path == Path(f'/proc/{pid}/ns/pid'):
+            raise PermissionError("target namespace unavailable")
+        return real_stat(path, *args, **kwargs)
+
+    def read(path, *args, **kwargs):
+        if path == Path(f'/proc/{pid}/stat'):
+            if failure == "missing":
+                raise FileNotFoundError("target gone")
+            if failure == "denied":
+                raise PermissionError("target unobservable")
+            return "malformed"
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(Path, "read_text", read)
+    if failure == "missing":
+        assert platform.process_identity(pid) is None
+    else:
+        with pytest.raises(OSError):
+            platform.process_identity(pid)
+
+
 @pytest.mark.parametrize("unavailable", ["boot", "namespace", "both"])
 def test_linux_identity_keeps_working_when_optional_scope_is_denied(monkeypatch, unavailable):
     if sys.platform != "linux":
@@ -661,6 +728,8 @@ def test_linux_identity_keeps_working_when_optional_scope_is_denied(monkeypatch,
     assert identity is not None
     assert (";boot:" in identity["birth_id"]) is (unavailable == "namespace")
     assert (";pidns:" in identity["birth_id"]) is (unavailable == "boot")
+    if unavailable in {"namespace", "both"}:
+        assert platform.process_birth_matches(identity["birth_id"], identity["birth_id"]) is None
 
 
 @pytest.mark.parametrize("expected,actual,result", [

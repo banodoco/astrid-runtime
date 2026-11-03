@@ -581,9 +581,15 @@ def process_identity(pid: int, *, timeout: float = 1.0):
             pass
         try:
             namespace = (root / "ns/pid").stat().st_ino
-            scope += f";pidns:{namespace}"
         except (FileNotFoundError, PermissionError):
-            pass
+            try:
+                # The PID coordinates in this proc view are relative to the
+                # observer's namespace, even when the target link is denied.
+                namespace = Path("/proc/self/ns/pid").stat().st_ino
+            except (FileNotFoundError, PermissionError):
+                namespace = None
+        if namespace is not None:
+            scope += f";pidns:{namespace}"
         raw = (root / "stat").read_text()
         fields = raw.rsplit(")", 1)[1].split()
         if not fields[19].isascii() or not fields[19].isdigit():
