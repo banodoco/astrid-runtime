@@ -30,6 +30,10 @@ _LEDGER_TEMP = ".lifecycle-transfer-ledger.tmp"
 _LEDGER_LIMIT = 128 * 1024
 _LEDGER_ENTRIES = 128
 _LEDGER_PHASE = "observed"
+_RECOVERY = "recovery_required"
+_RECOVERY_REASONS = frozenset(("unknown_identity", "binding_changed", "incomplete_census",
+                               "restart_unfenced", "lease_uncertain", "durability_failed",
+                               "recovery_required"))
 
 
 def _closed(value, keys):
@@ -365,7 +369,7 @@ class TransferSession:
                 if ledger is None:
                     return {"phase": _LEDGER_PHASE, "requests": []}
                 self._check_ledger_binding(ledger)
-                return {"phase": _LEDGER_PHASE, "requests": ledger["requests"]}
+                return {"phase": _ledger_phase(ledger), "requests": ledger["requests"]}
             except OSError as exc:
                 raise FenceUnavailable("recovery_required: ledger unavailable") from exc
             finally:
@@ -377,7 +381,37 @@ class TransferSession:
         request = {"operation_id": operation_id, "generation": generation,
                    "request_id": request_id, "expected_phase": expected_phase,
                    "binding_digest": binding_digest}
+        return self._record(request)
+
+    def require_recovery(self, *, operation_id, generation, request_id, expected_phase,
+                         binding_digest, reason):
+        """Durably block progress on uncertainty; this creates no native authority.
+
+        The reason is a reported uncertainty, not a verified native observation.
+        Recovery or a new generation requires the separate native protocol.
+        """
+        request = {"operation_id": operation_id, "generation": generation,
+                   "request_id": request_id, "expected_phase": expected_phase,
+                   "binding_digest": binding_digest, "action": "require_recovery",
+                   "reason": reason}
+        return self._record(request)
+
+    def request_transition(self, *, operation_id, generation, request_id, expected_phase,
+                           binding_digest, target_phase):
+        """Record an explicit refusal of transitions lacking their required producers."""
+        request = {"operation_id": operation_id, "generation": generation,
+                   "request_id": request_id, "expected_phase": expected_phase,
+                   "binding_digest": binding_digest, "action": "transition",
+                   "target_phase": target_phase}
+        return self._record(request)
+
+    def _record(self, request):
         _validate_request(request)
+        operation_id = request["operation_id"]
+        generation = request["generation"]
+        request_id = request["request_id"]
+        expected_phase = request["expected_phase"]
+        binding_digest = request["binding_digest"]
         with self._mutex:
             self._check()
             directory = None
@@ -407,7 +441,7 @@ class TransferSession:
                 if (operation_id != self._operation_id or generation != self._generation
                         or binding_digest != self._binding_digest):
                     raise FenceUnavailable("binding_changed")
-                if expected_phase != _LEDGER_PHASE:
+                if expected_phase != (_ledger_phase(ledger) if ledger else _LEDGER_PHASE):
                     raise FenceUnavailable("stale_phase")
                 if ledger is None:
                     ledger = {"version": 1, "operation_id": self._operation_id,
@@ -417,6 +451,10 @@ class TransferSession:
                     raise FenceUnavailable("recovery_required: ledger full")
                 result = {"code": "recorded", "stage": "ledger_only",
                           "lifecycle_side_effect": False, "sequence": len(ledger["requests"]) + 1}
+                if request.get("action") == "require_recovery":
+                    result.update(code=_RECOVERY, stage="recovery_required", phase=_RECOVERY)
+                elif request.get("action") == "transition":
+                    result.update(code=_transition_refusal(request["target_phase"]), stage="transition_refused")
                 ledger["requests"].append({"request": request, "result": result})
                 data = _encode_ledger(ledger)
                 if len(data) > _LEDGER_LIMIT:
@@ -464,7 +502,20 @@ def _encode_ledger(ledger):
 
 
 def _validate_request(request):
-    _closed(request, ("operation_id", "generation", "request_id", "expected_phase", "binding_digest"))
+    keys = ("operation_id", "generation", "request_id", "expected_phase", "binding_digest")
+    if type(request) is dict and "action" in request:
+        if request["action"] == "require_recovery":
+            _closed(request, (*keys, "action", "reason"))
+            if type(request["reason"]) is not str or request["reason"] not in _RECOVERY_REASONS:
+                raise FenceUnavailable("unsupported_transfer")
+        elif request["action"] == "transition":
+            _closed(request, (*keys, "action", "target_phase"))
+            if type(request["target_phase"]) is not str or not 0 < len(request["target_phase"]) <= 256:
+                raise FenceUnavailable("unsupported_transfer")
+        else:
+            raise FenceUnavailable("unsupported_transfer")
+    else:
+        _closed(request, keys)
     for key in ("operation_id", "generation", "request_id", "expected_phase"):
         value = _text(request[key])
         try:
@@ -476,12 +527,31 @@ def _validate_request(request):
     _digest(request["binding_digest"])
 
 
+def _ledger_phase(ledger):
+    return _RECOVERY if any(e["request"].get("action") == "require_recovery"
+                            for e in ledger["requests"]) else _LEDGER_PHASE
+
+
+def _transition_refusal(target):
+    if target in ("writer_claimed", "ready", "commit_intent", "commit_decided",
+                  "committed", "rollback_intent", "rollback_decided", "rolled_back_stopped"):
+        return "lease_uncertain"
+    if target == "restart_fenced":
+        return "restart_unfenced"
+    if target == "held_admitted":
+        return "incomplete_census"
+    if target in ("prepared", "held_provisional", "preparing_data", "selected", "recovery_required"):
+        return "recovery_required"
+    return "unsupported_transfer"
+
+
 def _validate_ledger(ledger):
     if type(ledger) is not dict or set(ledger) != {"version", "operation_id", "generation", "binding_digest", "requests"}:
         raise ValueError("invalid ledger fields")
     if type(ledger["version"]) is not int or ledger["version"] != 1 or type(ledger["requests"]) is not list or len(ledger["requests"]) > _LEDGER_ENTRIES:
         raise ValueError("invalid ledger version or length")
     seen = set()
+    phase = _LEDGER_PHASE
     for sequence, entry in enumerate(ledger["requests"], 1):
         if type(entry) is not dict or set(entry) != {"request", "result"}:
             raise ValueError("invalid ledger entry")
@@ -493,14 +563,20 @@ def _validate_ledger(ledger):
         if (request["request_id"] in seen or request["operation_id"] != ledger["operation_id"]
                 or request["generation"] != ledger["generation"]
                 or request["binding_digest"] != ledger["binding_digest"]
-                or request["expected_phase"] != _LEDGER_PHASE):
+                or request["expected_phase"] != phase):
             raise ValueError("inconsistent ledger request")
         seen.add(request["request_id"])
         result = entry["result"]
-        if (type(result) is not dict or set(result) != {"code", "stage", "lifecycle_side_effect", "sequence"}
-                or result["code"] != "recorded" or result["stage"] != "ledger_only"
-                or result["lifecycle_side_effect"] is not False
-                or type(result["sequence"]) is not int or result["sequence"] != sequence):
+        expected = {"code": "recorded", "stage": "ledger_only",
+                    "lifecycle_side_effect": False, "sequence": sequence}
+        if request.get("action") == "require_recovery":
+            phase = _RECOVERY
+            expected.update(code=_RECOVERY, stage="recovery_required", phase=_RECOVERY)
+        elif request.get("action") == "transition":
+            expected.update(code=_transition_refusal(request["target_phase"]), stage="transition_refused")
+        if (type(result) is not dict or result != expected
+                or result.get("lifecycle_side_effect") is not False
+                or type(result.get("sequence")) is not int):
             raise ValueError("invalid ledger result")
     if not ledger["requests"]:
         raise ValueError("empty ledger")
