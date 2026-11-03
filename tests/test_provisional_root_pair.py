@@ -1,5 +1,4 @@
 """Overlapping root custody is provisional; it does not admit a restore."""
-import fcntl
 import os
 import stat
 import sys
@@ -46,6 +45,8 @@ def test_pair_acquires_directories_before_owners_in_file_id_order(tmp_path, monk
 
 
 def test_contended_replacement_does_not_disturb_existing_owner(tmp_path):
+    import fcntl
+
     old, replacement = roots(tmp_path)
     held = os.open(replacement / "owner.lock", os.O_RDWR)
     try:
