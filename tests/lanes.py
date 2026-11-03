@@ -238,6 +238,10 @@ requires_linux_tree_custody = _declare(
     "linux-tree-custody", "sys_platform != 'linux'",
     "Linux waitid WNOWAIT process-group custody", ("unit", "portability-lifecycle", "integration"),
 ).mark()
+requires_linux_installer_lock_diagnostics = _declare(
+    "linux-installer-lock-diagnostics", "sys_platform != 'linux'",
+    "Linux installer lock failure diagnostics and flock exclusion", ("unit",),
+).mark()
 requires_posix_inherited_descriptors = _declare(
     "posix-inherited-descriptors", "os_name == 'nt'",
     "relay integration requires POSIX inherited descriptors", ("integration",),

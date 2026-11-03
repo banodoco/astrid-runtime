@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -216,10 +217,22 @@ def _installer_mutex(paths):
     if lock.is_symlink():
         raise OperatorUpgradeError("installer lifetime lock must not be a symlink")
     with lock.open("a+") as handle:
+        stage = "owner_only"
         try:
             platform.owner_only(lock)
+            stage = "lock_file"
             platform.lock_file(handle.fileno(), blocking=False)
         except OSError as exc:
+            if sys.platform == "linux":
+                category = {
+                    errno.EAGAIN: "would_block",
+                    errno.EACCES: "access_denied",
+                    errno.EPERM: "permission_denied",
+                }.get(exc.errno, "other")
+                raise OperatorUpgradeError(
+                    "another installer owns the installation lifetime lock "
+                    f"(stage={stage}, errno_category={category})"
+                ) from None
             raise OperatorUpgradeError("another installer owns the installation lifetime lock") from exc
         try:
             yield
