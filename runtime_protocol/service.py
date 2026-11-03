@@ -3220,10 +3220,18 @@ class RuntimeService:
             provider = self._timeline_commit_provider
         def port_factory(bound_context):
             require_active()
-            self._ensure_timeline_commit_baseline(commits, project_id, timeline_id, require_active)
-            current_head = commits.head(project_id, timeline_id)
-            self._verify_legacy_media_selections(commits.revision_closure(project_id, timeline_id, current_head["revision_id"]))
-            return RequestCommitPort(self, commits, bound_context, require_active)
+            # Restore's bounded source preflight must run before current-head
+            # validation: both closures may hold the same damaged child. The
+            # coordinator has already resolved accepted retries at this point.
+            port = RequestCommitPort(self, commits, bound_context, require_active)
+            try:
+                self._ensure_timeline_commit_baseline(commits, project_id, timeline_id, require_active)
+                current_head = commits.head(project_id, timeline_id)
+                self._verify_legacy_media_selections(commits.revision_closure(project_id, timeline_id, current_head["revision_id"]))
+            except BaseException:
+                port.close()
+                raise
+            return port
         if timing is not None:
             timing.end("service_admission")
         try:

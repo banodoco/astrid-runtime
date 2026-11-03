@@ -9,7 +9,7 @@ import copy
 
 import pytest
 
-from runtime_protocol.errors import AuthorizationError, RuntimeErrorBase
+from runtime_protocol.errors import AuthorizationError, ConflictError, RuntimeErrorBase
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 from runtime_protocol.timeline_commit import CommitRejected
@@ -217,6 +217,27 @@ def test_restore_rejects_damaged_exact_source_before_provider_or_writes(selected
     assert error.value.status in (409, 422)
     assert provider.calls == 0
     assert rows(service) == before and conn.total_changes == changes
+
+
+@pytest.mark.parametrize("selected", ["history"], indirect=True)
+@pytest.mark.parametrize("direct", [False, True])
+def test_shared_corrupt_child_runs_restore_preflight_before_current_head_validation(selected, direct):
+    service, provider, first, _ = selected
+    source = first["data"]["new_head"]
+    call = _restore(service, source, direct=direct, content_digest=first["data"]["content_digest"])
+    service.store.conn.execute(
+        "UPDATE shot_revisions SET content_digest=? WHERE id='shot-rev-1'",
+        ("sha256:" + "0" * 64,),
+    )
+    before = rows(service)
+    changes = service.store.conn.total_changes
+    with pytest.raises(ConflictError, match="dependency closure failed immutable verification") as error:
+        call()
+    assert error.value.details["reason"] == "dependency_unavailable"
+    assert error.value.details["revision_id"] == source
+    assert any(item["reason"] == "dependency_closure" for item in error.value.details["errors"])
+    assert provider.calls == 0
+    assert rows(service) == before and service.store.conn.total_changes == changes
 
 
 @pytest.mark.parametrize("direct", [False, True])

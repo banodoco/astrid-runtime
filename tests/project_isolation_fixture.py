@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from runtime_protocol.backup import restore_backup, verify_backup
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.upgrade import inspect_realm_schema, migrate_canonical_to_current
 
 
 ARCHIVE = Path(__file__).with_name("fixtures") / "precut-two-projects-v31.tar.gz"
@@ -54,10 +55,12 @@ def _extract_archive(destination: Path, archive_path: Path = ARCHIVE) -> Path:
 def load_project_isolation_fixture(tmp_path: Path) -> SimpleNamespace:
     """Restore only this capture and read its real identities and receipts."""
     backup = _extract_archive(tmp_path / "two-project-archive")
-    verified = verify_backup(backup, key=FIXTURE_BACKUP_KEY)
+    verified = verify_backup(backup, key=FIXTURE_BACKUP_KEY, older_schema=True)
     assert verified["manifest"]["schema"]["version"] == 31
     root = tmp_path / "two-project-realm"
-    restore_backup(backup, root, key=FIXTURE_BACKUP_KEY)
+    restore_backup(backup, root, key=FIXTURE_BACKUP_KEY, older_schema=True)
+    identity = inspect_realm_schema(root)
+    migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {identity['realm_id']}")
     service = RuntimeService(root)
     try:
         projects = {row["slug"]: row["project_id"] for row in service.list_projects()["items"]}
