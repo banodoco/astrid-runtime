@@ -859,7 +859,7 @@ def _provision_connection(connection: Any, actor_id: str, token: str, realm_id: 
         cancellation.wait_for(handshake, protocol_version=PROTOCOL_VERSION, schema_version=SCHEMA_VERSION)
 
 
-def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_root: Path, new_realm: bool, credential_before: bytes | None, catalog_before: bytes | None = None, source_before: bytes | None = None, source_profile: str = "astrid", candidate_pid: int | None = None, completed_stop_marker: Mapping[str, Any] | None = None) -> None:
+def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_root: Path, new_realm: bool, credential_before: bytes | None, catalog_before: bytes | None = None, source_before: bytes | None = None, source_profile: str = "astrid", candidate_pid: int | None = None, completed_stop_marker: Mapping[str, Any] | None = None, protected_publications: Mapping[Path, Mapping[str, Any] | None] | None = None) -> None:
     """Return neutral support state to its pre-launch shape after a failed handoff."""
     # Rollback is allowed to remove only metadata emitted by this candidate.
     # A concurrent/previous owner may still be serving even when its support
@@ -893,7 +893,8 @@ def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *
             current = _read_support_json(path)
             expected = candidate_publications.get(path) if candidate_publications is not None else object()
             if (not owner_present and candidate_pid is not None and candidate_publications is not None
-                    and current is not None and current == expected):
+                    and current is not None and current == expected
+                    and (protected_publications is None or current != protected_publications.get(path))):
                 try:
                     owned = int(current.get("pid", 0)) == int(candidate_pid)
                 except (TypeError, ValueError):
@@ -1131,6 +1132,8 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     def rollback_failed(**kwargs) -> None:
         _rollback_failed_bootstrap(
             paths, boundary, completed_stop_marker=completed_stop_before_launch,
+            protected_publications=(dict(zip((paths.instance_lock_path, paths.discovery_path), legacy_publications))
+                                    if legacy_publications is not None else None),
             **kwargs,
         )
     new_realm = False

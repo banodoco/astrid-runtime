@@ -3262,3 +3262,23 @@ def test_invalid_legacy_publications_are_never_reclaimed(operation, bad_record):
         assert not case.boundary.starts
     finally:
         case.tearDown()
+
+
+def test_r0_marker_survives_failed_start_with_reused_candidate_pid():
+    from types import SimpleNamespace
+    case = BootstrapTests()
+    case.setUp()
+    try:
+        root = case._configure()
+        marker = {"pid": 12345, "process_birth_id": "old", "runtime_instance_id": "r0", "realm_id": "configured-realm", "realm_root": str(root)}
+        case.paths.instance_lock_path.write_text(json.dumps(marker))
+        before = case.paths.instance_lock_path.read_bytes()
+        case.boundary._process = SimpleNamespace(pid=12345)
+        def failed_start(**kwargs):
+            raise RuntimeError("candidate failed")
+        case.boundary.start = failed_start
+        with pytest.raises(RuntimeError, match="candidate failed"):
+            bootstrap(case.paths, case.boundary, case.config)
+        assert case.paths.instance_lock_path.read_bytes() == before
+    finally:
+        case.tearDown()
