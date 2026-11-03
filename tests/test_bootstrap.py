@@ -49,6 +49,17 @@ PROFILE = SourceProfile(
 NATIVE_IDENTITY = {"release": 0, "managed_by": None}
 
 
+@contextmanager
+def held_realm_owner_lock(root):
+    fd = os.open(root / "owner.lock", os.O_RDONLY)
+    try:
+        bootstrap_module.runtime_platform.lock_file(fd, blocking=False)
+        yield
+    finally:
+        bootstrap_module.runtime_platform.unlock_file(fd)
+        os.close(fd)
+
+
 class FakeConnection:
     def __init__(self, boundary):
         self.boundary = boundary
@@ -570,15 +581,17 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(len(self.boundary.starts), starts)
         self.assertEqual(self.paths.instance_lock_path.read_bytes(), live_lock)
 
-        # The restored marker must still repair a subsequent discovery loss.
+        # Missing discovery while the real owner lock is held must refuse.
         discovery = self.paths.discovery_path.read_bytes()
         self.paths.discovery_path.unlink()
-        recovered = bootstrap(self.paths, self.boundary, self.config)
-        self.assertEqual(recovered.status, "reconnected")
-        self.assertEqual(recovered.runtime_instance_id, first.runtime_instance_id)
-        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery)
-        self.assertEqual(self.paths.instance_lock_path.read_bytes(), live_lock)
-        self.assertEqual(len(self.boundary.starts), starts)
+        root = Path(json.loads(live_lock)["realm_root"])
+        with held_realm_owner_lock(root):
+            with self.assertRaises(DuplicateOwnerError):
+                bootstrap(self.paths, self.boundary, self.config)
+            self.assertFalse(self.paths.discovery_path.exists())
+            self.assertEqual(self.paths.instance_lock_path.read_bytes(), live_lock)
+            self.assertEqual(len(self.boundary.starts), starts)
+        self.paths.discovery_path.write_bytes(discovery)
 
         calls = []
         down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
@@ -2265,11 +2278,12 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(self.paths.instance_lock_path.read_bytes(), marker_before)
 
     def test_lock_only_unknown_identity_revokes_receipt_before_later_disappearance(self):
-        self._configure()
+        root = self._configure()
         self.paths.instance_lock_path.write_text(json.dumps({"pid": 12345}))
         calls = []
-        with self.assertRaisesRegex(BootstrapError, "owner lock has no matching discovery"):
-            down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
+        with held_realm_owner_lock(root):
+            with self.assertRaisesRegex(BootstrapError, "owner lock has no matching discovery"):
+                down(self.paths, self.boundary, stop_manager=lambda: calls.append("manager"))
         self.assertEqual(calls, [])
         self.assertTrue(self.paths.instance_lock_path.exists())
 
@@ -3021,8 +3035,9 @@ class StaleOwnerTests(unittest.TestCase):
         marker["process_birth_id"] = self.boundary.process_birth_identity(os.getpid())
         self.paths.instance_lock_path.write_text(json.dumps(marker))
         before = self.paths.instance_lock_path.read_bytes()
-        with self.assertRaises(DuplicateOwnerError):
-            bootstrap(self.paths, self.boundary, self.config)
+        with held_realm_owner_lock(Path(marker["realm_root"])):
+            with self.assertRaises(DuplicateOwnerError):
+                bootstrap(self.paths, self.boundary, self.config)
         self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
         self.assertEqual(len(self.boundary.starts), 1)
 
@@ -3084,21 +3099,22 @@ class StaleOwnerTests(unittest.TestCase):
         self.assertEqual(json.loads(self.paths.instance_lock_path.read_text()), replacement)
 
 
-def test_up_repairs_only_the_verified_healthy_owner_discovery():
+def test_missing_discovery_with_busy_healthy_owner_refuses():
     case = BootstrapTests()
     case.setUp()
     try:
-        case._configure()
-        first = bootstrap(case.paths, case.boundary, case.config)
-        before = case.paths.discovery_path.read_bytes()
+        root = case._configure()
+        bootstrap(case.paths, case.boundary, case.config)
+        before = case.paths.instance_lock_path.read_bytes()
         case.paths.discovery_path.unlink()
-        with pytest.raises(BootstrapError, match="no matching discovery"):
-            down(case.paths, case.boundary)
-        recovered = bootstrap(case.paths, case.boundary, case.config)
-        assert recovered.status == "reconnected"
-        assert recovered.runtime_instance_id == first.runtime_instance_id
+        with held_realm_owner_lock(root):
+            with pytest.raises(BootstrapError, match="no matching discovery"):
+                down(case.paths, case.boundary)
+            with pytest.raises(DuplicateOwnerError):
+                bootstrap(case.paths, case.boundary, case.config)
         assert len(case.boundary.starts) == 1
-        assert case.paths.discovery_path.read_bytes() == before
+        assert not case.paths.discovery_path.exists()
+        assert case.paths.instance_lock_path.read_bytes() == before
     finally:
         case.tearDown()
         case.doCleanups()
@@ -3109,7 +3125,7 @@ def test_discovery_recovery_refuses_changed_owner_without_publication(changed):
     case = BootstrapTests()
     case.setUp()
     try:
-        case._configure()
+        root = case._configure()
         bootstrap(case.paths, case.boundary, case.config)
         case.paths.discovery_path.unlink()
         if changed == "health":
@@ -3124,12 +3140,136 @@ def test_discovery_recovery_refuses_changed_owner_without_publication(changed):
             marker["discovery"]["runtime_instance_id"] = "replacement"
             case.paths.instance_lock_path.write_text(json.dumps(marker))
         before = case.paths.instance_lock_path.read_bytes()
-        with pytest.raises(BootstrapError):
-            bootstrap(case.paths, case.boundary, case.config)
+        with held_realm_owner_lock(root):
+            with pytest.raises(BootstrapError):
+                bootstrap(case.paths, case.boundary, case.config)
         assert not case.paths.discovery_path.exists()
         assert case.paths.instance_lock_path.read_bytes() == before
         assert len(case.boundary.starts) == 1
         assert case.boundary.restart_calls == 0
     finally:
+        case.tearDown()
+        case.doCleanups()
+
+
+@pytest.mark.parametrize("operation", ["down", "up"])
+def test_lookahead_lock_only_free_owner_accepts_without_unlinking_marker(operation):
+    case = BootstrapTests()
+    case.setUp()
+    try:
+        root = case._configure()
+        lock = root / "owner.lock"
+        lock.write_bytes(b"R0 owner lock bytes\n")
+        marker = b'{"pid": 12345, "legacy": "R0"}\n'
+        case.paths.instance_lock_path.write_bytes(marker)
+        # PID observations cannot override a successfully acquired owner lock.
+        case.boundary.is_pid_alive = lambda _pid: True
+        if operation == "down":
+            calls = []
+            result = down(case.paths, case.boundary, stop_manager=lambda: calls.append("stop"))
+            assert result["status"] == "stopped"
+            assert calls == ["stop"]
+            assert case.paths.instance_lock_path.read_bytes() == marker
+            assert not case.paths.discovery_path.exists()
+        else:
+            result = bootstrap(case.paths, case.boundary, case.config)
+            assert result.status == "started"
+            assert len(case.boundary.starts) == 1
+            assert case.paths.discovery_path.exists()
+        assert lock.read_bytes() == b"R0 owner lock bytes\n"
+    finally:
+        case.tearDown()
+        case.doCleanups()
+
+
+@pytest.mark.parametrize("operation", ["down", "up"])
+@pytest.mark.parametrize("owner_state", ["busy", "missing", "unobservable"])
+def test_lookahead_lock_only_uncertain_owner_refuses_without_changes(operation, owner_state):
+    case = BootstrapTests()
+    case.setUp()
+    fd = None
+    try:
+        root = case._configure()
+        lock = root / "owner.lock"
+        lock.write_bytes(b"R0 owner lock bytes\n")
+        marker = b'{"pid": 12345, "legacy": "R0"}\n'
+        case.paths.instance_lock_path.write_bytes(marker)
+        user_data = root / "user-data"
+        user_data.write_bytes(b"user data\n")
+        if owner_state == "busy":
+            fd = os.open(lock, os.O_RDONLY)
+            bootstrap_module.runtime_platform.lock_file(fd, blocking=False)
+        elif owner_state == "missing":
+            lock.unlink()
+        else:
+            lock.unlink()
+            lock.symlink_to(user_data)
+        before_catalog = case.paths.catalog_path.read_bytes()
+        calls = []
+        with pytest.raises(BootstrapError):
+            if operation == "down":
+                down(case.paths, case.boundary, stop_manager=lambda: calls.append("stop"))
+            else:
+                bootstrap(case.paths, case.boundary, case.config)
+        assert calls == []
+        assert case.boundary.starts == []
+        assert case.paths.instance_lock_path.read_bytes() == marker
+        assert not case.paths.discovery_path.exists()
+        assert case.paths.catalog_path.read_bytes() == before_catalog
+        assert user_data.read_bytes() == b"user data\n"
+        if owner_state == "busy":
+            assert lock.read_bytes() == b"R0 owner lock bytes\n"
+        elif owner_state == "missing":
+            assert not lock.exists()
+        else:
+            assert lock.is_symlink()
+    finally:
+        if fd is not None:
+            bootstrap_module.runtime_platform.unlock_file(fd)
+            os.close(fd)
+        case.tearDown()
+        case.doCleanups()
+
+
+@pytest.mark.parametrize("operation", ["down", "up"])
+def test_lookahead_rechecks_owner_lock_before_acting(operation):
+    case = BootstrapTests()
+    case.setUp()
+    fd = None
+    try:
+        root = case._configure()
+        lock = root / "owner.lock"
+        lock.write_bytes(b"R0 lock bytes\n")
+        marker = b'{"pid": 12345, "legacy": "R0"}\n'
+        case.paths.instance_lock_path.write_bytes(marker)
+        original = bootstrap_module._realm_owner_present
+        observations = []
+
+        def owner_arrives_after_first_probe(realm_root, **kwargs):
+            nonlocal fd
+            result = original(realm_root, **kwargs)
+            observations.append(result)
+            if len(observations) == 1:
+                fd = os.open(lock, os.O_RDONLY)
+                bootstrap_module.runtime_platform.lock_file(fd, blocking=False)
+            return result
+
+        calls = []
+        with patch.object(bootstrap_module, "_realm_owner_present", owner_arrives_after_first_probe):
+            with pytest.raises(BootstrapError):
+                if operation == "down":
+                    down(case.paths, case.boundary, stop_manager=lambda: calls.append("stop"))
+                else:
+                    bootstrap(case.paths, case.boundary, case.config)
+        assert observations[:2] == [False, True]
+        assert calls == []
+        assert case.boundary.starts == []
+        assert case.paths.instance_lock_path.read_bytes() == marker
+        assert not case.paths.discovery_path.exists()
+        assert lock.read_bytes() == b"R0 lock bytes\n"
+    finally:
+        if fd is not None:
+            bootstrap_module.runtime_platform.unlock_file(fd)
+            os.close(fd)
         case.tearDown()
         case.doCleanups()

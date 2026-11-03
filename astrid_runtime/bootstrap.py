@@ -637,11 +637,15 @@ def _pid_alive(boundary: RuntimeBoundary | None, pid: Any) -> bool:
         raise BootstrapError("Runtime liveness observation remains uncertain.") from exc
 
 
-def _realm_owner_present(root: Path) -> bool:
+def _realm_owner_present(root: Path, *, require_lock_file: bool = False) -> bool:
     """Observe the lifetime lock independently of the caller's PID namespace."""
+    if require_lock_file and (root / "owner.lock").is_symlink():
+        raise BootstrapError("Runtime realm ownership could not be established.")
     try:
         fd = os.open(root / "owner.lock", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
+        if require_lock_file:
+            raise BootstrapError("Runtime realm ownership could not be established.") from None
         return False
     except OSError as exc:
         raise BootstrapError("Runtime realm ownership could not be established.") from exc
@@ -1048,36 +1052,13 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     diagnostics: list[str] = []
 
     marker = _read_support_json(paths.instance_lock_path)
-    if (marker is not None and marker.get("state") is None
-            and _read_support_json(paths.discovery_path) is None
-            and isinstance(marker.get("discovery"), Mapping)):
-        recovery = marker["discovery"]
+    stale_lock_only = (marker is not None and marker.get("state") is None
+                       and _read_support_json(paths.discovery_path) is None)
+    if stale_lock_only:
         realm_root = _canonical_realm_root(str(realm["data_root"]))
-        pid, birth, instance_id, endpoint = _recorded_owner_identity(
-            recovery, realm_id=str(realm["realm_id"]), realm_root=realm_root,
-        )
-        if _owner_may_be_alive(boundary, marker):
-            _compatible(recovery, config, source)
-            if (not _lock_matches(paths, pid, instance_id, str(realm["realm_id"]), birth, realm_root)
-                    or not boundary.validate_owner(
-                        endpoint=endpoint, pid=pid, instance_id=instance_id,
-                        owner_lock=paths.instance_lock_path, process_birth_id=birth,
-                        expected_realm_id=str(realm["realm_id"]), expected_realm_root=realm_root)
-                    or not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id)):
-                raise DuplicateOwnerError("Runtime discovery recovery refused: live owner identity is unverified.")
-            _validated_matching_owner_identity(
-                boundary.owner_startup_identity(endpoint=endpoint, instance_id=instance_id),
-                instance_id=instance_id, requested_identity=requested_identity,
-            )
-            _validate_stop_endpoint(
-                paths, boundary, owner=(pid, birth, instance_id, endpoint),
-                realm_id=str(realm["realm_id"]), realm_root=realm_root,
-            )
-            if (_read_support_json(paths.instance_lock_path) != marker
-                    or _read_support_json(paths.discovery_path) is not None):
-                raise BootstrapError("Runtime owner changed during discovery recovery.")
-            atomic_write_json(paths.discovery_path, dict(recovery))
-    if marker is None or marker.get("state") is None:
+        if _realm_owner_present(realm_root, require_lock_file=True):
+            raise DuplicateOwnerError("Runtime realm owner is still active; refusing start.")
+    if not stale_lock_only and (marker is None or marker.get("state") is None):
         _reclaim_stale_owner_locked(paths, boundary)
     discovery = _read_support_json(paths.discovery_path)
     if discovery is not None and discovery.get("active_realm"):
@@ -1156,8 +1137,8 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     # ephemeral discovery write (or discovery may have been manually removed).
     # Never start a second owner while the durable instance lock still points
     # at a live process.
-    marker = _read_support_json(paths.instance_lock_path)
-    if marker and _owner_may_be_alive(boundary, marker):
+    current_marker = _read_support_json(paths.instance_lock_path)
+    if current_marker and not stale_lock_only and _owner_may_be_alive(boundary, current_marker):
         raise DuplicateOwnerError(
             "A different runtime owner is active for the selected realm; "
             "stop it before retrying astrid-runtime up --profile astrid."
@@ -1165,6 +1146,12 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
 
     realm_id = str(realm["realm_id"])
     realm_root = _canonical_realm_root(str(realm["data_root"]))
+    if stale_lock_only:
+        if (current_marker != marker
+                or _read_support_json(paths.discovery_path) is not None):
+            raise BootstrapError("Runtime owner changed before start.")
+        if _realm_owner_present(realm_root, require_lock_file=True):
+            raise DuplicateOwnerError("Runtime realm owner is still active; refusing start.")
     configure = getattr(boundary, "configure_source", None)
     if configure is not None:
         configure(source)
@@ -1869,13 +1856,15 @@ def _fenced_stop_and_manager(
     allow_missing_realm: bool = False,
     completed_stop_binding: Mapping[str, Any] | None = None,
     retained_completed_stop: Mapping[str, Any] | None = None,
+    preserve_stale_marker: bool = False,
 ) -> dict[str, Any]:
     """Stop an admitted owner and its manager while the caller holds the mutex."""
     try:
         fence = (nullcontext({"safe": True, "realm_absent": True})
                  if allow_missing_realm else interruption_fence(realm_root))
         with fence as final_report:
-            if owner is None and not allow_missing_realm and _realm_owner_present(realm_root):
+            if (owner is None and not allow_missing_realm
+                    and _realm_owner_present(realm_root, require_lock_file=preserve_stale_marker)):
                 raise BootstrapError(
                     "Runtime interruption refused: the realm owner is still active; "
                     "run astrid-runtime up --profile astrid to recover discovery."
@@ -2074,7 +2063,7 @@ def _fenced_stop_and_manager(
                         "binding": dict(retained_completed_stop["binding"]),
                     },
                 })
-        elif current_marker is not None:
+        elif current_marker is not None and not preserve_stale_marker:
             remove_file(paths.instance_lock_path)
     return {"status": "stopped", "realm_id": realm_id,
             "runtime": stopped, "interruption": final_report}
@@ -2381,6 +2370,7 @@ def _interrupt_owner_locked(
     stale_owner_identity = None
     retained_completed_stop = None
     reused_owner = False
+    stale_lock_only = False
     if discovery is None and marker is not None and marker.get("state") == "completed_stop":
         if pinokio_binding is None:
             _durable_remove(paths.instance_lock_path)
@@ -2439,7 +2429,13 @@ def _interrupt_owner_locked(
                 raise _pinokio_stop_refusal("Runtime Pinokio stopping-marker binding changed; refusing interruption.")
             retained_completed_stop = {**stopping, "binding": dict(recorded_binding)}
     elif discovery is None and marker is not None:
-        raise BootstrapError("Runtime interruption refused: owner lock has no matching discovery.")
+        if marker.get("state") is not None:
+            raise BootstrapError("Runtime interruption refused: unknown owner marker state.")
+        if pinokio_binding is not None:
+            raise _pinokio_stop_refusal("Runtime Pinokio interruption refused: no owner or completed-stop evidence.")
+        if _realm_owner_present(realm_root, require_lock_file=True):
+            raise BootstrapError("Runtime interruption refused: the realm owner is still active.")
+        stale_lock_only = True
     elif discovery is None and marker is None and pinokio_binding is not None:
         raise _pinokio_stop_refusal("Runtime Pinokio interruption refused: no owner or completed-stop evidence.")
     if discovery is not None:
@@ -2466,7 +2462,7 @@ def _interrupt_owner_locked(
             )
             if owner is None:
                 stale_owner_identity = (stale_pid, stale_birth)
-    elif (marker is not None and retained_completed_stop is None
+    elif (marker is not None and not stale_lock_only and retained_completed_stop is None
           and stale_owner_identity is None):
         raise BootstrapError("Runtime interruption refused: owner lock identity is incomplete.")
 
@@ -2528,6 +2524,7 @@ def _interrupt_owner_locked(
         stale_owner_identity=stale_owner_identity,
         completed_stop_binding=pinokio_binding if owner is not None else None,
         retained_completed_stop=retained_completed_stop,
+        preserve_stale_marker=stale_lock_only,
         validate_stop=validate_stop_context if pinokio_binding is not None or reused_owner else None,
     )
     return {"status": "stopped", "realm_id": str(realm["realm_id"]),
@@ -2559,13 +2556,11 @@ def _preflight_owner_interruption(
     elif discovery is None and marker is not None:
         if marker.get("state") not in ("completed_stop", "stopping"):
             _realm, realm_root = _selected_stop_realm(paths)
-            active = _realm_owner_present(realm_root)
-            raise BootstrapError(
-                "Runtime interruption refused: owner lock has no matching discovery. "
-                + ("The realm owner is still active. " if active else "")
-                + "Run astrid-runtime up --profile astrid to recover discovery.",
-                details={"safe": False, "owner_active": active},
-            )
+            if _realm_owner_present(realm_root, require_lock_file=True):
+                raise BootstrapError(
+                    "Runtime interruption refused: owner lock has no matching discovery. The realm owner is still active.",
+                    details={"safe": False, "owner_active": True},
+                )
     elif discovery is not None and marker is None:
         raise BootstrapError("Runtime interruption refused: owner lock does not match discovery.")
     elif discovery is None and marker is None and restore_selection is None:
