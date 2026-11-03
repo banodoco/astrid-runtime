@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from astrid_runtime import lifecycle_transfer_broker as transport
+from runtime_protocol import lifecycle_transfer_transport as transport
 from test_lifecycle_transfer_session import contender, fixture
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED") or not os.path.exists("/proc/self/cgroup"), reason="Linux only")

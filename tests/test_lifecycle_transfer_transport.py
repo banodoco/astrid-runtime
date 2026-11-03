@@ -8,7 +8,7 @@ import stat
 
 import pytest
 
-from astrid_runtime import lifecycle_transfer_broker as transport
+from runtime_protocol import lifecycle_transfer_transport as transport
 
 pytestmark = pytest.mark.skipif(os.name != "posix" or not os.path.exists("/proc/self/cgroup"), reason="Linux native peer credentials required")
 CAP = "a" * 64
@@ -208,3 +208,39 @@ def test_extra_or_truncated_rights_are_all_closed(tmp_path, count):
         left.close()
         right.close()
         os.close(fd)
+
+
+@pytest.mark.parametrize("changed", ["parent", "socket", "mode"])
+def test_pinned_endpoint_rejects_replacement_without_unlinking_it(tmp_path, changed):
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    path = parent / "socket"
+    listener = transport.listen(path)
+    try:
+        if changed == "parent":
+            parent.rename(tmp_path / "original")
+            parent.mkdir(mode=0o700)
+            path.write_text("replacement")
+        elif changed == "socket":
+            path.rename(parent / "original-socket")
+            path.write_text("replacement")
+        else:
+            path.chmod(0o666)
+        with pytest.raises(transport.TransferError):
+            listener.check()
+    finally:
+        listener.close()
+    assert path.exists()
+    if changed != "mode":
+        assert path.read_text() == "replacement"
+
+
+def test_private_endpoint_refuses_symlink_ancestor(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    (private / "nested").mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(private, target_is_directory=True)
+    with pytest.raises(OSError):
+        transport.listen(alias / "nested" / "socket")
+    assert not (private / "nested" / "socket").exists()

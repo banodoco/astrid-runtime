@@ -17,15 +17,19 @@ import socket
 import struct
 import threading
 import time
+import weakref
 
 from astrid_runtime._realm_fence import FenceUnavailable
 from astrid_runtime import lifecycle_transfer_broker as transport
+from runtime_protocol.lifecycle_transfer_transport import PrivateListener
 
 _VERSION = "astrid.provisional-control/v1"
 _MAX = 16 * 1024
 _TIMEOUT = 10.0
 _FIELDS = {"version", "capability", "operation_id", "generation", "binding_digest",
            "request_id", "expected_phase", "sequence", "action", "target_phase"}
+_CONTROLS = weakref.WeakKeyDictionary()
+_CONTROLS_LOCK = threading.Lock()
 
 
 def _unique(pairs):
@@ -54,6 +58,9 @@ class ProvisionalControl:
     as refusals by the existing durable session ledger.
     """
 
+    version = _VERSION
+    fields = _FIELDS
+
     def __init__(self, path, *, session, binding, controller, capability):
         if (not transport._hex(capability) or controller.uid != os.geteuid()
                 or type(binding) is not dict):
@@ -74,10 +81,16 @@ class ProvisionalControl:
         self._pid = os.getpid()
         self._serving = threading.Lock()
         self._listener = None
+        self._unavailable = False
         # Acquire the actual provisional locks before advertising the endpoint.
         # This does not admit a stopped owner or authorize a writer.
         session.pin_and_acquire_original().revalidate()
-        self._listener = transport.listen(Path(path))
+        with _CONTROLS_LOCK:
+            if session in _CONTROLS:
+                raise transport.TransferError("controller already bound to session")
+            # Never let close/disconnect create a new controller lifetime.
+            _CONTROLS[session] = True
+        self._listener = PrivateListener(Path(path))
 
     def close(self):
         if os.getpid() != self._pid:
@@ -103,42 +116,66 @@ class ProvisionalControl:
         finally:
             self._serving.release()
 
+    def serve_forever(self, stop):
+        """Run in the custody-holder process until its owner requests a stop.
+
+        Peer errors never terminate custody. Stopping this loop closes no locks
+        and is not a release, detach, or terminal lifecycle decision.
+        """
+        while not stop.is_set():
+            if self._unavailable:
+                stop.wait(0.1)
+                continue
+            try:
+                self.serve_once(timeout=0.1)
+            except (OSError, ValueError, FenceUnavailable, transport.TransferError):
+                # A replaced endpoint must not unwind the holder's session and
+                # close its original locks. Keep custody for explicit recovery.
+                self._unavailable = True
+
     def _serve_once(self, timeout):
         if os.getpid() != self._pid or self._listener is None:
             raise transport.TransferError("control unavailable")
+        self._listener.check()
         ready, _, _ = select.select([self._listener], [], [], timeout)
         if not ready:
             return False
         conn, _ = self._listener.accept()
         try:
+            self._deadline = time.monotonic() + _TIMEOUT
             transport._authenticate(conn, self._controller)
-            request = self._receive(conn)
+            request = self._receive(conn, deadline=self._deadline)
             transport._authenticate(conn, self._controller)
             result = self._dispatch(request)
             data = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
             if len(data) > _MAX:
                 raise transport.TransferError("control reply too large")
-            conn.settimeout(_TIMEOUT)
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise transport.TransferError("control deadline")
+            conn.settimeout(remaining)
             conn.sendall(struct.pack("!I", len(data)) + data)
-        except (OSError, ValueError, TypeError, UnicodeError, FenceUnavailable, transport.TransferError):
+        except (OSError, ValueError, TypeError, UnicodeError, RecursionError,
+                FenceUnavailable, transport.TransferError):
             # Invalid, disconnected and uncertain requests get no positive reply.
             pass
         finally:
             conn.close()
         return True
 
-    def _receive(self, conn):
+    def _receive(self, conn, *, listener=None, deadline=None):
         data = bytearray()
-        deadline = time.monotonic() + _TIMEOUT
+        deadline = time.monotonic() + _TIMEOUT if deadline is None else deadline
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise transport.TransferError("control deadline")
-            readable, _, _ = select.select([self._listener, conn], [], [], remaining)
+            active = self._listener if listener is None else listener
+            readable, _, _ = select.select([active, conn], [], [], remaining)
             if not readable:
                 raise transport.TransferError("control deadline")
-            if self._listener in readable:
-                extra, _ = self._listener.accept()
+            if active in readable:
+                extra, _ = active.accept()
                 extra.close()
             if conn not in readable:
                 continue
@@ -158,19 +195,24 @@ class ProvisionalControl:
         if len(data) < 5 or struct.unpack("!I", data[:4])[0] != len(data) - 4:
             raise transport.TransferError("incomplete control frame")
         value = json.loads(data[4:].decode("utf-8"), object_pairs_hook=_unique)
-        if type(value) is not dict or set(value) != _FIELDS:
+        if type(value) is not dict or set(value) != self.fields:
             raise transport.TransferError("invalid control fields")
         return value
 
-    def _dispatch(self, req):
-        if (req["version"] != _VERSION or type(req["capability"]) is not str
+    def _validate(self, req):
+        if (req["version"] != self.version or not transport._hex(req["capability"])
                 or not hmac.compare_digest(req["capability"], self._capability)
                 or req["operation_id"] != self._operation or req["generation"] != self._generation
                 or req["binding_digest"] != self._session.binding_digest
                 or type(req["sequence"]) is not int or req["sequence"] < 1
-                or type(req["request_id"]) is not str or not req["request_id"]
-                or type(req["expected_phase"]) is not str or type(req["target_phase"]) is not str):
+                or type(req["request_id"]) is not str or not 0 < len(req["request_id"]) <= 256
+                or type(req["action"]) is not str
+                or type(req["expected_phase"]) is not str or not 0 < len(req["expected_phase"]) <= 256
+                or type(req["target_phase"]) is not str or len(req["target_phase"]) > 256):
             raise transport.TransferError("control binding differs")
+
+    def _dispatch(self, req):
+        self._validate(req)
         self._session.pin_and_acquire_original().revalidate()
         status = self._session.query()
         if req["action"] == "query":
