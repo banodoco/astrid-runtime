@@ -11,7 +11,12 @@ on:
         type: string
 
 jobs:
+  p19-nonroot:
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/p19-nonroot.yml
+
   integration:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent

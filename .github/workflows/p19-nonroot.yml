@@ -2,6 +2,7 @@ name: P19 non-root focused executor
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
