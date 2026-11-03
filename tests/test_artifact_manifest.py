@@ -28,6 +28,15 @@ def test_release_manifest_contains_only_public_client_packages() -> None:
     assert not any(path.startswith(("clients/", "conformance/typescript/")) for path in artifacts)
 
 
+def test_artifact_manifest_binds_generated_timeline_editing_clients() -> None:
+    artifacts = artifact_manifest.build()["artifacts"]
+    assert "contract/openapi/workspace-v1.yaml" in artifacts
+    assert "packages/typescript/src/generated.ts" in artifacts
+    assert "packages/typescript/src/contract-metadata.ts" in artifacts
+    assert "packages/python/astrid_runtime_client/generated.py" in artifacts
+    assert "packages/python/astrid_runtime_client/contract_metadata.py" in artifacts
+
+
 def test_planted_one_byte_change_is_detected_and_named(tmp_path: Path) -> None:
     for relative in SAMPLE:
         target = tmp_path / relative

@@ -105,3 +105,20 @@ def test_typescript_generator_check_rejects_source_symlink_escapes(tmp_path: Pat
             result = subprocess.run(check, capture_output=True, text=True)
             assert result.returncode != 0
             assert "symlink" in result.stderr
+
+
+def test_timeline_editing_operations_are_in_the_canonical_typescript_projection() -> None:
+    from generators.generate import operation_index, validate_typescript_client
+
+    root = Path(__file__).parents[1]
+    operations = operation_index()
+    assert "updateTimelineEditing" in operations
+    assert "releaseTimelineEditing" in operations
+
+    source = (root / "packages/typescript/src/generated.ts").read_text()
+    assert "export interface TimelineEditingRequest" in source
+    assert "export interface TimelineEditingRelease" in source
+    assert "export interface TimelineEditingResponse" in source
+    assert "async updateTimelineEditing(projectId: string, timelineId: string, body: TimelineEditingRequest)" in source
+    assert "async releaseTimelineEditing(projectId: string, timelineId: string, body: TimelineEditingRelease)" in source
+    validate_typescript_client()

@@ -5288,14 +5288,30 @@ strictly increasing positive safe-integer sequence for that tab-session. Repeate
 or older sequences report the current state without extending or clearing it.
 A new tab-session ID must be unique for the lifetime of the Runtime process.
 
+For connected editing, the client admits a user mutation only after the initial
+lease `PUT` is acknowledged and it has reloaded and reconciled the canonical
+timeline head. Input intent captured while admission is pending must be retained
+and applied against that reconciled head; it must not mutate the editable draft
+before admission completes. An Agent publication accepted before the lease
+acknowledgement is therefore included in the reconciled basis. After the lease
+acknowledgement, the serialized acceptance check below prevents a new publication
+from crossing the live edit. A client that cannot complete acquisition and
+reconciliation must keep the captured intent pending. This is an online client
+ordering rule; the Runtime lease itself does not preserve unsaved edits across a
+Runtime restart or a period without connectivity.
+
 The owner key is project, timeline, authenticated actor, and tab-session. Any
 live lease gates publication, regardless of which user/tab owns it. A release
 cannot clear another actor or tab. Sequence fences survive release and expiry
 in memory, preventing delayed heartbeats from resurrecting a released lease;
-they disappear together with leases when Runtime restarts. Expiry, suspension,
-failed requests, and the interval before acknowledgement leave unsaved work
-unprotected. This mechanism supports one owning Runtime process, not strict
-offline priority or restart persistence.
+they disappear together with leases when Runtime restarts. Expiry, suspension
+and failed requests can leave unsaved work unprotected. The client tracks one
+ownership generation for a continuous acquisition: renewal requests advance the
+sequence within that generation, and a successful response remains a usable
+acknowledgement even if a later renewal has already been sent. Release or owner
+replacement ends that generation and fences its late responses; it cannot
+reactivate the released or replaced lease. This mechanism supports one owning
+Runtime process, not strict offline priority or restart persistence.
 
 A fresh publishing commit under a lease returns the normal soft HTTP 409 error:
 `code=conflict`, `details.status=refused`, `reason=user_editing`, with the original

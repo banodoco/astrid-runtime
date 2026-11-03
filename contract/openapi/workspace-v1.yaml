@@ -346,6 +346,7 @@ paths:
       responses: { '200': { description: Deterministic metadata-only Markdown/PNG view, content: { application/json: { schema: { $ref: './schemas/timeline-view.json' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/timelines/{timeline_id}/editing:
     put:
+      operationId: updateTimelineEditing
       description: Acknowledge an actor/tab editing lease before beginning local edits. Requires projects:write. Server monotonic TTL is capped at 10 seconds. Increase sequence for every renewal or release; duplicate/stale messages do not extend the lease. Cooperative App attribution on commits is not authenticated authority.
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineEditingRequest' } } } }
@@ -354,6 +355,7 @@ paths:
         '401': { description: Authenticated projects write scope required }
         '404': { $ref: '#/components/responses/NotFound' }
     delete:
+      operationId: releaseTimelineEditing
       description: Release only this authenticated actor/tab lease. A higher sequence fences delayed renewals for the lifetime of this Runtime process.
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineEditingRelease' } } } }
@@ -365,7 +367,7 @@ paths:
     post:
       operationId: commitTimeline
       description: Atomically validate and accept an edit batch; saving requires no renderer. Requires projects:write, including dry runs.
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: X-Timeline-Editing-Session, in: header, required: false, schema: { type: string }, description: Active authenticated actor/tab lease token. Attribution source.via alone grants no lease exemption. } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CommitRequest' } } } }
       responses:
         '200': { description: Accepted edit or nonpersistent preview, content: { application/json: { schema: { oneOf: [ { $ref: '#/components/schemas/CommitAcceptedMutation' }, { $ref: '#/components/schemas/CommitPreviewResponse' } ] } } } }

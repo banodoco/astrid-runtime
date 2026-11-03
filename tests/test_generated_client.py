@@ -238,6 +238,39 @@ def test_generated_client_smoke_and_scoped_handshake() -> None:
     assert calls[-1][2]["Idempotency-Key"] == "create-1"
 
 
+def test_timeline_editing_operations_are_generated_and_use_canonical_wire_routes():
+    from runtime_protocol.contract_metadata import OPERATIONS
+    from generators.generate import render_python_client
+
+    assert "updateTimelineEditing" in OPERATIONS
+    assert "releaseTimelineEditing" in OPERATIONS
+    root = Path(__file__).parents[1]
+    generated_source = root / "packages/python/astrid_runtime_client/generated.py"
+    assert generated_source.read_text() == render_python_client()
+    assert "class TimelineEditingRequest(TypedDict):" in generated_source.read_text()
+    assert "def update_timeline_editing(" in generated_source.read_text()
+    assert "def release_timeline_editing(" in generated_source.read_text()
+    calls = []
+    response = {"data": {"tab_session_id": "tab-1", "sequence": 7, "active": True, "expires_in_seconds": 10}}
+
+    def transport(method, path, headers, body):
+        calls.append((method, path, headers, body))
+        return 200, {}, json.dumps(response).encode()
+
+    client = WorkspaceClient("http://runtime", "token", transport=transport)
+    request = {"tab_session_id": "tab-1", "sequence": 7, "ttl_seconds": 10}
+    assert client.update_timeline_editing("project /1", "timeline ?", request) == response
+    release = {"tab_session_id": "tab-1", "sequence": 8}
+    assert client.release_timeline_editing("project /1", "timeline ?", release) == response
+
+    assert [(call[0], call[1]) for call in calls] == [
+        ("PUT", "/v1/projects/project%20%2F1/timelines/timeline%20%3F/editing"),
+        ("DELETE", "/v1/projects/project%20%2F1/timelines/timeline%20%3F/editing"),
+    ]
+    assert [json.loads(call[3]) for call in calls] == [request, release]
+    assert all(call[2]["Content-Type"] == "application/json" for call in calls)
+
+
 def test_connected_register_executor_response_uses_generated_capability_parser(tmp_path: Path) -> None:
     realm = tmp_path / "realm"
     RealmStore.initialize(realm).close()

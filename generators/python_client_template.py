@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from typing import Any, BinaryIO, Callable, Literal, Mapping
+from typing import Any, BinaryIO, Callable, Literal, Mapping, TypedDict, NotRequired
 from urllib.parse import urlsplit
 
 from .timeline_commit_types import CommitAcceptedMutation, CommitPreviewResponse, CommitRequest, DocumentPin, HistoryPage, MediaSelection, MediaSelectionQuery, VerifiedDocument, VerifiedDocumentObject, VerifiedMedia
@@ -39,6 +39,28 @@ def _urlopen_loopback(request: urllib.request.Request, *, timeout: float) -> Any
     _require_loopback(request.full_url)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LoopbackRedirects)
     return opener.open(request, timeout=timeout)
+
+
+class TimelineEditingRequest(TypedDict):
+    tab_session_id: str
+    sequence: int
+    ttl_seconds: NotRequired[float]
+
+
+class TimelineEditingRelease(TypedDict):
+    tab_session_id: str
+    sequence: int
+
+
+class TimelineEditingState(TypedDict):
+    tab_session_id: str
+    sequence: int
+    active: bool
+    expires_in_seconds: float
+
+
+class TimelineEditingResponse(TypedDict):
+    data: TimelineEditingState
 
 
 @dataclass(frozen=True)
@@ -855,6 +877,14 @@ class WorkspaceClient:
             result = MutationResult(value["data"], value["receipt"])
             return result
         return value
+
+    def update_timeline_editing(self, project_id: str, timeline_id: str, body: TimelineEditingRequest) -> TimelineEditingResponse:
+        """Acknowledge this actor/tab lease before reconciling and admitting edits."""
+        return self._json(self._request("PUT", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/editing", body=json.dumps(body, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+
+    def release_timeline_editing(self, project_id: str, timeline_id: str, body: TimelineEditingRelease) -> TimelineEditingResponse:
+        """Release only this owner; higher sequences fence delayed renewals."""
+        return self._json(self._request("DELETE", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/editing", body=json.dumps(body, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
 
     def rename_timeline(self, project_id: str, timeline_id: str, name: str, *, idempotency_key: str) -> MutationResult:
         return self._mutation_json(self._request("PATCH", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}", body=json.dumps({"name": name}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
