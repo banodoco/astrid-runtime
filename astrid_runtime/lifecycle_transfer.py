@@ -1,8 +1,13 @@
-"""Private, process-local provisional lifecycle transfer facade.
+"""Private provisional lifecycle transfer facade and observational ledger.
 
 Installation authority is a caller precondition. This module does not establish
-admission, native provenance, a writer, a durable ledger, or recovery authority.
+admission, native provenance, a writer, or recovery authority.
 """
+
+try:
+    import fcntl
+except ImportError:  # The facade still imports on unsupported platforms.
+    fcntl = None
 
 import hashlib
 import json
@@ -20,6 +25,11 @@ from ._transfer_session import ProvisionalTransferSession
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _MAX_SOURCE = 64 * 1024 * 1024
+_LEDGER = "lifecycle-transfer-ledger.json"
+_LEDGER_TEMP = ".lifecycle-transfer-ledger.tmp"
+_LEDGER_LIMIT = 128 * 1024
+_LEDGER_ENTRIES = 128
+_LEDGER_PHASE = "observed"
 
 
 def _closed(value, keys):
@@ -193,6 +203,8 @@ class TransferSession:
             # this provisional boundary cannot independently verify yet.
             encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
             self._binding_digest = hashlib.sha256(encoded).hexdigest()
+            self._operation_id = binding["operation_id"]
+            self._generation = binding["generation"]
             self._support = _path(str(paths.runtime_support))
             self._bootstrap = _path(str(paths.bootstrap_lock_path))
             if self._directories[3][0] != self._support or self._bootstrap != self._support / "bootstrap.lock":
@@ -258,6 +270,167 @@ class TransferSession:
             self._fence = ProvisionalFence(self)
             return self._fence
 
+    @property
+    def binding_digest(self):
+        """The commitment the caller must include in each ledger request."""
+        return self._binding_digest
+
+    def _ledger_directory(self):
+        fd = _open_directory(self._support)
+        try:
+            info = os.fstat(fd)
+            if (_identity(info) != self._directories[3][1] or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077):
+                raise FenceUnavailable("ledger support binding changed")
+            # Serialize cooperating readers/writers without creating a lock file.
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            current = _open_directory(self._support)
+            try:
+                if _identity(os.fstat(current)) != _identity(info):
+                    raise FenceUnavailable("ledger support binding changed")
+            finally:
+                os.close(current)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _verify_ledger_directory(self, directory):
+        held = os.fstat(directory)
+        current = _open_directory(self._support)
+        try:
+            if (_identity(os.fstat(current)) != _identity(held)
+                    or _identity(held) != self._directories[3][1]
+                    or held.st_uid != os.geteuid() or held.st_mode & 0o077):
+                raise FenceUnavailable("binding_changed")
+        finally:
+            os.close(current)
+
+    def _read_ledger(self, directory):
+        try:
+            os.stat(_LEDGER_TEMP, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FenceUnavailable("recovery_required: interrupted ledger write")
+        try:
+            fd = os.open(_LEDGER, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=directory)
+        except FileNotFoundError:
+            return None
+        try:
+            before = os.fstat(fd)
+            named = os.stat(_LEDGER, dir_fd=directory, follow_symlinks=False)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                    or before.st_mode & 0o077 or before.st_nlink != 1
+                    or _identity(before) != _identity(named) or before.st_size > _LEDGER_LIMIT):
+                raise FenceUnavailable("recovery_required: invalid ledger file")
+            data = b""
+            while len(data) <= _LEDGER_LIMIT:
+                block = os.read(fd, min(65536, _LEDGER_LIMIT + 1 - len(data)))
+                if not block:
+                    break
+                data += block
+            after = os.fstat(fd)
+            named_after = os.stat(_LEDGER, dir_fd=directory, follow_symlinks=False)
+            if (len(data) > _LEDGER_LIMIT or _identity(named_after) != _identity(before)
+                    or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                    != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                raise FenceUnavailable("recovery_required: ledger changed")
+            try:
+                ledger = json.loads(data)
+                if _encode_ledger(ledger) != data:
+                    raise ValueError("noncanonical ledger")
+                _validate_ledger(ledger)
+            except (ValueError, TypeError, KeyError, UnicodeError, RecursionError) as exc:
+                raise FenceUnavailable("recovery_required: invalid ledger") from exc
+            return ledger
+        finally:
+            os.close(fd)
+
+    def _check_ledger_binding(self, ledger):
+        if (ledger["operation_id"] != self._operation_id
+                or ledger["generation"] != self._generation
+                or ledger["binding_digest"] != self._binding_digest):
+            raise FenceUnavailable("binding_changed")
+
+    def query(self):
+        """Read recorded ledger facts only; this does not check native state or custody."""
+        with self._mutex:
+            self._check()
+            directory = None
+            try:
+                directory = self._ledger_directory()
+                ledger = self._read_ledger(directory)
+                if ledger is None:
+                    return {"phase": _LEDGER_PHASE, "requests": []}
+                self._check_ledger_binding(ledger)
+                return {"phase": _LEDGER_PHASE, "requests": ledger["requests"]}
+            except OSError as exc:
+                raise FenceUnavailable("recovery_required: ledger unavailable") from exc
+            finally:
+                if directory is not None:
+                    os.close(directory)
+
+    def record_request(self, *, operation_id, generation, request_id, expected_phase, binding_digest):
+        """Sequence a ledger-only request; no lifecycle action or authority is conferred."""
+        request = {"operation_id": operation_id, "generation": generation,
+                   "request_id": request_id, "expected_phase": expected_phase,
+                   "binding_digest": binding_digest}
+        _validate_request(request)
+        with self._mutex:
+            self._check()
+            directory = None
+            try:
+                self._revalidate_locked()
+                directory = self._ledger_directory()
+                ledger = self._read_ledger(directory)
+                if ledger is not None:
+                    # Check reused IDs before other envelope mismatches.
+                    for entry in ledger["requests"]:
+                        if entry["request"]["request_id"] == request_id:
+                            if entry["request"] != request:
+                                raise FenceUnavailable("binding_changed")
+                            self._check_ledger_binding(ledger)
+                            # A previous rename may have succeeded before a failed fsync.
+                            fd = os.open(_LEDGER, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                         dir_fd=directory)
+                            try:
+                                _sync_file(fd)
+                                os.fsync(directory)
+                            finally:
+                                os.close(fd)
+                            self._revalidate_locked()
+                            self._verify_ledger_directory(directory)
+                            return dict(entry["result"])
+                    self._check_ledger_binding(ledger)
+                if (operation_id != self._operation_id or generation != self._generation
+                        or binding_digest != self._binding_digest):
+                    raise FenceUnavailable("binding_changed")
+                if expected_phase != _LEDGER_PHASE:
+                    raise FenceUnavailable("stale_phase")
+                if ledger is None:
+                    ledger = {"version": 1, "operation_id": self._operation_id,
+                              "generation": self._generation, "binding_digest": self._binding_digest,
+                              "requests": []}
+                if len(ledger["requests"]) >= _LEDGER_ENTRIES:
+                    raise FenceUnavailable("recovery_required: ledger full")
+                result = {"code": "recorded", "stage": "ledger_only",
+                          "lifecycle_side_effect": False, "sequence": len(ledger["requests"]) + 1}
+                ledger["requests"].append({"request": request, "result": result})
+                data = _encode_ledger(ledger)
+                if len(data) > _LEDGER_LIMIT:
+                    raise FenceUnavailable("recovery_required: ledger full")
+                _write_ledger(directory, data)
+                self._revalidate_locked()
+                self._verify_ledger_directory(directory)
+                return dict(result)
+            except OSError as exc:
+                raise FenceUnavailable("durability_failed") from exc
+            finally:
+                if directory is not None:
+                    os.close(directory)
+
     def close(self):
         with self._mutex:
             if os.getpid() != self._pid:
@@ -284,3 +457,94 @@ class _Paths:
 def begin_transfer(paths, *, binding):
     """Create a session without acquiring realm write permission."""
     return TransferSession(paths, binding)
+
+
+def _encode_ledger(ledger):
+    return json.dumps(ledger, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def _validate_request(request):
+    _closed(request, ("operation_id", "generation", "request_id", "expected_phase", "binding_digest"))
+    for key in ("operation_id", "generation", "request_id", "expected_phase"):
+        value = _text(request[key])
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeError as exc:
+            raise FenceUnavailable("malformed ledger request") from exc
+        if size > 256:
+            raise FenceUnavailable("malformed ledger request")
+    _digest(request["binding_digest"])
+
+
+def _validate_ledger(ledger):
+    if type(ledger) is not dict or set(ledger) != {"version", "operation_id", "generation", "binding_digest", "requests"}:
+        raise ValueError("invalid ledger fields")
+    if type(ledger["version"]) is not int or ledger["version"] != 1 or type(ledger["requests"]) is not list or len(ledger["requests"]) > _LEDGER_ENTRIES:
+        raise ValueError("invalid ledger version or length")
+    seen = set()
+    for sequence, entry in enumerate(ledger["requests"], 1):
+        if type(entry) is not dict or set(entry) != {"request", "result"}:
+            raise ValueError("invalid ledger entry")
+        request = entry["request"]
+        try:
+            _validate_request(request)
+        except FenceUnavailable as exc:
+            raise ValueError("invalid request") from exc
+        if (request["request_id"] in seen or request["operation_id"] != ledger["operation_id"]
+                or request["generation"] != ledger["generation"]
+                or request["binding_digest"] != ledger["binding_digest"]
+                or request["expected_phase"] != _LEDGER_PHASE):
+            raise ValueError("inconsistent ledger request")
+        seen.add(request["request_id"])
+        result = entry["result"]
+        if (type(result) is not dict or set(result) != {"code", "stage", "lifecycle_side_effect", "sequence"}
+                or result["code"] != "recorded" or result["stage"] != "ledger_only"
+                or result["lifecycle_side_effect"] is not False
+                or type(result["sequence"]) is not int or result["sequence"] != sequence):
+            raise ValueError("invalid ledger result")
+    if not ledger["requests"]:
+        raise ValueError("empty ledger")
+
+
+def _sync_file(fd):
+    # macOS fsync alone need not flush hardware caches. Refuse if full sync is
+    # unavailable rather than acknowledge a weaker persistence guarantee.
+    if sys.platform == "darwin":
+        full_sync = getattr(fcntl, "F_FULLFSYNC", None)
+        if full_sync is None:
+            raise OSError("full file sync unavailable")
+        fcntl.fcntl(fd, full_sync)
+    else:
+        os.fsync(fd)
+
+
+def _write_ledger(directory, data):
+    # An interrupted temporary file blocks later writes until recovery; it is
+    # never overwritten, and repeated crashes cannot accumulate unbounded files.
+    name = _LEDGER_TEMP
+    fd = None
+    created = False
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=directory)
+        created = True
+        os.fchmod(fd, 0o600)
+        offset = 0
+        while offset < len(data):
+            written = os.write(fd, data[offset:])
+            if written <= 0:
+                raise OSError("short ledger write")
+            offset += written
+        _sync_file(fd)
+        os.close(fd)
+        fd = None
+        os.replace(name, _LEDGER, src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if created:
+            try:
+                os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
