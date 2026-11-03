@@ -16,6 +16,8 @@ import re
 import stat
 import sys
 import threading
+import time
+from enum import Enum
 from pathlib import Path
 
 from ._realm_fence import FenceUnavailable, _identity, _open_directory
@@ -31,6 +33,7 @@ _LEDGER_LIMIT = 128 * 1024
 _LEDGER_ENTRIES = 128
 _LEDGER_PHASE = "observed"
 _RECOVERY = "recovery_required"
+_EVIDENCE_DEADLINE_NS = 10_000_000_000
 _RECOVERY_REASONS = frozenset(("unknown_identity", "binding_changed", "incomplete_census",
                                "restart_unfenced", "lease_uncertain", "durability_failed",
                                "recovery_required"))
@@ -195,6 +198,19 @@ class ProvisionalFence:
         self._session._revalidate()
 
 
+class PreWriterPhase(Enum):
+    PREPARED = "prepared"
+    HELD_PROVISIONAL = "held_provisional"
+    RESTART_FENCED = "restart_fenced"
+    HELD_ADMITTED = "held_admitted"
+
+
+class PreWriterEvidence:
+    """Opaque, single-use local observation; never complete admission proof."""
+
+    __slots__ = ()
+
+
 class TransferSession:
     """Own the R2 fence until close; no descriptor aliases are exported."""
 
@@ -221,6 +237,7 @@ class TransferSession:
         self._fence = None
         self._closed = False
         self._poisoned = False
+        self._pre_writer_observation = None
 
     def _check(self):
         if self._closed or self._poisoned or os.getpid() != self._pid:
@@ -405,6 +422,85 @@ class TransferSession:
                    "target_phase": target_phase}
         return self._record(request)
 
+    def observe_pre_writer(self, *, provisional, target, operation_id, generation,
+                           request_id, expected_phase, binding_digest, sequence):
+        """Capture only locally verifiable custody, bound to one request.
+
+        This is deliberately incomplete evidence. It does not assert installation
+        authority, native absence or suppression. A new observation replaces any
+        outstanding observation from this session.
+        """
+        if type(target) is not PreWriterPhase or type(sequence) is not int or sequence < 0:
+            raise FenceUnavailable("unsupported_transfer")
+        request = {"operation_id": operation_id, "generation": generation,
+                   "request_id": request_id, "expected_phase": expected_phase,
+                   "binding_digest": binding_digest, "action": "transition",
+                   "target_phase": target.value}
+        _validate_request(request)
+        with self._mutex:
+            self._check()
+            self._pre_writer_observation = None
+            if provisional is not self._fence or self._custody is None:
+                raise FenceUnavailable("provisional fence not retained by session")
+            self._revalidate_locked()
+            evidence = PreWriterEvidence()
+            self._pre_writer_observation = (evidence, request, sequence, time.monotonic_ns())
+            return evidence
+
+    def transition_pre_writer(self, *, evidence):
+        """Consume local evidence and refuse until the missing R18 proofs exist.
+
+        No failed request is appended to the ledger. The legacy ledger remains
+        queryable and its request IDs cannot be repurposed by this API.
+        """
+        with self._mutex:
+            self._check()
+            observation = self._pre_writer_observation
+            self._pre_writer_observation = None
+            if (type(evidence) is not PreWriterEvidence or observation is None
+                    or evidence is not observation[0]):
+                raise FenceUnavailable("unknown_identity: invalid or consumed evidence")
+            _, request, sequence, observed_ns = observation
+            now = time.monotonic_ns()
+            if now < observed_ns or now - observed_ns > _EVIDENCE_DEADLINE_NS:
+                raise FenceUnavailable("unknown_identity: expired evidence")
+            directory = None
+            try:
+                if self._custody is None or self._fence is None:
+                    raise FenceUnavailable("unknown_identity: fence not retained")
+                self._revalidate_locked()
+                directory = self._ledger_directory()
+                ledger = self._read_ledger(directory)
+                if ledger is not None:
+                    self._check_ledger_binding(ledger)
+                    if any(e["request"]["request_id"] == request["request_id"]
+                           for e in ledger["requests"]):
+                        raise FenceUnavailable("binding_changed: request ID already used")
+                if (request["operation_id"] != self._operation_id
+                        or request["generation"] != self._generation
+                        or request["binding_digest"] != self._binding_digest):
+                    raise FenceUnavailable("binding_changed")
+                current_sequence = len(ledger["requests"]) if ledger else 0
+                if sequence != current_sequence:
+                    raise FenceUnavailable("stale_sequence")
+                phase = _ledger_phase(ledger) if ledger else _LEDGER_PHASE
+                predecessors = {"prepared": "observed", "held_provisional": "prepared",
+                                "restart_fenced": "held_provisional",
+                                "held_admitted": "restart_fenced"}
+                if request["expected_phase"] != phase or predecessors[request["target_phase"]] != phase:
+                    raise FenceUnavailable("stale_phase")
+                # A held local lock and matching caller claims cannot establish
+                # installation authority, durable journal preimages, a complete
+                # native census, or an effective restart fence.
+                raise FenceUnavailable("unsupported_transfer: authenticated installation authority, "
+                                       "durable journal preimages and fresh native work/census "
+                                       "verification unavailable")
+            except OSError as exc:
+                raise FenceUnavailable("recovery_required: ledger unavailable") from exc
+            finally:
+                if directory is not None:
+                    os.close(directory)
+
     def _record(self, request):
         _validate_request(request)
         operation_id = request["operation_id"]
@@ -474,6 +570,7 @@ class TransferSession:
             if os.getpid() != self._pid:
                 raise FenceUnavailable("transfer session belongs to another process")
             self._closed = True
+            self._pre_writer_observation = None
             if self._custody is not None:
                 custody, self._custody = self._custody, None
                 custody.close()
