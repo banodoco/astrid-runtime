@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       agent_sha:
-        description: Full immutable Agent commit SHA (empty uses fixture pin)
+        description: Full immutable Agent commit SHA (empty uses published b54117c9312165e2799554ec27480665d5cad2b1 for unit; fixture pin for portability)
         required: false
         type: string
 
@@ -77,7 +77,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: banodoco/astrid-agent
-          ref: 003eede5d8e69e4a778534a1fb4562680e21122c
+          ref: ${{ inputs.agent_sha || 'b54117c9312165e2799554ec27480665d5cad2b1' }}
           path: astrid-agent
       - name: Restore pip cache (C-08)
         id: c08-runtime-ci-4
