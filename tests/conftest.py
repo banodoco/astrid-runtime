@@ -5,12 +5,13 @@ import os
 import signal
 import subprocess
 import sys
+import sysconfig
 import time
 from pathlib import Path
 
 import pytest
 
-from tests.astrid_checkout import astrid_importable  # noqa: F401  (fixture)
+from tests.astrid_checkout import astrid_checkout, astrid_importable  # noqa: F401  (fixture)
 from tests.lanes import pytest_collection_modifyitems, pytest_configure  # noqa: F401  (lanes)
 from tests.process_groups import ProcessGroups
 
@@ -144,7 +145,7 @@ def _group_exists(pgid: int) -> bool:
 
 @pytest.fixture(scope="session")
 def stage1_runtime_environment(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """One offline venv containing both installed runtime packages.
+    """One offline venv containing the runtime and any selected Agent source.
 
     Local wheels are built with the running interpreter (the `test` extra
     pins setuptools>=70.1, which ships bdist_wheel), then installed into the
@@ -212,4 +213,26 @@ def stage1_runtime_environment(tmp_path_factory: pytest.TempPathFactory) -> Path
         [str(pip), "install", "--no-index", "--no-deps", "--force-reinstall", *(str(wheel) for wheel in wheels)],
         check=True,
     )
+    # The astrid profile selects the Agent's commit provider. Add the
+    # declared checkout to the isolated venv, rather than relying on the
+    # parent interpreter's editable install or PYTHONPATH. Neutral stage1
+    # tests can still run without an Agent checkout; selecting the astrid
+    # profile in that environment must fail rather than use an ambient one.
+    if os.environ.get("ASTRID_CHECKOUT") or (root.parent / "astrid").exists():
+        agent = astrid_checkout()
+        if not (agent / "astrid" / "sdk" / "timeline" / "commit.py").is_file():
+            raise AssertionError(f"Astrid checkout has no timeline commit provider: {agent}")
+        python = environment / scripts / ("python.exe" if os.name == "nt" else "python")
+        site_packages = Path(subprocess.check_output(
+            [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            text=True,
+        ).strip())
+        # Agent code also reads checkout-root metadata, so retain that layout.
+        # Its dependencies are supplied by the prepared test interpreter,
+        # just as they are for astrid_importable. The selected checkout is
+        # searched first; the freshly installed Runtime wheels remain ahead
+        # of both paths.
+        (site_packages / "astrid-checkout.pth").write_text(
+            str(agent) + "\n" + sysconfig.get_path("purelib") + "\n", encoding="utf-8"
+        )
     return environment

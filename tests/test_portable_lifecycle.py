@@ -11,7 +11,6 @@ import signal
 import socket
 import subprocess
 import sys
-import sysconfig
 import time
 import urllib.error
 import urllib.request
@@ -19,6 +18,7 @@ import urllib.request
 import pytest
 
 from runtime_protocol import platform
+from tests.astrid_checkout import astrid_checkout
 from tests.door_helpers import HOSTED, create_realm, door_call
 from astrid_runtime import update
 
@@ -192,6 +192,7 @@ def _environment(tmp_path: Path) -> dict[str, str]:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
     env["ASTRID_RUNTIME_HOME"] = str(home)
     env["ASTRID_RUNTIME_DATA_ROOT"] = str(tmp_path / "support")
     env["HOME"] = str(home)
@@ -257,6 +258,19 @@ def test_workspace_setup_uses_installed_cli_and_explicit_realm_without_starting_
 
 
 @pytest.mark.integration
+def test_stage1_loads_selected_agent_provider(stage1_runtime_environment: Path, tmp_path: Path):
+    agent = astrid_checkout()
+    probe = subprocess.run(
+        [str(_python(stage1_runtime_environment)), "-I", "-c",
+         "import pathlib, astrid.sdk.timeline.commit as provider; "
+         "print(pathlib.Path(provider.__file__).resolve())"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert Path(probe.stdout.strip()) == agent / "astrid" / "sdk" / "timeline" / "commit.py"
+
+
+@pytest.mark.integration
 def test_real_post_worker_finishes_after_runtime_daemon_process_is_killed(tmp_path: Path, monkeypatch):
     """Real authenticated door POST and Agent run_job; OS-manager survival is not claimed."""
     home = tmp_path / "home"
@@ -264,14 +278,14 @@ def test_real_post_worker_finishes_after_runtime_daemon_process_is_killed(tmp_pa
     data_home = home / "share"
     env = _environment(tmp_path)
     env["XDG_DATA_HOME"] = str(data_home)
-    env["PYTHONPATH"] = f"{ROOT}:{ROOT.parent / 'astrid-agent'}"
+    agent_root = astrid_checkout()
+    env["PYTHONPATH"] = os.pathsep.join((str(ROOT), str(agent_root)))
     monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
     realm = tmp_path / "realm"
     create_realm(realm)
     program = tmp_path / "program with spaces"
     data = tmp_path / "data with spaces"
     version = program / "versions" / "old"
-    agent_root = ROOT.parent / "astrid-agent"
     ready, trigger, worker_result = (tmp_path / "daemon.json", tmp_path / "worker.start",
                                      tmp_path / "worker.json")
     phase_path = tmp_path / "readiness-phases.json"
@@ -327,10 +341,12 @@ selection.write_text(json.dumps(selected)); marker=program/'install.json'; marke
 snapshots={{path:path.read_bytes() for path in (selection,program/'current',version/'version.json',profile,marker)}}
 fake=SimpleNamespace(root=realm,instance_id='old-instance',startup_identity={{'release':4,'managed_by':None}},startup_identity_instance_id='old-instance',support_root=data/'runtime',service=SimpleNamespace(realm={{'id':'test-realm'}}),_identity_agent_checkout=agent,_identity_runtime_checkout=runtime)
 admission=update.UpdateAdmission(fake)
-admission._selection=lambda *, allow_pending=False:(selection,snapshots,python,agent,runtime,4)
+admission._selection=lambda *, allow_pending=False, require_autostart=True:(selection,snapshots,python,agent,runtime,4)
 admission._installer_idle=lambda _path: contextlib.nullcontext()
 update.assert_interruption_safe=lambda _root:None
 def helper(_python,_agent,_runtime,payload,**kwargs):
+    if payload.get('action')=='reconcile':
+        return {{'disposition':'prepare-new'}}
     if payload.get('action')=='accept':
         op=payload['operation_id']; job={{'format':'astrid-update-job/v1','operation_id':op,'state':'accepted','job_name':payload['job_name'],'program_root':str(program),'data_root':str(data),'log_path':payload['log_path'],'old_instance_id':payload['old_instance_id'],'old_identity':payload['old_identity'],'old_version':payload['old_version'],'target_release':payload['metadata']['release'],'metadata':payload['metadata'],'message':'Update accepted.'}}
         marker_value=json.loads(marker.read_text()); marker_value['update_job']=job; marker.write_text(json.dumps(marker_value)); return job
@@ -578,9 +594,6 @@ def test_installed_foreground_use_down_then_up_again(
 ):
     manifest = _manifest(tmp_path)
     env = _environment(tmp_path)
-    # The offline Runtime wheel fixture contains no optional Agent dependencies.
-    # Supply the test interpreter's dependencies without changing that venv.
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, (env.get("PYTHONPATH"), sysconfig.get_path("purelib"))))
     created = _prepare_workspace(stage1_runtime_environment, manifest, env)
     assert created.returncode == 0, created.stderr + created.stdout
     discovery_path = tmp_path / "support" / "runtime" / "discovery.json"
