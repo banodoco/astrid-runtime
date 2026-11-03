@@ -55,6 +55,23 @@ def test_invalid_lease_never_gates(body):
     assert not leases.live("p", "t")
 
 
+def test_active_credential_is_scoped_and_revoked_with_lease():
+    clock = [1.0]
+    leases = TimelineEditingLeases(RLock(), clock=lambda: clock[0])
+    body = {"tab_session_id": "opaque-app-tab", "sequence": 1}
+    leases.update("p", "t", "alice", body)
+    assert leases.owns_live("p", "t", "alice", "opaque-app-tab")
+    for project, timeline, actor, tab in (("other", "t", "alice", "opaque-app-tab"),
+            ("p", "other", "alice", "opaque-app-tab"), ("p", "t", "bob", "opaque-app-tab"),
+            ("p", "t", "alice", "invented"), ("p", "t", "alice", None)):
+        assert not leases.owns_live(project, timeline, actor, tab)
+    leases.update("p", "t", "alice", {**body, "sequence": 2}, release=True)
+    assert not leases.owns_live("p", "t", "alice", "opaque-app-tab")
+    leases.update("p", "t", "alice", {**body, "sequence": 3})
+    clock[0] = 11.0
+    assert not leases.owns_live("p", "t", "alice", "opaque-app-tab")
+
+
 def test_direct_acceptance_checks_lease_after_replay(realm):
     service, commits, project, head, _ = realm
     ctx = context(service, project, head)
@@ -108,10 +125,11 @@ def patch(runtime, value, *, field="title", via="python"):
                                                 "before": {"state": "absent"}, "value": value}]}}]}
 
 
-def submit(runtime, body, key):
+def submit(runtime, body, key, *, editing_session=None):
     return runtime.commit_timeline(runtime.test_project, "main", body, idempotency_key=key,
         publisher="shared-product", authorize=lambda: {"actor": "shared-product"},
-        invocation_path=route_path(runtime.test_project, "main"))
+        invocation_path=route_path(runtime.test_project, "main"),
+        **({"editing_session": editing_session} if editing_session is not None else {}))
 
 
 @pytest.mark.integration
@@ -119,12 +137,21 @@ def test_source_via_app_is_cooperative_and_caller_spoofable(editing_runtime):
     runtime = editing_runtime
     app_claim = patch(runtime, "claimed-app", via="app")
     lease(runtime, 1)
-    # The frozen T1 contract deliberately exempts by source attribution. This
-    # proves that an agent caller able to submit the enum can claim the exemption.
-    accepted = submit(runtime, app_claim, "spoofed-app-source")
+    # Attribution alone, an invented credential, and another actor's live tab
+    # all remain behind the live-user gate. Refusal is not terminally cached.
+    for credential in (None, "invented-tab", "tab"):
+        with pytest.raises(RuntimeErrorBase) as caught:
+            submit(runtime, app_claim, "spoofed-app-source", editing_session=credential)
+        assert caught.value.status == 409
+        assert caught.value.details["reason"] == "user_editing"
+    lease(runtime, 1, tab="own-app-tab", actor="shared-product")
+    accepted = submit(runtime, app_claim, "spoofed-app-source", editing_session="own-app-tab")
     assert accepted["data"]["status"] == "accepted"
     document = accepted["data"]["canonical_document"]
     assert document["parent_revision"]["payload"]["config"]["title"] == "claimed-app"
+    lease(runtime, 2, tab="own-app-tab", actor="shared-product", release=True)
+    # Replay precedes gating even after the authority for a new write is gone.
+    assert submit(runtime, app_claim, "spoofed-app-source") == accepted
 
 
 @pytest.mark.integration
@@ -136,6 +163,7 @@ def test_app_preview_retry_and_saved_user_conflict(editing_runtime):
     other_app = patch(runtime, "other-user", via="app")
     before = counts(runtime)
     assert lease(runtime, 1)["active"]
+    assert lease(runtime, 1, tab="app", actor="shared-product")["active"]
     with pytest.raises(RuntimeErrorBase) as caught:
         submit(runtime, agent, "same-flight")
     assert caught.value.status == 409
@@ -147,14 +175,15 @@ def test_app_preview_retry_and_saved_user_conflict(editing_runtime):
     preview = submit(runtime, {**agent, "dry_run": True}, "preview")
     assert preview["data"]["status"] == "preview"
     assert counts(runtime) == before
-    saved = submit(runtime, user, "user-save")
+    saved = submit(runtime, user, "user-save", editing_session="app")
     assert saved["data"]["status"] == "accepted"
     after_save = counts(runtime)
     with pytest.raises(RuntimeErrorBase) as app_conflict:
-        submit(runtime, other_app, "stale-app")
+        submit(runtime, other_app, "stale-app", editing_session="app")
     assert app_conflict.value.details["reason"] == "value_conflict"
     assert counts(runtime) == after_save
     lease(runtime, 2, release=True)
+    lease(runtime, 2, tab="app", actor="shared-product", release=True)
     with pytest.raises(RuntimeErrorBase) as conflict:
         submit(runtime, agent, "same-flight")
     assert conflict.value.status == 409 and conflict.value.details["reason"] == "value_conflict"
@@ -163,6 +192,37 @@ def test_app_preview_retry_and_saved_user_conflict(editing_runtime):
     merged = submit(runtime, compatible, "compatible")
     assert merged["data"]["status"] == "merged"
     assert merged["data"]["canonical_document"]["parent_revision"]["payload"]["config"]["title"] == "user"
+
+
+@pytest.mark.integration
+def test_app_credential_is_rechecked_at_serialized_acceptance(editing_runtime, monkeypatch):
+    runtime = editing_runtime
+    body = patch(runtime, "app", via="app")
+    lease(runtime, 1)  # another actor's draft remains live throughout
+    lease(runtime, 1, tab="app", actor="shared-product")
+    ready, proceed = Event(), Event()
+    original = RequestCommitPort.accept
+    def paused_accept(port, candidate):
+        ready.set()
+        assert proceed.wait(10)
+        return original(port, candidate)
+    monkeypatch.setattr(RequestCommitPort, "accept", paused_accept)
+    before = counts(runtime)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        flight = pool.submit(submit, runtime, body, "revoked-app", editing_session="app")
+        try:
+            assert ready.wait(10)
+            lease(runtime, 2, tab="app", actor="shared-product", release=True)
+        finally:
+            proceed.set()
+        with pytest.raises(RuntimeErrorBase) as caught:
+            flight.result(timeout=15)
+    assert caught.value.details["reason"] == "user_editing"
+    assert counts(runtime) == before
+    monkeypatch.setattr(RequestCommitPort, "accept", original)
+    lease(runtime, 3, tab="app", actor="shared-product")
+    accepted = submit(runtime, body, "revoked-app", editing_session="app")
+    assert accepted["data"]["status"] == "accepted"
 
 
 @pytest.mark.integration

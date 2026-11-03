@@ -395,6 +395,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 publisher=publisher,
                 invocation_path=self._timeline_path(project_id, timeline_id, "commit"),
                 authorize=authorize,
+                editing_session=self.headers.get("X-Timeline-Editing-Session"),
             ))
 
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):

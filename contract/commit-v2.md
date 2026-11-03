@@ -5319,12 +5319,22 @@ retryable. Verified-baseline installation attests retained, checked facts withou
 changing authored content. These paths cannot replace an editable publication.
 Retired direct writers stay retired.
 
+The App sends its acknowledged opaque random `tab_session_id` in the
+`X-Timeline-Editing-Session` commit transport header. This credential is checked
+against the current project, timeline, authenticated actor and live lease at
+admission and again under the serialized acceptance mutex. It permits App saves
+while other tabs/users also hold leases. A missing, invented, expired, released,
+wrong-scope or wrong-actor credential grants no exemption; `source.via=app`
+alone never grants authority. The header is transport authority, outside the
+commit body/key/base identity: an already accepted receipt still replays after
+release. Sequence fencing remains owned by the existing lease registry.
+
 The default App and Agent may share a product bearer. Credentials authenticate
-actor/scopes, without a trusted App/Agent distinction. This deployment therefore
-uses the approved **cooperative attribution policy**: a valid commit with
-`source.via=app` is exempt so existing App saves continue, including another user's
-save. All other or absent sources are gated. This is not authenticated App
-authority: any bearer holder can spoof `app` to bypass this courtesy gate. Restore
-HTTP requests have no source attribution and wait for lease release, including
-App history restores. Source attribution never bypasses authentication, existing
-conflict checks, history validation, or acceptance integrity checks.
+actor/scopes, without a trusted App/Agent distinction. This is therefore a
+**cooperative lease-possession boundary**, not App-only authentication: a shared
+bearer holder can deliberately acquire its own lease and use that credential.
+The tab id must be unpredictable and must not be copied into commit attribution
+or durable history. No claim is made to distinguish applications holding the
+same bearer. Restore HTTP requests have no lease credential and wait for release,
+including App history restores. Lease possession never bypasses authentication,
+existing conflict checks, history validation, or acceptance integrity checks.

@@ -3116,9 +3116,11 @@ class RuntimeService:
             if self._timeline_commit_store is None:
                 self._timeline_commit_store = TimelineCommitStore(
                     self.store, validate_prepared=lambda value: validate_commit_value(value, "PreparedCommit"),
-                    # Shared product bearers cannot authenticate App vs Agent.
-                    # This is cooperative attribution, not an authority grant.
-                    publication_exempt=lambda request: request.get("source", {}).get("via") == "app",
+                    # Source is attribution only. A caller must possess its
+                    # own currently active, actor-bound tab lease credential.
+                    publication_exempt=lambda context: self.store._timeline_editing.owns_live(
+                        context["request"]["project_id"], context["request"]["timeline_id"],
+                        context.get("publisher"), context.get("editing_session")),
                 )
                 self._timeline_commit_coordinator = CommitExecutionCoordinator(self._timeline_commit_store)
             return self._timeline_commit_store, self._timeline_commit_coordinator
@@ -3163,7 +3165,8 @@ class RuntimeService:
     @_clear_replay_on_refusal
     @timed_timeline_commit
     def commit_timeline(self, project_id, timeline_id, body, *, idempotency_key,
-                        publisher, invocation_path, authorize, public_request_id=None):
+                        publisher, invocation_path, authorize, public_request_id=None,
+                        editing_session=None):
         from .timeline_commit_port import detached, route_path, validate_request
         body = detached(body)
         validate_request(body)
@@ -3176,12 +3179,13 @@ class RuntimeService:
             idempotency_key=idempotency_key, publisher=publisher,
             invocation_path=invocation_path, authorize=authorize,
             public_request_id=public_request_id,
+            editing_session=editing_session,
         )
 
     @_clear_replay_on_refusal
     def _execute_timeline_commit(self, project_id, timeline_id, request, original_body, *,
                                  operation, idempotency_key, publisher, invocation_path, authorize,
-                                 public_request_id=None):
+                                 public_request_id=None, editing_session=None):
         from .timeline_commit import CommitRejected
         from .timeline_commit_execution import (
             _emit_redacted_diagnostic,
@@ -3229,7 +3233,8 @@ class RuntimeService:
         }).encode()).hexdigest()
         context = {"request": detached(request), "invocation": invocation,
                    "request_hash": request_hash, "idempotency_key": idempotency_key,
-                   "publisher": publisher, "realm_id": self.realm["id"]}
+                   "publisher": publisher, "realm_id": self.realm["id"],
+                   "editing_session": editing_session}
         request_id = _new_request_id()
         timing = current_commit_timing()
         if timing is not None:

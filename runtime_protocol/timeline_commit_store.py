@@ -253,7 +253,7 @@ class TimelineCommitStore:
                 from .timeline_editing import TimelineEditingLeases
                 store._timeline_editing = TimelineEditingLeases(store._mutex)
             self.editing = store._timeline_editing
-        self._publication_exempt = publication_exempt or (lambda request: False)
+        self._publication_exempt = publication_exempt or (lambda context: False)
         # Validation uses the wire worker's authoritative schema, including
         # Agent-owned leaves. It must raise on invalid data, never normalize it.
         self.validate_prepared = validate_prepared
@@ -1846,7 +1846,7 @@ class TimelineCommitStore:
         with self.store._mutex:
             authorize()
             request = context["request"]
-            if (request.get("dry_run", False) or self._publication_exempt(request)
+            if (request.get("dry_run", False) or self._publication_exempt(context)
                     or not self.editing.live(request["project_id"], request["timeline_id"])):
                 return
             raise CommitRejected({

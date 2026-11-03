@@ -63,7 +63,7 @@ NON_PRODUCT_ACTORS = frozenset({"owner", "astrid-pack-host"})
 REQUEST_HEADERS = frozenset({
     "accept", "content-type", "content-length", "range", "if-match", "if-none-match", "idempotency-key",
     "x-filename", "x-original-name", "x-expected-digest", "x-media-width", "x-media-height",
-    "x-media-duration-seconds",
+    "x-media-duration-seconds", "x-timeline-editing-session",
 })
 RESPONSE_HEADERS = ("content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified")
 # Body framing is the Runtime's to judge (it refuses non-identity binary encodings and trailers).

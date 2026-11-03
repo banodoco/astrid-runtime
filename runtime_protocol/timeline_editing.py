@@ -46,3 +46,16 @@ class TimelineEditingLeases:
             now = self._clock()
             return any(key[:2] == (project, timeline) and expiry > now
                        for key, (_, expiry) in self._leases.items())
+
+    def owns_live(self, project, timeline, actor, tab_session_id):
+        """Possession of a live tab credential, never source attribution.
+
+        The App creates an opaque random tab id. Shared product credentials
+        can still deliberately acquire their own lease; this is cooperative
+        authority, not authentication of a particular client application.
+        """
+        if not isinstance(tab_session_id, str) or not tab_session_id:
+            return False
+        with self._mutex:
+            _, expiry = self._leases.get((project, timeline, actor, tab_session_id), (0, 0))
+            return expiry > self._clock()
