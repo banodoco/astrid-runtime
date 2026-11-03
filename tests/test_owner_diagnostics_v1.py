@@ -94,13 +94,29 @@ def test_connect_refusal_and_observation_counts_match(monkeypatch, capfd):
     run()
     assert calls == baseline and "owner" not in calls
     result = records(capfd)
-    assert [(r["phase"], r["predicate"], r["result"]) for r in result] == [
+    admission = [
+        r
+        for r in result
+        if r["predicate"]
+        in {
+            "connect_realm_present",
+            "connect_discovery_present",
+            "connect_pid_alive",
+            "connect_owner_valid",
+        }
+    ]
+    assert [(r["phase"], r["predicate"], r["result"]) for r in admission] == [
         ("admission", "connect_realm_present", "pass"),
         ("admission", "connect_discovery_present", "pass"),
         ("admission", "connect_pid_alive", "fail"),
         ("admission", "connect_owner_valid", "unavailable"),
     ]
-    assert result[-1]["depends_on"] == "connect_pid_alive"
+    assert admission[-1]["depends_on"] == "connect_pid_alive"
+    assert {r["predicate"] for r in result if r["result"] == "unavailable"} >= {
+        "connect_owner_valid",
+        "connect_health",
+        "connect_selected_realm",
+    }
     assert "private" not in json.dumps(result) and "123" not in json.dumps(result)
 
 

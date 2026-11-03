@@ -24,7 +24,7 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from .bootstrap import BootstrapCustodyUncertain, BootstrapError, SourceProfile
-from .owner_diagnostics import instrument, outcome
+from .owner_diagnostics import instrument, observation, outcome, phase_instrument, predicate_chain
 from .loopback_http import urlopen_loopback
 from .custody_broker import (
     ACTIVE_CAPABILITY_NAME,
@@ -478,8 +478,9 @@ class LocalRuntimeBoundary:
             ) from exc
         return process, broker
 
+    @phase_instrument
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path, source_profile: SourceProfile) -> Mapping[str, Any]:
-        if self._process and self._process.poll() is None:
+        if self._process and not outcome("startup_prior_child_exited", self._process.poll() is not None):
             raise BootstrapError("runtime boundary already owns a live daemon")
         realm_root = self._validate_path(Path(realm_root), "realm root")
         owner_lock = self._validate_path(Path(owner_lock), "owner lock")
@@ -515,10 +516,19 @@ class LocalRuntimeBoundary:
         try:
             endpoint = self._wait_endpoint(support_root, self._process)
             discovery = self._read_discovery(support_root)
-            identity = default_process_identity(self._process.pid)
-            if identity is None:
+            with observation("startup_native_identity_read"):
+                identity = default_process_identity(self._process.pid)
+            if not outcome(
+                "startup_native_identity_present", identity is not None, blocked=("startup_native_birth_matches",)
+            ):
                 raise BootstrapError("Ready Runtime child disappeared before custody publication.")
-            if platform.process_birth_matches(str(discovery.get("process_birth_id") or ""), str(identity.get("birth_id") or "")) is not True:
+            if not outcome(
+                "startup_native_birth_matches",
+                platform.process_birth_matches(
+                    str(discovery.get("process_birth_id") or ""), str(identity.get("birth_id") or "")
+                )
+                is True,
+            ):
                 raise BootstrapError("Ready Runtime birth identity differs from discovery.")
             if broker is None:
                 custody = NativeProcessCustody(support_root, identity)
@@ -621,7 +631,7 @@ class LocalRuntimeBoundary:
         deadline = time.monotonic() + self.wait_seconds
         while time.monotonic() < deadline:
             cancellation.check()
-            if process.poll() is not None:
+            if not outcome("startup_child_running", process.poll() is None):
                 cause = self._startup_failure(self._log_path(support_root), self._log_offset)
                 raise BootstrapError(
                     f"Runtime daemon exited during startup: {cause} (see {self._log_path(support_root)})." if cause
@@ -634,14 +644,19 @@ class LocalRuntimeBoundary:
             # discovery and owner marker.  The daemon publishes its own PID
             # atomically only after realm admission succeeds.
             try:
-                advertised_pid = int(discovery.get("pid", 0))
+                with observation("startup_advertised_pid_parse", malformed=(TypeError, ValueError)):
+                    advertised_pid = int(discovery.get("pid", 0))
             except (TypeError, ValueError):
                 advertised_pid = 0
-            if advertised_pid and advertised_pid != process.pid:
+            if outcome("startup_advertised_pid_present", bool(advertised_pid)) and not outcome(
+                "startup_advertised_pid_matches", advertised_pid == process.pid
+            ):
                 cancellation.pause(0.05) if cancellation.active() else time.sleep(0.05)
                 continue
             endpoint = str(discovery.get("endpoint", ""))
-            if endpoint and self._http_health(endpoint):
+            if outcome("startup_endpoint_present", bool(endpoint), blocked=("startup_endpoint_health",)) and outcome(
+                "startup_endpoint_health", self._http_health(endpoint)
+            ):
                 cancellation.check()
                 return endpoint
             cancellation.pause(0.05) if cancellation.active() else time.sleep(0.05)
@@ -805,8 +820,9 @@ class LocalRuntimeBoundary:
             return False
         if not outcome("lock_object", isinstance(marker, dict)):
             return False
-        if (not outcome("lock_pid", str(marker.get("pid")) == str(pid))
-                or not outcome("lock_instance", str(marker.get("runtime_instance_id")) == instance_id)):
+        if not outcome("lock_pid", str(marker.get("pid")) == str(pid), blocked=("lock_instance",)) or not outcome(
+            "lock_instance", str(marker.get("runtime_instance_id")) == instance_id
+        ):
             return False
         if expected_realm_id is not None and not outcome("lock_realm", str(marker.get("realm_id")) == str(expected_realm_id)):
             return False
@@ -826,8 +842,9 @@ class LocalRuntimeBoundary:
         actual_birth = self.process_birth_identity(pid)
         outcome("birth_observed", actual_birth is not None)
         health = self._http_health_payload(endpoint)
-        if (not outcome("health_present", bool(health))
-                or not outcome("health_instance", health.get("runtime_instance_id") == instance_id)):
+        if not outcome("health_present", bool(health), blocked=("health_instance",)) or not outcome(
+            "health_instance", health.get("runtime_instance_id") == instance_id
+        ):
             return False
         if actual_birth is None:
             if outcome("birth_legacy", platform.is_legacy_linux_birth_id(str(expected_birth))):
@@ -860,13 +877,14 @@ class LocalRuntimeBoundary:
         grace = getattr(process, "_runtime_stop_grace", 5.0)
         try:
             if sys.platform != "darwin":
-                platform.stop_tree(process, grace=grace)
+                with observation("cleanup_native_stop"):
+                    platform.stop_tree(process, grace=grace)
                 return
-            if not getattr(process, "_runtime_boundary_sole_reaper", False):
+            if not outcome("cleanup_sole_reaper", bool(getattr(process, "_runtime_boundary_sole_reaper", False))):
                 raise CustodyError("Runtime child has no authoritative sole-reaper ownership")
-            if process.poll() is not None:
+            if outcome("cleanup_child_exited", process.poll() is not None):
                 return
-            if not isinstance(broker, RoleBoundCustodyBroker):
+            if not outcome("cleanup_broker_registered", isinstance(broker, RoleBoundCustodyBroker)):
                 raise CustodyError("Runtime child has no registered kernel custody")
             close_channel = getattr(broker, "close_post_exec_channel", None)
             if close_channel is not None:
@@ -877,22 +895,25 @@ class LocalRuntimeBoundary:
                 close_authority_scope(broker.authority_scope_root, deadline=deadline)
             signal_owned = broker.signal_failed_admission if broker.error is not None else broker.signal
             for signum, timeout in ((platform.TERM, grace), (platform.KILL, 2.0)):
-                if process.poll() is not None:
+                if outcome("cleanup_child_exited", process.poll() is not None):
                     return
                 try:
-                    signal_owned(signum, expected_pid=process.pid)
+                    with observation("cleanup_term" if signum == platform.TERM else "cleanup_kill"):
+                        signal_owned(signum, expected_pid=process.pid)
                 except CustodyError:
                     # Only the retained, reaped direct-child handle proves this exit race.
-                    if process.poll() is not None:
+                    if outcome("cleanup_child_exited", process.poll() is not None):
                         return
                     raise
                 try:
-                    process.wait(timeout=timeout)
+                    with observation("cleanup_wait", malformed=(subprocess.TimeoutExpired,)):
+                        process.wait(timeout=timeout)
                     return
                 except subprocess.TimeoutExpired:
                     continue
             raise CustodyError("Runtime child remains alive after bounded kernel-custody cleanup")
         except (CustodyError, OSError) as exc:
+            outcome("cleanup_complete", None, error=True)
             failure = BootstrapError(f"Runtime cleanup remains uncertain: {exc}")
             process._runtime_cleanup_error = failure
             if primary is not None:
@@ -967,6 +988,7 @@ class LocalRuntimeBoundary:
         process._runtime_owner_released_anchor = anchor
         return ack
 
+    @instrument
     def stop_owner(self, **kwargs) -> Mapping[str, Any]:
         """Stop an adopted owner using the same birth/lock fences as restart."""
         return self.restart(**kwargs, start_after_stop=False)
@@ -1005,11 +1027,52 @@ class LocalRuntimeBoundary:
         native_record = self._read_discovery_file(support / ACTIVE_CAPABILITY_NAME)
         native_owner = native_record.get("version") == NATIVE_CAPABILITY_VERSION
 
+        @predicate_chain(
+            "signal_pid_positive",
+            "signal_endpoint_present",
+            "signal_instance_present",
+            "signal_birth_present",
+            "signal_not_operator_pid",
+            "signal_publications_read",
+            "signal_roots_parse",
+            "signal_discovery_pid",
+            "signal_discovery_endpoint",
+            "signal_discovery_instance",
+            "signal_discovery_birth",
+            "signal_discovery_realm",
+            "signal_discovery_root",
+            "signal_lock_pid",
+            "signal_lock_instance",
+            "signal_lock_birth",
+            "signal_lock_realm",
+            "signal_lock_root",
+            "signal_pid_alive",
+            "signal_birth",
+            "signal_health_instance",
+            "signal_endpoint_instance",
+            "signal_endpoint_realm",
+            "signal_health",
+            "signal_group_leader",
+        )
         def validate_before_signal(*, require_health: bool = True) -> None:
             """Re-read every fence immediately before the first signal."""
-            if expected_pid <= 0 or not endpoint or not expected_instance or not expected_birth:
+            if (
+                not outcome(
+                    "signal_pid_positive",
+                    expected_pid > 0,
+                )
+                or not outcome(
+                    "signal_endpoint_present",
+                    endpoint,
+                )
+                or not outcome(
+                    "signal_instance_present",
+                    expected_instance,
+                )
+                or not outcome("signal_birth_present", expected_birth)
+            ):
                 raise BootstrapError("Runtime restart refused: discovery identity is incomplete.")
-            if expected_pid == os.getpid():
+            if not outcome("signal_not_operator_pid", expected_pid != os.getpid()):
                 raise BootstrapError("Runtime restart refused: owner PID is the current operator process.")
             try:
                 discovery = self._read_discovery_file(discovery_path)
@@ -1021,7 +1084,9 @@ class LocalRuntimeBoundary:
                 finally:
                     os.close(fd)
             except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                outcome("signal_publications_read", None, error=True)
                 raise BootstrapError("Runtime restart refused: owner discovery or lock is unavailable.") from exc
+            outcome("signal_publications_read", True)
             try:
                 expected_root = self._validate_path(root, "expected realm root").resolve()
                 discovery_root = self._validate_path(
@@ -1031,7 +1096,12 @@ class LocalRuntimeBoundary:
                     Path(str(marker.get("realm_root") or "")), "owner realm root"
                 ).resolve()
             except (BootstrapError, OSError) as exc:
+                outcome(
+                    "signal_roots_parse",
+                    False if isinstance(exc, BootstrapError) else None,
+                )
                 raise BootstrapError("Runtime restart refused: realm-root identity is invalid.") from exc
+            outcome("signal_roots_parse", True)
             health = self._http_health_payload(endpoint)
             endpoint_identity = self.endpoint_metadata(
                 endpoint=endpoint,
@@ -1062,26 +1132,63 @@ class LocalRuntimeBoundary:
                 raise BootstrapError("Runtime restart refused: owner identity changed or is stale.")
             # A group kill is only safe for the daemon's own session leader.
             try:
-                if not native_owner and platform.process_group(expected_pid) != expected_pid:
+                if not native_owner and not outcome(
+                    "signal_group_leader", platform.process_group(expected_pid) == expected_pid
+                ):
                     raise BootstrapError("Runtime restart refused: owner is not its own process-group leader.")
             except OSError as exc:
+                outcome("signal_group_leader", None, error=True)
                 raise BootstrapError("Runtime restart refused: owner process disappeared.") from exc
 
+        @predicate_chain(
+            "escalation_identity_read",
+            "escalation_identity_present",
+            "escalation_pid_matches",
+            "escalation_uid_matches",
+            "escalation_birth_matches",
+            "escalation_group_leader",
+            "escalation_metadata_object",
+            "escalation_metadata_identity",
+            "escalation_metadata_root",
+            "escalation_metadata_endpoint",
+            "escalation_metadata_read",
+            "escalation_health_owner",
+            "escalation_endpoint_owner",
+        )
         def validate_escalation_target() -> None:
             # TERM deliberately revokes readiness and removes discovery while
             # the same daemon may still be draining. Those absent surfaces do
             # not replace custody: the signal below still verifies the sealed
             # target and current authenticated actor/generation under its guard.
-            observed = default_process_identity(expected_pid)
-            if (observed is None
-                    or observed.get("pid") != expected_pid
-                    or observed.get("uid") != platform.current_user()
-                    or not _selected_owner_birth_matches(
-                        expected_birth, str(observed.get("birth_id") or ""), pid=expected_pid,
-                    )):
+            with observation("escalation_identity_read"):
+                observed = default_process_identity(expected_pid)
+            if (
+                not outcome(
+                    "escalation_identity_present",
+                    observed is not None,
+                )
+                or not outcome(
+                    "escalation_pid_matches",
+                    observed.get("pid") == expected_pid,
+                )
+                or not outcome(
+                    "escalation_uid_matches",
+                    observed.get("uid") == platform.current_user(),
+                )
+                or not outcome(
+                    "escalation_birth_matches",
+                    _selected_owner_birth_matches(
+                        expected_birth,
+                        str(observed.get("birth_id") or ""),
+                        pid=expected_pid,
+                    ),
+                )
+            ):
                 raise BootstrapError("Runtime escalation refused: selected incarnation changed or disappeared.")
             try:
-                if not native_owner and platform.process_group(expected_pid) != expected_pid:
+                if not native_owner and not outcome(
+                    "escalation_group_leader", platform.process_group(expected_pid) == expected_pid
+                ):
                     raise BootstrapError("Runtime escalation refused: selected owner session changed.")
                 def read_optional_identity_file(path):
                     try:
@@ -1102,20 +1209,61 @@ class LocalRuntimeBoundary:
                 for metadata, realm_key in ((discovery, "active_realm"), (marker, "realm_id")):
                     if metadata is None:
                         continue
-                    if (not isinstance(metadata, dict)
-                            or any(str(metadata.get(k)) != str(v) for k, v in {
-                                "pid": expected_pid, "process_birth_id": expected_birth,
-                                "runtime_instance_id": expected_instance, realm_key: expected_realm}.items())
-                            or self._validate_path(Path(str(metadata.get("realm_root") or "")), "owner realm root").resolve() != root.resolve()
-                            or (realm_key == "active_realm" and metadata.get("endpoint") != endpoint)):
+                    if (
+                        not outcome(
+                            "escalation_metadata_object",
+                            isinstance(metadata, dict),
+                        )
+                        or not outcome(
+                            "escalation_metadata_identity",
+                            not any(
+                                (
+                                    not outcome(
+                                        "escalation_metadata_" + k,
+                                        str(metadata.get(k)) == str(v),
+                                    )
+                                    for k, v in {
+                                        "pid": expected_pid,
+                                        "process_birth_id": expected_birth,
+                                        "runtime_instance_id": expected_instance,
+                                        realm_key: expected_realm,
+                                    }.items()
+                                )
+                            ),
+                        )
+                        or not outcome(
+                            "escalation_metadata_root",
+                            self._validate_path(
+                                Path(str(metadata.get("realm_root") or "")),
+                                "owner realm root",
+                            ).resolve()
+                            == root.resolve(),
+                        )
+                        or not outcome(
+                            "escalation_metadata_endpoint",
+                            not (realm_key == "active_realm" and metadata.get("endpoint") != endpoint),
+                        )
+                    ):
                         raise BootstrapError("Runtime escalation refused: conflicting replacement metadata.")
             except (OSError, ValueError, UnicodeDecodeError) as exc:
+                outcome("escalation_metadata_read", None, error=True)
                 raise BootstrapError("Runtime escalation refused: identity metadata is unreadable.") from exc
+            outcome("escalation_metadata_read", True)
             health = self._http_health_payload(endpoint)
             endpoint_identity = self.endpoint_metadata(endpoint=endpoint, credential_file=support / "credentials" / "owner.token")
-            if ((health and health.get("runtime_instance_id") != expected_instance)
-                    or (endpoint_identity and (endpoint_identity.get("runtime_instance_id") != expected_instance
-                                               or endpoint_identity.get("realm_id") != expected_realm))):
+            if not outcome(
+                "escalation_health_owner",
+                not (health and health.get("runtime_instance_id") != expected_instance),
+            ) or not outcome(
+                "escalation_endpoint_owner",
+                not (
+                    endpoint_identity
+                    and (
+                        endpoint_identity.get("runtime_instance_id") != expected_instance
+                        or endpoint_identity.get("realm_id") != expected_realm
+                    )
+                ),
+            ):
                 raise BootstrapError("Runtime escalation refused: endpoint belongs to a replacement.")
 
         # A stopped owner must still pass the birth/lock identity fence.  The
@@ -1125,49 +1273,90 @@ class LocalRuntimeBoundary:
         validate_before_signal(require_health=require_health)
         if not self._process and getattr(self, "_detached_pid", None):
             detached = int(self._detached_pid)
-            if detached != expected_pid:
+            if not outcome("signal_adopted_pid", detached == expected_pid):
                 raise BootstrapError("Runtime restart refused: adopted owner PID changed.")
             validate_before_signal(require_health=require_health)
             identity = {"pid": detached, "birth_id": expected_birth, "uid": platform.current_user()}
             if native_owner:
                 custody = NativeProcessCustody(support, identity)
-                custody.signal(platform.TERM, validate=lambda: validate_before_signal(require_health=require_health))
+                with observation("signal_term"):
+                    custody.signal(
+                        platform.TERM,
+                        validate=lambda: validate_before_signal(require_health=require_health),
+                    )
                 deadline = time.monotonic() + shutdown_grace
-                while self.is_pid_alive(detached) and time.monotonic() < deadline:
+                while outcome("signal_target_alive", self.is_pid_alive(detached)) and time.monotonic() < deadline:
                     time.sleep(0.05)
-                if self.is_pid_alive(detached):
-                    custody.signal(platform.KILL, validate=validate_escalation_target)
+                if outcome("signal_target_alive", self.is_pid_alive(detached)):
+                    with observation("signal_kill"):
+                        custody.signal(platform.KILL, validate=validate_escalation_target)
                 deadline = time.monotonic() + 2.0
-                while self.is_pid_alive(detached) and time.monotonic() < deadline:
+                while outcome("signal_target_alive", self.is_pid_alive(detached)) and time.monotonic() < deadline:
                     time.sleep(0.05)
-                if self.is_pid_alive(detached):
+                if outcome("signal_target_alive", self.is_pid_alive(detached)):
                     raise BootstrapError("Runtime native cleanup remains uncertain after bounded wait.")
                 self._detached_pid = None
                 if not start_after_stop:
                     return {"state": "stopped", "realm_id": realm_id}
                 return self.start(realm_id=realm_id, realm_root=root, owner_lock=owner_lock, source_profile=source)
-            loaded = load_sealed_capability(support / ACTIVE_CAPABILITY_NAME, expected_identity=identity)
+            with observation("signal_capability_load"):
+                loaded = load_sealed_capability(support / ACTIVE_CAPABILITY_NAME, expected_identity=identity)
             sealed = loaded["reference"]["role_custody"]
             authority = RoleCustodyAuthority(Path(str(sealed["scope_root"])), "runtime_owner")
             actor = AuthenticatedCleanupActor.current()
-            claimed = self._commit_owner_transition(authority, kind="claim", actor=actor,
-                                                    generation=authority.reference()["generation"],
-                                                    owner_epoch=loaded["owner_epoch"], sealed=sealed)
+            validate_before_signal(require_health=require_health)
+            with observation("signal_custody_claim"):
+                claimed = self._commit_owner_transition(
+                    authority,
+                    kind="claim",
+                    actor=actor,
+                    generation=authority.reference()["generation"],
+                    owner_epoch=loaded["owner_epoch"],
+                    sealed=sealed,
+                )
             attempted = False
 
             def deliver(words, signum):
                 nonlocal attempted
                 attempted = True
-                signal_audit_token(words, signum)
+                with observation("signal_delivery"):
+                    signal_audit_token(words, signum)
 
             def selected_owner_absent():
-                observed = default_process_identity(detached)
-                return (observed is None
-                        or observed.get("pid") != identity["pid"]
-                        or observed.get("uid") != identity["uid"]
-                        or not _selected_owner_birth_matches(
-                            str(identity["birth_id"]), str(observed.get("birth_id") or ""), pid=detached,
-                        ))
+                with observation("signal_selected_identity_read"):
+                    observed = default_process_identity(detached)
+                return outcome(
+                    "signal_selected_owner_absent",
+                    (
+                        not outcome(
+                            "signal_selected_identity_present",
+                            observed is not None,
+                            blocked=(
+                                "signal_selected_pid_matches",
+                                "signal_selected_uid_matches",
+                                "signal_selected_birth_matches",
+                            ),
+                        )
+                        or not outcome(
+                            "signal_selected_pid_matches",
+                            observed.get("pid") == identity["pid"],
+                            blocked=("signal_selected_uid_matches", "signal_selected_birth_matches"),
+                        )
+                        or not outcome(
+                            "signal_selected_uid_matches",
+                            observed.get("uid") == identity["uid"],
+                            blocked=("signal_selected_birth_matches",),
+                        )
+                        or not outcome(
+                            "signal_selected_birth_matches",
+                            _selected_owner_birth_matches(
+                                str(identity["birth_id"]),
+                                str(observed.get("birth_id") or ""),
+                                pid=detached,
+                            ),
+                        )
+                    ),
+                )
 
             try:
                 validate_before_signal(require_health=require_health)
@@ -1177,16 +1366,16 @@ class LocalRuntimeBoundary:
                     actor=actor, generation=claimed["generation"], signal_provider=deliver,
                 )
                 deadline = time.monotonic() + shutdown_grace
-                while time.monotonic() < deadline and self.is_pid_alive(detached):
+                while time.monotonic() < deadline and outcome("signal_target_alive", self.is_pid_alive(detached)):
                     time.sleep(0.05)
-                if self.is_pid_alive(detached):
+                if outcome("signal_target_alive", self.is_pid_alive(detached)):
                     validate_escalation_target()
                     signal_sealed_capability(
                         support / ACTIVE_CAPABILITY_NAME, expected_identity=identity, signum=platform.KILL,
                         actor=actor, generation=claimed["generation"], signal_provider=deliver,
                     )
                 deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and self.is_pid_alive(detached):
+                while time.monotonic() < deadline and outcome("signal_target_alive", self.is_pid_alive(detached)):
                     time.sleep(0.05)
                 if not selected_owner_absent():
                     raise BootstrapError("Runtime detached cleanup remains uncertain after bounded wait.")
@@ -1212,7 +1401,11 @@ class LocalRuntimeBoundary:
             self._detached_pid = None
         else:
             process = self._process
-            if process is None or process.pid != expected_pid:
+            if not outcome(
+                "signal_handle_present",
+                process is not None,
+                blocked=("signal_handle_pid",),
+            ) or not outcome("signal_handle_pid", process.pid == expected_pid):
                 raise BootstrapError("Runtime restart refused: owned process handle changed.")
             validate_before_signal()
             self.stop()  # Reclaim an explicit release before retained-child cleanup.

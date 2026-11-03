@@ -2958,13 +2958,30 @@ class StaleOwnerTests(unittest.TestCase):
             record = json.loads(path.read_text())
             record["pid"] = os.getpid()
             path.write_text(json.dumps(record))
-        expected = json.loads(self.paths.discovery_path.read_text())["process_birth_id"]
-        # The reused PID is a real live process. Birth observations for newly
-        # launched fake owners still use their synthetic test marker.
+        actual = LocalRuntimeBoundary.process_birth_identity(os.getpid())
+        assert actual is not None
+        expected = (
+            actual.replace("proc-start-ticks:", "proc-start-ticks:0", 1)
+            if actual.startswith("proc-start-ticks:")
+            else "previous:" + actual
+        )
+        for path in (self.paths.discovery_path, self.paths.instance_lock_path):
+            record = json.loads(path.read_text())
+            record["process_birth_id"] = expected
+            path.write_text(json.dumps(record))
         self.boundary.is_pid_alive = lambda pid: pid == os.getpid() or pid in self.boundary.alive
         self.boundary.process_birth_identity = lambda pid: (
-            (None if observation == "unknown" else expected if observation == "same"
-             else LocalRuntimeBoundary.process_birth_identity(pid)) if pid == os.getpid() else None)
+            (None if observation == "unknown" else expected if observation == "same" else actual)
+            if pid == os.getpid()
+            else f"synthetic:instance-{pid}:{pid}"
+        )
+        start = self.boundary.start
+
+        def start_new_owner(**kwargs):
+            self.boundary.valid_owner = True
+            return start(**kwargs)
+
+        self.boundary.start = start_new_owner
         self.boundary.valid_owner = False
         return first
 

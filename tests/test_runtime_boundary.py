@@ -734,8 +734,16 @@ def test_retained_stop_owner_reclaims_release_before_term_kill_and_positive_wait
 
 
 @pytest.mark.parametrize("replacement", [False, True, "invalid"])
-def test_postterm_escalation_allows_withdrawal_but_rejects_replacement(tmp_path, monkeypatch, replacement):
+@pytest.mark.parametrize("diagnostics", [False, True])
+def test_postterm_escalation_allows_withdrawal_but_rejects_replacement(
+    tmp_path, monkeypatch, capfd, replacement, diagnostics
+):
+    if diagnostics:
+        monkeypatch.setenv("ASTRID_INSTALLER_ALL_PREDICATES_DIAGNOSTICS", "1")
+    else:
+        monkeypatch.delenv("ASTRID_INSTALLER_ALL_PREDICATES_DIAGNOSTICS", raising=False)
     module, boundary, authority, _, identities, _, signals, kwargs = _detached_runtime(tmp_path, monkeypatch)
+    capfd.readouterr()  # Setup observations precede the stop phase.
     def deliver(words, signum):
         signals.append(signum)
         if signum == signal.SIGTERM:
@@ -760,7 +768,22 @@ def test_postterm_escalation_allows_withdrawal_but_rejects_replacement(tmp_path,
         assert boundary.stop_owner(**kwargs)["exit_evidence"] == "nonchild_absence_observed"
         assert signals == [signal.SIGTERM, signal.SIGKILL]
         assert authority.reference()["generation"] == 3
+    stderr = capfd.readouterr().err
+    if diagnostics:
+        from tests.test_owner_diagnostics_v1 import PREFIX
 
+        observed = [json.loads(line[len(PREFIX) :]) for line in stderr.splitlines()]
+        assert all(item["phase"] == "stop" for item in observed)
+        assert str(tmp_path) not in stderr and "replacement" not in stderr
+        assert any(item["predicate"] == "escalation_birth_matches" and item["result"] == "pass" for item in observed)
+        if replacement == "invalid":
+            assert any(
+                item["predicate"] == "escalation_metadata_read" and item["result"] == "unknown" for item in observed
+            )
+        elif replacement:
+            assert any(item["predicate"] == "escalation_metadata_pid" and item["result"] == "fail" for item in observed)
+    else:
+        assert stderr == ""
 
 
 @pytest.mark.parametrize("outcome", ["live", "absent", "unknown"])
