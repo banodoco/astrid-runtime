@@ -771,12 +771,13 @@ def _reclaim_stale_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) 
     if not present or any(_owner_may_be_alive(boundary, record) for _, record in present):
         return False
     _realm, selected_root = _selected_stop_realm(paths)
-    if not realm_owner_lock_free(selected_root):
-        return False
-    if any(_read_support_json(path) != record for path, record in records):
-        raise BootstrapError("Runtime owner changed during stale-owner cleanup.")
-    for path, _ in present:
-        remove_file(path)
+    with _locked_realm_owner_file(selected_root) as free:
+        if not free:
+            return False
+        if any(_read_support_json(path) != record for path, record in records):
+            raise BootstrapError("Runtime owner changed during stale-owner cleanup.")
+        for path, _ in present:
+            remove_file(path)
     return True
 
 
