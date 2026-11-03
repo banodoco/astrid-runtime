@@ -2273,6 +2273,47 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertTrue(self.paths.instance_lock_path.exists())
 
+    @unittest.skipIf(sys.platform == "win32", "R0 POSIX flock semantics")
+    def test_r0_shaped_marker_refused_by_both_guards_with_free_or_held_realm_lock(self):
+        from runtime_protocol import platform
+
+        root = self._configure()
+        marker = {
+            "pid": 12345, "process_birth_id": "old-birth",
+            "runtime_instance_id": "old-instance", "realm_id": "configured-realm",
+            "realm_root": str(root),
+        }
+        self.paths.instance_lock_path.write_text(json.dumps(marker))
+        before = self.paths.instance_lock_path.read_bytes()
+        lock_path = root / "owner.lock"
+        self.assertTrue(lock_path.is_file())
+        calls = []
+        with lock_path.open("r+") as lock:
+            for held in (False, True):
+                if held:
+                    platform.lock_file(lock.fileno(), blocking=False)
+                try:
+                    for guard in ("preflight", "locked"):
+                        with self.subTest(held=held, guard=guard):
+                            with self.assertRaisesRegex(BootstrapError, "no matching discovery") as caught:
+                                if guard == "preflight":
+                                    bootstrap_module._preflight_owner_interruption(self.paths)
+                                else:
+                                    bootstrap_module._interrupt_owner_locked(
+                                        self.paths, self.boundary,
+                                        stop_manager=lambda: calls.append("manager"),
+                                    )
+                            if guard == "preflight":
+                                self.assertEqual(caught.exception.details["owner_active"], held)
+                            self.assertEqual(self.paths.instance_lock_path.read_bytes(), before)
+                            self.assertFalse(self.paths.discovery_path.exists())
+                            self.assertTrue(lock_path.is_file())
+                            self.assertEqual(calls, [])
+                            self.assertEqual(self.boundary.restart_calls, 0)
+                finally:
+                    if held:
+                        platform.unlock_file(lock.fileno())
+
     def test_reused_identity_in_matching_publication_revokes_receipt(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
