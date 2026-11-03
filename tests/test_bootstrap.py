@@ -2273,6 +2273,33 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertTrue(self.paths.instance_lock_path.exists())
 
+    def test_r0_shaped_marker_without_service_and_census_evidence_refuses_both_guards(self):
+        # R0 writes exactly these owner fields, but neither a service-manager
+        # binding nor a record of detached descendants. A dead-looking PID and
+        # an unlocked realm alone must never authorize marker retirement.
+        root = self._configure()
+        marker = {
+            "pid": 41001, "process_birth_id": "linux:12345",
+            "runtime_instance_id": "r0-instance", "realm_id": "configured-realm",
+            "realm_root": str(root),
+        }
+        self.paths.instance_lock_path.write_text(json.dumps(marker), encoding="utf-8")
+        original = self.paths.instance_lock_path.read_bytes()
+        self.assertFalse(bootstrap_module._realm_owner_present(root))
+        self.assertTrue((root / "owner.lock").exists())
+        calls = []
+        for guard in (
+            lambda: bootstrap_module._preflight_owner_interruption(self.paths),
+            lambda: bootstrap_module._interrupt_owner_locked(
+                self.paths, self.boundary, stop_manager=lambda: calls.append("manager")),
+        ):
+            with self.subTest(guard=guard):
+                with self.assertRaises(BootstrapError):
+                    guard()
+                self.assertEqual(self.paths.instance_lock_path.read_bytes(), original)
+                self.assertFalse(self.paths.discovery_path.exists())
+                self.assertEqual(calls, [])
+
     def test_reused_identity_in_matching_publication_revokes_receipt(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)
