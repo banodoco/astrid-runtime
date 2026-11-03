@@ -83,7 +83,7 @@ jobs:
         path: ${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip'
           || '~/.cache/pip' }}
         key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-  unit:
+  g3-unit:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -141,7 +141,7 @@ jobs:
         path: ${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip'
           || '~/.cache/pip' }}
         key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-  darwin-native:
+  g3-darwin-native:
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
@@ -186,7 +186,7 @@ jobs:
         path: ${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip'
           || '~/.cache/pip' }}
         key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-  typescript-client:
+  g3-typescript-client:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -217,7 +217,7 @@ jobs:
       working-directory: packages/typescript
     - run: npm test
       working-directory: packages/typescript
-  boundary:
+  g3-boundary:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -264,7 +264,7 @@ jobs:
         path: ${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip'
           || '~/.cache/pip' }}
         key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-  sandbox-process-control:
+  g3-sandbox-process-control:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -289,7 +289,7 @@ jobs:
 
         '
     - run: sh tests/seccomp/run-suite.sh
-  portability-lifecycle:
+  g3-portability-lifecycle:
     env:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     defaults:

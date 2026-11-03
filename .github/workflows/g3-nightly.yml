@@ -25,7 +25,7 @@ name: G3 runtime nightly
 permissions:
   contents: read
 jobs:
-  integration:
+  g3-integration:
     runs-on: ubuntu-latest
     env:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
