@@ -499,7 +499,7 @@ class CommitExecutionCoordinator:
             raise CommitOutcomeUnknown() from exc
 
     def execute(self, context, provider, port_factory, *, authorize, diagnostic_request_id=None,
-                public_request_id=None, idempotency_key=None):
+                public_request_id=None, idempotency_key=None, editing_session=None):
         timing = current_commit_timing()
         token = None
         if timing is None:
@@ -509,7 +509,7 @@ class CommitExecutionCoordinator:
                 result = self._execute(context, provider, port_factory, authorize=authorize,
                                        diagnostic_request_id=diagnostic_request_id,
                                        public_request_id=public_request_id,
-                                       idempotency_key=idempotency_key)
+                                       idempotency_key=idempotency_key, editing_session=editing_session)
                 timing.mark_outcome(result)
                 return result
             except BaseException:
@@ -520,7 +520,7 @@ class CommitExecutionCoordinator:
                     finish_commit_timing(timing, token)
 
     def _execute(self, context, provider, port_factory, *, authorize, diagnostic_request_id=None,
-                 public_request_id=None, idempotency_key=None):
+                 public_request_id=None, idempotency_key=None, editing_session=None):
         context = detached(context)
         if request_identity(context) != context["request_hash"]:
             reject("invocation_mismatch", status=422)
@@ -543,7 +543,7 @@ class CommitExecutionCoordinator:
                 return replay
             if not acquired:
                 reject("idempotency_mismatch")
-            self.commit_store.check_editing(context, authorize=authorize)
+            self.commit_store.check_editing(context, authorize=authorize, editing_session=editing_session)
             outcome = error = port = None
             try:
                 if timing is not None:

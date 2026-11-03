@@ -104,11 +104,13 @@ def public_failure(failure):
 
 
 class RequestCommitPort:
-    def __init__(self, service, commit_store, context, authorize):
+    def __init__(self, service, commit_store, context, authorize, *, editing_session=None):
         self.__service = service
         self.__store = commit_store
         self.__context = detached(context)
         self.__authorize = authorize
+        # Transport authority is never part of provider or persisted context.
+        self.__editing_session = editing_session
         self.__closed = False
         self.__closures = {}
         self.__source_closures = {}
@@ -699,7 +701,8 @@ class RequestCommitPort:
             if self.__request.get("dry_run", False):
                 raise refused("dry_run_accept", "dry run cannot accept")
             prepared = self._prepared(prepared)
-            return self.__store.accept(self.__context, prepared, authorize=self.__authorize, inputs=self)
+            return self.__store.accept(self.__context, prepared, authorize=self.__authorize, inputs=self,
+                                       editing_session=self.__editing_session)
         except StaleHead as exc:
             if any(item.get("op") == "timeline.restore" for item in self.__request["commands"]):
                 raise refused("stale_head", "restore head pair changed", current=exc.current_head) from exc

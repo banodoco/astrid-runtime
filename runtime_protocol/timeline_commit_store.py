@@ -253,7 +253,7 @@ class TimelineCommitStore:
                 from .timeline_editing import TimelineEditingLeases
                 store._timeline_editing = TimelineEditingLeases(store._mutex)
             self.editing = store._timeline_editing
-        self._publication_exempt = publication_exempt or (lambda context: False)
+        self._publication_exempt = publication_exempt or (lambda context, editing_session: False)
         # Validation uses the wire worker's authoritative schema, including
         # Agent-owned leaves. It must raise on invalid data, never normalize it.
         self.validate_prepared = validate_prepared
@@ -1839,14 +1839,14 @@ class TimelineCommitStore:
         if any(c["op"] == "timeline.restore" for c in request["commands"]) and expected != base:
             reject("stale_head")
 
-    def check_editing(self, context, *, authorize, initializing=False):
+    def check_editing(self, context, *, authorize, initializing=False, editing_session=None):
         """Admission hint and definitive acceptance fence use the same owner."""
         from .timeline_commit import CommitRejected
 
         with self.store._mutex:
             authorize()
             request = context["request"]
-            if (request.get("dry_run", False) or self._publication_exempt(context)
+            if (request.get("dry_run", False) or self._publication_exempt(context, editing_session)
                     or not self.editing.live(request["project_id"], request["timeline_id"])):
                 return
             raise CommitRejected({
@@ -1863,7 +1863,7 @@ class TimelineCommitStore:
             })
 
     @_evaluation
-    def accept(self, context, prepared, *, authorize, inputs=None):
+    def accept(self, context, prepared, *, authorize, inputs=None, editing_session=None):
         context, prepared = detached(context), detached(prepared)
         with self.store._mutex:
             if self.conn.in_transaction:
@@ -1875,7 +1875,7 @@ class TimelineCommitStore:
                     return replay
                 if context["request"].get("dry_run", False):
                     reject("dry_run_accept", status=422)
-                self.check_editing(context, authorize=authorize)
+                self.check_editing(context, authorize=authorize, editing_session=editing_session)
                 self._check_context(context)
                 self._check_head(context, prepared["expected_head"])
                 self._check_shot_destinations(context, prepared, inputs)

@@ -203,6 +203,7 @@ def test_app_credential_is_rechecked_at_serialized_acceptance(editing_runtime, m
     ready, proceed = Event(), Event()
     original = RequestCommitPort.accept
     def paused_accept(port, candidate):
+        assert "editing_session" not in port._provider_context()
         ready.set()
         assert proceed.wait(10)
         return original(port, candidate)

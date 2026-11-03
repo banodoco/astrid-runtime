@@ -3118,9 +3118,9 @@ class RuntimeService:
                     self.store, validate_prepared=lambda value: validate_commit_value(value, "PreparedCommit"),
                     # Source is attribution only. A caller must possess its
                     # own currently active, actor-bound tab lease credential.
-                    publication_exempt=lambda context: self.store._timeline_editing.owns_live(
+                    publication_exempt=lambda context, editing_session: self.store._timeline_editing.owns_live(
                         context["request"]["project_id"], context["request"]["timeline_id"],
-                        context.get("publisher"), context.get("editing_session")),
+                        context.get("publisher"), editing_session),
                 )
                 self._timeline_commit_coordinator = CommitExecutionCoordinator(self._timeline_commit_store)
             return self._timeline_commit_store, self._timeline_commit_coordinator
@@ -3233,8 +3233,7 @@ class RuntimeService:
         }).encode()).hexdigest()
         context = {"request": detached(request), "invocation": invocation,
                    "request_hash": request_hash, "idempotency_key": idempotency_key,
-                   "publisher": publisher, "realm_id": self.realm["id"],
-                   "editing_session": editing_session}
+                   "publisher": publisher, "realm_id": self.realm["id"]}
         request_id = _new_request_id()
         timing = current_commit_timing()
         if timing is not None:
@@ -3249,7 +3248,8 @@ class RuntimeService:
             self._ensure_timeline_commit_baseline(commits, project_id, timeline_id, require_active)
             current_head = commits.head(project_id, timeline_id)
             self._verify_legacy_media_selections(commits.revision_closure(project_id, timeline_id, current_head["revision_id"]))
-            return RequestCommitPort(self, commits, bound_context, require_active)
+            return RequestCommitPort(self, commits, bound_context, require_active,
+                                     editing_session=editing_session)
         if timing is not None:
             timing.end("service_admission")
         try:
@@ -3258,7 +3258,7 @@ class RuntimeService:
                 if replay is not None:
                     return replay
                 require_active()
-                commits.check_editing(context, authorize=check)
+                commits.check_editing(context, authorize=check, editing_session=editing_session)
                 _emit_redacted_diagnostic(
                     request_id, reason="provider_none", public_request_id=public_request_id,
                     idempotency_key=idempotency_key,
@@ -3267,7 +3267,7 @@ class RuntimeService:
             outcome = coordinator.execute(context, provider, port_factory, authorize=check,
                                           diagnostic_request_id=request_id,
                                           public_request_id=public_request_id,
-                                          idempotency_key=idempotency_key)
+                                          idempotency_key=idempotency_key, editing_session=editing_session)
             if "http_status" in outcome:
                 failure = public_failure(outcome)
                 if _is_history_failure(outcome):
