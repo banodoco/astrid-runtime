@@ -236,13 +236,14 @@ def test_historical_restore_requires_owned_lease_and_replays_after_release(editi
     # Establish a newer historical head with the real provider before restoring.
     saved = submit(runtime, patch(runtime, "saved"), "restore-seed")
     assert saved["data"]["status"] == "accepted"
+    restore_head = runtime.get_project_timeline(runtime.test_project, "main")
+    restore_body = {"expected_head": restore_head["head_revision_id"],
+                    "expected_publication_id": restore_head["head_publication_id"]}
 
     def restore(key, *, editing_session=None):
-        head = runtime.get_project_timeline(runtime.test_project, "main")
         return runtime.restore_project_parent_composition_revision(
             runtime.test_project, "main", source_revision,
-            {"expected_head": head["head_revision_id"],
-             "expected_publication_id": head["head_publication_id"]},
+            restore_body,
             idempotency_key=key, publisher="shared-product",
             authorize=lambda: {"actor": "shared-product"},
             invocation_path=route_path(runtime.test_project, "main",
