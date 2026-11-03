@@ -39,6 +39,88 @@ def _identity(info):
     return info.st_dev, info.st_ino
 
 
+class ProvisionalRootPair:
+    """Pin two existing roots in lock order, without authorizing a restore.
+
+    This is an initial acquisition primitive: it must not be nested inside an
+    already-held realm fence. Both roots are retained until close. Publication,
+    lineage authorization, and transfer admission require separate authority.
+    """
+
+    def __init__(self, original, replacement):
+        if sys.platform not in ("linux", "darwin"):
+            raise FenceUnavailable("unsupported transfer platform")
+        self._roots = []
+        self._closed = False
+        self._poisoned = False
+        try:
+            for path in (Path(original), Path(replacement)):
+                fd = _open_directory(path)
+                self._roots.append({"path": path, "directory": fd, "owner": None})
+                info = os.fstat(fd)
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+                    raise FenceUnavailable("realm directory identity is invalid")
+            self._roots.sort(key=lambda item: _identity(os.fstat(item["directory"])))
+            if _identity(os.fstat(self._roots[0]["directory"])) == _identity(os.fstat(self._roots[1]["directory"])):
+                raise FenceUnavailable("realm roots are not distinct")
+            # Never wait while holding one root: acquire all directory locks
+            # in stable file-ID order before opening and locking either owner.
+            for item in self._roots:
+                platform.lock_file(item["directory"], blocking=False)
+            for item in self._roots:
+                item["owner"] = os.open("owner.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                        dir_fd=item["directory"])
+                owner = os.fstat(item["owner"])
+                if (not stat.S_ISREG(owner.st_mode) or owner.st_uid != os.geteuid()
+                        or owner.st_nlink != 1 or owner.st_mode & 0o077):
+                    raise FenceUnavailable("owner lock identity is invalid")
+                platform.lock_file(item["owner"], blocking=False)
+            self.revalidate()
+        except BaseException as exc:
+            self.close()
+            if isinstance(exc, OSError):
+                raise FenceUnavailable("realm pair custody unavailable") from exc
+            raise
+
+    def revalidate(self):
+        if self._closed or self._poisoned or len(self._roots) != 2:
+            raise FenceUnavailable("realm pair fence is closed")
+        try:
+            for item in self._roots:
+                current = _open_directory(item["path"])
+                try:
+                    directory = os.fstat(item["directory"])
+                    owner = os.fstat(item["owner"])
+                    named_owner = os.stat("owner.lock", dir_fd=item["directory"], follow_symlinks=False)
+                    if (_identity(os.fstat(current)) != _identity(directory)
+                            or directory.st_uid != os.geteuid()
+                            or _identity(owner) != _identity(named_owner)
+                            or not stat.S_ISREG(named_owner.st_mode)
+                            or owner.st_nlink != 1 or owner.st_uid != os.geteuid()
+                            or owner.st_mode & 0o077):
+                        raise FenceUnavailable("realm pair binding changed")
+                finally:
+                    os.close(current)
+        except (OSError, FenceUnavailable) as exc:
+            self._poisoned = True
+            raise FenceUnavailable("realm pair binding unavailable") from exc
+
+    def close(self):
+        self._closed = True
+        for item in reversed(self._roots):
+            for name in ("owner", "directory"):
+                fd, item[name] = item[name], None
+                if fd is not None:
+                    os.close(fd)
+        self._roots = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
 class ProvisionalRealmFence:
     """Own two locked descriptions until close, without ever issuing LOCK_UN.
 
