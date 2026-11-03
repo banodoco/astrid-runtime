@@ -3,6 +3,7 @@ import array
 import fcntl
 import multiprocessing
 import os
+from pathlib import Path
 import socket
 import stat
 
@@ -50,7 +51,7 @@ def _contends(path):
 
 
 def _pair(tmp_path, *, capability=CAP):
-    endpoint = tmp_path / "socket"
+    endpoint = Path(os.path.relpath(tmp_path / "socket"))
     directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     owner_path = tmp_path / "owner.lock"
     owner_path.touch(mode=0o600)

@@ -3,6 +3,7 @@ import array
 import json
 import multiprocessing
 import os
+from pathlib import Path
 import socket
 import struct
 from types import SimpleNamespace
@@ -67,7 +68,8 @@ def running(tmp_path):
     config, root, _, binding = fixture(tmp_path)
     controller = transport.linux_peer_identity(os.getpid())
     binding["controller"] = {"pid": controller.pid, "uid": controller.uid, "birth": controller.birth}
-    path = tmp_path / "control.sock"
+    # AF_UNIX pathname limits apply to the supplied name, not its absolute path.
+    path = Path(os.path.relpath(tmp_path / "control.sock"))
     ctx = multiprocessing.get_context("spawn")
     parent, child = ctx.Pipe()
     process = ctx.Process(target=broker, args=(path, config.runtime_support, binding, controller, child))
@@ -162,3 +164,32 @@ def test_second_connection_rejected_while_controller_active(running):
         first.shutdown(socket.SHUT_WR)
         assert first.recv(4)
     assert exchange(path, peer, request)["code"] == "observed"
+
+
+def test_delivery_action_is_refused_without_authority_or_rights(running):
+    """The old control frame cannot request delivery, including on replay."""
+    path, root, peer, request = running
+    delivery = dict(request, action="provisional_delivery", target_phase="candidate")
+    for attempt in (delivery, delivery, dict(delivery, request_id="another")):
+        with transport.connect(path, peer) as conn:
+            conn.settimeout(5)
+            conn.sendall(encode(attempt))
+            conn.shutdown(socket.SHUT_WR)
+            data, ancillary, flags, _ = conn.recvmsg(
+                65536, socket.CMSG_SPACE(16 * array.array("i").itemsize)
+            )
+            # Close any unexpected rights before failing the assertion.
+            received = []
+            for level, kind, payload in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    fds = array.array("i")
+                    fds.frombytes(payload[:len(payload) - len(payload) % fds.itemsize])
+                    received.extend(fds)
+            try:
+                assert not data and not ancillary
+                assert not flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC)
+            finally:
+                for fd in received:
+                    os.close(fd)
+        assert contender(root / "owner.lock") == 17
+    assert exchange(path, peer, request) == {"code": "observed", "phase": "observed", "request_count": 0}

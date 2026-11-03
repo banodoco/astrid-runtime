@@ -171,6 +171,11 @@ class ProvisionalControl:
                 or type(req["request_id"]) is not str or not req["request_id"]
                 or type(req["expected_phase"]) is not str or type(req["target_phase"]) is not str):
             raise transport.TransferError("control binding differs")
+        # The v1 endpoint has no authenticated delivery-authority exchange.
+        # Refuse unknown actions before consulting the local recovery ledger:
+        # an empty or missing ledger must never make delivery available.
+        if req["action"] not in ("query", "transition"):
+            raise transport.TransferError("unsupported control action")
         self._session.pin_and_acquire_original().revalidate()
         status = self._session.query()
         if req["action"] == "query":
