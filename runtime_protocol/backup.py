@@ -344,65 +344,61 @@ def _verify_manifested_realm(root_fd: int, manifest: dict, cas: dict) -> None:
         os.close(cas_fd)
 
 
-def _connection_from_fd(root_fd: int, name: str) -> sqlite3.Connection:
+def _connection_from_fd(fd: int, name: str) -> sqlite3.Connection:
     """Open SQLite through a duplicated, already-pinned descriptor.
 
     ``immutable`` prevents SQLite from consulting sibling WAL/journal paths.
     POSIX uses a descriptor alias; Windows uses a private snapshot copied from
     the pinned descriptor. Neither opens the unpinned backup pathname.
     """
-    fd = _open_relative(root_fd, name)
-    try:
-        value = os.fstat(fd)
-        if not stat.S_ISREG(value.st_mode):
-            raise ConflictError(f"backup SQLite entry is not a regular file: {name}")
-        if os.name == "nt":
-            # Windows has no /dev/fd alias. Copy from the already-pinned file
-            # descriptor into a private snapshot, then open that immutable
-            # snapshot. Chunking keeps memory bounded for large databases.
-            before = _snapshot_identity(value)
-            snapshot_dir = tempfile.TemporaryDirectory(prefix="astrid-backup-verify-")
-            snapshot_path = Path(snapshot_dir.name) / "realm.sqlite3"
-            try:
-                with snapshot_path.open("wb") as output:
-                    while True:
-                        chunk = os.read(fd, 1024 * 1024)
-                        if not chunk:
-                            break
-                        output.write(chunk)
-                    output.flush()
-                    os.fsync(output.fileno())
-                if _snapshot_identity(os.fstat(fd)) != before:
-                    raise ConflictError("backup SQLite file changed while being snapshotted")
-
-                class SnapshotConnection(sqlite3.Connection):
-                    def close(self):
-                        try:
-                            super().close()
-                        finally:
-                            directory = getattr(self, "_snapshot_directory", None)
-                            if directory is not None:
-                                self._snapshot_directory = None
-                                directory.cleanup()
-
-                connection = sqlite3.connect(
-                    snapshot_path.as_uri() + "?immutable=1", uri=True, factory=SnapshotConnection
-                )
-                connection._snapshot_directory = snapshot_dir
-                return connection
-            except Exception:
-                snapshot_dir.cleanup()
-                raise
-        sqlite_fd = os.dup(fd)
+    value = os.fstat(fd)
+    if not stat.S_ISREG(value.st_mode):
+        raise ConflictError(f"backup SQLite entry is not a regular file: {name}")
+    if os.name == "nt":
+        # Windows has no /dev/fd alias. Copy from the already-pinned file
+        # descriptor into a private snapshot, then open that immutable
+        # snapshot. Chunking keeps memory bounded for large databases.
+        before = _snapshot_identity(value)
+        snapshot_dir = tempfile.TemporaryDirectory(prefix="astrid-backup-verify-")
+        snapshot_path = Path(snapshot_dir.name) / "realm.sqlite3"
         try:
-            connection = sqlite3.connect(f"file:/dev/fd/{sqlite_fd}?immutable=1", uri=True)
-            os.close(sqlite_fd)
+            with snapshot_path.open("wb") as output:
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            if _snapshot_identity(os.fstat(fd)) != before:
+                raise ConflictError("backup SQLite file changed while being snapshotted")
+
+            class SnapshotConnection(sqlite3.Connection):
+                def close(self):
+                    try:
+                        super().close()
+                    finally:
+                        directory = getattr(self, "_snapshot_directory", None)
+                        if directory is not None:
+                            self._snapshot_directory = None
+                            directory.cleanup()
+
+            connection = sqlite3.connect(
+                snapshot_path.as_uri() + "?immutable=1", uri=True, factory=SnapshotConnection
+            )
+            connection._snapshot_directory = snapshot_dir
             return connection
         except Exception:
-            os.close(sqlite_fd)
+            snapshot_dir.cleanup()
             raise
-    finally:
-        os.close(fd)
+    sqlite_fd = os.dup(fd)
+    try:
+        connection = sqlite3.connect(f"file:/dev/fd/{sqlite_fd}?immutable=1", uri=True)
+        os.close(sqlite_fd)
+        return connection
+    except Exception:
+        os.close(sqlite_fd)
+        raise
 
 
 def _snapshot_identity(value) -> tuple[int, int, int, int, int]:
@@ -437,22 +433,49 @@ def _inspect_consolidated_realm(
     """Run the full RealmStore doctor logic over an immutable descriptor DB."""
     from .store import RealmStore
 
-    connection = _connection_from_fd(root_fd, "realm.sqlite3")
-    connection.row_factory = sqlite3.Row
-    inspector = object.__new__(RealmStore)
-    # Keep CAS reads rooted at the retained directory descriptor. POSIX uses
-    # /dev/fd; Windows resolves the retained directory handle to its pinned
-    # final path.
-    inspector.root = Path(os.path_from_fd(root_fd)) if os.name == "nt" else Path(f"/dev/fd/{root_fd}")
-    inspector.db_path = inspector.root / "realm.sqlite3"
-    inspector.cas_root = inspector.root / "cas" / "sha256"
+    db_fd = _open_relative(root_fd, "realm.sqlite3")
     try:
-        inspector._cas_root_fd = _open_relative(root_fd, "cas/sha256", directory=True)
-    except FileNotFoundError:
-        inspector._cas_root_fd = -1
-    inspector.conn = connection
-    inspector._mutex = threading.RLock()
+        before = _snapshot_identity(os.fstat(db_fd))
+    except BaseException:
+        os.close(db_fd)
+        raise
+
+    def check_database_entry():
+        try:
+            entry = os.stat("realm.sqlite3", dir_fd=root_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(entry.st_mode) or _snapshot_identity(entry) != before
+                    or _snapshot_identity(os.fstat(db_fd)) != before):
+                raise ConflictError("backup SQLite file changed during inspection")
+        except FileNotFoundError as exc:
+            raise ConflictError("backup SQLite file changed during inspection") from exc
+
     try:
+        check_database_entry()
+        connection = _connection_from_fd(db_fd, "realm.sqlite3")
+    except BaseException:
+        os.close(db_fd)
+        raise
+    cas_fd = -1
+    try:
+        connection.row_factory = sqlite3.Row
+        inspector = object.__new__(RealmStore)
+        # Keep CAS reads rooted at the retained directory descriptor. POSIX uses
+        # /dev/fd; Windows resolves the retained directory handle to its pinned
+        # final path.
+        inspector.root = Path(os.path_from_fd(root_fd)) if os.name == "nt" else Path(f"/dev/fd/{root_fd}")
+        # The timeline verifier stats this path. Darwin does not support walking
+        # from a /dev/fd directory alias, but does support a file descriptor alias.
+        # Keep the very descriptor used to open SQLite alive throughout inspection.
+        inspector.db_path = (inspector.root / "realm.sqlite3" if os.name == "nt"
+                             else Path(f"/dev/fd/{db_fd}"))
+        inspector.cas_root = inspector.root / "cas" / "sha256"
+        try:
+            cas_fd = _open_relative(root_fd, "cas/sha256", directory=True)
+        except FileNotFoundError:
+            cas_fd = -1
+        inspector._cas_root_fd = cas_fd
+        inspector.conn = connection
+        inspector._mutex = threading.RLock()
         report = inspector.integrity_report(timeout_seconds=timeout_seconds)
         if not report.get("ok"):
             # Only the current-schema finding may be waived, and only after
@@ -465,11 +488,16 @@ def _inspect_consolidated_realm(
             if int(identity["version"]) >= SCHEMA_VERSION:
                 raise ConflictError("realm failed integrity checks", details=report)
         realm = inspector.realm
+        check_database_entry()
+        _reject_sqlite_sidecars(root_fd, label="backup candidate")
         return report, realm
     finally:
-        connection.close()
-        if inspector._cas_root_fd >= 0:
-            os.close(inspector._cas_root_fd)
+        try:
+            connection.close()
+        finally:
+            os.close(db_fd)
+            if cas_fd >= 0:
+                os.close(cas_fd)
 
 
 def verify_backup(backup_dir: str | Path, *, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any] | None = None, older_schema: bool = False) -> dict:

@@ -429,3 +429,82 @@ def test_storage_admission_below_default_floor_is_refused(tmp_path, monkeypatch)
         assert service.store.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     finally:
         service.close()
+
+
+def test_backup_inspection_uses_pinned_database_file_alias(tmp_path, monkeypatch):
+    import errno
+    import re
+    import runtime_protocol.timeline_commit_store as timeline_store
+
+    service = _service(tmp_path / "realm")
+    try:
+        backup = tmp_path / "backup"
+        service.backup(backup)
+        original_stat = timeline_store.os.stat
+        file_aliases = []
+
+        def darwin_stat(path, *args, **kwargs):
+            name = os.fspath(path) if not isinstance(path, int) else ""
+            if isinstance(name, str) and re.match(r"^/dev/fd/\d+/", name):
+                raise FileNotFoundError(errno.ENOENT, "directory descriptor traversal unavailable", name)
+            if isinstance(name, str) and re.fullmatch(r"/dev/fd/\d+", name):
+                fd = int(name.rsplit("/", 1)[1])
+                assert os.fstat(fd).st_ino == original_stat(path, *args, **kwargs).st_ino
+                file_aliases.append(name)
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(timeline_store.os, "stat", darwin_stat)
+        assert verify_backup(backup)["doctor"]["ok"]
+        service.restore(backup, tmp_path / "restored")
+        if os.name != "nt":
+            assert file_aliases
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("damage", ["database", "cas", "-wal", "-shm", "-journal"])
+def test_backup_verification_rejects_corrupt_bytes_and_sidecars(tmp_path, damage):
+    service = _service(tmp_path / "realm")
+    try:
+        project = service.create_project({"name": "Backup damage"})
+        service.ingest(project["id"], b"backup object", media_type="text/plain", original_name="object.txt", idempotency_key="backup-object")
+        backup = tmp_path / "backup"
+        service.backup(backup)
+        if damage == "database":
+            (backup / "realm.sqlite3").write_bytes(b"corrupt database")
+        elif damage == "cas":
+            next(path for path in (backup / "cas" / "sha256").glob("*/*") if path.is_file()).write_bytes(b"corrupt object")
+        else:
+            (backup / ("realm.sqlite3" + damage)).write_bytes(b"unmanifested")
+        with pytest.raises(ConflictError):
+            verify_backup(backup)
+        with pytest.raises(ConflictError):
+            restore_backup(backup, tmp_path / "restored")
+        assert not (tmp_path / "restored").exists()
+    finally:
+        service.close()
+
+
+def test_backup_inspection_rejects_database_replacement(tmp_path, monkeypatch):
+    service = _service(tmp_path / "realm")
+    try:
+        backup = tmp_path / "backup"
+        service.backup(backup)
+        replacement = tmp_path / "replacement.sqlite3"
+        replacement.write_bytes((backup / "realm.sqlite3").read_bytes())
+        original_report = RealmStore.integrity_report
+        replaced = False
+
+        def replace_after_report(inspector, *args, **kwargs):
+            nonlocal replaced
+            report = original_report(inspector, *args, **kwargs)
+            os.replace(replacement, backup / "realm.sqlite3")
+            replaced = True
+            return report
+
+        monkeypatch.setattr(RealmStore, "integrity_report", replace_after_report)
+        with pytest.raises(ConflictError, match="SQLite file changed during inspection"):
+            verify_backup(backup)
+        assert replaced
+    finally:
+        service.close()
