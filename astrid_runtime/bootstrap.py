@@ -1061,6 +1061,9 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     if not stale_lock_only and (marker is None or marker.get("state") is None):
         _reclaim_stale_owner_locked(paths, boundary)
     discovery = _read_support_json(paths.discovery_path)
+    if stale_lock_only and (discovery is not None
+                            or _read_support_json(paths.instance_lock_path) != marker):
+        raise BootstrapError("Runtime owner changed before start.")
     if discovery is not None and discovery.get("active_realm"):
         _compatible(discovery, config, source)
         pid = discovery.get("pid")

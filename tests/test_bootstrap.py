@@ -3273,3 +3273,31 @@ def test_lookahead_rechecks_owner_lock_before_acting(operation):
             os.close(fd)
         case.tearDown()
         case.doCleanups()
+
+
+def test_lookahead_up_refuses_new_discovery_after_lock_probe():
+    case = BootstrapTests()
+    case.setUp()
+    try:
+        root = case._configure()
+        (root / "owner.lock").write_bytes(b"R0 lock bytes\n")
+        marker = b'{"pid": 12345, "legacy": "R0"}\n'
+        case.paths.instance_lock_path.write_bytes(marker)
+        replacement = b'{"active_realm": "configured-realm", "pid": 42}\n'
+        original = bootstrap_module._realm_owner_present
+
+        def publish_after_probe(realm_root, **kwargs):
+            result = original(realm_root, **kwargs)
+            case.paths.discovery_path.write_bytes(replacement)
+            return result
+
+        with patch.object(bootstrap_module, "_realm_owner_present", publish_after_probe):
+            with pytest.raises(BootstrapError, match="owner changed before start"):
+                bootstrap(case.paths, case.boundary, case.config)
+        assert case.boundary.starts == []
+        assert case.paths.instance_lock_path.read_bytes() == marker
+        assert case.paths.discovery_path.read_bytes() == replacement
+        assert (root / "owner.lock").read_bytes() == b"R0 lock bytes\n"
+    finally:
+        case.tearDown()
+        case.doCleanups()
