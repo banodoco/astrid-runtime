@@ -534,7 +534,8 @@ def _ledger_phase(ledger):
 
 def _transition_refusal(target):
     if target in ("writer_claimed", "ready", "commit_intent", "commit_decided",
-                  "committed", "rollback_intent", "rollback_decided", "rolled_back_stopped"):
+                  "detach_committed", "committed", "rollback_intent", "rollback_decided",
+                  "rolled_back_stopped", "finalize_release"):
         return "lease_uncertain"
     if target == "restart_fenced":
         return "restart_unfenced"

@@ -49,7 +49,8 @@ def test_recovery_transition_is_durable_and_replayable(tmp_path):
     ("preparing_data", "recovery_required"), ("selected", "recovery_required"),
     ("writer_claimed", "lease_uncertain"), ("ready", "lease_uncertain"),
     ("commit_intent", "lease_uncertain"), ("commit_decided", "lease_uncertain"),
-    ("committed", "lease_uncertain"), ("rollback_intent", "lease_uncertain"),
+    ("detach_committed", "lease_uncertain"), ("committed", "lease_uncertain"),
+    ("finalize_release", "lease_uncertain"), ("rollback_intent", "lease_uncertain"),
     ("rollback_decided", "lease_uncertain"), ("rolled_back_stopped", "lease_uncertain"),
     ("unknown", "unsupported_transfer"), ("recovery_required", "recovery_required"),
 ])
