@@ -5358,3 +5358,9 @@ or durable history. No claim is made to distinguish applications holding the
 same bearer. Restore HTTP requests have no lease credential and wait for release,
 including App history restores. Lease possession never bypasses authentication,
 existing conflict checks, history validation, or acceptance integrity checks.
+
+An App historical restore uses the same optional actor/tab editing-session
+header as commit. It is passed through to the existing serialized acceptance
+gate, outside the exact two-field restore body and durable replay identity.
+A live owner can restore under its own lease; other publishers remain gated,
+and a prior receipt can still replay after that owner releases.

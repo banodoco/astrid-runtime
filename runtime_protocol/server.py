@@ -864,6 +864,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         f"composition-revisions/{quote(path[6], safe='')}/restore",
                     ),
                     authorize=authorize,
+                    **({"editing_session": self.headers["X-Timeline-Editing-Session"]}
+                       if self.headers.get("X-Timeline-Editing-Session") else {}),
                 ))
         if len(path) == 7 and path[:2] == ["v1", "projects"] and path[5] == "revisions" and method == "GET":
             self._identity("projects:read")

@@ -227,6 +227,55 @@ def test_app_credential_is_rechecked_at_serialized_acceptance(editing_runtime, m
 
 
 @pytest.mark.integration
+def test_historical_restore_requires_owned_lease_and_replays_after_release(editing_runtime):
+    runtime = editing_runtime
+    initial = runtime.get_project_timeline(runtime.test_project, "main")
+    source_revision = initial["head_revision_id"]
+    source_publication = initial["head_publication_id"]
+
+    # Establish a newer historical head with the real provider before restoring.
+    saved = submit(runtime, patch(runtime, "saved"), "restore-seed")
+    assert saved["data"]["status"] == "accepted"
+
+    def restore(key, *, editing_session=None):
+        head = runtime.get_project_timeline(runtime.test_project, "main")
+        return runtime.restore_project_parent_composition_revision(
+            runtime.test_project, "main", source_revision,
+            {"expected_head": head["head_revision_id"],
+             "expected_publication_id": head["head_publication_id"]},
+            idempotency_key=key, publisher="shared-product",
+            authorize=lambda: {"actor": "shared-product"},
+            invocation_path=route_path(runtime.test_project, "main",
+                f"composition-revisions/{source_revision}/restore"),
+            **({"editing_session": editing_session} if editing_session is not None else {}),
+        )
+
+    lease(runtime, 1, tab="other-tab", actor="other-actor")
+    for credential in (None, "other-tab"):
+        with pytest.raises(RuntimeErrorBase) as refused:
+            restore("restore-refused", editing_session=credential)
+        assert refused.value.status == 409
+        assert refused.value.details["reason"] == "user_editing"
+    lease(runtime, 2, tab="other-tab", actor="other-actor", release=True)
+
+    lease(runtime, 1, tab="restore-owner", actor="shared-product")
+    with pytest.raises(RuntimeErrorBase) as missing:
+        restore("restore-authorized")
+    assert missing.value.status == 409
+    assert missing.value.details["reason"] == "user_editing"
+
+    accepted = restore("restore-authorized", editing_session="restore-owner")
+    assert accepted["data"]["status"] == "accepted"
+    assert accepted["data"]["canonical_document"]["parent_revision"]["revision_id"] == source_revision
+    lease(runtime, 2, tab="restore-owner", actor="shared-product", release=True)
+    assert restore("restore-authorized") == accepted
+
+    # The original revision and its publication identity remain the restore target.
+    assert source_revision == initial["head_revision_id"]
+    assert source_publication == initial["head_publication_id"]
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("operation", ["commit", "restore-adapter", "restore-command"])
 def test_admission_acceptance_interleaving_and_same_key_replay(editing_runtime, monkeypatch, operation):
     runtime = editing_runtime

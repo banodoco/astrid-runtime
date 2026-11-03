@@ -3443,7 +3443,7 @@ class RuntimeService:
     def restore_project_parent_composition_revision(self, project_id, timeline_id, revision, body, *,
                                                     idempotency_key=None, publisher=None,
                                                     invocation_path=None, authorize=None,
-                                                    public_request_id=None):
+                                                    public_request_id=None, editing_session=None):
         from .timeline_commit_port import detached, route_path
         body = detached(body)
         if not isinstance(body, dict) or set(body) != {"expected_head", "expected_publication_id"}:
@@ -3463,7 +3463,7 @@ class RuntimeService:
             project_id, timeline_id, request, body, operation="restoreProjectParentCompositionRevision",
             idempotency_key=idempotency_key, publisher=publisher,
             invocation_path=invocation_path, authorize=authorize,
-            public_request_id=public_request_id,
+            public_request_id=public_request_id, editing_session=editing_session,
         )
 
     def inspect_timeline(self, project, timeline_id, options=None):

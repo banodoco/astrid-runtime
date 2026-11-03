@@ -329,6 +329,26 @@ def test_restore_route_passes_original_body_identity_and_canonical_path():
     assert calls == [(project_id, timeline_id, revision, body, "restore-key-1", "publisher-1", path)]
 
 
+def test_restore_route_forwards_editing_session_only_when_present():
+    path = f"/v1/projects/{PROJECT}/timelines/{TIMELINE}/composition-revisions/revision-1/restore"
+    body = restore_body()
+    calls = []
+
+    def restore(project, timeline, selected_revision, original, *, idempotency_key,
+                publisher, invocation_path, authorize, **optional):
+        calls.append((original, optional))
+        assert authorize()["actor"] == publisher
+        return {"data": {"status": "accepted"}, "receipt": {"receipt_id": "r1"}}
+
+    handler = make_handler(
+        SimpleNamespace(restore_project_parent_composition_revision=restore), body,
+        path=path, headers={"Idempotency-Key": "restore-key-1",
+                            "X-Timeline-Editing-Session": "restore-owner"},
+    )
+    handler._route()
+    assert calls == [(body, {"editing_session": "restore-owner"})]
+
+
 @pytest.mark.parametrize("raw", [
     b'{"expected_head":"r","expected_head":"r2","expected_publication_id":"p"}',
     b'{"expected_head":"r","expected_publication_id":"p","opaque":1e999}',

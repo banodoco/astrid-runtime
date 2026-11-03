@@ -465,7 +465,7 @@ paths:
     post:
       operationId: restoreProjectParentCompositionRevision
       description: Publish the exact historical parent and dependency closure as a new head using compare-and-swap.
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: X-Timeline-Editing-Session, in: header, required: false, schema: { type: string }, description: Active authenticated actor/tab lease token. Carried outside restore body and replay identity. } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RestoreParentCompositionRevision' } } } }
       responses: { '200': { description: New parent revision published from the exact historical closure, content: { application/json: { schema: { $ref: '#/components/schemas/CommitAcceptedMutation' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/timeline-documents:
