@@ -25,7 +25,7 @@ name: G3 runtime ci
 permissions:
   contents: read
 jobs:
-  windows-realm-publication:
+  g3-windows-realm-publication:
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
