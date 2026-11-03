@@ -298,6 +298,18 @@ requires_linux_o_path = _declare(
     "dirfd-o-path", "sys_platform != 'linux'",
     "the ancestor walk uses Linux O_PATH", ("unit",),
 ).mark()
+requires_posix_interval_timers = _declare(
+    "posix-interval-timers", "sys_platform == 'win32'",
+    "POSIX interval timers", ("unit",),
+).mark()
+requires_linux_retained_listener = _declare(
+    "linux-retained-listener", "sys_platform != 'linux'",
+    "Linux retained listener primitive", ("unit",),
+).mark()
+requires_darwin_authenticated_cleanup = _declare(
+    "darwin-authenticated-cleanup", "sys_platform != 'darwin'",
+    "Darwin role-bound custody and POSIX inherited descriptors", ("unit",),
+).mark()
 
 # Decided while the test runs, so it is a call rather than a mark. The skip can
 # only fire on Windows, and only for WinError 1314 (no symlink privilege).

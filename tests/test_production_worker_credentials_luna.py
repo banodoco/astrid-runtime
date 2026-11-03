@@ -9,7 +9,18 @@ import pytest
 from http_helpers import Api
 from runtime_protocol.auth import AuthorizationError, CredentialStore
 from runtime_protocol.daemon import RuntimeDaemon, WORKER_ACTOR, WORKER_SCOPES
+from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
+
+
+def _provision_before_http_start(daemon):
+    # Match daemon startup ordering while stopping before HTTP is opened.
+    daemon.service = RuntimeService(daemon.root, support_root=daemon.support_root)
+    try:
+        daemon._provision_credentials()
+    finally:
+        daemon.service.close()
+        daemon.service = None
 
 
 def test_pack_host_credential_is_scoped_distinct_and_rotated_for_new_owner(tmp_path):
@@ -89,7 +100,7 @@ def test_receiptless_worker_bearer_is_rotated_before_http_start(tmp_path):
     support = tmp_path / "support"
     RealmStore.initialize(root).close()
     first = RuntimeDaemon(root, support_root=support)
-    first._provision_credentials()
+    _provision_before_http_start(first)
     stale = first.worker_token
     assert stale != first.token
     assert first.credentials.load(stale) == {"actor": WORKER_ACTOR, "scopes": sorted(WORKER_SCOPES)}
@@ -98,7 +109,7 @@ def test_receiptless_worker_bearer_is_rotated_before_http_start(tmp_path):
         first.credentials.require(stale, "admin")
 
     second = RuntimeDaemon(root, support_root=support)
-    second._provision_credentials()
+    _provision_before_http_start(second)
 
     assert second.worker_token != stale
     with pytest.raises(AuthorizationError):
@@ -114,7 +125,7 @@ def test_pre_marker_worker_bearer_is_rotated_before_http_start(tmp_path):
     path.with_suffix(".commit").unlink()
 
     daemon = RuntimeDaemon(root, support_root=support)
-    daemon._provision_credentials()
+    _provision_before_http_start(daemon)
 
     assert daemon.worker_token != stale
     with pytest.raises(AuthorizationError):

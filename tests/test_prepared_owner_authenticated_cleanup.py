@@ -15,9 +15,11 @@ from astrid_runtime.custody_broker import RoleBoundCustodyBroker, default_proces
 from runtime_protocol.local_execution_supervisor import RetainedProcess
 from runtime_protocol.local_worker import _digest
 from runtime_protocol.local_worker_composition import CrossProcessWorkerPreparer, _PreparedWorker
+from tests.lanes import requires_darwin_authenticated_cleanup
 from tests.test_local_worker import host_only_profile_case
 
 
+@requires_darwin_authenticated_cleanup
 def test_authenticated_delayed_cleanup_ack_precedes_original_child_reap(tmp_path):
     root = Path(__file__).resolve().parents[1]
     scope = tmp_path / "custody"

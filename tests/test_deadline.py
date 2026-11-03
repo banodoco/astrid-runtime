@@ -6,8 +6,9 @@ import textwrap
 
 import pytest
 
+from tests.lanes import requires_posix_interval_timers
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX interval timers")
+pytestmark = requires_posix_interval_timers
 
 
 def run_scope(program):
