@@ -327,10 +327,12 @@ selection.write_text(json.dumps(selected)); marker=program/'install.json'; marke
 snapshots={{path:path.read_bytes() for path in (selection,program/'current',version/'version.json',profile,marker)}}
 fake=SimpleNamespace(root=realm,instance_id='old-instance',startup_identity={{'release':4,'managed_by':None}},startup_identity_instance_id='old-instance',support_root=data/'runtime',service=SimpleNamespace(realm={{'id':'test-realm'}}),_identity_agent_checkout=agent,_identity_runtime_checkout=runtime)
 admission=update.UpdateAdmission(fake)
-admission._selection=lambda *, allow_pending=False:(selection,snapshots,python,agent,runtime,4)
+admission._selection=lambda *, allow_pending=False, require_autostart=True:(selection,snapshots,python,agent,runtime,4)
 admission._installer_idle=lambda _path: contextlib.nullcontext()
 update.assert_interruption_safe=lambda _root:None
 def helper(_python,_agent,_runtime,payload,**kwargs):
+    if payload.get('action')=='reconcile':
+        return {{'disposition':'prepare-new'}}
     if payload.get('action')=='accept':
         op=payload['operation_id']; job={{'format':'astrid-update-job/v1','operation_id':op,'state':'accepted','job_name':payload['job_name'],'program_root':str(program),'data_root':str(data),'log_path':payload['log_path'],'old_instance_id':payload['old_instance_id'],'old_identity':payload['old_identity'],'old_version':payload['old_version'],'target_release':payload['metadata']['release'],'metadata':payload['metadata'],'message':'Update accepted.'}}
         marker_value=json.loads(marker.read_text()); marker_value['update_job']=job; marker.write_text(json.dumps(marker_value)); return job
