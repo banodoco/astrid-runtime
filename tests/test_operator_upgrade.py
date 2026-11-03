@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import os
 from types import SimpleNamespace
 import sqlite3
 
@@ -132,9 +133,26 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
     return paths, profile, realm_root
 
 
-def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, monkeypatch):
+def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, monkeypatch, request):
     paths, profile, realm_root = _fixture(tmp_path)
     boundary = _Boundary(paths)
+    from runtime_protocol import platform
+    fd = os.open(realm_root / "owner.lock", os.O_RDONLY)
+    platform.lock_file(fd, blocking=False)
+    held = [True]
+    def release_lock():
+        if held[0]:
+            platform.unlock_file(fd)
+            held[0] = False
+    def finish():
+        release_lock()
+        os.close(fd)
+    request.addfinalizer(finish)
+    original_stop = boundary.stop_owner
+    def stop_owner(**kwargs):
+        original_stop(**kwargs)
+        release_lock()
+    boundary.stop_owner = stop_owner
     started = []
     migration_calls = []
 

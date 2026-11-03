@@ -23,6 +23,7 @@ from .bootstrap import (
     _bootstrap_mutex,
     _canonical_realm_root,
     _lock_matches,
+    _locked_realm_owner_file,
     _read_catalog,
     _read_support_json,
     _selected_realm,
@@ -147,13 +148,15 @@ def _journal(paths: RuntimePaths, *, operation_id: str, state: str, journal_root
 
 
 def _owner_record(paths: RuntimePaths, realm_id: str, realm_root: Path, boundary: RuntimeBoundary) -> dict[str, Any] | None:
+    # A missing or stale publication is not evidence that the realm is idle.
+    # The lock is an instantaneous observation; the later owner fence must
+    # independently acquire it before operating on the realm.
+    with _locked_realm_owner_file(realm_root) as free:
+        if free:
+            return None
     discovery = _read_support_json(paths.discovery_path)
     if not discovery or not discovery.get("pid"):
-        marker = _read_support_json(paths.instance_lock_path)
-        if marker and int(marker.get("pid", 0) or 0) > 0:
-            if boundary.is_pid_alive(int(marker["pid"])):
-                raise OperatorUpgradeError("runtime owner identity is incomplete; use astrid-runtime restart before upgrading")
-        return None
+        raise OperatorUpgradeError("runtime owner identity is incomplete; refusing to signal it")
     if str(discovery.get("active_realm")) != realm_id:
         raise OperatorUpgradeError("runtime discovery does not match the selected realm")
     required = ("endpoint", "pid", "runtime_instance_id", "process_birth_id", "realm_root")
@@ -331,6 +334,10 @@ def _restore_installation(paths, realm_root, archive):
 def _stop_selected(paths, boundary, realm_id, realm_root, config):
     owner = _owner_record(paths, realm_id, realm_root, boundary)
     if owner:
+        marker = _read_support_json(paths.instance_lock_path)
+        if not _lock_matches(paths, int(owner["pid"]), str(owner["runtime_instance_id"]),
+                             realm_id, str(owner["process_birth_id"]), realm_root):
+            raise OperatorUpgradeError("runtime owner lock changed before stop")
         source = config.resolve_source_profile(paths)
         boundary.prepare_restart(source_profile=source, realm_id=realm_id, realm_root=realm_root,
                                  support_root=paths.runtime_support, pid=int(owner["pid"]))
@@ -339,8 +346,18 @@ def _stop_selected(paths, boundary, realm_id, realm_root, config):
                 instance_id=str(owner["runtime_instance_id"]), process_birth_id=str(owner["process_birth_id"]),
                 realm_id=realm_id, owner_lock=paths.instance_lock_path,
                 discovery_path=paths.discovery_path, require_health=False)
-        remove_file(paths.discovery_path)
-        remove_file(paths.instance_lock_path)
+        # A new owner may publish immediately after stop. Do not remove its
+        # records, and keep the lifetime lock through both final removals.
+        with _locked_realm_owner_file(realm_root) as free:
+            if not free:
+                raise OperatorUpgradeError("runtime owner lock is busy after stop")
+            current = (_read_support_json(paths.discovery_path), _read_support_json(paths.instance_lock_path))
+            if any(value is not None and value != expected
+                   for value, expected in zip(current, (owner, marker))):
+                raise OperatorUpgradeError("runtime owner changed during stop")
+            for path, value in zip((paths.discovery_path, paths.instance_lock_path), current):
+                if value is not None:
+                    remove_file(path)
 
 
 def _start_operation(paths, boundary, config, operation_id):
