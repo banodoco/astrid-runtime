@@ -17,6 +17,7 @@ import sqlite3
 import threading
 from pathlib import Path
 import stat
+import sys
 import tempfile
 from contextlib import ExitStack
 from typing import Any, Mapping
@@ -348,17 +349,17 @@ def _connection_from_fd(root_fd: int, name: str) -> sqlite3.Connection:
     """Open SQLite through a duplicated, already-pinned descriptor.
 
     ``immutable`` prevents SQLite from consulting sibling WAL/journal paths.
-    POSIX uses a descriptor alias; Windows uses a private snapshot copied from
-    the pinned descriptor. Neither opens the unpinned backup pathname.
+    Linux uses a descriptor alias; macOS and Windows use a private snapshot
+    copied from the pinned descriptor. Neither opens the unpinned backup path.
     """
     fd = _open_relative(root_fd, name)
     try:
         value = os.fstat(fd)
         if not stat.S_ISREG(value.st_mode):
             raise ConflictError(f"backup SQLite entry is not a regular file: {name}")
-        if os.name == "nt":
-            # Windows has no /dev/fd alias. Copy from the already-pinned file
-            # descriptor into a private snapshot, then open that immutable
+        if os.name == "nt" or sys.platform == "darwin":
+            # SQLite cannot reopen descriptor aliases on macOS or Windows.
+            # Copy from the already-pinned descriptor into a private immutable
             # snapshot. Chunking keeps memory bounded for large databases.
             before = _snapshot_identity(value)
             snapshot_dir = tempfile.TemporaryDirectory(prefix="astrid-backup-verify-")
@@ -389,6 +390,8 @@ def _connection_from_fd(root_fd: int, name: str) -> sqlite3.Connection:
                     snapshot_path.as_uri() + "?immutable=1", uri=True, factory=SnapshotConnection
                 )
                 connection._snapshot_directory = snapshot_dir
+                if sys.platform == "darwin":
+                    connection._snapshot_path = snapshot_path
                 return connection
             except Exception:
                 snapshot_dir.cleanup()
@@ -437,22 +440,39 @@ def _inspect_consolidated_realm(
     """Run the full RealmStore doctor logic over an immutable descriptor DB."""
     from .store import RealmStore
 
-    connection = _connection_from_fd(root_fd, "realm.sqlite3")
-    connection.row_factory = sqlite3.Row
     inspector = object.__new__(RealmStore)
-    # Keep CAS reads rooted at the retained directory descriptor. POSIX uses
-    # /dev/fd; Windows resolves the retained directory handle to its pinned
-    # final path.
-    inspector.root = Path(os.path_from_fd(root_fd)) if os.name == "nt" else Path(f"/dev/fd/{root_fd}")
-    inspector.db_path = inspector.root / "realm.sqlite3"
-    inspector.cas_root = inspector.root / "cas" / "sha256"
+    inspector._cas_root_fd = -1
+    connection = _connection_from_fd(root_fd, "realm.sqlite3")
     try:
-        inspector._cas_root_fd = _open_relative(root_fd, "cas/sha256", directory=True)
-    except FileNotFoundError:
-        inspector._cas_root_fd = -1
-    inspector.conn = connection
-    inspector._mutex = threading.RLock()
-    try:
+        connection.row_factory = sqlite3.Row
+        # CAS reads use _cas_root_fd below. Timeline integrity also stats db_path;
+        # on macOS that must name the private snapshot, not /dev/fd/<dirfd>/... .
+        inspector.root = Path(os.path_from_fd(root_fd)) if os.name == "nt" else Path(f"/dev/fd/{root_fd}")
+        inspector.db_path = getattr(connection, "_snapshot_path", inspector.root / "realm.sqlite3")
+        inspector.cas_root = inspector.root / "cas" / "sha256"
+        try:
+            inspector._cas_root_fd = _open_relative(root_fd, "cas/sha256", directory=True)
+        except FileNotFoundError:
+            inspector._cas_root_fd = -1
+
+        def read_cas_object(digest: str) -> bytes:
+            # Timeline history checks must use the same pinned CAS as the doctor,
+            # including on macOS where directory descriptor aliases cannot work.
+            _object_path(inspector.cas_root, digest)  # validate before relative open
+            if inspector._cas_root_fd < 0:
+                raise NotFoundError("object not found")
+            fd = _open_relative(inspector._cas_root_fd, f"{digest[:2]}/{digest[2:]}")
+            with os.fdopen(fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ConflictError("CAS object must be a regular file")
+                data = stream.read()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise ConflictError("CAS object failed hash verification")
+            return data
+
+        inspector._read_cas_object = read_cas_object
+        inspector.conn = connection
+        inspector._mutex = threading.RLock()
         report = inspector.integrity_report(timeout_seconds=timeout_seconds)
         if not report.get("ok"):
             # Only the current-schema finding may be waived, and only after
@@ -467,9 +487,11 @@ def _inspect_consolidated_realm(
         realm = inspector.realm
         return report, realm
     finally:
-        connection.close()
-        if inspector._cas_root_fd >= 0:
-            os.close(inspector._cas_root_fd)
+        try:
+            connection.close()
+        finally:
+            if inspector._cas_root_fd >= 0:
+                os.close(inspector._cas_root_fd)
 
 
 def verify_backup(backup_dir: str | Path, *, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any] | None = None, older_schema: bool = False) -> dict:

@@ -1178,18 +1178,22 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(order, ["stop", "start"])
         self.assertEqual(self.boundary.restart_calls, 1)
 
-    def test_down_manager_callback_runs_once_after_stop_under_shared_fence(self):
+    def test_down_manager_callback_receives_validated_owner_under_shared_fence(self):
         root = self._configure()
         bootstrap(self.paths, self.boundary, self.config)
-        order = []
-        original_stop = self.boundary.stop_owner
+        owner = json.loads(self.paths.discovery_path.read_text())
+        calls = []
 
-        def stop_owner(**kwargs):
-            order.append("runtime")
-            return original_stop(**kwargs)
-
-        def stop_manager():
-            order.append("manager")
+        def pre_stop_manager(identity):
+            calls.append(identity)
+            self.assertEqual(identity["pid"], owner["pid"])
+            self.assertEqual(identity["process_birth_id"], owner["process_birth_id"])
+            self.assertEqual(identity["runtime_instance_id"], owner["runtime_instance_id"])
+            self.assertEqual(identity["realm_id"], owner["active_realm"])
+            self.assertEqual(identity["realm_root"], str(root.resolve()))
+            self.assertEqual(identity["endpoint"], owner["endpoint"])
+            marker = json.loads(self.paths.instance_lock_path.read_text())
+            self.assertEqual(marker["state"], "stopping")
             probe = subprocess.run(
                 [
                     sys.executable,
@@ -1210,10 +1214,9 @@ class BootstrapTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.boundary.stop_owner = stop_owner
-        result = down(self.paths, self.boundary, stop_manager=stop_manager)
+        result = down(self.paths, self.boundary, pre_stop_manager=pre_stop_manager)
         self.assertEqual(result["status"], "stopped")
-        self.assertEqual(order, ["runtime", "manager"])
+        self.assertEqual(len(calls), 1)
 
     def test_down_restart_and_installer_stop_use_shared_primitive(self):
         self._configure()
@@ -1725,14 +1728,10 @@ class BootstrapTests(unittest.TestCase):
         root = self._configure()
         bootstrap(self.paths, self.boundary, self.config)
         order = []
-        original_stop = self.boundary.stop_owner
 
-        def stop_owner(**kwargs):
-            order.append("runtime")
-            return original_stop(**kwargs)
-
-        def stop_manager():
+        def pre_stop_manager(owner):
             order.append("manager")
+            self.assertEqual(owner["pid"], self.boundary.next_pid - 1)
             connection = sqlite3.connect(root / "realm.sqlite3", timeout=0.02)
             try:
                 with self.assertRaises(sqlite3.OperationalError):
@@ -1740,9 +1739,8 @@ class BootstrapTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.boundary.stop_owner = stop_owner
-        result = down(self.paths, self.boundary, stop_manager=stop_manager)
-        self.assertEqual(order, ["runtime", "manager"])
+        result = down(self.paths, self.boundary, pre_stop_manager=pre_stop_manager)
+        self.assertEqual(order, ["manager"])
         self.assertEqual(result["status"], "stopped")
         self.assertFalse(self.paths.discovery_path.exists())
         self.assertFalse(self.paths.instance_lock_path.exists())
