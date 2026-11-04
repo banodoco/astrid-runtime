@@ -106,7 +106,12 @@ def _materialize_backup(root: Path, temporary: Path, backup: dict) -> dict[str, 
     return {"bytes_cloned": 0, "bytes_copied": sum(size for _, size in files)}
 
 
-def adopt_workspace(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig, *, source: str | Path, realm_id: str) -> dict[str, Any]:
+def adopt_workspace(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig, *, source: str | Path, realm_id: str, read_only_source: bool = False, no_start: bool = False) -> dict[str, Any]:
+    if read_only_source != no_start:
+        raise WorkspaceAdoptError("--read-only-source and --no-start must be used together")
+    if read_only_source:
+        from .workspace_copy import adopt_copy
+        return adopt_copy(paths, config, source=source, realm_id=realm_id)
     root = _root(source, must_exist=True)
     # An incomplete/unsafe manifest must fail verification rather than being
     # reclassified as a stopped realm.

@@ -36,15 +36,22 @@ def _installed_data_root(home: Path) -> Path | None:
         return None
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(record, dict) or record.get("owner") != INSTALL_RECORD_OWNER:
-            return None
-        raw = record.get("data_root")
-        if not isinstance(raw, str) or not raw.strip():
-            return None
-        root = Path(raw).expanduser()
-        return root if root.is_absolute() else None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
+    if not isinstance(record, dict) or record.get("owner") != INSTALL_RECORD_OWNER:
+        return None
+    r1_selected = "r1_data_root" in record
+    raw = record.get("r1_data_root") if r1_selected else record.get("data_root")
+    if not isinstance(raw, str) or not raw.strip():
+        if r1_selected:
+            raise ValueError("install record contains an invalid r1_data_root")
+        return None
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        if r1_selected:
+            raise ValueError("install record contains an invalid r1_data_root")
+        return None
+    return root
 
 
 @dataclass(frozen=True)

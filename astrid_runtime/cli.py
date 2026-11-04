@@ -113,6 +113,8 @@ def parser() -> argparse.ArgumentParser:
     _profile_args(workspace_adopt)
     workspace_adopt.add_argument("--from", dest="source", required=True, type=Path, help="source data root, stopped realm root, or authenticated backup directory")
     workspace_adopt.add_argument("--realm-id", required=True)
+    workspace_adopt.add_argument("--read-only-source", action="store_true")
+    workspace_adopt.add_argument("--no-start", action="store_true")
 
     backup = sub.add_parser("backup", help="create a verified backup through the runtime")
     _read_args(backup)
@@ -481,7 +483,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.workspace_command == "adopt":
                 from .workspace_adopt import adopt_workspace
-                result = adopt_workspace(paths, boundary, _config(args, paths), source=args.source, realm_id=args.realm_id)
+                result = adopt_workspace(paths, boundary, _config(args, paths), source=args.source, realm_id=args.realm_id, read_only_source=args.read_only_source, no_start=args.no_start)
             else:
                 result = configure_workspace(
                     paths,
