@@ -272,6 +272,27 @@ def test_offline_receipt_and_full_read_only_tree(tmp_path, monkeypatch):
     assert not (paths.app_support / "runtime" / "discovery.json").exists()
 
 
+def test_copied_cas_remains_independent_after_adoption(tmp_path):
+    old, realm, paths, config = setup_copy(tmp_path)
+    payload = b"immutable CAS data"
+    digest = hashlib.sha256(payload).hexdigest()
+    source = realm / "cas" / "sha256" / digest[:2] / digest[2:]
+    source.parent.mkdir(exist_ok=True)
+    source.write_bytes(payload)
+    os.chmod(source, 0o644)
+    before = full_manifest(old)
+
+    receipt = call(old, paths, config)
+    assert full_manifest(old) == before
+    assert receipt["source_inventory_sha256"] == receipt["destination_inventory_sha256"] == receipt["post_inventory_sha256"]
+
+    target = paths.realms_dir / "film" / "cas" / "sha256" / digest[:2] / digest[2:]
+    assert not os.path.samefile(source, target)
+    target.chmod(0o600)
+    target.write_bytes(b"changed only in R1")
+    assert full_manifest(old) == before
+
+
 @pytest.mark.parametrize("method", ["copied", "cloned"])
 def test_source_mutation_refuses_for_all_copy_methods(tmp_path, monkeypatch, method):
     old, realm, paths, config = setup_copy(tmp_path)
