@@ -1449,11 +1449,14 @@ def _pinokio_stop_binding(
     selected_pinokio = bool(isinstance(selected, Mapping)
                             and selected.get("owner") == INSTALL_RECORD_OWNER
                             and selected.get("managed_by") == "pinokio")
+    r1_selected = isinstance(selected, Mapping) and "r1_data_root" in selected
+    selected_data_key = "r1_data_root" if r1_selected else "data_root"
+    selected_realm_key = "r1_realm_root" if r1_selected else "realm_root"
     selected_for_data = False
     if selected_pinokio:
         try:
             selected_for_data = (
-                _canonical_handoff_path(selected.get("data_root"), label="selection data root", directory=True)
+                _canonical_handoff_path(selected.get(selected_data_key), label="selection data root", directory=True)
                 == paths.app_support
             )
         except BootstrapError:
@@ -1543,14 +1546,19 @@ def _pinokio_stop_binding(
     if (selected.get("owner") != INSTALL_RECORD_OWNER
             or selected.get("managed_by") != "pinokio"
             or _canonical_handoff_path(selected.get("program_root"), label="selection program root", directory=True) != program_root
-            or _canonical_handoff_path(selected.get("data_root"), label="selection data root", directory=True) != paths.app_support
+            or _canonical_handoff_path(selected.get(selected_data_key), label="selection data root", directory=True) != paths.app_support
             or str(selected.get("realm_id") or "") != realm_id
-            or _canonical_handoff_path(selected.get("realm_root"), label="selection realm root", directory=True) != expected_root):
+            or _canonical_handoff_path(selected.get(selected_realm_key), label="selection realm root", directory=True) != expected_root):
         raise BootstrapError("Runtime Pinokio stop binding conflicts with the selected install record.")
     if (install_marker.get("owner") != INSTALL_RECORD_OWNER
             or install_marker.get("managed_by") != "pinokio"
-            or _canonical_handoff_path(install_marker.get("data_root"), label="install marker data root", directory=True) != paths.app_support):
+            or _canonical_handoff_path(install_marker.get(selected_data_key), label="install marker data root", directory=True) != paths.app_support):
         raise BootstrapError("Runtime Pinokio stop binding conflicts with the program install marker.")
+    if r1_selected:
+        # Retain and bind the saved R0 provenance across the two Agent records.
+        legacy_root = _canonical_handoff_path(selected.get("data_root"), label="legacy selection data root", directory=True)
+        if _canonical_handoff_path(install_marker.get("data_root"), label="legacy install marker data root", directory=True) != legacy_root:
+            raise BootstrapError("Runtime Pinokio stop binding conflicts with the legacy data root.")
 
     def read_version(root: Path, *, label: str) -> tuple[bytes, dict[str, Any], dict[str, Any], bytes, Path]:
         version_raw, version = _private_handoff_json(root / "version.json")
@@ -1606,6 +1614,8 @@ def _pinokio_stop_binding(
     def digest(raw: bytes) -> str:
         return hashlib.sha256(raw).hexdigest()
     stable_marker = {key: install_marker.get(key) for key in ("owner", "managed_by", "data_root")}
+    if r1_selected:
+        stable_marker["r1_data_root"] = install_marker.get("r1_data_root")
     return {
         "program_root": str(program_root),
         "data_root": str(paths.app_support),
