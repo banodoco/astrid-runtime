@@ -222,18 +222,16 @@ class _HistoryReadCursor:
 
 class _HistoryReadInputs:
     """Exact consumed SQL results and CAS bytes for one authoritative read."""
-    def __init__(self, connection, cas_root):
-        self.connection, self.cas_root = connection, cas_root
+    def __init__(self, connection, read_object):
+        self.connection, self.read_object = connection, read_object
         self.rows, self.objects = {}, {}
 
     def execute(self, query, parameters=()):
         return _HistoryReadCursor(self, query, tuple(parameters))
 
     def check(self):
-        from .cas import ContentAddressedStore
-
         for object_id, expected in self.objects.items():
-            data = ContentAddressedStore(self.cas_root).read(object_id)
+            data = self.read_object(object_id)
             if (len(data), hashlib.sha256(data).digest()) != expected:
                 raise ProtocolError("accepted commit object changed during verification")
         for (query, parameters, method), expected in self.rows.items():
@@ -417,10 +415,8 @@ class TimelineCommitStore:
     def _check_history_objects(self):
         # CAS is outside SQLite's change boundary. Keep the existing physical
         # byte verification, including for objects consumed by cached ancestry.
-        from .cas import ContentAddressedStore
-
         for object_id, expected in self._history_state["objects"].items():
-            data = ContentAddressedStore(self.store.cas_root).read(object_id)
+            data = self._read_object(object_id)
             if (len(data), hashlib.sha256(data).digest()) != expected:
                 raise ProtocolError("accepted commit object changed during verification")
 
@@ -521,7 +517,7 @@ class TimelineCommitStore:
                 yield
             return
         previous = current["inputs"]
-        inputs = previous if previous is not None else _HistoryReadInputs(self.store.conn, self.store.cas_root)
+        inputs = previous if previous is not None else _HistoryReadInputs(self.store.conn, self._read_object)
         current["inputs"] = inputs
         try:
             self._sync_replay_memo()
@@ -556,10 +552,18 @@ class TimelineCommitStore:
         inputs = self._history_inputs
         return inputs if inputs is not None else self.store.conn
 
-    def _read_history_object(self, object_id):
+    def _read_object(self, object_id):
+        # Consolidated backup inspection supplies a descriptor-pinned reader;
+        # live realms retain their ordinary CAS implementation.
+        reader = getattr(self.store, "_read_cas_object", None)
+        if reader is not None:
+            return reader(object_id)
         from .cas import ContentAddressedStore
 
-        data = ContentAddressedStore(self.store.cas_root).read(object_id)
+        return ContentAddressedStore(self.store.cas_root).read(object_id)
+
+    def _read_history_object(self, object_id):
+        data = self._read_object(object_id)
         value = (len(data), hashlib.sha256(data).digest())
         previous = self._history_state["objects"].get(object_id)
         if previous is not None and previous != value:
@@ -646,7 +650,7 @@ class TimelineCommitStore:
                      "dependencies": {identity: set()}, "pending": deque([identity]),
                      "replays": {}, "current": identity,
                      "inputs": current["inputs"] if current["inputs"] is not None else
-                               _HistoryReadInputs(self.store.conn, self.store.cas_root)}
+                               _HistoryReadInputs(self.store.conn, self._read_object)}
         current["traversal"] = traversal
         try:
             while traversal["pending"]:
