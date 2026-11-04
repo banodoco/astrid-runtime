@@ -70,7 +70,7 @@ def _bind_candidate_recovery(candidate, realm, destination, final_realm):
     lifecycle.check_startup(realm)
     lifecycle.verify_tree(archive / "realm", record["inventory"])
     binding = lifecycle.read_record(realm / lifecycle.MARKER)
-    record["realm_root"] = str(final_realm)
+    record["realm_root"] = str(final_realm.resolve())
     binding["archive"] = str(destination / relative_archive)
     lifecycle.write_record(archive / "activation.json", record)
     lifecycle.write_record(realm / lifecycle.MARKER, binding)

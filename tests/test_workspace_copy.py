@@ -155,6 +155,36 @@ def test_v26_published_recovery_resolves_and_passes_startup(tmp_path, monkeypatc
     assert full_manifest(old) == before
 
 
+def test_adopted_activation_startup_accepts_symlinked_parent_alias(tmp_path, monkeypatch):
+    from runtime_protocol import catalog, v33_lifecycle as lifecycle
+
+    old, _realm, paths, config = setup_copy(tmp_path)
+    result = call(old, paths, config)
+    published = paths.realms_dir / "film"
+    alias_parent = tmp_path / "private-var-alias"
+    alias_parent.symlink_to(tmp_path, target_is_directory=True)
+    aliased_root = alias_parent / paths.app_support.name / "runtime" / "realms" / "film"
+    assert aliased_root.resolve() == published.resolve()
+
+    # /var is an approved macOS alias in _safe_path.  Permit the equivalent
+    # test-only alias here so startup validation still checks the same inode.
+    safe_path = catalog._safe_path
+    def allow_test_alias(path, label):
+        target = Path(path).expanduser()
+        if target == aliased_root or target.is_relative_to(alias_parent):
+            if not target.is_absolute():
+                raise ValueError(f"{label} must be absolute")
+            return target
+        return safe_path(path, label)
+    monkeypatch.setattr(catalog, "_safe_path", allow_test_alias)
+
+    archive, record = lifecycle.activation(published)
+    assert result["ok"] is True
+    assert record["realm_root"] == str(Path(record["realm_root"]).resolve())
+    assert archive.is_relative_to(paths.app_support)
+    lifecycle.check_startup(aliased_root)
+
+
 @pytest.mark.parametrize("point", ["binding", "published_validation"])
 def test_interrupted_binding_or_published_validation_retains_safe_state(tmp_path, monkeypatch, point):
     old, realm, paths, config = setup_copy(tmp_path)
@@ -182,7 +212,7 @@ def test_interrupted_binding_or_published_validation_retains_safe_state(tmp_path
     assert full_manifest(old) == before
 
 
-@pytest.mark.parametrize("damage", ["archive_reference", "realm_reference", "image"])
+@pytest.mark.parametrize("damage", ["archive_reference", "operation_id", "realm_id", "realm_reference", "image"])
 def test_published_recovery_validation_refuses_corruption_and_retains_both_roots(tmp_path, monkeypatch, damage):
     from runtime_protocol.errors import ConflictError
     lifecycle = workspace_copy.lifecycle
@@ -197,6 +227,10 @@ def test_published_recovery_validation_refuses_corruption_and_retains_both_roots
             binding = lifecycle.read_record(published / lifecycle.MARKER)
             lifecycle.write_record(published / lifecycle.MARKER,
                                    {**binding, "archive": str(paths.app_support / "missing-archive")})
+        elif damage in {"operation_id", "realm_id"}:
+            binding = lifecycle.read_record(published / lifecycle.MARKER)
+            key, value = ("operation_id", "foreign-operation") if damage == "operation_id" else ("realm_id", "foreign-realm")
+            lifecycle.write_record(published / lifecycle.MARKER, {**binding, key: value})
         elif damage == "realm_reference":
             lifecycle.write_record(archive / "activation.json", {**record, "realm_root": str(old)})
         else:

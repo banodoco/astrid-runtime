@@ -217,8 +217,12 @@ def activation(root):
     binding = read_record(marker)
     archive = Path(binding["archive"])
     record = read_record(archive / "activation.json")
+    try:
+        same_root = Path(record["realm_root"]).expanduser().resolve() == Path(root).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        same_root = False
     if (record["operation_id"] != binding["operation_id"] or record["realm_id"] != binding["realm_id"]
-            or record["realm_root"] != str(Path(root))):
+            or not same_root):
         raise ConflictError("v33 activation binding mismatch")
     check_root_binding(root, record["root_identity"])
     return archive, record
