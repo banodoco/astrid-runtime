@@ -1918,9 +1918,8 @@ def _fenced_stop_and_manager(
             with _downstream_stop_errors():
                 if owner is not None:
                     pid, birth, instance_id, endpoint = owner
-                    stop_owner = getattr(boundary, "stop_owner", None)
-                    if not callable(stop_owner):
-                        raise BootstrapError("Runtime boundary lacks the birth-checked stop handoff.")
+                    if not callable(stop_manager):
+                        raise BootstrapError("Runtime interruption refused: service-manager stop callback is unavailable.")
                     # Durable Runtime-written intent, before the first signal:
                     # if the controller dies after TERM, a retry can prove
                     # this exact owner was being stopped by C1.
@@ -1941,17 +1940,19 @@ def _fenced_stop_and_manager(
                     if final_marker != intent:
                         atomic_write_json(paths.instance_lock_path, intent)
                     marker = intent
-                    # First destructive operation: Runtime's existing validated stop.
-                    stopped = stop_owner(
-                        endpoint=endpoint, pid=pid, instance_id=instance_id,
-                        process_birth_id=birth, realm_id=realm_id,
-                        owner_lock=paths.instance_lock_path,
-                        discovery_path=paths.discovery_path, require_health=False,
+                    # The Agent stops its service manager while this durable
+                    # intent and the realm fence are held. It receives only the
+                    # identity Runtime validated above, before any signal occurs.
+                    stopped = stop_manager({
+                        "pid": int(pid), "process_birth_id": str(birth),
+                        "runtime_instance_id": str(instance_id),
+                        "realm_id": str(realm_id), "realm_root": str(realm_root),
+                        "endpoint": str(endpoint),
+                        "owner_lock": str(paths.instance_lock_path),
+                    })
+                    _require_owner_absent(
+                        boundary, pid, birth, context="after service-manager stop",
                     )
-                    if completed_stop_binding is not None:
-                        _require_owner_absent(
-                            boundary, pid, birth, context="after Runtime stop",
-                        )
                 elif stop_foreground is not None:
                     stopped = stop_foreground()
                 # The stopped owner can remove its own advertisements. A new
@@ -1992,8 +1993,8 @@ def _fenced_stop_and_manager(
                         raise BootstrapError(
                             "Runtime interruption refused: owner absence could not be re-established immediately before manager stop."
                         ) from exc
-                if stop_manager is not None:
-                    stop_manager()
+                if owner is None and stop_manager is not None:
+                    stop_manager(None)
     except ConflictError as exc:
         raise _raise_conflict(exc) from exc
     except BootstrapError:
@@ -2588,9 +2589,14 @@ def down(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
     stop_foreground=None, restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
-    """Stop the selected owner, then its manager, under one lifecycle fence."""
+    """Stop the selected owner through the manager under one lifecycle fence.
+
+    ``stop_manager`` receives the Runtime-validated owner mapping, or ``None``
+    when there is no live owner. The callback runs while the durable stop
+    intent and lifecycle fence are held.
+    """
     if stop_manager is not None and not callable(stop_manager):
-        raise TypeError("stop_manager must be a zero-argument callback")
+        raise TypeError("stop_manager must accept an owner mapping or None")
     if stop_foreground is not None and not callable(stop_foreground):
         raise TypeError("stop_foreground must be a zero-argument callback")
     if restore_selection is not None and not isinstance(restore_selection, RestoreSelection):
