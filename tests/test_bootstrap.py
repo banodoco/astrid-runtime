@@ -2951,9 +2951,15 @@ class StaleOwnerTests(unittest.TestCase):
         from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
         self._configure()
         first = bootstrap(self.paths, self.boundary, self.config)
+        native_birth = LocalRuntimeBoundary.process_birth_identity(os.getpid())
         for path in (self.paths.discovery_path, self.paths.instance_lock_path):
             record = json.loads(path.read_text())
             record["pid"] = os.getpid()
+            if native_birth and native_birth.startswith("proc-start-ticks:"):
+                # A synthetic/scoped comparison is unknown, not a reused PID.
+                # Change only ticks within the real process's boot/namespace.
+                tick, separator, scope = native_birth.removeprefix("proc-start-ticks:").partition(";")
+                record["process_birth_id"] = f"proc-start-ticks:{int(tick) + 1}{separator}{scope}"
             path.write_text(json.dumps(record))
         expected = json.loads(self.paths.discovery_path.read_text())["process_birth_id"]
         # The reused PID is a real live process. Birth observations for newly

@@ -12,6 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from tests.lanes import requires_linux_tree_custody
+
 from astrid_runtime.bootstrap import BootstrapError, SourceProfile
 from astrid_runtime.runtime_boundary import ADMISSION_TIMEOUT_ENV, LocalRuntimeBoundary
 from runtime_protocol import platform as runtime_platform
@@ -227,6 +229,228 @@ def test_validate_owner_uses_daemon_identity_when_birth_probe_is_unavailable(tmp
         instance_id="instance",
         owner_lock=owner,
     )
+
+
+def test_validate_owner_accepts_live_r0_linux_birth_bridge(tmp_path, monkeypatch):
+    from astrid_runtime import runtime_boundary as module
+
+    pid = 12345
+    recorded = "proc-start-ticks:42"
+    observed = "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77"
+    realm = tmp_path / "realm"
+    realm.mkdir()
+    owner = tmp_path / "instance.lock"
+    owner.write_text(json.dumps({
+        "pid": pid, "process_birth_id": recorded, "runtime_instance_id": "instance",
+        "realm_id": "realm", "realm_root": str(realm.resolve()),
+    }))
+    boundary = LocalRuntimeBoundary()
+    bridge_calls = []
+    monkeypatch.setattr(boundary, "is_pid_alive", lambda candidate: candidate == pid)
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda candidate: observed if candidate == pid else None)
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda _endpoint: {
+        "status": "ok", "protocol": "workspace.v1", "runtime_instance_id": "instance",
+    })
+    monkeypatch.setattr(module.platform, "legacy_linux_birth_matches_live_owner", lambda expected, actual, *, pid: (
+        bridge_calls.append((expected, actual, pid)) or (expected, actual, pid) == (recorded, observed, 12345)
+    ))
+
+    assert boundary.validate_owner(
+        endpoint="http://127.0.0.1:61217", pid=pid, instance_id="instance", owner_lock=owner,
+        process_birth_id=recorded, expected_realm_id="realm", expected_realm_root=realm,
+    ) is True
+    assert bridge_calls == [(recorded, observed, pid)]
+
+
+def test_validate_owner_refuses_r0_linux_birth_without_a_live_scoped_observation(tmp_path, monkeypatch):
+    from astrid_runtime import runtime_boundary as module
+
+    pid = 12345
+    recorded = "proc-start-ticks:42"
+    owner = tmp_path / "instance.lock"
+    owner.write_text(json.dumps({
+        "pid": pid, "process_birth_id": recorded, "runtime_instance_id": "instance",
+    }))
+    boundary = LocalRuntimeBoundary()
+    monkeypatch.setattr(boundary, "is_pid_alive", lambda candidate: candidate == pid)
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda _candidate: None)
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda _endpoint: {
+        "status": "ok", "protocol": "workspace.v1", "runtime_instance_id": "instance",
+    })
+    monkeypatch.setattr(module.platform, "is_legacy_linux_birth_id", lambda value: value == recorded)
+
+    assert boundary.validate_owner(
+        endpoint="http://127.0.0.1:61217", pid=pid, instance_id="instance", owner_lock=owner,
+        process_birth_id=recorded,
+    ) is False
+
+
+@pytest.mark.parametrize("mismatch", ["endpoint-instance", "lock-instance", "realm"])
+def test_r0_linux_birth_bridge_keeps_instance_and_realm_owner_fences(tmp_path, monkeypatch, mismatch):
+    from astrid_runtime import runtime_boundary as module
+
+    pid = 12345
+    recorded = "proc-start-ticks:42"
+    observed = "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77"
+    realm = tmp_path / "realm"
+    other_realm = tmp_path / "other-realm"
+    realm.mkdir()
+    other_realm.mkdir()
+    owner = tmp_path / "instance.lock"
+    owner.write_text(json.dumps({
+        "pid": pid, "process_birth_id": recorded,
+        "runtime_instance_id": "other-instance" if mismatch == "lock-instance" else "instance",
+        "realm_id": "other-realm" if mismatch == "realm" else "realm",
+        "realm_root": str((other_realm if mismatch == "realm" else realm).resolve()),
+    }))
+    boundary = LocalRuntimeBoundary()
+    monkeypatch.setattr(boundary, "is_pid_alive", lambda candidate: candidate == pid)
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda candidate: observed if candidate == pid else None)
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda _endpoint: {
+        "status": "ok", "protocol": "workspace.v1",
+        "runtime_instance_id": "other-instance" if mismatch == "endpoint-instance" else "instance",
+    })
+    monkeypatch.setattr(module.platform, "legacy_linux_birth_matches_live_owner", lambda *_args, **_kwargs: True)
+
+    assert boundary.validate_owner(
+        endpoint="http://127.0.0.1:61217", pid=pid, instance_id="instance", owner_lock=owner,
+        process_birth_id=recorded, expected_realm_id="realm", expected_realm_root=realm,
+    ) is False
+
+
+@pytest.mark.parametrize("endpoint_identity", [
+    {},
+    {"runtime_instance_id": "other-instance", "realm_id": "realm"},
+    {"runtime_instance_id": "instance", "realm_id": "other-realm"},
+])
+def test_stop_endpoint_retains_authenticated_instance_and_realm_binding(tmp_path, endpoint_identity):
+    from astrid_runtime.bootstrap import _validate_stop_endpoint
+    from astrid_runtime.paths import RuntimePaths
+
+    paths = RuntimePaths.sandbox(tmp_path)
+    paths.ensure_support_dirs()
+    realm = tmp_path / "realm"
+    realm.mkdir()
+    calls = []
+
+    class Boundary:
+        def validate_owner(self, **kwargs):
+            calls.append(kwargs)
+            return True
+
+        def endpoint_metadata(self, **_kwargs):
+            return endpoint_identity
+
+    with pytest.raises(BootstrapError, match="endpoint identity does not match"):
+        _validate_stop_endpoint(
+            paths, Boundary(), owner=(12345, "proc-start-ticks:42", "instance", "http://127.0.0.1:61217"),
+            realm_id="realm", realm_root=realm,
+        )
+    assert calls == [{
+        "endpoint": "http://127.0.0.1:61217", "pid": 12345, "instance_id": "instance",
+        "owner_lock": paths.instance_lock_path, "process_birth_id": "proc-start-ticks:42",
+        "expected_realm_id": "realm", "expected_realm_root": realm,
+    }]
+
+
+@requires_linux_tree_custody
+@pytest.mark.parametrize("after_term", [
+    "absent", "draining", "replacement", "metadata-replacement",
+    "before-pid", "before-birth", "before-realm", "before-endpoint", "before-custody",
+])
+def test_stop_live_r0_linux_owner_keeps_native_signal_and_escalation_fences(tmp_path, monkeypatch, after_term):
+    from pathlib import Path
+    from astrid_runtime import custody_broker as custody, runtime_boundary as module
+    from astrid_runtime.bootstrap import _validate_stop_endpoint
+    from astrid_runtime.paths import RuntimePaths
+
+    pid, boot = 12345, "b38142f7-84c5-487d-95a4-8180cbff3972"
+    paths = RuntimePaths.sandbox(tmp_path)
+    paths.ensure_support_dirs()
+    realm = tmp_path / "realm"
+    realm.mkdir()
+    recorded = "proc-start-ticks:42"
+    observed = f"{recorded};boot:{boot};pidns:77"
+    uid = runtime_platform.current_user()
+    identities = {
+        os.getpid(): {"pid": os.getpid(), "uid": uid, "birth_id": "controller-birth"},
+        pid: {"pid": pid, "uid": uid, "birth_id": observed},
+    }
+    marker = {"pid": pid, "process_birth_id": recorded, "runtime_instance_id": "instance",
+              "realm_id": "realm", "realm_root": str(realm)}
+    endpoint = "http://127.0.0.1:61217"
+    paths.instance_lock_path.write_text(json.dumps(marker))
+    paths.discovery_path.write_text(json.dumps({**marker, "active_realm": "realm", "endpoint": endpoint}))
+    monkeypatch.setattr(runtime_platform, "process_identity", lambda candidate, **_: identities.get(candidate))
+    original_read, original_stat = Path.read_text, Path.stat
+    def read(path, *args, **kwargs):
+        return boot if str(path) == "/proc/sys/kernel/random/boot_id" else original_read(path, *args, **kwargs)
+    def stat(path, *args, **kwargs):
+        return SimpleNamespace(st_ino=77) if str(path) == "/proc/1/ns/pid" else original_stat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(Path, "stat", stat)
+    boundary = LocalRuntimeBoundary()
+    boundary.prepare_restart(
+        source_profile=SourceProfile(profile="astrid", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path)),
+        realm_id="realm", realm_root=realm, support_root=paths.runtime_support, pid=pid,
+    )
+    health = {"status": "ok", "protocol": "workspace.v1", "runtime_instance_id": "instance"}
+    endpoint_identity = {"runtime_instance_id": "instance", "realm_id": "realm"}
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda _: dict(health))
+    monkeypatch.setattr(boundary, "endpoint_metadata", lambda **_: dict(endpoint_identity))
+    native = custody.NativeProcessCustody(paths.runtime_support, {"pid": pid, "uid": uid, "birth_id": recorded})
+    native.publish()
+    assert _validate_stop_endpoint(paths, boundary, owner=(pid, recorded, "instance", endpoint),
+                                   realm_id="realm", realm_root=realm) == endpoint_identity
+    sent, closed = [], []
+    monkeypatch.setattr(runtime_platform, "pidfd_open", lambda candidate: 99 if candidate == pid else pytest.fail("wrong PID"))
+    original_close = os.close
+    monkeypatch.setattr(runtime_platform.os, "close", lambda fd: closed.append(fd) if fd == 99 else original_close(fd))
+    def deliver(fd, signum):
+        assert fd == 99
+        # The native custody guard must still cover every actual signal.
+        with pytest.raises(BlockingIOError):
+            with runtime_platform.file_lock(native.lock, blocking=False):
+                pytest.fail("signal escaped native custody guard")
+        sent.append(signum)
+        if signum == runtime_platform.KILL or after_term == "absent":
+            identities.pop(pid)
+        else:
+            paths.discovery_path.unlink()
+            paths.instance_lock_path.unlink()
+            health.clear()
+            endpoint_identity.clear()
+            if after_term == "replacement":
+                identities[pid]["birth_id"] = observed.replace("ticks:42", "ticks:43")
+            elif after_term == "metadata-replacement":
+                paths.discovery_path.write_text(json.dumps({**marker, "runtime_instance_id": "replacement"}))
+    monkeypatch.setattr(runtime_platform, "pidfd_send_signal", deliver)
+    ticks = iter(range(0, 1000, 10))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
+    kwargs = dict(endpoint=endpoint, pid=pid, instance_id="instance", process_birth_id=recorded,
+                  realm_id="realm", owner_lock=paths.instance_lock_path, discovery_path=paths.discovery_path)
+    if after_term.startswith("before-"):
+        if after_term in {"before-pid", "before-birth", "before-realm"}:
+            key, replacement = {"before-pid": ("pid", pid + 1), "before-birth": ("process_birth_id", observed),
+                                "before-realm": ("realm_id", "other-realm")}[after_term]
+            paths.instance_lock_path.write_text(json.dumps({**marker, key: replacement}))
+        elif after_term == "before-endpoint":
+            endpoint_identity["runtime_instance_id"] = "replacement"
+        else:
+            record = json.loads(native.path.read_text())
+            record["target"]["birth_id"] = observed
+            custody._atomic_owner_json(native.path, record)
+        with pytest.raises((BootstrapError, custody.CustodyError), match="identity changed|differs from the selected"):
+            boundary.stop_owner(**kwargs)
+        assert sent == []
+    elif after_term in {"replacement", "metadata-replacement"}:
+        with pytest.raises(BootstrapError, match="incarnation changed|conflicting replacement"):
+            boundary.stop_owner(**kwargs)
+        assert sent == [runtime_platform.TERM]
+    else:
+        assert boundary.stop_owner(**kwargs)["state"] == "stopped"
+        assert sent == ([runtime_platform.TERM] if after_term == "absent" else [runtime_platform.TERM, runtime_platform.KILL])
+    assert closed == [99] * len(sent)
 
 
 def test_slow_healthy_runtime_and_degraded_owner(tmp_path):

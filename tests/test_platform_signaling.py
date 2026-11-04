@@ -15,6 +15,9 @@ from runtime_protocol import platform
 from tests.lanes import requires_linux_tree_custody
 
 
+SCOPED_LINUX_BIRTH = "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77"
+
+
 @pytest.mark.parametrize("control_event", [2, 5, 6])
 def test_windows_console_close_waits_for_runtime_cleanup_before_return(monkeypatch, control_event):
     handlers = {}
@@ -249,7 +252,7 @@ def test_linux_pidfd_syscall_refuses_integer_wraparound(monkeypatch, operation, 
 
 @pytest.mark.parametrize("missing", [None, "pidfd_open", "pidfd_send_signal", "both"])
 def test_linux_signaling_uses_each_available_stdlib_wrapper(monkeypatch, missing):
-    expected = {"pid": 123, "uid": 501, "birth_id": "proc-start-ticks:42"}
+    expected = {"pid": 123, "uid": 501, "birth_id": SCOPED_LINUX_BIRTH}
     calls = []
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
 
@@ -290,7 +293,7 @@ def test_linux_signaling_uses_each_available_stdlib_wrapper(monkeypatch, missing
 @pytest.mark.parametrize("opener_available", [False, True])
 def test_linux_signaling_refuses_unknown_abi_and_closes_any_open_pidfd(monkeypatch, opener_available):
     _syscall, library = _syscall_environment(monkeypatch, machine="mips64")
-    expected = {"pid": 123, "uid": 501, "birth_id": "proc-start-ticks:42"}
+    expected = {"pid": 123, "uid": 501, "birth_id": SCOPED_LINUX_BIRTH}
     observe = Mock(return_value=expected)
     close = Mock()
     monkeypatch.setattr(platform, "process_identity", observe)
@@ -315,7 +318,7 @@ def test_linux_signaling_refuses_unknown_abi_and_closes_any_open_pidfd(monkeypat
 
 def test_foreign_close_during_signaling_is_neither_recorded_nor_swallowed(monkeypatch):
     _syscall_environment(monkeypatch, machine="mips64")
-    expected = {"pid": 123, "uid": 501, "birth_id": "proc-start-ticks:42"}
+    expected = {"pid": 123, "uid": 501, "birth_id": SCOPED_LINUX_BIRTH}
     reader, writer = os.pipe()
     closed = []
     _intercept_close(monkeypatch, closed.append)
@@ -353,7 +356,7 @@ def test_linux_signaling_does_not_observe_identity_when_pidfd_open_fails(monkeyp
 def test_linux_signaling_closes_pidfd_when_send_syscall_fails(monkeypatch):
     syscall, _library = _syscall_environment(monkeypatch)
     syscall.side_effect = [18, -1]
-    expected = {"pid": 123, "uid": 501, "birth_id": "proc-start-ticks:42"}
+    expected = {"pid": 123, "uid": 501, "birth_id": SCOPED_LINUX_BIRTH}
     monkeypatch.delattr(platform.os, "pidfd_open", raising=False)
     monkeypatch.delattr(platform.signal, "pidfd_send_signal", raising=False)
     monkeypatch.setattr(platform, "process_identity", lambda _pid: expected)
@@ -574,7 +577,7 @@ def test_public_pidfd_helpers_propagate_errors_without_closing_fd(
 
 
 def test_signal_process_uses_public_pidfd_helpers(monkeypatch):
-    expected = {"pid": 123, "uid": 501, "birth_id": "proc-start-ticks:42"}
+    expected = {"pid": 123, "uid": 501, "birth_id": SCOPED_LINUX_BIRTH}
     calls = []
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(platform, "pidfd_open", lambda pid: calls.append(("open", pid)) or 18)

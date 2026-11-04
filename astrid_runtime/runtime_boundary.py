@@ -53,6 +53,14 @@ STARTUP_WAIT_MARGIN_SECONDS = 5.0
 SERVICE_OWNER_STOP_GRACE_SECONDS = 20.0
 
 
+def _selected_owner_birth_matches(expected: str, observed: str, *, pid: int) -> bool:
+    """Accept an exact birth ID or the narrow live R0 Linux bridge."""
+    return (
+        platform.process_birth_matches(expected, observed) is True
+        or platform.legacy_linux_birth_matches_live_owner(expected, observed, pid=pid) is True
+    )
+
+
 def _authoring_profile(source: SourceProfile) -> str:
     """Resolve the trusted provider profile for either Runtime launch route."""
     profile = {"astrid": "astrid"}.get(source.profile)
@@ -807,12 +815,14 @@ class LocalRuntimeBoundary:
         if not health or health.get("runtime_instance_id") != instance_id:
             return False
         if actual_birth is None:
+            if platform.is_legacy_linux_birth_id(str(expected_birth)):
+                return False
             # Restricted clients may be able to prove that a PID exists but
             # not inspect its birth marker. Require the daemon itself to
             # attest the durable runtime instance over its loopback health
             # endpoint; health alone is never an identity proof.
             pass
-        elif platform.process_birth_matches(str(expected_birth), actual_birth) is not True:
+        elif not _selected_owner_birth_matches(str(expected_birth), actual_birth, pid=pid):
             return False
         # A degraded runtime can still be the correct owner. Keep health
         # admission separate so database failures are not called PID conflicts.
@@ -1024,7 +1034,9 @@ class LocalRuntimeBoundary:
                 str(marker.get("realm_id")) == expected_realm,
                 marker_root == expected_root,
                 self.is_pid_alive(expected_pid),
-                platform.process_birth_matches(expected_birth, self.process_birth_identity(expected_pid) or "") is True,
+                _selected_owner_birth_matches(
+                    expected_birth, self.process_birth_identity(expected_pid) or "", pid=expected_pid,
+                ),
                 bool(health and health.get("runtime_instance_id") == expected_instance),
                 bool(endpoint_identity and endpoint_identity.get("runtime_instance_id") == expected_instance),
                 bool(endpoint_identity and endpoint_identity.get("realm_id") == expected_realm),
@@ -1045,8 +1057,12 @@ class LocalRuntimeBoundary:
             # not replace custody: the signal below still verifies the sealed
             # target and current authenticated actor/generation under its guard.
             observed = default_process_identity(expected_pid)
-            if observed is None or any(observed.get(k) != v for k, v in
-                                       {"pid": expected_pid, "birth_id": expected_birth, "uid": platform.current_user()}.items()):
+            if (observed is None
+                    or observed.get("pid") != expected_pid
+                    or observed.get("uid") != platform.current_user()
+                    or not _selected_owner_birth_matches(
+                        expected_birth, str(observed.get("birth_id") or ""), pid=expected_pid,
+                    )):
                 raise BootstrapError("Runtime escalation refused: selected incarnation changed or disappeared.")
             try:
                 if not native_owner and platform.process_group(expected_pid) != expected_pid:
@@ -1130,7 +1146,12 @@ class LocalRuntimeBoundary:
 
             def selected_owner_absent():
                 observed = default_process_identity(detached)
-                return observed is None or any(observed.get(k) != identity[k] for k in identity)
+                return (observed is None
+                        or observed.get("pid") != identity["pid"]
+                        or observed.get("uid") != identity["uid"]
+                        or not _selected_owner_birth_matches(
+                            str(identity["birth_id"]), str(observed.get("birth_id") or ""), pid=detached,
+                        ))
 
             try:
                 validate_before_signal(require_health=require_health)

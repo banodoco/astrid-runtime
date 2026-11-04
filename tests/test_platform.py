@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import ctypes
+import errno
 import os
 from pathlib import Path
 import signal
@@ -342,6 +343,120 @@ def test_linux_signal_refuses_mismatched_birth_before_kernel_signal(monkeypatch,
     assert closed == [99]
 
 
+def _stub_linux_birth_scope(monkeypatch, *, boot="b38142f7-84c5-487d-95a4-8180cbff3972", pidns=77):
+    class FakePath:
+        def __init__(self, value): self.value = str(value)
+        def __truediv__(self, part): return FakePath(self.value.rstrip("/") + "/" + str(part))
+        def read_text(self):
+            assert self.value == "/proc/sys/kernel/random/boot_id"
+            if boot is None:
+                raise PermissionError("boot ID unavailable")
+            return boot
+        def stat(self):
+            assert self.value == "/proc/1/ns/pid"
+            if pidns is None:
+                raise PermissionError("PID namespace unavailable")
+            return SimpleNamespace(st_ino=pidns)
+
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux", stderr=sys.stderr))
+    monkeypatch.setattr(platform, "Path", FakePath)
+    monkeypatch.setattr(platform, "_fallbacks_noted", set())
+
+
+@pytest.mark.parametrize("mode", ["pidfd", "sandbox"])
+@pytest.mark.parametrize("recorded", ["legacy", "scoped"])
+def test_linux_signal_accepts_only_the_validated_r0_live_owner_bridge(monkeypatch, mode, recorded):
+    pid = 77
+    boot = "b38142f7-84c5-487d-95a4-8180cbff3972"
+    observed = {"pid": pid, "uid": 501, "birth_id": f"proc-start-ticks:42;boot:{boot};pidns:77"}
+    sent, closed = [], []
+
+    _stub_linux_birth_scope(monkeypatch)
+    def open_pidfd(candidate):
+        assert candidate == pid
+        if mode == "sandbox":
+            raise OSError(errno.ENOSYS, "pidfd unavailable")
+        return 99
+    monkeypatch.setattr(platform, "pidfd_open", open_pidfd)
+    monkeypatch.setattr(platform, "_sandbox_process_control", lambda: mode == "sandbox")
+    monkeypatch.setattr(platform, "pidfd_send_signal", lambda fd, signum: sent.append((fd, signum)))
+    monkeypatch.setattr(platform.os, "kill", lambda candidate, signum: sent.append((candidate, signum)))
+    monkeypatch.setattr(platform.os, "close", closed.append)
+    monkeypatch.setattr(platform, "process_identity", lambda candidate: dict(observed) if candidate == pid else None)
+
+    birth = "proc-start-ticks:42" if recorded == "legacy" else observed["birth_id"]
+    platform.signal_process({"pid": pid, "uid": 501, "birth_id": birth}, platform.TERM)
+    assert sent == [(99 if mode == "pidfd" else pid, platform.TERM)]
+    assert closed == ([99] if mode == "pidfd" else [])
+
+
+@pytest.mark.parametrize("mode", ["pidfd", "sandbox"])
+@pytest.mark.parametrize("mismatch", [
+    "pid", "uid", "ticks", "boot", "pidns", "malformed-record",
+    "malformed-observation", "partial-scope", "unscoped-observation",
+    "absent", "unknown", "fresh-pid", "fresh-birth", "fresh-absent", "fresh-unknown",
+    "boot-unavailable", "pidns-unavailable", "scoped-ticks", "scoped-boot", "scoped-pidns",
+    "partial-record", "missing-record",
+])
+def test_linux_legacy_signal_refuses_identity_mismatch_and_missing_evidence(monkeypatch, mode, mismatch):
+    boot = "b38142f7-84c5-487d-95a4-8180cbff3972"
+    birth = f"proc-start-ticks:42;boot:{boot};pidns:77"
+    expected = {"pid": 77, "uid": 501, "birth_id": "proc-start-ticks:42"}
+    observed = {**expected, "birth_id": birth}
+    if mismatch.startswith("scoped-"):
+        old, new = {"scoped-ticks": ("ticks:42", "ticks:43"),
+                    "scoped-boot": (boot, "de2e05aa-6956-451e-9dd9-521955212d27"),
+                    "scoped-pidns": ("pidns:77", "pidns:78")}[mismatch]
+        expected["birth_id"] = birth.replace(old, new)
+    elif mismatch == "partial-record":
+        expected["birth_id"] += f";boot:{boot}"
+    elif mismatch == "missing-record":
+        expected.pop("birth_id")
+    elif mismatch in {"pid", "uid"}:
+        observed[mismatch] += 1
+    elif mismatch in {"ticks", "boot", "pidns"}:
+        old, new = {"ticks": ("ticks:42", "ticks:43"), "boot": (boot, "de2e05aa-6956-451e-9dd9-521955212d27"),
+                    "pidns": ("pidns:77", "pidns:78")}[mismatch]
+        observed["birth_id"] = birth.replace(old, new)
+    elif mismatch == "malformed-record":
+        expected["birth_id"] = "proc-start-ticks:bad"
+    elif mismatch == "malformed-observation":
+        observed["birth_id"] += ";pidns:77"
+    elif mismatch == "partial-scope":
+        observed["birth_id"] = f"proc-start-ticks:42;boot:{boot}"
+    elif mismatch == "unscoped-observation":
+        observed["birth_id"] = "proc-start-ticks:42"
+    fresh = dict(observed)
+    if mismatch == "fresh-pid":
+        fresh["pid"] += 1
+    elif mismatch == "fresh-birth":
+        fresh["birth_id"] = birth.replace("ticks:42", "ticks:43")
+    rows = iter((None if mismatch == "absent" else OSError("unknown") if mismatch == "unknown" else observed,
+                 None if mismatch == "fresh-absent" else OSError("unknown") if mismatch == "fresh-unknown" else fresh))
+    def identity(pid):
+        assert pid == expected["pid"]
+        row = next(rows)
+        if isinstance(row, OSError):
+            raise row
+        return row
+    _stub_linux_birth_scope(monkeypatch, boot=None if mismatch == "boot-unavailable" else boot,
+                           pidns=None if mismatch == "pidns-unavailable" else 77)
+    closed = []
+    def open_pidfd(_pid):
+        if mode == "sandbox":
+            raise OSError(errno.ENOSYS, "pidfd unavailable")
+        return 99
+    monkeypatch.setattr(platform, "pidfd_open", open_pidfd)
+    monkeypatch.setattr(platform, "_sandbox_process_control", lambda: mode == "sandbox")
+    monkeypatch.setattr(platform, "process_identity", identity)
+    monkeypatch.setattr(platform, "pidfd_send_signal", lambda *_: pytest.fail("unverified pidfd signal"))
+    monkeypatch.setattr(platform.os, "kill", lambda *_: pytest.fail("unverified PID signal"))
+    monkeypatch.setattr(platform.os, "close", closed.append)
+    with pytest.raises(OSError, match="incarnation changed|unknown"):
+        platform.signal_process(expected, platform.TERM)
+    assert closed == ([99] if mode == "pidfd" else [])
+
+
 def test_darwin_identity_keeps_legacy_birth_marker_and_brackets_native_observation(monkeypatch):
     monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="darwin"))
     seconds = int(time.mktime((2026, 10, 9, 18, 21, 21, 0, 0, -1)))
@@ -628,6 +743,109 @@ def test_windows_tree_drained_preserves_query_errors(monkeypatch):
 ])
 def test_process_birth_comparison_handles_reboot_namespace_and_legacy(expected, actual, result):
     assert platform.process_birth_matches(expected, actual) is result
+
+
+def test_legacy_linux_birth_bridge_accepts_only_fresh_current_host_owner(monkeypatch):
+    boot = "b38142f7-84c5-487d-95a4-8180cbff3972"
+    observed = f"proc-start-ticks:42;boot:{boot};pidns:77"
+
+    class FakePath:
+        def __init__(self, value): self.value = str(value)
+        def __truediv__(self, part): return FakePath(self.value.rstrip("/") + "/" + str(part))
+        def read_text(self):
+            assert self.value == "/proc/sys/kernel/random/boot_id"
+            return boot
+        def stat(self):
+            assert self.value == "/proc/1/ns/pid"
+            return SimpleNamespace(st_ino=77)
+
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(platform, "Path", FakePath)
+    monkeypatch.setattr(platform, "process_identity", lambda pid: {
+        "pid": pid, "uid": 501, "birth_id": observed,
+    })
+
+    assert platform.legacy_linux_birth_matches_live_owner(
+        "proc-start-ticks:42", observed, pid=123,
+    ) is True
+
+
+@pytest.mark.parametrize("expected,actual,result", [
+    ("proc-start-ticks:43", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77", False),
+    ("proc-start-ticks:bad", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77", None),
+    ("proc-start-ticks:42;boot:x", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42;boot:not-a-uuid;pidns:77", None),
+    ("proc-start-ticks:٤٢", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77;pidns:77", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77;extra:1", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:７７", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77;", None),
+    ("proc-start-ticks:42", "proc-start-ticks:42", None),
+    ("proc-start-ticks:42", "", None),
+    ("proc-start-ticks:42", None, None),
+    (None, "proc-start-ticks:42", None),
+])
+def test_legacy_linux_birth_bridge_rejects_malformed_or_partial_values(monkeypatch, expected, actual, result):
+    _stub_linux_birth_scope(monkeypatch)
+    monkeypatch.setattr(platform, "process_identity", lambda pid: {"pid": pid, "birth_id": actual})
+    assert platform.legacy_linux_birth_matches_live_owner(expected, actual, pid=123) is result
+
+
+@pytest.mark.parametrize("pid", [0, -1, True, False, "123", 1.5, None])
+def test_legacy_linux_birth_bridge_requires_a_valid_selected_pid(monkeypatch, pid):
+    _stub_linux_birth_scope(monkeypatch)
+    monkeypatch.setattr(platform, "process_identity", lambda _: pytest.fail("invalid PID was observed"))
+    assert platform.legacy_linux_birth_matches_live_owner(
+        "proc-start-ticks:42", "proc-start-ticks:42;boot:b38142f7-84c5-487d-95a4-8180cbff3972;pidns:77", pid=pid,
+    ) is None
+
+
+@pytest.mark.parametrize("host", ["darwin", "win32"])
+def test_legacy_linux_birth_bridge_is_linux_only(monkeypatch, host):
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform=host))
+    assert platform.is_legacy_linux_birth_id("proc-start-ticks:42") is False
+    assert platform.legacy_linux_birth_matches_live_owner("proc-start-ticks:42", "proc-start-ticks:42", pid=123) is None
+
+
+@pytest.mark.parametrize("kind", [
+    "pid-replacement", "birth-replacement", "foreign-boot", "foreign-namespace",
+    "unreadable", "namespace-unreadable", "unknown", "absent", "malformed-boot",
+])
+def test_legacy_linux_birth_bridge_refuses_untrusted_live_observations(monkeypatch, kind):
+    boot = "b38142f7-84c5-487d-95a4-8180cbff3972"
+    foreign_boot = "de2e05aa-6956-451e-9dd9-521955212d27"
+    namespace = "77" if kind != "foreign-namespace" else "78"
+    actual_boot = foreign_boot if kind == "foreign-boot" else boot
+    actual = f"proc-start-ticks:42;boot:{actual_boot};pidns:{namespace}"
+
+    class FakePath:
+        def __init__(self, value): self.value = str(value)
+        def __truediv__(self, part): return FakePath(self.value.rstrip("/") + "/" + str(part))
+        def read_text(self):
+            if kind == "unreadable":
+                raise PermissionError("restricted proc mount")
+            return "corrupt" if kind == "malformed-boot" else boot
+        def stat(self):
+            if kind == "namespace-unreadable":
+                raise PermissionError("restricted proc mount")
+            return SimpleNamespace(st_ino=77)
+
+    monkeypatch.setattr(platform, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(platform, "Path", FakePath)
+    if kind == "unknown":
+        monkeypatch.setattr(platform, "process_identity", lambda _pid: (_ for _ in ()).throw(OSError("denied")))
+    elif kind == "absent":
+        monkeypatch.setattr(platform, "process_identity", lambda _pid: None)
+    else:
+        monkeypatch.setattr(platform, "process_identity", lambda pid: {
+            "pid": pid + 1 if kind == "pid-replacement" else pid,
+            "uid": 501,
+            "birth_id": actual.replace("ticks:42", "ticks:43") if kind == "birth-replacement" else actual,
+        })
+
+    assert platform.legacy_linux_birth_matches_live_owner("proc-start-ticks:42", actual, pid=123) is None
 
 
 def test_linux_identity_includes_incarnation_scope():
