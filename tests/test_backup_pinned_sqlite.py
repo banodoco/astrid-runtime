@@ -130,6 +130,37 @@ def test_backup_darwin_snapshot_cleans_up_failed_open(tmp_path, monkeypatch, dar
         os.close(root_fd)
 
 
+def test_backup_darwin_snapshot_cleans_up_failed_inspector_setup(tmp_path, monkeypatch, darwin_verifier):
+    _database(tmp_path / "realm.sqlite3", "original")
+    root_fd = backup_module.open_directory_chain(tmp_path)
+    original_open = backup_module._open_relative
+    original_connection = backup_module._connection_from_fd
+    connections = []
+
+    def deny_cas(root_fd, name, **kwargs):
+        if name == "cas/sha256":
+            raise PermissionError("injected CAS open failure")
+        return original_open(root_fd, name, **kwargs)
+
+    def retain_connection(*args, **kwargs):
+        connection = original_connection(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(backup_module, "_open_relative", deny_cas)
+    monkeypatch.setattr(backup_module, "_connection_from_fd", retain_connection)
+    try:
+        with pytest.raises(PermissionError, match="CAS open failure"):
+            backup_module._inspect_consolidated_realm(root_fd)
+        assert darwin_verifier and all(not path.exists() for path in darwin_verifier)
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connections[0].execute("SELECT 1")
+    finally:
+        for connection in connections:
+            connection.close()
+        os.close(root_fd)
+
+
 def test_backup_darwin_roundtrip_and_adoption_copy(tmp_path, darwin_verifier):
     from astrid_runtime.workspace_adopt import _materialize_backup, _pinned_backup_source
 

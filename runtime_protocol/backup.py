@@ -440,38 +440,39 @@ def _inspect_consolidated_realm(
     """Run the full RealmStore doctor logic over an immutable descriptor DB."""
     from .store import RealmStore
 
-    connection = _connection_from_fd(root_fd, "realm.sqlite3")
-    connection.row_factory = sqlite3.Row
     inspector = object.__new__(RealmStore)
-    # CAS reads use _cas_root_fd below. Timeline integrity also stats db_path;
-    # on macOS that must name the private snapshot, not /dev/fd/<dirfd>/... .
-    inspector.root = Path(os.path_from_fd(root_fd)) if os.name == "nt" else Path(f"/dev/fd/{root_fd}")
-    inspector.db_path = getattr(connection, "_snapshot_path", inspector.root / "realm.sqlite3")
-    inspector.cas_root = inspector.root / "cas" / "sha256"
+    inspector._cas_root_fd = -1
+    connection = _connection_from_fd(root_fd, "realm.sqlite3")
     try:
-        inspector._cas_root_fd = _open_relative(root_fd, "cas/sha256", directory=True)
-    except FileNotFoundError:
-        inspector._cas_root_fd = -1
+        connection.row_factory = sqlite3.Row
+        # CAS reads use _cas_root_fd below. Timeline integrity also stats db_path;
+        # on macOS that must name the private snapshot, not /dev/fd/<dirfd>/... .
+        inspector.root = Path(os.path_from_fd(root_fd)) if os.name == "nt" else Path(f"/dev/fd/{root_fd}")
+        inspector.db_path = getattr(connection, "_snapshot_path", inspector.root / "realm.sqlite3")
+        inspector.cas_root = inspector.root / "cas" / "sha256"
+        try:
+            inspector._cas_root_fd = _open_relative(root_fd, "cas/sha256", directory=True)
+        except FileNotFoundError:
+            inspector._cas_root_fd = -1
 
-    def read_cas_object(digest: str) -> bytes:
-        # Timeline history checks must use the same pinned CAS as the doctor,
-        # including on macOS where directory descriptor aliases cannot work.
-        _object_path(inspector.cas_root, digest)  # validate before relative open
-        if inspector._cas_root_fd < 0:
-            raise NotFoundError("object not found")
-        fd = _open_relative(inspector._cas_root_fd, f"{digest[:2]}/{digest[2:]}")
-        with os.fdopen(fd, "rb") as stream:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                raise ConflictError("CAS object must be a regular file")
-            data = stream.read()
-        if hashlib.sha256(data).hexdigest() != digest:
-            raise ConflictError("CAS object failed hash verification")
-        return data
+        def read_cas_object(digest: str) -> bytes:
+            # Timeline history checks must use the same pinned CAS as the doctor,
+            # including on macOS where directory descriptor aliases cannot work.
+            _object_path(inspector.cas_root, digest)  # validate before relative open
+            if inspector._cas_root_fd < 0:
+                raise NotFoundError("object not found")
+            fd = _open_relative(inspector._cas_root_fd, f"{digest[:2]}/{digest[2:]}")
+            with os.fdopen(fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ConflictError("CAS object must be a regular file")
+                data = stream.read()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise ConflictError("CAS object failed hash verification")
+            return data
 
-    inspector._read_cas_object = read_cas_object
-    inspector.conn = connection
-    inspector._mutex = threading.RLock()
-    try:
+        inspector._read_cas_object = read_cas_object
+        inspector.conn = connection
+        inspector._mutex = threading.RLock()
         report = inspector.integrity_report(timeout_seconds=timeout_seconds)
         if not report.get("ok"):
             # Only the current-schema finding may be waived, and only after
@@ -486,9 +487,11 @@ def _inspect_consolidated_realm(
         realm = inspector.realm
         return report, realm
     finally:
-        connection.close()
-        if inspector._cas_root_fd >= 0:
-            os.close(inspector._cas_root_fd)
+        try:
+            connection.close()
+        finally:
+            if inspector._cas_root_fd >= 0:
+                os.close(inspector._cas_root_fd)
 
 
 def verify_backup(backup_dir: str | Path, *, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any] | None = None, older_schema: bool = False) -> dict:
