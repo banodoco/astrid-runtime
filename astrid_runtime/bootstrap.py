@@ -1865,6 +1865,7 @@ def _fenced_stop_and_manager(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_id: str, realm_root: Path,
     discovery: Mapping[str, Any] | None, marker: Mapping[str, Any] | None,
     owner: tuple[int, str, str, str] | None, stop_manager=None,
+    pre_stop_manager=None,
     stop_foreground=None, validate_stop=None, stale_owner_identity=None,
     allow_missing_realm: bool = False,
     completed_stop_binding: Mapping[str, Any] | None = None,
@@ -1918,8 +1919,6 @@ def _fenced_stop_and_manager(
             with _downstream_stop_errors():
                 if owner is not None:
                     pid, birth, instance_id, endpoint = owner
-                    if not callable(stop_manager):
-                        raise BootstrapError("Runtime interruption refused: service-manager stop callback is unavailable.")
                     # Durable Runtime-written intent, before the first signal:
                     # if the controller dies after TERM, a retry can prove
                     # this exact owner was being stopped by C1.
@@ -1940,19 +1939,32 @@ def _fenced_stop_and_manager(
                     if final_marker != intent:
                         atomic_write_json(paths.instance_lock_path, intent)
                     marker = intent
-                    # The Agent stops its service manager while this durable
-                    # intent and the realm fence are held. It receives only the
-                    # identity Runtime validated above, before any signal occurs.
-                    stopped = stop_manager({
-                        "pid": int(pid), "process_birth_id": str(birth),
-                        "runtime_instance_id": str(instance_id),
-                        "realm_id": str(realm_id), "realm_root": str(realm_root),
-                        "endpoint": str(endpoint),
-                        "owner_lock": str(paths.instance_lock_path),
-                    })
-                    _require_owner_absent(
-                        boundary, pid, birth, context="after service-manager stop",
+                    if pre_stop_manager is not None:
+                        if not callable(pre_stop_manager):
+                            raise BootstrapError("Runtime interruption refused: pre-stop service-manager callback is unavailable.")
+                        # Agent stops/disable-reconciles the service manager
+                        # while durable stop intent and the realm fence are held.
+                        # Runtime still performs the birth-checked owner stop.
+                        pre_stop_manager({
+                            "pid": int(pid), "process_birth_id": str(birth),
+                            "runtime_instance_id": str(instance_id),
+                            "realm_id": str(realm_id), "realm_root": str(realm_root),
+                            "endpoint": str(endpoint),
+                            "owner_lock": str(paths.instance_lock_path),
+                        })
+                    stop_owner = getattr(boundary, "stop_owner", None)
+                    if not callable(stop_owner):
+                        raise BootstrapError("Runtime boundary lacks the birth-checked stop handoff.")
+                    stopped = stop_owner(
+                        endpoint=endpoint, pid=pid, instance_id=instance_id,
+                        process_birth_id=birth, realm_id=realm_id,
+                        owner_lock=paths.instance_lock_path,
+                        discovery_path=paths.discovery_path, require_health=False,
                     )
+                    if completed_stop_binding is not None:
+                        _require_owner_absent(
+                            boundary, pid, birth, context="after Runtime stop",
+                        )
                 elif stop_foreground is not None:
                     stopped = stop_foreground()
                 # The stopped owner can remove its own advertisements. A new
@@ -1993,8 +2005,8 @@ def _fenced_stop_and_manager(
                         raise BootstrapError(
                             "Runtime interruption refused: owner absence could not be re-established immediately before manager stop."
                         ) from exc
-                if owner is None and stop_manager is not None:
-                    stop_manager(None)
+                if stop_manager is not None:
+                    stop_manager()
     except ConflictError as exc:
         raise _raise_conflict(exc) from exc
     except BootstrapError:
@@ -2288,6 +2300,7 @@ def _inspect_restore_realm(snapshot: Mapping[str, Any]) -> None:
 
 def _interrupt_owner_locked(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
+    pre_stop_manager=None,
     stop_foreground=None, restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
     """Admit, fence, stop and clean the selected Runtime owner."""
@@ -2525,6 +2538,7 @@ def _interrupt_owner_locked(
     result = _fenced_stop_and_manager(
         paths, boundary, realm_id=str(realm["realm_id"]), realm_root=realm_root,
         discovery=discovery, marker=marker, owner=owner, stop_manager=stop_manager,
+        pre_stop_manager=pre_stop_manager,
         stop_foreground=stop_foreground if owner is None else None,
         stale_owner_identity=stale_owner_identity,
         completed_stop_binding=pinokio_binding if owner is not None else None,
@@ -2537,6 +2551,7 @@ def _interrupt_owner_locked(
 
 def _interrupt_owner(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
+    pre_stop_manager=None,
     stop_foreground=None, restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
     """Serialize owner validation, the lifecycle fence and manager callback."""
@@ -2544,6 +2559,7 @@ def _interrupt_owner(
     with _bootstrap_mutex(paths):
         return _interrupt_owner_locked(
             paths, boundary, stop_manager=stop_manager,
+            pre_stop_manager=pre_stop_manager,
             stop_foreground=stop_foreground, restore_selection=restore_selection,
         )
 
@@ -2587,21 +2603,25 @@ def _preflight_owner_interruption(
 
 def down(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
+    pre_stop_manager=None,
     stop_foreground=None, restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
-    """Stop the selected owner through the manager under one lifecycle fence.
+    """Stop the selected owner under one lifecycle fence.
 
-    ``stop_manager`` receives the Runtime-validated owner mapping, or ``None``
-    when there is no live owner. The callback runs while the durable stop
-    intent and lifecycle fence are held.
+    ``pre_stop_manager`` receives the Runtime-validated owner mapping before
+    Runtime signals it. ``stop_manager`` retains its zero-argument post-stop
+    contract and also runs for an idle stop.
     """
     if stop_manager is not None and not callable(stop_manager):
-        raise TypeError("stop_manager must accept an owner mapping or None")
+        raise TypeError("stop_manager must be a zero-argument callback")
+    if pre_stop_manager is not None and not callable(pre_stop_manager):
+        raise TypeError("pre_stop_manager must accept the validated owner mapping")
     if stop_foreground is not None and not callable(stop_foreground):
         raise TypeError("stop_foreground must be a zero-argument callback")
     if restore_selection is not None and not isinstance(restore_selection, RestoreSelection):
         raise TypeError("restore_selection must be a RestoreSelection")
     return _interrupt_owner(paths, boundary, stop_manager=stop_manager,
+                            pre_stop_manager=pre_stop_manager,
                             stop_foreground=stop_foreground,
                             restore_selection=restore_selection)
 

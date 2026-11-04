@@ -1184,7 +1184,7 @@ class BootstrapTests(unittest.TestCase):
         owner = json.loads(self.paths.discovery_path.read_text())
         calls = []
 
-        def stop_manager(identity):
+        def pre_stop_manager(identity):
             calls.append(identity)
             self.assertEqual(identity["pid"], owner["pid"])
             self.assertEqual(identity["process_birth_id"], owner["process_birth_id"])
@@ -1213,9 +1213,8 @@ class BootstrapTests(unittest.TestCase):
                     connection.execute("BEGIN IMMEDIATE")
             finally:
                 connection.close()
-            self.boundary.alive.discard(identity["pid"])
 
-        result = down(self.paths, self.boundary, stop_manager=stop_manager)
+        result = down(self.paths, self.boundary, pre_stop_manager=pre_stop_manager)
         self.assertEqual(result["status"], "stopped")
         self.assertEqual(len(calls), 1)
 
@@ -1730,7 +1729,7 @@ class BootstrapTests(unittest.TestCase):
         bootstrap(self.paths, self.boundary, self.config)
         order = []
 
-        def stop_manager(owner):
+        def pre_stop_manager(owner):
             order.append("manager")
             self.assertEqual(owner["pid"], self.boundary.next_pid - 1)
             connection = sqlite3.connect(root / "realm.sqlite3", timeout=0.02)
@@ -1739,9 +1738,8 @@ class BootstrapTests(unittest.TestCase):
                     connection.execute("BEGIN IMMEDIATE")
             finally:
                 connection.close()
-            self.boundary.alive.discard(owner["pid"])
 
-        result = down(self.paths, self.boundary, stop_manager=stop_manager)
+        result = down(self.paths, self.boundary, pre_stop_manager=pre_stop_manager)
         self.assertEqual(order, ["manager"])
         self.assertEqual(result["status"], "stopped")
         self.assertFalse(self.paths.discovery_path.exists())
