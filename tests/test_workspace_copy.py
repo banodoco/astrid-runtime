@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import hashlib
 
 import pytest
 
@@ -33,6 +34,221 @@ def inventory(root):
         return workspace_copy._inventory(fd)
     finally:
         os.close(fd)
+
+
+def full_manifest(root):
+    result = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        st = path.lstat()
+        result[str(path.relative_to(root))] = (st.st_mode, st.st_dev, st.st_ino, st.st_uid, st.st_gid,
+                                                st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                                                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None)
+    return result
+
+
+def test_flagged_busy_owner_refuses_without_source_mutation_or_signal(tmp_path, monkeypatch):
+    from runtime_protocol import platform
+    old, realm, paths, config = setup_copy(tmp_path)
+    before = full_manifest(old)
+    real_open = os.open
+    lock_opens = []
+    def checked_open(path, flags, *args, **kwargs):
+        if path == "owner.lock" and kwargs.get("dir_fd") is not None:
+            lock_opens.append(flags)
+            assert flags & os.O_ACCMODE == os.O_RDONLY
+            assert flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK
+            assert not flags & (os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+        return real_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(os, "open", checked_open)
+    monkeypatch.setattr(os, "kill", lambda *a: pytest.fail("unexpected signal"))
+    monkeypatch.setattr(os, "killpg", lambda *a: pytest.fail("unexpected signal"))
+    for module in ("astrid_runtime.workspace_adopt", "runtime_protocol.upgrade"):
+        monkeypatch.setattr(module + "._owner_fence", lambda *a: pytest.fail("unexpected source owner fence"))
+    with (realm / "owner.lock").open("rb") as owner:
+        platform.lock_file(owner.fileno(), blocking=False)
+        with pytest.raises(WorkspaceAdoptError, match="owner lock is busy"):
+            call(old, paths, config)
+    assert not paths.app_support.exists()
+    assert not list(old.parent.glob(".old-r1.adopt-*"))
+    assert lock_opens
+    assert full_manifest(old) == before
+
+
+def test_owner_becoming_busy_before_publication_refuses(tmp_path, monkeypatch):
+    from runtime_protocol import platform
+    old, realm, paths, config = setup_copy(tmp_path)
+    before = full_manifest(old)
+    bind = workspace_copy._bind_candidate_recovery
+    with (realm / "owner.lock").open("rb") as owner:
+        def bind_then_hold(*args):
+            bind(*args)
+            platform.lock_file(owner.fileno(), blocking=False)
+        monkeypatch.setattr(workspace_copy, "_bind_candidate_recovery", bind_then_hold)
+        with pytest.raises(WorkspaceAdoptError, match="owner lock is busy"):
+            call(old, paths, config)
+    assert not paths.app_support.exists()
+    assert not list(old.parent.glob(".old-r1.adopt-*"))
+    assert full_manifest(old) == before
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink", "fifo", "denied"])
+def test_existing_lock_inspection_is_noncreating_and_fail_closed(tmp_path, monkeypatch, kind):
+    old, realm, paths, config = setup_copy(tmp_path)
+    lock = realm / "owner.lock"
+    if kind != "denied":
+        lock.unlink()
+    if kind == "symlink":
+        lock.symlink_to(old / "credentials" / "astrid.json")
+    elif kind == "fifo":
+        os.mkfifo(lock)
+    elif kind == "denied":
+        real_open = os.open
+        def deny(path, flags, *args, **kwargs):
+            if path == "owner.lock" and kwargs.get("dir_fd") is not None:
+                raise PermissionError("inspection denied")
+            return real_open(path, flags, *args, **kwargs)
+        monkeypatch.setattr(os, "open", deny)
+    before = full_manifest(old)
+    if kind == "missing":
+        assert call(old, paths, config)["ok"] is True
+        assert not lock.exists()
+    else:
+        with pytest.raises(WorkspaceAdoptError, match="source owner lock"):
+            call(old, paths, config)
+        assert not paths.app_support.exists()
+    assert full_manifest(old) == before
+
+
+def test_v26_published_recovery_resolves_and_passes_startup(tmp_path, monkeypatch):
+    from runtime_protocol import v33_lifecycle as lifecycle
+    from runtime_protocol.errors import ConflictError
+    from runtime_protocol.store import RealmStore
+    old, realm, paths, config = setup_copy(tmp_path)
+    before = full_manifest(old)
+    bind = workspace_copy._bind_candidate_recovery
+    retained = {}
+    def capture_recovery(*args):
+        archive, record = lifecycle.activation(args[1])
+        retained["record"] = record.copy()
+        retained["bytes"] = {str(p.relative_to(archive)): p.read_bytes()
+                             for p in archive.rglob("*") if p.is_file() and p.name != "activation.json"}
+        return bind(*args)
+    monkeypatch.setattr(workspace_copy, "_bind_candidate_recovery", capture_recovery)
+    result = call(old, paths, config)
+    published = paths.realms_dir / "film"
+    archive, record = lifecycle.activation(published)
+    assert result["source_version"] == 26
+    assert result["migration"]["recovery_set"] == str(archive)
+    assert archive.is_relative_to(paths.app_support)
+    assert record["realm_root"] == str(published)
+    assert record["state"] == "backfill_complete"
+    assert {**retained["record"], "realm_root": str(published)} == record
+    assert {str(p.relative_to(archive)): p.read_bytes()
+            for p in archive.rglob("*") if p.is_file() and p.name != "activation.json"} == retained["bytes"]
+    assert json.loads((paths.app_support / workspace_copy.RECEIPT).read_text()) == result
+    assert ".adopt-" not in json.dumps(result)
+    lifecycle.verify_tree(archive / "realm", record["inventory"])
+    lifecycle.check_startup(published)
+    RealmStore(published).close()
+    with pytest.raises(ConflictError, match="provider/baseline verification is pending"):
+        lifecycle.require_ready(published)
+    assert full_manifest(old) == before
+
+
+@pytest.mark.parametrize("point", ["binding", "published_validation"])
+def test_interrupted_binding_or_published_validation_retains_safe_state(tmp_path, monkeypatch, point):
+    old, realm, paths, config = setup_copy(tmp_path)
+    before = full_manifest(old)
+    if point == "binding":
+        write = workspace_copy.lifecycle.write_record
+        def interrupt(path, value):
+            if Path(path).name == workspace_copy.lifecycle.MARKER and str(value.get("archive", "")).startswith(str(paths.app_support)):
+                raise OSError("interrupted binding")
+            return write(path, value)
+        monkeypatch.setattr(workspace_copy.lifecycle, "write_record", interrupt)
+    else:
+        validate = workspace_copy.lifecycle.check_startup
+        def interrupt(root):
+            if Path(root).is_relative_to(paths.app_support):
+                raise OSError("interrupted published validation")
+            return validate(root)
+        monkeypatch.setattr(workspace_copy.lifecycle, "check_startup", interrupt)
+    with pytest.raises(OSError, match="interrupted"):
+        call(old, paths, config)
+    assert paths.app_support.exists() == (point == "published_validation")
+    if paths.app_support.exists():
+        with pytest.raises(WorkspaceAdoptError, match="destination already exists"):
+            call(old, paths, config)
+    assert full_manifest(old) == before
+
+
+@pytest.mark.parametrize("damage", ["archive_reference", "realm_reference", "image"])
+def test_published_recovery_validation_refuses_corruption_and_retains_both_roots(tmp_path, monkeypatch, damage):
+    from runtime_protocol.errors import ConflictError
+    lifecycle = workspace_copy.lifecycle
+    old, realm, paths, config = setup_copy(tmp_path)
+    before = full_manifest(old)
+    publish = workspace_copy._publish
+    def publish_then_damage(*args):
+        publish(*args)
+        published = paths.realms_dir / "film"
+        archive, record = lifecycle.activation(published)
+        if damage == "archive_reference":
+            binding = lifecycle.read_record(published / lifecycle.MARKER)
+            lifecycle.write_record(published / lifecycle.MARKER,
+                                   {**binding, "archive": str(paths.app_support / "missing-archive")})
+        elif damage == "realm_reference":
+            lifecycle.write_record(archive / "activation.json", {**record, "realm_root": str(old)})
+        else:
+            image = archive / "realm" / "realm.sqlite3"
+            image.write_bytes(image.read_bytes() + b"corruption")
+    monkeypatch.setattr(workspace_copy, "_publish", publish_then_damage)
+    with pytest.raises(ConflictError):
+        call(old, paths, config)
+    assert paths.app_support.exists()
+    retained = full_manifest(paths.app_support)
+    with pytest.raises(WorkspaceAdoptError, match="destination already exists"):
+        call(old, paths, config)
+    assert full_manifest(paths.app_support) == retained
+    assert full_manifest(old) == before
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX interruption fixture")
+@pytest.mark.parametrize("point", ["binding", "publication"])
+def test_abrupt_exit_during_binding_or_after_publication(tmp_path, monkeypatch, point):
+    from runtime_protocol import v33_lifecycle as lifecycle
+    old, realm, paths, config = setup_copy(tmp_path)
+    before = full_manifest(old)
+    if point == "binding":
+        write = lifecycle.write_record
+        def exit_during_binding(path, value):
+            if Path(path).name == lifecycle.MARKER and str(value.get("archive", "")).startswith(str(paths.app_support)):
+                os._exit(77)
+            return write(path, value)
+        monkeypatch.setattr(lifecycle, "write_record", exit_during_binding)
+    else:
+        publish = workspace_copy._publish
+        def exit_after_publication(*args):
+            publish(*args)
+            os._exit(77)
+        monkeypatch.setattr(workspace_copy, "_publish", exit_after_publication)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            call(old, paths, config)
+        finally:
+            os._exit(78)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 77
+    assert full_manifest(old) == before
+    if point == "binding":
+        assert not paths.app_support.exists()
+        assert list(old.parent.glob(".old-r1.adopt-*"))
+    else:
+        assert paths.app_support.exists()
+        lifecycle.check_startup(paths.realms_dir / "film")
+        with pytest.raises(WorkspaceAdoptError, match="destination already exists"):
+            call(old, paths, config)
 
 
 def test_offline_receipt_and_full_read_only_tree(tmp_path, monkeypatch):
@@ -219,6 +435,7 @@ def test_mutation_after_copy_before_publication_refuses(tmp_path, monkeypatch):
 
 def test_uncertain_publication_retains_destination_and_refuses_retry(tmp_path, monkeypatch):
     old, realm, paths, config = setup_copy(tmp_path)
+    before = full_manifest(old)
     publish = workspace_copy._publish
     def publish_then_fail(*args):
         publish(*args)
@@ -228,6 +445,10 @@ def test_uncertain_publication_retains_destination_and_refuses_retry(tmp_path, m
         call(old, paths, config)
     receipt = paths.app_support / workspace_copy.RECEIPT
     assert receipt.exists()
+    published = full_manifest(paths.app_support)
     with pytest.raises(WorkspaceAdoptError, match="destination already exists"):
         call(old, paths, config)
     assert receipt.exists()
+    assert full_manifest(old) == before
+    assert full_manifest(paths.app_support) == published
+    workspace_copy.lifecycle.check_startup(paths.realms_dir / "film")

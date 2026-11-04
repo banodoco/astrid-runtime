@@ -270,6 +270,88 @@ class BootstrapTests(unittest.TestCase):
             self.assertNotIn("state", current_marker)
             self.assertEqual(len(self.boundary.starts), 2)
 
+    def test_pinokio_r1_selected_stop_retains_legacy_provenance(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        selection_path = selection_dir / "astrid-install.json"
+        selection = json.loads(selection_path.read_text())
+        marker_path = Path(selection["program_root"]) / "install.json"
+        marker = json.loads(marker_path.read_text())
+        legacy = self.paths.home / "old-data"
+        legacy_realm = legacy / "runtime" / "realms" / "configured-realm"
+        legacy_realm.mkdir(parents=True)
+        selection.update(data_root=str(legacy), realm_root=str(legacy_realm),
+                         r1_data_root=str(self.paths.app_support), r1_realm_root=str(root))
+        marker.update(data_root=str(legacy), r1_data_root=str(self.paths.app_support))
+        selection_path.write_text(json.dumps(selection))
+        marker_path.write_text(json.dumps(marker))
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
+            bootstrap(self.paths, self.boundary, self.config)
+            owner = json.loads(self.paths.discovery_path.read_text())
+            with patch.object(self.boundary, "stop_owner", wraps=self.boundary.stop_owner) as stop:
+                down(self.paths, self.boundary)
+            stopped = stop.call_args.kwargs
+            for field in ("pid", "process_birth_id"):
+                self.assertEqual(stopped[field], owner[field])
+            self.assertEqual(stopped["instance_id"], owner["runtime_instance_id"])
+            self.assertEqual(stopped["realm_id"], "configured-realm")
+            self.assertEqual(stopped["owner_lock"], self.paths.instance_lock_path)
+            receipt = json.loads(self.paths.instance_lock_path.read_text())["completed_stop"]
+            self.assertEqual(receipt["binding"]["data_root"], str(self.paths.app_support))
+            self.assertEqual(receipt["binding"]["realm_root"], str(root))
+            self.assertEqual(receipt["binding"]["service_declaration"], source.service_declaration)
+            self.assertEqual(json.loads(selection_path.read_text()), selection)
+            self.assertEqual(json.loads(marker_path.read_text()), marker)
+            # A fresh stop must revalidate both roots in the program marker.
+            marker_path.write_text(json.dumps({**marker, "r1_data_root": str(legacy)}))
+            manager_calls = []
+            with self.assertRaises(BootstrapError):
+                down(self.paths, self.boundary, stop_manager=lambda: manager_calls.append(True))
+            self.assertEqual(manager_calls, [])
+
+    def test_pinokio_r1_stop_refuses_marker_or_realm_mismatch(self):
+        root = self._configure()
+        selection_dir, source = self._configure_pinokio_selection(root)
+        selection_path = selection_dir / "astrid-install.json"
+        selection = json.loads(selection_path.read_text())
+        marker_path = Path(selection["program_root"]) / "install.json"
+        marker = json.loads(marker_path.read_text())
+        legacy = self.paths.home / "old-data"
+        legacy_realm = legacy / "runtime" / "realms" / "configured-realm"
+        legacy_realm.mkdir(parents=True)
+        selection.update(data_root=str(legacy), realm_root=str(legacy_realm),
+                         r1_data_root=str(self.paths.app_support), r1_realm_root=str(root))
+        marker.update(data_root=str(legacy), r1_data_root=str(self.paths.app_support))
+        self.config = BootstrapConfig(source_profile=source)
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(selection_dir), "LOCALAPPDATA": str(selection_dir)}):
+            selection_path.write_text(json.dumps(selection))
+            marker_path.write_text(json.dumps(marker))
+            bootstrap(self.paths, self.boundary, self.config)
+            for field in ("marker_missing", "marker_wrong", "realm_missing", "realm_wrong",
+                          "data_empty", "data_wrong", "realm_id", "legacy_marker"):
+                bad_selection, bad_marker = dict(selection), dict(marker)
+                if field == "marker_missing":
+                    bad_marker.pop("r1_data_root")
+                elif field == "marker_wrong":
+                    bad_marker["r1_data_root"] = str(legacy)
+                elif field == "realm_missing":
+                    bad_selection.pop("r1_realm_root")
+                elif field == "realm_wrong":
+                    bad_selection["r1_realm_root"] = str(self.paths.app_support)
+                elif field == "data_empty":
+                    bad_selection["r1_data_root"] = ""
+                elif field == "data_wrong":
+                    bad_selection["r1_data_root"] = str(legacy)
+                elif field == "realm_id":
+                    bad_selection["realm_id"] = "other-realm"
+                else:
+                    bad_marker["data_root"] = str(self.paths.app_support)
+                selection_path.write_text(json.dumps(bad_selection))
+                marker_path.write_text(json.dumps(bad_marker))
+                with self.subTest(field=field), self.assertRaises(BootstrapError):
+                    bootstrap_module._pinokio_stop_binding(self.paths, {"realm_id": "configured-realm", "data_root": str(root)})
+
     def test_pinokio_completed_stop_rejects_missing_evidence_and_reused_pid(self):
         root = self._configure()
         selection_dir, source = self._configure_pinokio_selection(root)

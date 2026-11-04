@@ -18,12 +18,72 @@ from runtime_protocol.dirfd import copy_file_at, open_directory_chain, pin_direc
 from runtime_protocol.store import RealmStore, SCHEMA_VERSION
 from runtime_protocol.upgrade import inspect_canonical_schema, migrate_canonical_to_current
 from runtime_protocol.backup import BACKUP_INTEGRITY_TIMEOUT_SECONDS
+from runtime_protocol import v33_lifecycle as lifecycle
 from .bootstrap import _commit_source_profile_metadata, _validate_source_profile
 from .paths import RuntimePaths
 from .workspace import _opaque_realm_id, _root
 
 RETRY = "Astrid changed while updating; your data is untouched; quit Astrid and run the install line again"
 RECEIPT = "adopt-receipt.r1.json"
+
+
+def _check_owner_not_busy(realm):
+    """Inspect the supported lifetime lock without creating or changing it."""
+    from .workspace_adopt import WorkspaceAdoptError
+    directory = open_directory_chain(realm)
+    try:
+        try:
+            fd = os.open("owner.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except FileNotFoundError:
+            # LEGACY-R0-OWNERSHIP-EVIDENCE: absence is not proof of a stop.
+            return
+        except OSError as exc:
+            raise WorkspaceAdoptError("source owner lock cannot be inspected; stop the old runtime first") from exc
+        try:
+            opened = os.fstat(fd)
+            if (not stat.S_ISREG(opened.st_mode)
+                    or _identity(opened) != _identity(os.stat("owner.lock", dir_fd=directory, follow_symlinks=False))):
+                raise WorkspaceAdoptError("source owner lock is not a regular file")
+            try:
+                platform.lock_file(fd, exclusive=True, blocking=False)
+            except OSError as exc:
+                raise WorkspaceAdoptError("source owner lock is busy or cannot be inspected; stop the old runtime first") from exc
+            platform.unlock_file(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory)
+
+
+def _bind_candidate_recovery(candidate, realm, destination, final_realm):
+    """Validate private recovery evidence, then bind its records to publication."""
+    state = lifecycle.activation(realm)
+    if state is None:
+        return
+    archive, record = state
+    try:
+        relative_archive = archive.relative_to(candidate)
+    except ValueError as exc:
+        raise ValueError("recovery archive is outside the candidate") from exc
+    if ".." in relative_archive.parts:
+        raise ValueError("recovery archive is outside the candidate")
+    lifecycle.check_startup(realm)
+    lifecycle.verify_tree(archive / "realm", record["inventory"])
+    binding = lifecycle.read_record(realm / lifecycle.MARKER)
+    record["realm_root"] = str(final_realm)
+    binding["archive"] = str(destination / relative_archive)
+    lifecycle.write_record(archive / "activation.json", record)
+    lifecycle.write_record(realm / lifecycle.MARKER, binding)
+
+
+def _relocate_result(value, candidate, destination):
+    if isinstance(value, dict):
+        return {k: _relocate_result(v, candidate, destination) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_relocate_result(v, candidate, destination) for v in value]
+    if isinstance(value, str) and (value == str(candidate) or value.startswith(str(candidate) + os.sep)):
+        return str(destination) + value[len(str(candidate)):]
+    return value
 
 
 def _identity(st):
@@ -187,10 +247,11 @@ def adopt_copy(paths, config, *, source, realm_id):
     candidate_stat = None
     published = False
     try:
+        realm = _source_root(root, realm_id)
+        _check_owner_not_busy(realm)
         before, before_hash, sqlite_hash = _inventory(source_fd)
         if any(row[0] in (RECEIPT, "update-journal.r1.json") for row in before):
             raise WorkspaceAdoptError("source contains a reserved R1 record")
-        realm = _source_root(root, realm_id)
         rel_realm = realm.relative_to(root)
         operation = uuid.uuid4().hex
         candidate = Path(tempfile.mkdtemp(prefix=f".{destination.name}.adopt-{operation}-", dir=root.parent))
@@ -241,6 +302,8 @@ def adopt_copy(paths, config, *, source, realm_id):
         report = RealmStore.inspect_realm(target_realm, deep=True, timeout_seconds=BACKUP_INTEGRITY_TIMEOUT_SECONDS)
         if int(final["version"]) != SCHEMA_VERSION or not report.get("ok"):
             raise WorkspaceAdoptError("copied realm failed final integrity checks")
+        _bind_candidate_recovery(candidate, target_realm, destination, final_realm)
+        migration = _relocate_result(migration, candidate, destination)
         candidate_paths = RuntimePaths.current(data_root=candidate)
         candidate_paths.ensure_support_dirs()
         for name in ("discovery.json", "instance.lock", "bootstrap.lock", "adopt-journal.json"):
@@ -263,6 +326,7 @@ def adopt_copy(paths, config, *, source, realm_id):
         if manifest_path and manifest_hash != manifest_before:
             raise WorkspaceAdoptError("source profile manifest changed during adoption")
         # Repeat after all candidate work, immediately before durable publication.
+        _check_owner_not_busy(realm)
         try:
             last, last_hash, last_sqlite = _inventory(source_fd)
         except (OSError, ValueError, UnicodeError) as exc:
@@ -285,6 +349,14 @@ def adopt_copy(paths, config, *, source, realm_id):
         _publish(parent_fd, candidate.name, destination.name)
         published = True
         validate_parent(root, parent)
+        recovery = lifecycle.activation(final_realm)
+        if recovery is None and migration.get("recovery_set"):
+            raise WorkspaceAdoptError("published migration recovery marker is missing")
+        if recovery is not None:
+            lifecycle.check_startup(final_realm)
+            lifecycle.verify_tree(recovery[0] / "realm", recovery[1]["inventory"])
+            if migration.get("recovery_set") and migration["recovery_set"] != str(recovery[0]):
+                raise WorkspaceAdoptError("published recovery path does not match migration receipt")
         return receipt
     finally:
         os.close(source_fd); close_pinned(parent); os.close(parent_fd)
