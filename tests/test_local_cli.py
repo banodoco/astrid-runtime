@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -155,6 +156,14 @@ def test_down_cli_json_preserves_complete_bootstrap_refusal_details(monkeypatch,
         "headline": "Astrid is busy (1 tasks running). Try again when they finish.",
         "message": "Astrid is busy (1 tasks running). Try again when they finish.\ntask-17 [running_task; test; running; age 12s]",
     }
+    # An earlier in-process test (tasks clear) may already have imported
+    # Runtime's own astrid_runtime_client from packages/python. The selected
+    # Agent finder rightly refuses that cached origin; production `down` never
+    # pre-imports it, so drop the stale copy for this in-process call.
+    for name in [n for n in sys.modules if n.split(".", 1)[0] == "astrid_runtime_client"]:
+        origin = getattr(sys.modules[name], "__file__", None)
+        if not origin or not Path(origin).resolve().is_relative_to(astrid_importable):
+            monkeypatch.delitem(sys.modules, name)
     monkeypatch.setattr(cli, "LocalRuntimeBoundary", Boundary)
     monkeypatch.setattr(cli, "down", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         BootstrapError(details["message"], details=details)
