@@ -502,3 +502,144 @@ def test_lease_refusals_disable_and_shutdown_cleanup(running_runtime):
     daemon.stop()
     with pytest.raises(OSError):
         os.fstat(retained_fd)
+
+
+# --- PK-13: one node per pack HTTP refusal kind ------------------------------
+# Each node names one refusal a browser or client can observe on the pack
+# routes, with its exact status and error code, on the direct listener or the
+# browser door as stated.
+
+
+def _error_code(body: bytes):
+    """Runtime errors carry {"code": ...}; door refusals carry {"error": code}."""
+    value = json.loads(body)
+    return value["code"] if "code" in value else value["error"]
+
+
+def _lease_url(admission: dict) -> str:
+    return f"/api/runtime/packs/leases/{PACK_ID}/{admission['digest']}"
+
+
+def _pack_routes(admission: dict):
+    """One request per pack route kind: inventory, asset, lease, release."""
+    return (
+        ("GET", "/api/runtime/packs/inventory"),
+        ("GET", _asset_path(admission, "chunks/lazy.js")),
+        ("POST", _lease_url(admission)),
+        ("DELETE", "/api/runtime/packs/leases/" + "e" * 64),
+    )
+
+
+def test_http_refusal_kind_unauthenticated(running_runtime):
+    daemon, _state, admission, _expected, _token = running_runtime
+    for method, path in _pack_routes(admission):
+        status, _headers, body = _request(daemon.endpoint, path, method)
+        assert (status, _error_code(body)) == (401, "unauthorized"), path
+
+
+def test_http_refusal_kind_scope_insufficient(running_runtime):
+    daemon, _state, admission, _expected, _token = running_runtime
+    limited, _path = daemon.credentials.provision("pack-http-kind-limited", ["tasks:read"])
+    for method, path in _pack_routes(admission):
+        status, _headers, body = _request(daemon.endpoint, path, method, token=limited)
+        assert (status, _error_code(body)) == (401, "unauthorized"), path
+    assert daemon.service._pack_leases == {}
+
+
+def test_http_refusal_kind_route_method_not_exact(running_runtime):
+    daemon, _state, admission, _expected, _token = running_runtime
+    for method, path in (
+        ("PUT", "/api/runtime/packs/inventory"),
+        ("POST", _asset_path(admission, "chunks/lazy.js")),
+        ("GET", _lease_url(admission)),
+        ("POST", "/api/runtime/packs/leases/" + "e" * 64),
+    ):
+        status, _headers, body = _request(daemon.endpoint, path, method, token=daemon.token)
+        assert (status, _error_code(body)) == (404, "not_found"), (method, path)
+        assert b"pack route requires an exact admitted path and method" in body
+    assert daemon.service._pack_leases == {}
+
+
+def test_http_refusal_kind_route_shape_not_exact(running_runtime):
+    daemon, _state, admission, _expected, _token = running_runtime
+    digest = admission["digest"]
+    for method, path in (
+        ("GET", "/api/runtime/packs/inventory/"),
+        ("GET", f"/api/runtime/packs/assets/{PACK_ID}/{digest}"),
+        ("GET", f"/api/runtime/packs/assets/{PACK_ID}/{digest.upper()}/index.js"),
+        ("POST", f"/api/runtime/packs/leases/{PACK_ID}/{digest}/extra"),
+        ("DELETE", "/api/runtime/packs/leases/" + "E" * 64),
+    ):
+        status, _headers, body = _request(daemon.endpoint, path, method, token=daemon.token)
+        assert (status, _error_code(body)) == (404, "not_found"), (method, path)
+
+
+@pytest.mark.parametrize("kind,request_kwargs,expected", [
+    ("door_invalid_host", {"headers": {"Host": "localhost"}, "origin": HOSTED}, (403, "invalid_host")),
+    ("door_foreign_origin", {"origin": "https://foreign.example"}, (403, "hosted_origin_required")),
+    ("door_browser_credentials", {"origin": HOSTED, "headers": {"Cookie": "session=1"}}, (403, "browser_credentials_forbidden")),
+    ("door_route_not_allowed", {"origin": HOSTED, "method": "DELETE"}, (404, "route_not_allowed")),
+    ("door_preflight_header_not_allowed", {"origin": HOSTED, "method": "OPTIONS", "headers": {
+        "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "x-output-binding"}},
+        (403, "header_not_allowed")),
+])
+def test_door_refusal_kind(running_runtime, kind, request_kwargs, expected):
+    daemon, _state, admission, _expected, _token = running_runtime
+    kwargs = dict(request_kwargs)
+    method = kwargs.pop("method", "GET")
+    status, _headers, body = _request(daemon.door_endpoint, _asset_path(admission, "chunks/lazy.js"), method, **kwargs)
+    assert (status, _error_code(body)) == expected, kind
+
+
+def test_http_refusal_kind_range_not_satisfiable(running_runtime):
+    daemon, _state, admission, expected, _token = running_runtime
+    size = len(expected["chunks/lazy.js"][0])
+    for header in ("bytes=abc", f"bytes={size}-", "bytes=5-2", "bytes=-0"):
+        status, headers, body = _request(
+            daemon.endpoint, _asset_path(admission, "chunks/lazy.js"),
+            token=daemon.token, headers={"Range": header},
+        )
+        assert (status, _error_code(body)) == (416, "invalid_range"), header
+        assert headers["Content-Range"] == f"bytes */{size}"
+
+
+@pytest.mark.parametrize("kind,expected", [
+    ("bundle_not_admitted", (404, "not_found")),
+    ("asset_not_listed", (404, "not_found")),
+    ("lease_revision_not_admitted", (404, "not_found")),
+    ("admitted_bytes_fail_verification", (409, "conflict")),
+    ("lease_bytes_fail_verification", (409, "conflict")),
+    ("installed_snapshot_invalid", (422, "validation_error")),
+    ("installed_snapshot_unreadable", (409, "conflict")),
+])
+def test_http_admission_refusal_kind(running_runtime, kind, expected):
+    daemon, state, admission, _expected, _token = running_runtime
+    method, path = "GET", _asset_path(admission, "chunks/lazy.js")
+    chunk = Path(admission["root"]) / f".build/{admission['sourceDigest']}/chunks/lazy.js"
+    original = chunk.read_bytes()
+    if kind == "bundle_not_admitted":
+        path = f"/api/runtime/packs/assets/{PACK_ID}/{'c' * 64}/index.js"
+    elif kind == "asset_not_listed":
+        path = _asset_path(admission, "chunks/unlisted.js")
+    elif kind == "lease_revision_not_admitted":
+        method, path = "POST", f"/api/runtime/packs/leases/{PACK_ID}/{'c' * 64}"
+    elif kind in ("admitted_bytes_fail_verification", "lease_bytes_fail_verification"):
+        chunk.write_bytes(b"x" * len(original))
+        if kind == "lease_bytes_fail_verification":
+            method, path = "POST", _lease_url(admission)
+    elif kind == "installed_snapshot_invalid":
+        state["snapshot"] = {"version": 2, "revision": 1, "packs": []}
+        path = "/api/runtime/packs/inventory"
+    elif kind == "installed_snapshot_unreadable":
+        def unreadable():
+            raise OSError("installer record unavailable")
+        daemon.service._pack_admissions = unreadable
+        path = "/api/runtime/packs/inventory"
+    try:
+        status, _headers, body = _request(daemon.endpoint, path, method, token=daemon.token)
+        assert (status, _error_code(body)) == expected, kind
+        status, _headers, body = _request(daemon.door_endpoint, path, method, origin=HOSTED)
+        assert (status, _error_code(body)) == expected, kind
+        assert daemon.service._pack_leases == {}
+    finally:
+        chunk.write_bytes(original)

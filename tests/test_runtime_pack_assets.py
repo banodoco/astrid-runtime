@@ -339,3 +339,216 @@ def test_malformed_installed_snapshot_refuses_before_serving(admitted_runtime, s
         service.pack_inventory()
     with pytest.raises(ValidationError):
         service.open_pack_asset(PACK_ID, admission["digest"], ENTRY_PATH)
+
+
+# --- PK-13: one node per artifact-manifest, asset and lease refusal kind -----
+# Each node names one refusal of validate_pack_artifact, pack_asset_path, the
+# service's asset open, or the lease API, asserting exact class and message.
+
+
+def _mutate_manifest(manifest, admission, kind):
+    files = manifest["files"]
+    chunk = next(row for row in files if row["path"] == "chunks/lazy.js")
+    if kind == "manifest_not_canonical_json":
+        manifest["extensionManifest"] = {"id": "example.extension", "weight": float("nan")}
+    elif kind == "manifest_fields_unsupported":
+        del manifest["toolchainDigest"]
+    elif kind == "manifest_hash_differs":
+        return "f" * 64
+    elif kind == "manifest_identity_differs":
+        manifest["entry"] = "main.js"
+    elif kind == "manifest_digest_malformed":
+        manifest["toolchainDigest"] = "not-a-sha256"
+    elif kind == "manifest_sections_not_objects":
+        manifest["sharedModules"] = []
+    elif kind == "shared_module_lock_malformed":
+        manifest["sharedModules"] = {"react": {"url": "/vendor/react.js"}}
+    elif kind == "shared_module_version_unpinned":
+        manifest["sharedModules"] = {"react": {"url": "/vendor/react.js", "sha256": "d" * 64, "version": "^18.3.1"}}
+    elif kind == "shared_module_url_not_host_relative":
+        manifest["sharedModules"] = {"react": {"url": "https://cdn.example/react.js", "sha256": "d" * 64, "version": "18.3.1"}}
+    elif kind == "files_empty":
+        manifest["files"] = []
+    elif kind == "file_fields_unsupported":
+        chunk["executable"] = True
+    elif kind == "file_paths_collide":
+        files.append({**chunk, "path": chunk["path"].upper()})
+    elif kind == "file_disk_outside_build_layout":
+        chunk["disk"] = "../outside.js"
+    elif kind == "file_size_invalid":
+        chunk["size"] = -1
+    elif kind == "file_mime_differs_from_extension":
+        chunk["mime"] = "application/x-executable"
+    elif kind == "files_unsorted_or_without_entry":
+        files.reverse()
+    elif kind == "entry_hash_differs_from_bundle":
+        next(row for row in files if row["path"] == ENTRY_PATH)["sha256"] = "0" * 64
+    elif kind == "graph_index_differs_from_files":
+        manifest["graphIndexDigest"] = "0" * 64
+    else:
+        raise AssertionError(kind)
+    return _sha(_canonical(manifest))
+
+
+MANIFEST_REFUSALS = {
+    "manifest_not_canonical_json": (ValidationError, "pack artifact manifest must contain canonical UTF-8 JSON"),
+    "manifest_fields_unsupported": (ValidationError, "pack artifact manifest has missing or unsupported fields"),
+    "manifest_hash_differs": (ConflictError, "pack artifact manifest hash differs from installed admission"),
+    "manifest_identity_differs": (ConflictError, "pack artifact identity differs from installed admission"),
+    "manifest_digest_malformed": (ValidationError, "pack admission toolchainDigest must be a full lowercase SHA-256"),
+    "manifest_sections_not_objects": (ValidationError, "extensionManifest and sharedModules must be objects"),
+    "shared_module_lock_malformed": (ValidationError, "pack artifact shared module lock is malformed"),
+    "shared_module_version_unpinned": (ValidationError, "pack artifact shared module version must be pinned"),
+    "shared_module_url_not_host_relative": (ValidationError, "pack artifact shared module URL must be host-relative"),
+    "files_empty": (ValidationError, "pack artifact files must be a nonempty sorted list"),
+    "file_fields_unsupported": (ValidationError, "pack artifact file has missing or unsupported fields"),
+    "file_paths_collide": (ValidationError, "pack artifact file paths collide"),
+    "file_disk_outside_build_layout": (ValidationError, "pack artifact disk path differs from the confined build layout"),
+    "file_size_invalid": (ValidationError, "pack artifact file size must be a nonnegative safe integer"),
+    "file_mime_differs_from_extension": (ValidationError, "pack artifact MIME differs from its supported file extension"),
+    "files_unsorted_or_without_entry": (ValidationError, "pack artifact files must be sorted and include index.js"),
+    "entry_hash_differs_from_bundle": (ConflictError, "pack artifact entry hash differs from admitted bundle digest"),
+    "graph_index_differs_from_files": (ConflictError, "pack artifact graph index hash differs from its file membership"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(MANIFEST_REFUSALS))
+def test_artifact_manifest_refusal_kind(admitted_runtime, kind):
+    service, state, admission, _expected, _root = admitted_runtime
+    manifest = admission["artifactManifest"]
+    admission["artifactManifestDigest"] = _mutate_manifest(manifest, admission, kind)
+    error, message = MANIFEST_REFUSALS[kind]
+    with pytest.raises(error, match=message):
+        service.pack_inventory()
+    with pytest.raises(error, match=message):
+        service.open_pack_asset(PACK_ID, admission["digest"], ENTRY_PATH)
+
+
+ASSET_PATH_REFUSALS = {
+    "path_not_normalized_or_decorated": ("chunks\\lazy.js", "pack asset path must be a normalized confined UTF-8 name"),
+    "path_not_valid_utf8": ("\ud800.js", "pack asset path must be valid UTF-8"),
+    "path_unsafe_or_aliased_component": ("chunks/../index.js", "pack asset path contains an unsafe or aliased component"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(ASSET_PATH_REFUSALS))
+def test_asset_logical_path_refusal_kind(admitted_runtime, kind):
+    service, _state, admission, _expected, _root = admitted_runtime
+    path, message = ASSET_PATH_REFUSALS[kind]
+    with pytest.raises(ValidationError, match=message):
+        service.open_pack_asset(PACK_ID, admission["digest"], path)
+
+
+class _OsProxy:
+    def __init__(self, real, **overrides):
+        self._real, self._overrides = real, overrides
+
+    def __getattr__(self, name):
+        return self._overrides.get(name) or getattr(self._real, name)
+
+
+def _rewrite_entry_prelude(admission, root):
+    manifest = admission["artifactManifest"]
+    entry_row = next(row for row in manifest["files"] if row["path"] == ENTRY_PATH)
+    entry_path = root / entry_row["disk"]
+    entry = entry_path.read_bytes().replace(b"astrid-graph-index-sha256:", b"astrid-graph-index-sha256-x:", 1)
+    entry_path.write_bytes(entry)
+    entry_row.update(sha256=_sha(entry), size=len(entry))
+    manifest["digest"] = admission["digest"] = _sha(entry)
+    admission["artifactManifestDigest"] = _sha(_canonical(manifest))
+
+
+ASSET_OPEN_REFUSALS = {
+    "asset_pack_id_invalid": (ValidationError, "pack asset packId is invalid"),
+    "asset_bundle_digest_malformed": (ValidationError, "pack asset bundle digest must be a full lowercase SHA-256"),
+    "bundle_not_installed_or_admitted": (NotFoundError, "pack bundle is not installed and admitted"),
+    "asset_not_listed": (NotFoundError, "pack asset is not listed in the admitted manifest"),
+    "artifact_bytes_missing": (ConflictError, "installed pack artifact bytes are missing; reinstall the admitted bundle"),
+    "artifact_not_accessible_regular_file": (ConflictError, "installed pack artifact must be an accessible regular file"),
+    "artifact_not_regular_file": (ConflictError, "pack asset chunks/lazy.js must be a regular file"),
+    "artifact_size_differs": (ConflictError, "pack asset chunks/lazy.js size does not match staged metadata"),
+    "artifact_hash_differs": (ConflictError, "pack asset chunks/lazy.js hash or size does not match staged metadata"),
+    "artifact_unreadable": (ConflictError, "pack asset chunks/lazy.js is unavailable"),
+    "entry_does_not_commit_graph_index": (ConflictError, "pack entry does not commit the admitted graph index"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(ASSET_OPEN_REFUSALS))
+def test_asset_open_refusal_kind(admitted_runtime, monkeypatch, kind):
+    from runtime_protocol import service as service_module
+
+    service, _state, admission, _expected, root = admitted_runtime
+    pack_id, digest, path = PACK_ID, admission["digest"], "chunks/lazy.js"
+    chunk = root / f".build/{SOURCE_DIGEST}/chunks/lazy.js"
+    if kind == "asset_pack_id_invalid":
+        pack_id = "../escape"
+    elif kind == "asset_bundle_digest_malformed":
+        digest = digest.upper()
+    elif kind == "bundle_not_installed_or_admitted":
+        digest = "c" * 64
+    elif kind == "asset_not_listed":
+        (chunk.parent / "unlisted.js").write_bytes(b"export default 0;\n")
+        path = "chunks/unlisted.js"
+    elif kind == "artifact_bytes_missing":
+        chunk.unlink()
+    elif kind == "artifact_not_accessible_regular_file":
+        moved = chunk.with_name("moved.js")
+        chunk.rename(moved)
+        chunk.symlink_to(moved.name)
+    elif kind == "artifact_not_regular_file":
+        chunk.unlink()
+        chunk.mkdir()
+    elif kind == "artifact_size_differs":
+        chunk.write_bytes(chunk.read_bytes() + b"// appended\n")
+    elif kind == "artifact_hash_differs":
+        chunk.write_bytes(b"x" * chunk.stat().st_size)
+    elif kind == "artifact_unreadable":
+        real = service_module.os
+
+        def read(fd, size):
+            if real.fstat(fd).st_ino == chunk.stat().st_ino:
+                raise OSError(5, "Input/output error")
+            return real.read(fd, size)
+
+        monkeypatch.setattr(service_module, "os", _OsProxy(real, read=read))
+    elif kind == "entry_does_not_commit_graph_index":
+        _rewrite_entry_prelude(admission, root)
+        digest = admission["digest"]
+    else:
+        raise AssertionError(kind)
+    error, message = ASSET_OPEN_REFUSALS[kind]
+    with pytest.raises(error, match=message):
+        service.open_pack_asset(pack_id, digest, path)
+
+
+LEASE_REFUSALS = {
+    "lease_pack_id_invalid": (ValidationError, "packId must identify one installed pack"),
+    "lease_digest_malformed": (ValidationError, "pack digest must be a lowercase SHA-256"),
+    "lease_revision_not_admitted": (NotFoundError, "only an installed admitted revision can acquire a lease"),
+    "lease_bytes_fail_verification": (ConflictError, "hash or size does not match staged metadata"),
+    "lease_token_malformed": (ValidationError, "pack lease must be a lowercase SHA-256 token"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(LEASE_REFUSALS))
+def test_lease_refusal_kind(admitted_runtime, kind):
+    service, _state, admission, _expected, root = admitted_runtime
+    error, message = LEASE_REFUSALS[kind]
+    if kind == "lease_token_malformed":
+        call = lambda: service.release_pack_lease("not-a-lease")  # noqa: E731
+    else:
+        pack_id, digest = PACK_ID, admission["digest"]
+        if kind == "lease_pack_id_invalid":
+            pack_id = "../escape"
+        elif kind == "lease_digest_malformed":
+            digest = "short"
+        elif kind == "lease_revision_not_admitted":
+            digest = "c" * 64
+        elif kind == "lease_bytes_fail_verification":
+            chunk = root / f".build/{SOURCE_DIGEST}/chunks/lazy.js"
+            chunk.write_bytes(b"x" * chunk.stat().st_size)
+        call = lambda: service.acquire_pack_lease(pack_id, digest)  # noqa: E731
+    with pytest.raises(error, match=message):
+        call()
+    # A refused lease never retains a folder handle.
+    assert service._pack_leases == {}

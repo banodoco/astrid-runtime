@@ -138,3 +138,77 @@ def test_real_cli_child_reads_persisted_admissions_and_restarts(tmp_path, owned_
                 process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
             output, errors = process.communicate(timeout=15)
             assert process.returncode == 0, (output, errors)
+
+
+# --- PK-13: one node per startup composition refusal kind --------------------
+# Startup selects exactly one admission authority. These nodes need no Agent
+# provider: they use the neutral daemon composition directly.
+
+
+def test_startup_refusal_kind_reader_and_collection_both_selected(tmp_path):
+    from runtime_protocol.daemon import RuntimeDaemon
+
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    with pytest.raises(ValueError, match="select either an installed pack collection or an admission reader"):
+        RuntimeDaemon(realm, support_root=tmp_path / "support",
+                      pack_admissions=lambda: {"version": 1, "revision": 0, "packs": []},
+                      installed_pack_root=tmp_path / "installed")
+
+
+def test_startup_refusal_kind_collection_not_absolute(tmp_path):
+    from runtime_protocol.daemon import RuntimeDaemon
+    from runtime_protocol.errors import ValidationError
+
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    for value in ("relative/installed", str(tmp_path / "x" / ".." / "installed")):
+        with pytest.raises(ValidationError, match="installed pack collection must be an absolute folder"):
+            RuntimeDaemon(realm, support_root=tmp_path / "support", installed_pack_root=value)
+
+
+def test_startup_refusal_kind_reader_not_callable(tmp_path):
+    from runtime_protocol.errors import ValidationError
+    from runtime_protocol.service import RuntimeService
+
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    with pytest.raises(ValidationError, match="pack_admissions must be an installed admission snapshot reader"):
+        RuntimeService(realm, pack_admissions={"version": 1, "revision": 0, "packs": []})
+
+
+def test_startup_refusal_kind_cli_collection_not_absolute(tmp_path, capsys):
+    from runtime_protocol import cli
+
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    status = cli.main(["start", "--root", str(realm), "--support-root", str(tmp_path / "support"),
+                       "--installed-pack-root", "relative/installed"])
+    output = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert status == 1
+    assert output["ok"] is False
+    assert output["error"]["code"] == "validation_error"
+    assert output["error"]["message"] == "installed pack collection must be an absolute folder"
+
+
+def test_startup_refusal_kind_unsafe_default_agent_collection(tmp_path):
+    """A symlinked Agent pack collection is composed but never served."""
+    from runtime_protocol.daemon import RuntimeDaemon
+
+    agent = _repo(tmp_path / "agent")
+    runtime = _repo(tmp_path / "runtime-provenance")
+    actual = tmp_path / "actual-packs"
+    _write_committed_pack(actual / PACK_ID)
+    (agent / "astrid").mkdir()
+    (agent / "astrid" / "packs").symlink_to(actual, target_is_directory=True)
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    daemon = RuntimeDaemon(realm, support_root=tmp_path / "support",
+                           agent_checkout=agent, runtime_checkout=runtime).start()
+    try:
+        status, _headers, body = _request(daemon.endpoint, "/api/runtime/packs/inventory", token=daemon.token)
+        assert status == 409
+        assert json.loads(body)["message"].startswith("installed pack admission files are unavailable or unsafe")
+        assert daemon.service._pack_leases == {}
+    finally:
+        daemon.stop()

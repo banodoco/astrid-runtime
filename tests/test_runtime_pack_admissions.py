@@ -351,3 +351,204 @@ def test_open_asset_stream_survives_folder_rename_and_admission_withdrawal(tmp_p
         if stream is not None:
             stream.close()
         daemon.stop()
+
+
+# --- PK-13: one node per installed-admission refusal kind --------------------
+# Each node names one refusal the installed reader (InstalledPackAdmissions) or
+# the committed-snapshot gate (read_pack_admissions) can raise, and asserts its
+# exact error class and message, so a kind cannot pass by tripping another one.
+
+
+class _OsProxy:
+    """Delegate to the real os module, overriding only the named calls."""
+
+    def __init__(self, real, **overrides):
+        self._real, self._overrides = real, overrides
+
+    def __getattr__(self, name):
+        return self._overrides.get(name) or getattr(self._real, name)
+
+
+def _reader_refusal(tmp_path, monkeypatch, kind):
+    from runtime_protocol import store as store_module
+    from runtime_protocol.store import InstalledPackAdmissions
+
+    collection = tmp_path / "installed"
+    root, record, _expected = _write_installed_pack(collection)
+    build = root / ".build"
+    admission_path = build / "admission.json"
+    manifest_path = build / f"{SOURCE_DIGEST}.artifact-manifest.json"
+    if kind == "collection_not_absolute":
+        for value in ("relative/installed", str(tmp_path / "x" / ".." / "installed")):
+            with pytest.raises(ValidationError, match="absolute folder"):
+                InstalledPackAdmissions(value)
+        return None
+    if kind == "metadata_not_bounded_regular_file":
+        admission_path.unlink()
+        admission_path.mkdir()
+    elif kind == "metadata_changed_during_read":
+        real = store_module.os
+        appended = []
+
+        def fdopen(fd, *args, **kwargs):
+            stream = real.fdopen(fd, *args, **kwargs)
+            if not appended:
+                appended.append(True)
+                with open(admission_path, "ab") as concurrent_writer:
+                    concurrent_writer.write(b" ")
+            return stream
+
+        monkeypatch.setattr(store_module, "os", _OsProxy(real, fdopen=fdopen))
+    elif kind == "metadata_ambiguous_json":
+        admission_path.write_bytes(_canonical(record).replace(b'{"artifactManifestDigest"', b'{"version":1,"artifactManifestDigest"', 1))
+    elif kind == "folder_identities_collide":
+        (collection / PACK_ID.upper()).mkdir()
+    elif kind == "folder_is_symlink":
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (collection / "linked_pack").symlink_to(target, target_is_directory=True)
+    elif kind == "admission_fields_invalid":
+        admission_path.write_bytes(_canonical({**record, "transactionId": ""}))
+    elif kind == "admission_digest_malformed":
+        admission_path.write_bytes(_canonical({**record, "sourceDigest": SOURCE_DIGEST.upper()}))
+    elif kind == "manifest_bytes_not_canonical":
+        manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+    elif kind == "metadata_unavailable_or_unsafe":
+        manifest_path.unlink()
+    else:
+        raise AssertionError(kind)
+    return InstalledPackAdmissions(collection)
+
+
+READER_REFUSALS = {
+    "collection_not_absolute": (ValidationError, "installed pack collection must be an absolute folder"),
+    "metadata_not_bounded_regular_file": (ValidationError, "installed pack metadata must be a bounded regular JSON file"),
+    "metadata_changed_during_read": (ConflictError, "installed pack metadata changed during admission"),
+    "metadata_ambiguous_json": (ValidationError, "installed pack metadata must be unambiguous UTF-8 JSON"),
+    "folder_identities_collide": (ConflictError, "installed pack folder identities collide"),
+    "folder_is_symlink": (ConflictError, "installed pack folder must not be a symlink"),
+    "admission_fields_invalid": (ValidationError, "installed pack admission fields or folder identity are invalid"),
+    "admission_digest_malformed": (ValidationError, "pack admission sourceDigest must be a full lowercase SHA-256"),
+    "manifest_bytes_not_canonical": (ConflictError, "installed pack manifest bytes differ from canonical admission digest"),
+    "metadata_unavailable_or_unsafe": (ConflictError, "installed pack admission files are unavailable or unsafe"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(READER_REFUSALS))
+def test_installed_reader_refusal_kind(tmp_path, monkeypatch, kind):
+    error, message = READER_REFUSALS[kind]
+    reader = _reader_refusal(tmp_path, monkeypatch, kind)
+    if reader is None:
+        return
+    with pytest.raises(error, match=message):
+        reader()
+
+
+def test_installed_reader_refuses_oversized_metadata(tmp_path):
+    from runtime_protocol.store import InstalledPackAdmissions
+
+    collection = tmp_path / "installed"
+    root, _record, _expected = _write_installed_pack(collection)
+    (root / ".build/admission.json").write_bytes(b" " * (8 * 1024 * 1024 + 1))
+    with pytest.raises(ValidationError, match="bounded regular JSON file"):
+        InstalledPackAdmissions(collection)()
+
+
+@pytest.mark.parametrize("body", [b'{"version":NaN}', b'{"version":1,"version":1}', b'{"packId":"\xff"}'])
+def test_installed_reader_ambiguous_json_forms_share_one_refusal(tmp_path, body):
+    from runtime_protocol.store import InstalledPackAdmissions
+
+    collection = tmp_path / "installed"
+    root, _record, _expected = _write_installed_pack(collection)
+    (root / ".build/admission.json").write_bytes(body)
+    with pytest.raises(ValidationError, match="unambiguous UTF-8 JSON"):
+        InstalledPackAdmissions(collection)()
+
+
+def _snapshot_record(tmp_path):
+    from tests.test_runtime_pack_assets import _write_pack
+
+    admission, _expected = _write_pack(tmp_path / "installed" / PACK_ID)
+    return admission
+
+
+SNAPSHOT_REFUSALS = {
+    "snapshot_unreadable": (ConflictError, "installed pack admissions cannot be read"),
+    "snapshot_not_version_1": (ValidationError, "must return a version 1 committed snapshot"),
+    "record_not_object": (ValidationError, "installed pack admission must be an object"),
+    "record_pack_id_invalid": (ValidationError, "installed pack admission packId is invalid"),
+    "record_ids_collide": (ConflictError, "installed pack admission ids collide"),
+    "record_enabled_not_boolean": (ValidationError, "installed pack admission enabled must be boolean"),
+    "record_fields_unsupported": (ValidationError, "installed browser pack admission has missing or unsupported fields"),
+    "record_root_not_canonical": (ValidationError, "installed pack admission root must be an absolute canonical folder"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(SNAPSHOT_REFUSALS))
+def test_committed_snapshot_refusal_kind(tmp_path, kind):
+    from runtime_protocol.store import read_pack_admissions
+
+    record = _snapshot_record(tmp_path)
+    packs = [record]
+    snapshot = {"version": 1, "revision": 1, "packs": packs}
+    if kind == "snapshot_unreadable":
+        def reader():
+            raise OSError("installer record unavailable")
+    else:
+        if kind == "snapshot_not_version_1":
+            snapshot["version"] = 2
+        elif kind == "record_not_object":
+            packs[:] = [PACK_ID]
+        elif kind == "record_pack_id_invalid":
+            packs[:] = [{**record, "packId": "../escape"}]
+        elif kind == "record_ids_collide":
+            packs.append({**record, "packId": PACK_ID.upper()})
+        elif kind == "record_enabled_not_boolean":
+            packs[:] = [{**record, "enabled": 1}]
+        elif kind == "record_fields_unsupported":
+            packs[:] = [{**record, "unexpected": True}]
+        elif kind == "record_root_not_canonical":
+            packs[:] = [{**record, "root": "relative/installed/" + PACK_ID}]
+        else:
+            raise AssertionError(kind)
+
+        def reader():
+            return snapshot
+    error, message = SNAPSHOT_REFUSALS[kind]
+    with pytest.raises(error, match=message):
+        read_pack_admissions(reader)
+
+
+def test_installed_folder_replaced_after_admission_is_refused(tmp_path):
+    """The reader's folder identity binds every later open of that admission."""
+    import shutil
+
+    from runtime_protocol.service import RuntimeService
+    from runtime_protocol.store import InstalledPackAdmissions
+
+    collection = tmp_path / "installed"
+    root, record, _expected = _write_installed_pack(collection)
+
+    class ReplacedAfterSnapshot(InstalledPackAdmissions):
+        def __call__(self, *, pack_id=None):
+            snapshot = super().__call__(pack_id=pack_id)
+            # The installer replaces the folder with identical bytes right
+            # after the committed snapshot was taken.
+            copy = root.with_name("copy")
+            shutil.copytree(root, copy, symlinks=True)
+            shutil.rmtree(root)
+            copy.rename(root)
+            return snapshot
+
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    service = RuntimeService(realm, pack_admissions=ReplacedAfterSnapshot(collection))
+    try:
+        for call in (service.pack_inventory,
+                     lambda: service.acquire_pack_lease(PACK_ID, record["digest"]),
+                     lambda: service.open_pack_asset(PACK_ID, record["digest"], ENTRY_PATH)):
+            with pytest.raises(ConflictError, match="installed pack folder changed after admission"):
+                call()
+        assert service._pack_leases == {}
+    finally:
+        service.close()
