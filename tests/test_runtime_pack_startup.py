@@ -20,6 +20,11 @@ from tests.test_runtime_pack_http import _request
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Pre-main maps the "astrid" source profile to the trusted Agent Timeline
+# authoring provider, which startup loads before admission. Like the other
+# real astrid-profile startup tests, those below need the Agent checkout
+# (ASTRID_CHECKOUT) and carry the integration marker.
+
 
 def _write_committed_pack(root):
     _root, record, expected = _write_installed_pack(root.parent)
@@ -37,7 +42,8 @@ def _repo(root):
     return root
 
 
-def test_foreground_uses_source_profile_installed_packs_without_callback(tmp_path):
+@pytest.mark.integration
+def test_foreground_uses_source_profile_installed_packs_without_callback(tmp_path, astrid_importable):
     agent = _repo(tmp_path / "agent")
     runtime = _repo(tmp_path / "runtime-provenance")
     admission, expected = _write_committed_pack(agent / "astrid" / "packs" / PACK_ID)
@@ -61,8 +67,9 @@ def test_foreground_uses_source_profile_installed_packs_without_callback(tmp_pat
         boundary.stop()
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("source", ["profile", "explicit_collection"])
-def test_real_cli_child_reads_persisted_admissions_and_restarts(tmp_path, owned_process_groups, source):
+def test_real_cli_child_reads_persisted_admissions_and_restarts(tmp_path, owned_process_groups, source, astrid_importable):
     agent = _repo(tmp_path / "agent")
     runtime = _repo(tmp_path / "runtime-provenance")
     collection = (agent / "astrid" / "packs") if source == "profile" else tmp_path / "selected-packs"
@@ -92,7 +99,7 @@ def test_real_cli_child_reads_persisted_admissions_and_restarts(tmp_path, owned_
             argv += ["--installed-pack-root", str(collection)]
         env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "TMPDIR": str(temp),
                "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
-               "PYTHONPATH": os.pathsep.join((str(ROOT / "packages" / "python"), str(ROOT)))}
+               "PYTHONPATH": os.pathsep.join((str(ROOT / "packages" / "python"), str(ROOT), str(astrid_importable)))}
         process = owned_process_groups.popen(argv, env=env, cwd=tmp_path, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
