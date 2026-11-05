@@ -126,7 +126,7 @@ def test_reboot_is_safe_disabled_and_resume_is_typed(monkeypatch, tmp_path, caps
     assert fake.calls[-1][0] == "resume"
 
 
-def test_down_cli_json_preserves_complete_bootstrap_refusal_details(monkeypatch, tmp_path, capsys):
+def test_down_cli_json_preserves_complete_bootstrap_refusal_details(monkeypatch, tmp_path, capsys, astrid_importable):
     paths = RuntimePaths.current(tmp_path / "home", data_root=tmp_path / "support")
     paths.ensure_support_dirs()
     realm_root = paths.realms_dir / "realm"
@@ -139,7 +139,7 @@ def test_down_cli_json_preserves_complete_bootstrap_refusal_details(monkeypatch,
     }))
     paths.discovery_path.write_text(json.dumps({"pid": 123, "active_realm": "realm"}))
     (paths.source_profiles_dir / "astrid.json").write_text(json.dumps({
-        "profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": "/source",
+        "profile": "astrid", "runtime_checkout": str(Path(__file__).resolve().parents[1]), "source_checkout": str(astrid_importable),
     }))
 
     class Boundary:
@@ -156,7 +156,7 @@ def test_down_cli_json_preserves_complete_bootstrap_refusal_details(monkeypatch,
         "message": "Astrid is busy (1 tasks running). Try again when they finish.\ntask-17 [running_task; test; running; age 12s]",
     }
     monkeypatch.setattr(cli, "LocalRuntimeBoundary", Boundary)
-    monkeypatch.setattr(cli, "down", lambda *_args: (_ for _ in ()).throw(
+    monkeypatch.setattr(cli, "down", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         BootstrapError(details["message"], details=details)
     ))
     assert cli.main(["down", "--data-root", str(paths.app_support), "--json"]) == 1
