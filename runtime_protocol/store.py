@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import uuid
+import unicodedata
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,7 @@ from . import cancellation
 from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
 from .cas import ContentAddressedStore
-from .dirfd import remove_tree_at
+from .dirfd import remove_tree_at, open_directory_chain
 from .snapshot_refs import check_working_copy_base, parent_revision_row, prepare_snapshot, publish_snapshot, rewrite_spec_snapshots, source_kind_of, validate_capture_scope, working_copy_binding
 from .sqlite_uri import sqlite_file_uri
 from .storage import free_disk_floor_bytes
@@ -47,6 +48,279 @@ IDEMPOTENCY_RESULT_WINDOW_SECONDS = 24 * 60 * 60
 IDEMPOTENCY_RESULT_MARKER = "__runtime_idempotency_result_expired_v1"
 IDEMPOTENCY_RESULT_MARKER_PREFIX = '{"' + IDEMPOTENCY_RESULT_MARKER + '":'
 SPEC_RETENTION_DAYS = 30
+
+# D0-3 browser artifact format. These are file-format rules, independent of
+# which packs the installer has selected. Only declared collections are read.
+PACK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+PACK_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+PACK_ASSET_MIMES = {
+    ".js": "text/javascript", ".css": "text/css", ".png": "image/png",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".svg": "image/svg+xml",
+    ".webp": "image/webp", ".gif": "image/gif", ".woff": "font/woff",
+    ".woff2": "font/woff2",
+}
+
+
+def pack_asset_path(value):
+    """Require an unambiguous, portable, confined logical artifact name."""
+    if (not isinstance(value, str) or not value
+            or unicodedata.normalize("NFC", value) != value
+            or any(ord(c) < 32 or ord(c) == 127 or c in '\\%?#:<>"|*' for c in value)):
+        raise ValidationError("pack asset path must be a normalized confined UTF-8 name")
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise ValidationError("pack asset path must be valid UTF-8") from exc
+    for part in value.split("/"):
+        stem = part.split(".")[0].upper()
+        if (part in ("", ".", "..") or part.endswith((".", " "))
+                or stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                or stem in {f"{kind}{n}" for kind in ("COM", "LPT") for n in "123456789¹²³"}):
+            raise ValidationError("pack asset path contains an unsafe or aliased component")
+    return value
+
+
+def _pack_digest(value, field):
+    if not isinstance(value, str) or not PACK_DIGEST_RE.fullmatch(value):
+        raise ValidationError(f"pack admission {field} must be a full lowercase SHA-256")
+    return value
+
+
+def _pack_json_bytes(value):
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValidationError("pack artifact manifest must contain canonical UTF-8 JSON") from exc
+
+
+def validate_pack_artifact(record):
+    """Validate an installer-owned admission; do not admit caller manifests."""
+    manifest = record.get("artifactManifest")
+    required = {"version", "packId", "sourceDigest", "digest", "graphIndexDigest",
+                "toolchainDigest", "entry", "extensionManifest", "sharedModules", "files"}
+    if not isinstance(manifest, dict) or set(manifest) != required:
+        raise ValidationError("pack artifact manifest has missing or unsupported fields")
+    if hashlib.sha256(_pack_json_bytes(manifest)).hexdigest() != record["artifactManifestDigest"]:
+        raise ConflictError("pack artifact manifest hash differs from installed admission")
+    if (type(manifest["version"]) is not int or manifest["version"] != 1
+            or manifest["entry"] != "index.js"
+            or any(manifest[key] != record[key] for key in ("packId", "sourceDigest", "digest"))):
+        raise ConflictError("pack artifact identity differs from installed admission")
+    for key in ("graphIndexDigest", "toolchainDigest"):
+        _pack_digest(manifest[key], key)
+    if not isinstance(manifest["extensionManifest"], dict) or not isinstance(manifest["sharedModules"], dict):
+        raise ValidationError("pack artifact extensionManifest and sharedModules must be objects")
+    for item in manifest["sharedModules"].values():
+        if not isinstance(item, dict) or set(item) != {"url", "sha256", "version"}:
+            raise ValidationError("pack artifact shared module lock is malformed")
+        _pack_digest(item["sha256"], "shared module sha256")
+        if not isinstance(item["version"], str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", item["version"]):
+            raise ValidationError("pack artifact shared module version must be pinned")
+        url = item["url"]
+        if not isinstance(url, str) or not url.startswith("/"):
+            raise ValidationError("pack artifact shared module URL must be host-relative")
+        pack_asset_path(url[1:])
+    files = manifest["files"]
+    if not isinstance(files, list) or not files:
+        raise ValidationError("pack artifact files must be a nonempty sorted list")
+    by_path, folded, graph = {}, set(), []
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {"path", "disk", "sha256", "size", "mime"}:
+            raise ValidationError("pack artifact file has missing or unsupported fields")
+        name = pack_asset_path(item["path"])
+        if name.casefold() in folded:
+            raise ValidationError("pack artifact file paths collide")
+        folded.add(name.casefold())
+        by_path[name] = item
+        expected_disk = (f'.build/{record["sourceDigest"]}.js' if name == "index.js"
+                         else f'.build/{record["sourceDigest"]}/{name}')
+        if item["disk"] != expected_disk:
+            raise ValidationError("pack artifact disk path differs from the confined build layout", details={"path": name})
+        _pack_digest(item["sha256"], f"file {name} sha256")
+        if type(item["size"]) is not int or not 0 <= item["size"] <= (1 << 53) - 1:
+            raise ValidationError("pack artifact file size must be a nonnegative safe integer", details={"path": name})
+        expected_mime = PACK_ASSET_MIMES.get(Path(name).suffix.lower())
+        if expected_mime is None or item["mime"] != expected_mime:
+            raise ValidationError("pack artifact MIME differs from its supported file extension", details={"path": name})
+        if name != "index.js":
+            graph.append({"logical_path": name, "sha256": item["sha256"],
+                          "size": item["size"], "mime": item["mime"]})
+    if list(by_path) != sorted(by_path) or "index.js" not in by_path:
+        raise ValidationError("pack artifact files must be sorted and include index.js")
+    if by_path["index.js"]["sha256"] != record["digest"]:
+        raise ConflictError("pack artifact entry hash differs from admitted bundle digest")
+    if hashlib.sha256(_pack_json_bytes(graph)).hexdigest() != manifest["graphIndexDigest"]:
+        raise ConflictError("pack artifact graph index hash differs from its file membership")
+    return by_path
+
+
+def _read_pack_json(directory_fd, name):
+    """Read regular, no-follow installer metadata without a pathname reopen."""
+    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 8 * 1024 * 1024:
+            raise ValidationError("installed pack metadata must be a bounded regular JSON file")
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            data = stream.read(8 * 1024 * 1024 + 1)
+        after = os.fstat(fd)
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                or len(data) != before.st_size):
+            raise ConflictError("installed pack metadata changed during admission")
+    finally:
+        os.close(fd)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError(f"non-JSON number: {value}")
+
+    try:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object,
+                           parse_constant=invalid_constant)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ValidationError("installed pack metadata must be unambiguous UTF-8 JSON") from exc
+    return value, data
+
+
+class InstalledPackAdmissions:
+    """Read M1's files in one declared installed collection, without writes.
+
+    Missing admissions do not grant browser access (including ordinary Python
+    packs and withdrawn/disabled admissions). Reserved installer directories
+    are never installed packs. No environment, source tree or retired-folder
+    discovery participates in this authority.
+    """
+
+    def __init__(self, root):
+        root = Path(root).expanduser()
+        if not root.is_absolute() or ".." in root.parts:
+            raise ValidationError("installed pack collection must be an absolute folder")
+        self.root = root
+
+    def __call__(self, *, pack_id=None):
+        collection_fd = None
+        records, revision = [], 0
+        try:
+            try:
+                collection_fd = open_directory_chain(self.root)
+            except FileNotFoundError:
+                return {"version": 1, "revision": 0, "packs": []}
+            names = sorted(os.listdir(collection_fd))
+            seen = set()
+            for name in names:
+                if name.startswith(".") or not PACK_ID_RE.fullmatch(name):
+                    continue
+                if name.casefold() in seen:
+                    raise ConflictError("installed pack folder identities collide")
+                seen.add(name.casefold())
+                if pack_id is not None and name != pack_id:
+                    continue
+                pack_fd = build_fd = None
+                try:
+                    info = os.stat(name, dir_fd=collection_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(info.st_mode):
+                        if stat.S_ISLNK(info.st_mode):
+                            raise ConflictError("installed pack folder must not be a symlink")
+                        continue
+                    pack_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=collection_fd)
+                    try:
+                        build_fd = os.open(".build", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=pack_fd)
+                        admission, _bytes = _read_pack_json(build_fd, "admission.json")
+                    except FileNotFoundError:
+                        continue
+                    required = {"version", "packId", "sourceDigest", "digest", "artifactManifestDigest",
+                                "committedRevision", "transactionId"}
+                    if (not isinstance(admission, dict) or set(admission) != required
+                            or type(admission["version"]) is not int or admission["version"] != 1
+                            or admission["packId"] != name
+                            or type(admission["committedRevision"]) is not int
+                            or not 0 <= admission["committedRevision"] <= (1 << 53) - 1
+                            or not isinstance(admission["transactionId"], str)
+                            or not admission["transactionId"] or len(admission["transactionId"]) > 256
+                            or any(ord(c) < 32 or ord(c) == 127 for c in admission["transactionId"])):
+                        raise ValidationError("installed pack admission fields or folder identity are invalid")
+                    for key in ("sourceDigest", "digest", "artifactManifestDigest"):
+                        _pack_digest(admission[key], key)
+                    manifest, manifest_bytes = _read_pack_json(build_fd, f'{admission["sourceDigest"]}.artifact-manifest.json')
+                    if (_pack_json_bytes(manifest) != manifest_bytes
+                            or hashlib.sha256(manifest_bytes).hexdigest() != admission["artifactManifestDigest"]):
+                        raise ConflictError("installed pack manifest bytes differ from canonical admission digest")
+                    held = os.fstat(pack_fd)
+                    records.append({key: admission[key] for key in ("packId", "sourceDigest", "digest", "artifactManifestDigest")} | {
+                        "root": str(self.root / name), "artifactManifest": manifest, "enabled": True,
+                        "rootIdentity": (held.st_dev, held.st_ino),
+                    })
+                    revision = max(revision, admission["committedRevision"])
+                finally:
+                    if build_fd is not None:
+                        os.close(build_fd)
+                    if pack_fd is not None:
+                        os.close(pack_fd)
+        except OSError as exc:
+            raise ConflictError("installed pack admission files are unavailable or unsafe; restore the committed installer files") from exc
+        finally:
+            if collection_fd is not None:
+                os.close(collection_fd)
+        return {"version": 1, "revision": revision, "packs": records}
+
+
+def read_pack_admissions(reader, *, pack_id=None):
+    """Take one committed installer snapshot, never a second presence list.
+
+    The composed reader owns atomicity with install/uninstall and returns
+    {version:1, revision:int, packs:[{packId, sourceDigest, digest,
+    artifactManifestDigest, root, artifactManifest, enabled}]}. A null manifest
+    denotes an ordinary pack without browser assets. No RPC writes this data.
+    """
+    try:
+        snapshot = (reader(pack_id=pack_id) if isinstance(reader, InstalledPackAdmissions)
+                    else copy.deepcopy(reader()) if reader is not None
+                    else {"version": 1, "revision": 0, "packs": []})
+    except OSError as exc:
+        raise ConflictError("installed pack admissions cannot be read; restore the committed installer record") from exc
+    if (not isinstance(snapshot, dict) or set(snapshot) != {"version", "revision", "packs"}
+            or type(snapshot["version"]) is not int or snapshot["version"] != 1
+            or type(snapshot["revision"]) is not int or not 0 <= snapshot["revision"] <= (1 << 53) - 1
+            or not isinstance(snapshot["packs"], list)):
+        raise ValidationError("installed pack admission reader must return a version 1 committed snapshot")
+    seen, admitted = set(), []
+    for record in snapshot["packs"]:
+        if not isinstance(record, dict):
+            raise ValidationError("installed pack admission must be an object")
+        record_id = record.get("packId")
+        if not isinstance(record_id, str) or not PACK_ID_RE.fullmatch(record_id):
+            raise ValidationError("installed pack admission packId is invalid")
+        if record_id.casefold() in seen:
+            raise ConflictError("installed pack admission ids collide")
+        seen.add(record_id.casefold())
+        if pack_id is not None and pack_id != record_id:
+            continue
+        if type(record.get("enabled")) is not bool:
+            raise ValidationError("installed pack admission enabled must be boolean")
+        if not record["enabled"] or record.get("artifactManifest") is None:
+            continue
+        fields = {"packId", "sourceDigest", "digest", "artifactManifestDigest", "root", "artifactManifest", "enabled"}
+        if isinstance(reader, InstalledPackAdmissions):
+            fields.add("rootIdentity")
+        if set(record) != fields:
+            raise ValidationError("installed browser pack admission has missing or unsupported fields")
+        for key in ("sourceDigest", "digest", "artifactManifestDigest"):
+            _pack_digest(record[key], key)
+        root = record["root"]
+        if not isinstance(root, str) or "\x00" in root or not Path(root).is_absolute() or str(Path(root)) != root or ".." in Path(root).parts:
+            raise ValidationError("installed pack admission root must be an absolute canonical folder")
+        record["files"] = validate_pack_artifact(record)
+        admitted.append(record)
+    return snapshot["revision"], sorted(admitted, key=lambda item: item["packId"])
 
 
 def _local_realm_root(root: str | Path) -> Path:
