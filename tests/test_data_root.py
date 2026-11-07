@@ -75,7 +75,7 @@ def test_default_data_root_is_used_without_environment_or_install_record(tmp_pat
     [
         ("linux", Path(".local/share/astrid-install.json")),
         ("darwin", Path(".local/share/astrid-install.json")),
-        ("win32", Path("astrid-install.json")),
+        ("win32", Path("Astrid Installer/astrid-install.json")),
     ],
 )
 def test_install_record_path_matches_installer_per_os(tmp_path, monkeypatch, system, expected_suffix):
@@ -90,6 +90,53 @@ def test_install_record_path_matches_installer_per_os(tmp_path, monkeypatch, sys
         else home / expected_suffix
     )
     assert paths_module._install_record_path(home) == expected
+
+
+@pytest.mark.parametrize("system", ["linux", "darwin", "win32"])
+def test_installer_lock_is_the_selection_records_sibling(tmp_path, monkeypatch, system):
+    from astrid_runtime import update
+
+    home = tmp_path / "home"
+    local = tmp_path / "local-app-data"
+    monkeypatch.setattr(paths_module.platform.sys, "platform", system)
+    monkeypatch.setattr(update.sys, "platform", system)
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    expected = (local / "Astrid Installer" if system == "win32" else home / ".local" / "share") / "astrid-install.lock"
+    assert update._installer_lock_path(paths_module._install_record_path(home)) == expected
+
+
+def test_windows_selection_record_passes_the_private_parent_rule(tmp_path, monkeypatch):
+    """Model read_private: only protected installer directories admit reads."""
+    import importlib
+
+    from runtime_protocol import windows_security
+
+    bootstrap = importlib.import_module("astrid_runtime.bootstrap")
+
+    local = tmp_path / "local-app-data"
+    monkeypatch.setattr(paths_module.platform.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    protected = {local / "Astrid Installer"}
+
+    def read_private(path):
+        path = Path(path)
+        if path.parent not in protected:
+            raise PermissionError("unsafe Windows owner/DACL: a protected, non-NULL DACL is required")
+        return path.read_bytes()
+
+    monkeypatch.setattr(windows_security, "read_private", read_private)
+    record = paths_module._install_record_path(tmp_path / "home")
+    record.parent.mkdir(parents=True)
+    record.write_text('{"owner": "haus.astrid.runtime", "managed_by": "pinokio"}', encoding="utf-8")
+
+    _raw, selected = bootstrap._private_handoff_json(record)
+    assert selected["managed_by"] == "pinokio"
+    legacy = local / "astrid-install.json"
+    legacy.write_text(record.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(bootstrap.BootstrapError, match="unavailable"):
+        bootstrap._private_handoff_json(legacy)
 
 
 def test_install_record_path_follows_xdg_data_home_on_linux(tmp_path, monkeypatch):

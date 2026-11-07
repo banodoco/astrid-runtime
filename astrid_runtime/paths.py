@@ -20,10 +20,16 @@ INSTALL_RECORD_OWNER = "haus.astrid.runtime"
 
 
 def _install_record_path(home: Path) -> Path:
-    """Return the installer selection record path for the current platform."""
+    """Return the installer selection record path for the current platform.
+
+    The record is the installer lock's sibling. On Windows both live in the
+    installer's private ``Astrid Installer`` directory: LOCALAPPDATA itself has
+    an inherited DACL, so a record there can never pass the private read that
+    binds a stopped Pinokio installation.
+    """
     if platform.sys.platform == "win32":
         local_app_data = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
-        return local_app_data / "astrid-install.json"
+        return local_app_data / "Astrid Installer" / "astrid-install.json"
     if platform.sys.platform == "linux":
         return Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share") / "astrid-install.json"
     return home / ".local" / "share" / "astrid-install.json"
