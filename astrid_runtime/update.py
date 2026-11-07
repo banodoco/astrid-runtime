@@ -627,10 +627,8 @@ def read_update_status(home=None, *, available=False, reason=None):
 
 
 def _installer_lock_path(selection_path):
-    parent = selection_path.parent
-    if sys.platform == "win32":
-        parent = parent / "Astrid Installer"
-    return parent / "astrid-install.lock"
+    # The selection record is the installer lock's sibling on every platform.
+    return selection_path.parent / "astrid-install.lock"
 
 
 def _installer_lock_held(home):
