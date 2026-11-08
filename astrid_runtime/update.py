@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -17,12 +18,15 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 
 from runtime_protocol import platform
 from runtime_protocol.errors import AuthorizationError, ConflictError
 from runtime_protocol.lifecycle import assert_interruption_safe
 from .identity import normalize_startup_identity
 from .paths import INSTALL_RECORD_OWNER, _install_record_path
+
+_LOGGER = logging.getLogger(__name__)
 
 MANIFEST_URL = "https://astrid.haus/install-manifest.json"
 BOOTSTRAP_URL = "https://astrid.haus/install"
@@ -414,7 +418,16 @@ class UpdateAdmission:
                     shutil.rmtree(temporary, ignore_errors=True)
         except ConflictError:
             raise
-        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            # Runtime log only: the exception text must never reach the response.
+            # The step is the innermost traceback frame (function, file, line).
+            frames = traceback.extract_tb(exc.__traceback__)
+            last = frames[-1] if frames else None
+            _LOGGER.warning(
+                "update request refused as selection-or-inputs-invalid; swallowed %s: %s (step=%s at %s:%s)",
+                type(exc).__name__, " ".join(str(exc).split())[:500],
+                last.name if last else "unknown", Path(last.filename).name if last else "unknown",
+                last.lineno if last else 0)
             raise UpdateRefusal("selection-or-inputs-invalid", "The selected installation or update inputs do not match this running Astrid.") from None
         finally:
             self._lock.release()

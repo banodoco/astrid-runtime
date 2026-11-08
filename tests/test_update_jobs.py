@@ -887,6 +887,39 @@ def test_update_route_h5_returns_uncertain_acknowledgement(tmp_path, monkeypatch
         world.stop()
 
 
+def test_update_route_logs_swallowed_oserror_but_keeps_public_refusal(tmp_path, monkeypatch, caplog):
+    world = start_door_world(tmp_path)
+    try:
+        admission, _, _prepared = _admission_fixture(tmp_path, monkeypatch, None)
+        admission.daemon = world.daemon
+        real_helper = admission._helper
+
+        def failing_prepare(python, agent, runtime, payload, **kwargs):
+            if "action" not in payload:
+                raise OSError("secret-disk-detail unreadable")
+            return real_helper(python, agent, runtime, payload, **kwargs)
+
+        admission._helper = failing_prepare
+        world.daemon.update_admission = admission
+
+        with caplog.at_level("WARNING", logger=update.__name__):
+            response = world.call("/api/runtime/v1/update", "POST", body=b"")
+
+        assert response.status == 409
+        body = response.json()
+        assert body["code"] == "conflict"
+        assert body["message"] == "The selected installation or update inputs do not match this running Astrid."
+        assert body["details"]["reason"] == "selection-or-inputs-invalid"
+        raw = json.dumps(body)
+        assert "secret-disk-detail" not in raw and "OSError" not in raw
+        messages = [r.getMessage() for r in caplog.records if r.name == update.__name__]
+        assert len(messages) == 1
+        assert "swallowed OSError: secret-disk-detail unreadable" in messages[0]
+        assert "step=failing_prepare at test_update_jobs.py:" in messages[0]
+    finally:
+        world.stop()
+
+
 def test_update_route_preserves_frozen_accepted_response(tmp_path):
     world = start_door_world(tmp_path)
     accepted = {
