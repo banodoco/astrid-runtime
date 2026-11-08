@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
+import re
 import os
 from pathlib import Path
 import shutil
@@ -92,7 +93,7 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
             for _ in range(2):
                 response = world.call("/api/runtime/v1/update/status")
                 assert response.status == 200
-                assert response.json() == {"available": True, "state": "none", "self_update": True}
+                assert response.json() == {"available": True, "state": "none", "self_update": True, "reason": "none"}
             assert calls == [] and marker.read_bytes() == before
 
             # GET only observes durable evidence. It must not admit, launch,
@@ -117,7 +118,7 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
         record["preferences"] = {"autostart": False}
         _write(selected, record)
         assert world.call("/api/runtime/v1/update/status").json() == {
-            "available": False, "reason": "autostart-off", "state": "none"}
+            "available": False, "reason": "autostart-off", "state": "none", "self_update": False}
         assert calls == [] and marker.read_bytes() == before
         del record["preferences"]
         _write(selected, record)
@@ -1124,7 +1125,7 @@ def test_self_update_is_true_when_helper_lists_its_actions_on_every_os(tmp_path,
         tmp_path, monkeypatch, platform,
         {"available": True, "actions": ["availability", "reconcile", "prepare", "accept", "fail", "launch"]})
 
-    assert admission.status() == {"available": True, "state": "none", "self_update": True}
+    assert admission.status() == {"available": True, "state": "none", "self_update": True, "reason": "none"}
     assert calls == [{"action": "availability"}]
 
 
@@ -1136,11 +1137,11 @@ def test_self_update_is_true_when_helper_lists_its_actions_on_every_os(tmp_path,
 def test_self_update_is_false_for_helpers_that_cannot_list_their_actions(tmp_path, monkeypatch, reply):
     admission, _calls = _probe_admission(tmp_path, monkeypatch, "darwin", reply)
 
-    assert admission.status() == {"available": True, "state": "none", "self_update": False}
+    assert admission.status() == {"available": True, "state": "none", "self_update": False, "reason": "none"}
 
 
-@pytest.mark.parametrize("managed_by, message", [("pinokio", "Pinokio"), ("source", "source")])
-def test_status_reads_managed_elsewhere_for_pinokio_and_source(tmp_path, monkeypatch, managed_by, message):
+@pytest.mark.parametrize("managed_by, reason", [("pinokio", "managed-elsewhere"), ("source", "source")])
+def test_status_reads_managed_elsewhere_for_pinokio_and_source_for_source(tmp_path, monkeypatch, managed_by, reason):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
@@ -1150,7 +1151,7 @@ def test_status_reads_managed_elsewhere_for_pinokio_and_source(tmp_path, monkeyp
     admission._helper = lambda *_args: pytest.fail("GET must not probe a managed-elsewhere install")
 
     assert admission.status() == {
-        "available": False, "reason": "managed-elsewhere", "state": "none", "self_update": False}
+        "available": False, "reason": reason, "state": "none", "self_update": False}
 
 
 @pytest.mark.parametrize("failure", [
@@ -1180,3 +1181,10 @@ def test_status_emits_reason_in_a_non_none_state(tmp_path):
 
     assert status["state"] == "recovery-needed"
     assert status["reason"] == "busy" and status["self_update"] is True
+
+
+def test_self_update_actions_cover_every_action_the_request_path_sends():
+    sent = set(re.findall(r'"action":\s*"([a-z-]+)"', Path(update.__file__).read_text()))
+    # prepare is the request that carries no action key.
+    assert sent and (sent | {"prepare"}) <= update._SELF_UPDATE_ACTIONS
+    assert "reconcile" in update._SELF_UPDATE_ACTIONS and "fail" not in update._SELF_UPDATE_ACTIONS

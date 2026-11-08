@@ -30,11 +30,8 @@ WINDOWS_BOOTSTRAP_URL = "https://astrid.haus/install.ps1"
 MAX_METADATA_BYTES = 1024 * 1024
 _STATUS_REASONS = frozenset({"busy", "autostart-off", "unsupported-service-manager"})
 # GET /v1/update/status may also say these; a helper or POST refusal may not.
-_REPORTED_REASONS = _STATUS_REASONS | {"needs-repair", "managed-elsewhere"}
-_MANAGED_ELSEWHERE = frozenset({"pinokio", "source"})
-# The helper actions in-app update needs. Helpers that cannot list their
-# actions are older than this contract and read as not self-updating.
-_SELF_UPDATE_ACTIONS = frozenset({"availability", "prepare", "accept", "launch"})
+# "source" is the POST refusal's own reason; "none" means the Runtime can update.
+_REPORTED_REASONS = _STATUS_REASONS | {"needs-repair", "managed-elsewhere", "source"}
 
 
 class UpdateRefusal(ConflictError):
@@ -87,6 +84,12 @@ def _assert_autostart_supported(selected):
             )
 
 
+# Every helper action the request path sends (prepare is the request with no
+# action key). Helpers that cannot list their actions are older than this
+# contract and read as not self-updating.
+_SELF_UPDATE_ACTIONS = frozenset({"availability", "reconcile", "prepare", "accept", "launch"})
+
+
 class UpdateAdmission:
     def __init__(self, daemon, launcher=None):
         self.daemon = daemon
@@ -115,7 +118,7 @@ class UpdateAdmission:
         except UpdateRefusal as refusal:
             available = False
             candidate = refusal.details.get("reason")
-            reason = "managed-elsewhere" if candidate in _MANAGED_ELSEWHERE else candidate
+            reason = "managed-elsewhere" if candidate == "pinokio" else candidate
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             available = False
         if available and _installer_lock_held(home):
@@ -476,7 +479,7 @@ def _terminal_success_verified(root, selected, job, transaction, state):
 
 
 def read_update_status(home=None, *, available=False, reason=None, self_update=False):
-    """Project update status: self_update, and a reason in every state while unavailable.
+    """Project update status: self_update, and a reason in every state ("none" when available).
 
     The reason is for the App to explain itself; anything not classified reads
     needs-repair. Older Apps ignore keys they do not know.
@@ -484,7 +487,7 @@ def read_update_status(home=None, *, available=False, reason=None, self_update=F
     result = dict(_read_update_status(home, available=available))
     result["self_update"] = self_update is True
     if result["available"]:
-        result.pop("reason", None)
+        result["reason"] = "none"
     else:
         result["reason"] = reason if reason in _REPORTED_REASONS else "needs-repair"
     return result
