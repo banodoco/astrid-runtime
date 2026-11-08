@@ -29,6 +29,9 @@ BOOTSTRAP_URL = "https://astrid.haus/install"
 WINDOWS_BOOTSTRAP_URL = "https://astrid.haus/install.ps1"
 MAX_METADATA_BYTES = 1024 * 1024
 _STATUS_REASONS = frozenset({"busy", "autostart-off", "unsupported-service-manager"})
+# GET /v1/update/status may also say these; a helper or POST refusal may not.
+# "source" is the POST refusal's own reason; "none" means the Runtime can update.
+_REPORTED_REASONS = _STATUS_REASONS | {"needs-repair", "managed-elsewhere", "source"}
 
 
 class UpdateRefusal(ConflictError):
@@ -81,6 +84,12 @@ def _assert_autostart_supported(selected):
             )
 
 
+# Every helper action the request path sends (prepare is the request with no
+# action key). Helpers that cannot list their actions are older than this
+# contract and read as not self-updating.
+_SELF_UPDATE_ACTIONS = frozenset({"availability", "reconcile", "prepare", "accept", "launch"})
+
+
 class UpdateAdmission:
     def __init__(self, daemon, launcher=None):
         self.daemon = daemon
@@ -96,25 +105,25 @@ class UpdateAdmission:
             return read_update_status(home, available=False, reason="busy")
         reason = None
         available = True
+        self_update = False
         try:
             # A pending journal is status evidence, not permission for GET to
             # recover it. POST reaches the Agent's locked reconciler instead.
             selection = self._selection(allow_pending=True)
-            if sys.platform == "linux":
-                availability = self._status_availability(*selection[2:5])
-                if availability["available"] is False:
-                    available = False
-                    candidate = availability.get("reason")
-                    reason = candidate if candidate in _STATUS_REASONS else None
+            availability = self._status_availability(*selection[2:5])
+            self_update = availability.get("self_update") is True
+            if availability["available"] is False:
+                available = False
+                reason = availability.get("reason")
         except UpdateRefusal as refusal:
             available = False
             candidate = refusal.details.get("reason")
-            reason = candidate if candidate in _STATUS_REASONS else None
+            reason = "managed-elsewhere" if candidate == "pinokio" else candidate
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             available = False
         if available and _installer_lock_held(home):
             available, reason = False, "busy"
-        return read_update_status(home, available=available, reason=reason)
+        return read_update_status(home, available=available, reason=reason, self_update=self_update)
 
     def _status_availability(self, python, agent, runtime):
         """Read the Agent capability without invoking admission or recovery."""
@@ -127,10 +136,14 @@ class UpdateAdmission:
             return {"available": False}
         if not isinstance(availability, dict) or type(availability.get("available")) is not bool:
             return {"available": False}
+        actions = availability.get("actions")
+        supported = (isinstance(actions, list) and all(isinstance(item, str) for item in actions)
+                     and _SELF_UPDATE_ACTIONS <= set(actions))
         if availability["available"]:
-            return {"available": True}
+            return {"available": True, "self_update": supported}
         reason = availability.get("reason")
-        return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}
+        return {"available": False, "self_update": supported,
+                **({"reason": reason} if reason in _STATUS_REASONS else {})}
 
     def _helper(self, python, agent, runtime, payload):
         script = ("import sys; sys.path[:0]=sys.argv[1:3]; "
@@ -465,13 +478,25 @@ def _terminal_success_verified(root, selected, job, transaction, state):
         return False
 
 
-def read_update_status(home=None, *, available=False, reason=None):
+def read_update_status(home=None, *, available=False, reason=None, self_update=False):
+    """Project update status: self_update, and a reason in every state ("none" when available).
+
+    The reason is for the App to explain itself; anything not classified reads
+    needs-repair. Older Apps ignore keys they do not know.
+    """
+    result = dict(_read_update_status(home, available=available))
+    result["self_update"] = self_update is True
+    if result["available"]:
+        result["reason"] = "none"
+    else:
+        result["reason"] = reason if reason in _REPORTED_REASONS else "needs-repair"
+    return result
+
+
+def _read_update_status(home=None, *, available=False):
     """Read the authoritative accepted job and C2 journal without recovery."""
     def none():
-        result = {"available": bool(available), "state": "none"}
-        if not available and reason in _STATUS_REASONS:
-            result["reason"] = reason
-        return result
+        return {"available": bool(available), "state": "none"}
 
     def recovery_needed():
         return {"available": bool(available), "state": "recovery-needed", "result": "Recovery needed."}
