@@ -84,10 +84,13 @@ class RuntimeDaemon:
         if pack_admissions is not None and installed_pack_root is not None:
             raise ValueError("select either an installed pack collection or an admission reader")
         selected_pack_root = installed_pack_root
-        if pack_admissions is None and selected_pack_root is None and agent_checkout:
-            # SourceProfile already declares this installed Agent root in both
-            # foreground and child CLI startup; match Agent's canonical root.
-            selected_pack_root = Path(agent_checkout) / "astrid" / "packs"
+        if pack_admissions is None and selected_pack_root is None:
+            # One canonical installed-pack root: the same home rule the Agent's
+            # `astrid packs install` writes to (Path.home()/"Astrid"/"packs").
+            # ASTRID_PACKS_PATH only extends discovery and never selects the
+            # install collection; Runtime has no knowledge of the Agent's
+            # --packs-root override, so it reads only this default.
+            selected_pack_root = Path.home() / "Astrid" / "packs"
         self.pack_admissions = (InstalledPackAdmissions(selected_pack_root)
                                 if selected_pack_root is not None else pack_admissions)
         self.instance_id = uuid.uuid4().hex

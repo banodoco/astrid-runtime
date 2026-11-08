@@ -191,16 +191,19 @@ def test_startup_refusal_kind_cli_collection_not_absolute(tmp_path, capsys):
     assert output["error"]["message"] == "installed pack collection must be an absolute folder"
 
 
-def test_startup_refusal_kind_unsafe_default_agent_collection(tmp_path):
-    """A symlinked Agent pack collection is composed but never served."""
+def test_startup_refusal_kind_unsafe_default_home_collection(tmp_path, monkeypatch):
+    """A symlinked ~/Astrid/packs collection is composed but never served."""
     from runtime_protocol.daemon import RuntimeDaemon
 
     agent = _repo(tmp_path / "agent")
     runtime = _repo(tmp_path / "runtime-provenance")
     actual = tmp_path / "actual-packs"
     _write_committed_pack(actual / PACK_ID)
-    (agent / "astrid").mkdir()
-    (agent / "astrid" / "packs").symlink_to(actual, target_is_directory=True)
+    home = tmp_path / "home"
+    (home / "Astrid").mkdir(parents=True)
+    (home / "Astrid" / "packs").symlink_to(actual, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     realm = tmp_path / "realm"
     RealmStore.initialize(realm).close()
     daemon = RuntimeDaemon(realm, support_root=tmp_path / "support",

@@ -292,7 +292,11 @@ def test_http_inventory_uses_only_installed_records_and_live_withdrawal(tmp_path
         daemon.stop()
 
 
-def test_default_agent_checkout_root_is_composed_and_restart_rereads_files(tmp_path):
+def test_default_home_root_is_composed_and_restart_rereads_files(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     agent = tmp_path / "agent"
     runtime_checkout = tmp_path / "runtime-checkout"
     for checkout in (agent, runtime_checkout):
@@ -303,7 +307,8 @@ def test_default_agent_checkout_root_is_composed_and_restart_rereads_files(tmp_p
         (checkout / "tracked.txt").write_text("initial\n")
         subprocess.run(["git", "-C", str(checkout), "add", "tracked.txt"], check=True)
         subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "initial [skip ci]"], check=True)
-    collection = agent / "astrid" / "packs"
+    # Where the Agent's `astrid packs install` writes (Path.home()/Astrid/packs).
+    collection = home / "Astrid" / "packs"
     root, record, expected = _write_installed_pack(collection)
     realm = tmp_path / "realm"
     RealmStore.initialize(realm).close()
@@ -552,3 +557,23 @@ def test_installed_folder_replaced_after_admission_is_refused(tmp_path):
         assert service._pack_leases == {}
     finally:
         service.close()
+
+
+def test_production_default_ignores_agent_checkout_packs_and_reads_home_root(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("ASTRID_PACKS_PATH", str(tmp_path / "extra"))
+    # The retired fallback location must not be read.
+    _write_installed_pack(tmp_path / "agent" / "astrid" / "packs")
+    _root, record, expected = _write_installed_pack(home / "Astrid" / "packs")
+    daemon = _start_daemon(tmp_path, None)  # production arguments: no installed_pack_root
+    try:
+        inventory = _inventory(daemon)
+        assert [p["packId"] for p in inventory["packs"]] == [PACK_ID]
+        status, _h, body = _http(daemon.endpoint, daemon.token, "GET",
+                                 f"/api/runtime/packs/assets/{PACK_ID}/{record['digest']}/{ENTRY_PATH}")
+        assert status == 200 and body == expected[ENTRY_PATH][0]
+    finally:
+        daemon.stop()
