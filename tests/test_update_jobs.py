@@ -1221,3 +1221,29 @@ def test_self_update_actions_cover_every_action_the_request_path_sends():
     # prepare is the request that carries no action key.
     assert sent and (sent | {"prepare"}) <= update._SELF_UPDATE_ACTIONS
     assert "reconcile" in update._SELF_UPDATE_ACTIONS and "fail" not in update._SELF_UPDATE_ACTIONS
+
+
+def test_update_request_makes_temporary_folder_owner_only_not_validate_only(tmp_path, monkeypatch):
+    world = start_door_world(tmp_path)
+    try:
+        admission, _, _prepared = _admission_fixture(tmp_path, monkeypatch, None)
+        admission.daemon = world.daemon
+        calls = {"owner_only": [], "private_directory": []}
+        real_owner_only = update.platform.owner_only
+
+        def recording_owner_only(path, *args, **kwargs):
+            calls["owner_only"].append((path, kwargs))
+            return real_owner_only(path, *args, **kwargs)
+
+        monkeypatch.setattr(update.platform, "owner_only", recording_owner_only)
+        monkeypatch.setattr(update.platform, "private_directory",
+                            lambda path: calls["private_directory"].append(Path(path)))
+        world.daemon.update_admission = admission
+
+        world.call("/api/runtime/v1/update", "POST", body=b"")
+
+        folders = [(p, kw) for p, kw in calls["owner_only"] if isinstance(p, Path) and p.name.startswith("astrid-update-")]
+        assert folders and all(kw.get("directory") is True for _, kw in folders)
+        assert not calls["private_directory"]
+    finally:
+        world.stop()
