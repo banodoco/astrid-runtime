@@ -351,9 +351,10 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         if profile.host_launch.get("additional_pack_roots") or installed_collection_present(self.config.get("installed_pack_root")):
             # Retained custody discovers every verified installed pack at launch,
             # not only selected ones; unverified packs are named refusals.
+            # Keep custody whenever the installed collection is present, even with no
+            # launch roots: the personal root then always goes through custody, so
+            # a refused pack is never loaded by the host outside it (END round 3, B1).
             external_sources = OwnerSourceCapture(preparation=request, config=self.config)
-            if not external_sources.launch_roots and not profile.host_launch.get("additional_pack_roots"):
-                external_sources = None
         parent, control_child = socket.socketpair()
         activation, activation_child = socket.socketpair()
         binding_parent, binding_child = socket.socketpair()
