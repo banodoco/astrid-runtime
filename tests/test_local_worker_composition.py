@@ -957,7 +957,11 @@ def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_withou
             assert not os.get_blocking(captures['observer'])
             assert fcntl.fcntl(captures['observer'], fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
             assert handle.observer_read_fd is not None and stat.S_ISFIFO(os.fstat(handle.observer_read_fd).st_mode)
-        assert not set(env)&{'PYTHONPATH','PYTHONHOME','PYTHONDONTWRITEBYTECODE','ASTRID_RUNTIME_OWNER_TOKEN','ASTRID_EXECUTION_TARGET_JSON'}
+        assert not set(env)&{'PYTHONPATH','PYTHONHOME','ASTRID_RUNTIME_OWNER_TOKEN','ASTRID_EXECUTION_TARGET_JSON'}
+        # Bytecode policy is Runtime-owned, never the ambient value: no writes,
+        # and the cache prefix is the private support root, outside every pack root.
+        assert env['PYTHONDONTWRITEBYTECODE']=='1' and env['PYTHONPYCACHEPREFIX']==str(profile.support_root/'host-bytecode')
+        assert not Path(env['PYTHONPYCACHEPREFIX']).is_relative_to(config['pack_root'])
     finally:
         handle.control.close();handle.activation.close()
         os.close(captures['observer']);os.close(handle.observer_read_fd)

@@ -284,3 +284,215 @@ def test_empty_reserved_namespace_is_also_a_collision(owner_source):
     with pytest.raises(gate.HostLaunchError, match="collision"): owner_source.capture()
 
 
+
+
+# --- Plan 06 Runtime-5: grant bound, state custody, inventory bound, bytecode ---
+
+def install_many(collection, count):
+    """``count`` extra installed packs plus the fixture's "tool", one group record."""
+    admissions = json.loads((collection / ".group.json").read_text())["admissions"]
+    roots = []
+    for index in range(count):
+        pack_id = f"pack{index:02d}"
+        roots.append(install_pack(collection, pack_id))
+        admissions.update(json.loads((collection / ".group.json").read_text())["admissions"])
+    state = json.loads((collection / ".group.json").read_text()); state["admissions"] = admissions
+    (collection / ".group.json").write_text(json.dumps(state))
+    return roots
+
+
+def launch(case, root):
+    """One full launch of ``root`` in the case's workspace: capture, verify, claim."""
+    f = case.f; profile = f.args["preparation"]["profile"]
+    grant = sources._derive_installed_grant(str(case.collection), root.name)
+    profile["host_launch"]["additional_pack_roots"] = [{"path": str(root), "files": grant["files"]}]
+    f.record["selected_profile_digest"] = gate.raw_digest(profile)
+    capture = case.capture()
+    verifier = gate.TrustedLocalHostLaunchVerifier(installed_release=f.record, external_sources=capture)
+    proof = verifier.verify(**f.args)
+    verifier.claim(proof, **f.args, binding_fd=31)
+    return capture
+
+
+def stored_roots(case):
+    state = sources._read_state(sources._state_path(case.service.support_root))
+    return [g["root"] for g in state["grants"]]
+
+
+def test_seventeen_or_more_installed_packs_all_launch_in_one_workspace(owner_source):
+    """(a) The bound is the real installed-pack count, not a constant 16."""
+    case = owner_source
+    roots = install_many(case.collection, 17)
+    for root in [case.root, *roots]:
+        launch(case, root)
+    assert len(stored_roots(case)) == 18 == sources._installed_pack_count(case.collection)
+    assert sorted(stored_roots(case)) == sorted(str(r) for r in [case.root, *roots])
+
+
+def test_stored_grant_whose_install_no_longer_verifies_is_dropped_not_refused(owner_source):
+    """Stored history never refuses a launch; it is re-derived or dropped."""
+    case = owner_source
+    first, second = install_many(case.collection, 2)
+    launch(case, first); launch(case, second)
+    pin = json.loads((first / "PIN").read_text()); pin["commit"] = "f" * 40
+    (first / "PIN").write_text(json.dumps(pin) + "\n")  # no longer verifies
+    shutil.rmtree(second)  # no longer installed
+    launch(case, case.root)
+    assert stored_roots(case) == [str(case.root)]
+
+
+@pytest.mark.parametrize("corruption", ["bytes", "shape"])
+def test_corrupt_previous_state_is_refused_by_name_and_never_overwritten(owner_source, corruption):
+    """(b) Unreadable state is a named refusal, not a silent reset of old grants."""
+    case = owner_source
+    case.capture()
+    path = sources._state_path(case.service.support_root)
+    if corruption == "bytes":
+        path.write_bytes(b"\x00not json"); path.chmod(0o600)
+    else:
+        from runtime_protocol.local_execution_handoff import write_protected
+        write_protected(path, {"workspace_uuid": case.service.realm["id"], "grants": "lost"})
+    before = path.read_bytes()
+    with pytest.raises(gate.HostLaunchError, match=r"owner state .*grants\.json.*refusing to overwrite"):
+        case.capture()
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("locked", [True, False])
+def test_concurrent_writers_never_lose_a_grant(owner_source, monkeypatch, locked):
+    """(c) Two launches interleave read-merge-write; the lock serializes them.
+
+    Writer A reads the state, then waits for writer B to finish writing. With
+    the lock B cannot even read until A has published, so both grants survive.
+    The unlocked control shows this interleaving would otherwise lose A's grant.
+    """
+    import contextlib
+    import threading
+    from runtime_protocol import local_execution_handoff as handoff
+    case = owner_source
+    first, second = install_many(case.collection, 2)
+    grants = {name: sources._derive_installed_grant(str(case.collection), name) for name in (first.name, second.name)}
+    workspace = case.service.realm["id"]
+    events = []; b_written = threading.Event(); a_read = threading.Event()
+    real_read, real_write = sources._read_state, handoff.write_protected
+
+    def read(path, **kwargs):
+        name = threading.current_thread().name
+        value = real_read(path, **kwargs)
+        events.append((name, "read"))
+        if name == "A":
+            a_read.set(); b_written.wait(0.5)
+        return value
+
+    def write(path, value):
+        real_write(path, value)
+        name = threading.current_thread().name
+        events.append((name, "write"))
+        if name == "B": b_written.set()
+
+    monkeypatch.setattr(sources, "_read_state", read)
+    monkeypatch.setattr(handoff, "write_protected", write)
+    if not locked:
+        monkeypatch.setattr(sources.platform, "file_lock", lambda *_a, **_k: contextlib.nullcontext())
+    errors = []
+
+    def writer(name):
+        try:
+            if name == "B": a_read.wait(2)
+            sources._persist_derived_grants(case.service.support_root, workspace, [grants[{"A": first.name, "B": second.name}[name]]], str(case.collection))
+        except Exception as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+    threads = [threading.Thread(target=writer, args=(n,), name=n) for n in ("A", "B")]
+    for t in threads: t.start()
+    for t in threads: t.join(10)
+    assert not errors
+    roots = [g["root"] for g in real_read(sources._state_path(case.service.support_root))["grants"]]
+    if locked:
+        assert events == [("A", "read"), ("A", "write"), ("B", "read"), ("B", "write")]
+        assert roots == sorted([str(first), str(second)])
+    else:
+        assert events[:3] == [("A", "read"), ("B", "read"), ("B", "write")]
+        assert roots == [str(first)]  # B's grant lost: what the lock prevents
+
+
+def test_many_concurrent_launch_writers_keep_every_grant(owner_source):
+    import threading
+    case = owner_source
+    roots = install_many(case.collection, 12)
+    grants = [sources._derive_installed_grant(str(case.collection), r.name) for r in roots]
+    workspace = case.service.realm["id"]; barrier = threading.Barrier(len(grants))
+
+    def writer(grant):
+        barrier.wait()
+        sources._persist_derived_grants(case.service.support_root, workspace, [grant], str(case.collection))
+    threads = [threading.Thread(target=writer, args=(g,)) for g in grants]
+    for t in threads: t.start()
+    for t in threads: t.join(30)
+    assert stored_roots(case) == sorted(str(r) for r in roots)
+
+
+def test_oversized_installed_file_is_refused_by_name_before_reading(owner_source, monkeypatch):
+    """(d) st_size is checked before any byte of the file is read."""
+    from pathlib import Path
+    case = owner_source
+    big = case.root / "weights.bin"
+    with big.open("wb") as handle:
+        handle.truncate(sources.SOURCE_LIMIT + 1)
+    real = Path.read_bytes
+    def guarded(self):
+        assert self != big, "oversized file was read"
+        return real(self)
+    monkeypatch.setattr(Path, "read_bytes", guarded)
+    with pytest.raises(gate.HostLaunchError, match=r"installed pack file weights\.bin exceeds"):
+        sources._derive_installed_grant(str(case.collection), "tool")
+    with pytest.raises(gate.HostLaunchError, match=r"weights\.bin exceeds"):
+        case.capture()
+
+
+def _tree_snapshot(root):
+    return {str(p.relative_to(root)): (p.lstat().st_mode, None if p.is_dir() else p.read_bytes())
+        for p in sorted(root.rglob("*"))}
+
+
+def test_installed_tree_is_byte_identical_after_derive_launch_and_import(owner_source):
+    """(e) No __pycache__ or byte changes appear in the installed collection,
+    even when a child imports pack code with the Runtime pack-host env."""
+    import subprocess
+    import sys
+    case = owner_source
+    before = _tree_snapshot(case.collection)
+    sources._derive_installed_grant(str(case.collection), "tool")
+    launch(case, case.root)
+    config = case.f.args["config"]
+    environment = {"PATH": "/usr/bin:/bin",
+        **gate.bytecode_environment(case.service.support_root, config, case.f.args["preparation"]["profile"])}
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+    prefix = environment["PYTHONPYCACHEPREFIX"]
+    assert not Path_is_within(prefix, str(case.collection))
+    subprocess.run([sys.executable, "-c", f"import sys; sys.path.insert(0, {str(case.root)!r}); import action; assert action.ANSWER == 7"],
+        env=environment, check=True, cwd=str(case.service.support_root))
+    assert _tree_snapshot(case.collection) == before
+    assert not list(case.collection.rglob("__pycache__")) and not list(case.collection.rglob("*.pyc"))
+
+
+def Path_is_within(child, parent):
+    from pathlib import Path
+    return Path(child).is_relative_to(parent)
+
+
+@pytest.mark.parametrize("edge", ["writes", "inside", "partial"])
+def test_verifier_refuses_any_bytecode_env_but_the_runtime_policy(owner_source, edge):
+    case = owner_source; f = case.f
+    config = f.args["config"]; profile = f.args["preparation"]["profile"]
+    policy = gate.bytecode_environment(case.service.support_root, config, profile)
+    capture = case.capture()
+    ok = gate.TrustedLocalHostLaunchVerifier(installed_release=f.record, external_sources=capture)
+    ok.verify(**{**f.args, "environment": {**f.args["environment"], **policy}})
+    if edge == "writes": bad = {**policy, "PYTHONDONTWRITEBYTECODE": "0"}
+    elif edge == "inside": bad = {**policy, "PYTHONPYCACHEPREFIX": str(case.collection / "cache")}
+    else: bad = {"PYTHONDONTWRITEBYTECODE": "1"}
+    verifier = gate.TrustedLocalHostLaunchVerifier(installed_release=f.record, external_sources=case.capture())
+    with pytest.raises(gate.HostLaunchError, match="bytecode"):
+        verifier.verify(**{**f.args, "environment": {**f.args["environment"], **bad}})
+    with pytest.raises(gate.HostLaunchError, match="inside an installed pack collection"):
+        gate.bytecode_environment(case.collection, config, profile)

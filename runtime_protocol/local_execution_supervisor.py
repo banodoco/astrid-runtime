@@ -1047,6 +1047,10 @@ class NativeHostSession:
             # This launch-owned descriptor replaces any profile or ambient
             # overlay before the verifier binds the final child environment.
             environment[TIMELINE_OBSERVER_FD_ENV] = str(observer_write_fd)
+            # Installed pack trees are never written by the pack host or its
+            # children: Runtime-owned bytecode policy, cache outside every collection.
+            from .verified_host_launch import bytecode_environment
+            environment.update(bytecode_environment(config["support_root"], config, preparation["profile"]))
             if requested_protocol is None:
                 if config["source_checkout"] is not None:
                     environment["PYTHONPATH"] = config["source_checkout"]

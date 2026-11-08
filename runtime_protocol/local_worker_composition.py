@@ -391,6 +391,10 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             # Fixed product roots are owner-selected, not ambient authority.
             environment.update(ASTRID_OUTPUT_ROOT=str(profile.support_root / "host-output"), ASTRID_RUNTIME_DATA_ROOT=str(profile.realm_root))
             Path(environment["ASTRID_OUTPUT_ROOT"]).mkdir(parents=True, exist_ok=True)
+            # Installed pack trees are never written: no bytecode, and any
+            # cache prefix is the private support root, outside every collection.
+            from .verified_host_launch import bytecode_environment
+            environment.update(bytecode_environment(profile.support_root, self.config, selected))
             release = _installed_host_release(profile, self.config)
             verifier = (TrustedLocalHostLaunchVerifier(installed_release=release, external_sources=external_sources)
                 if external_sources is not None else TrustedLocalHostLaunchVerifier(installed_release=release))

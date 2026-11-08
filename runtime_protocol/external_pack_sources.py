@@ -54,15 +54,23 @@ def _state_path(support_root):
     return root / "external-pack-sources" / "grants.json"
 
 
-def _read_state(path):
+def _read_state(path, *, missing_ok=False):
+    """The owner state, or a refusal naming the state file; never a silent reset."""
     from .local_execution_handoff import read_protected
     _no_alias(path)
+    if missing_ok:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise HostLaunchError(f"external source owner state {path} is unreadable; refusing to overwrite it") from exc
     if not platform.is_owner_only(path.parent, directory=True):
-        raise HostLaunchError("external source owner state is not private")
+        raise HostLaunchError(f"external source owner state {path} is not private")
     try:
         return read_protected(path)
-    except (OSError, ValueError, RuntimeError) as exc:
-        raise HostLaunchError("external source owner state is not an owner-only file") from exc
+    except Exception as exc:
+        raise HostLaunchError(f"external source owner state {path} is unreadable or corrupt; refusing to overwrite it") from exc
 
 
 GROUP_STATE = ".group.json"
@@ -93,20 +101,40 @@ def _json_file(path, label):
 
 
 def _installed_inventory(root):
+    """Pin every installed file; each size is checked before any byte is read."""
     _no_alias(root)
-    files = {}
+    files = {}; total = 0
     for path in sorted(root.rglob("*")):
         _no_alias(path)
         if path.is_dir():
             continue
-        if not stat.S_ISREG(path.lstat().st_mode):
-            raise HostLaunchError("installed pack contains a non-regular file")
-        files[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
-        if len(files) > FILE_LIMIT:
+        relative = str(path.relative_to(root))
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HostLaunchError(f"installed pack file {relative} is not a regular file")
+        if len(files) >= FILE_LIMIT:
             raise HostLaunchError("external source inventory exceeds its bound")
+        total += metadata.st_size
+        if metadata.st_size > SOURCE_LIMIT or total > SOURCE_LIMIT:
+            raise HostLaunchError(f"installed pack file {relative} exceeds the {SOURCE_LIMIT}-byte source bound")
+        files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     if not files:
         raise HostLaunchError("installed pack is empty")
     return files
+
+
+def _installed_pack_count(installed_root):
+    """The real number of installed packs: the grant bound for this collection."""
+    installed_root = Path(_absolute(str(installed_root)))
+    _no_alias(installed_root)
+    try:
+        names = [entry.name for entry in os.scandir(installed_root)
+            if not entry.name.startswith(".") and entry.is_dir(follow_symlinks=False)]
+    except OSError as exc:
+        raise HostLaunchError("installed pack collection is unreadable") from exc
+    if len(names) > FILE_LIMIT:
+        raise HostLaunchError("installed pack collection exceeds its bound")
+    return len(names)
 
 
 def _derive_installed_grant(installed_root, pack_id):
@@ -152,32 +180,62 @@ def _derive_installed_grant(installed_root, pack_id):
         "subpath": pack_id, "tree": tree, "root": str(root), "files": _installed_inventory(root),
         "definitions": definitions.get("definitions")}
     try:
-        _validate_grants([grant])
+        _validate_grants([grant], limit=1)
     except HostLaunchError as exc:
         raise HostLaunchError(f"installed pack definitions are invalid: {exc}") from exc
     return grant
 
 
-def _persist_derived_grants(support_root, workspace_uuid, grants):
-    """Persist derived grants (merged by root) where the Agent re-reads them."""
+def _current_grant(installed_root, stored):
+    """Re-derive a stored grant from the current install, or None (dropped)."""
+    if (not isinstance(stored, dict) or stored.get("checkout") != str(installed_root)
+            or not isinstance(stored.get("subpath"), str)):
+        return None
+    try:
+        current = _derive_installed_grant(installed_root, stored["subpath"])
+    except HostLaunchError:
+        return None
+    return current if current["root"] == stored.get("root") else None
+
+
+def _persist_derived_grants(support_root, workspace_uuid, grants, installed_root):
+    """Persist the current grants where the Agent re-reads them.
+
+    The whole read-merge-write runs under an exclusive lock on a sibling lock
+    file, so two launches in one workspace serialize: the second always reads
+    the first's published grant before it merges. The write is a temporary
+    file in the same directory, fsynced, then os.replace (write_protected).
+    Grants are keyed by root. Stored grants are only history: each one is kept
+    only while its root still derives from the current installed collection,
+    so history can never refuse a launch. Unreadable state is a named refusal.
+    """
     from .local_execution_handoff import write_protected
     path = _state_path(support_root)
     _no_alias(path)
-    merged = {}
-    try:
-        previous = _read_state(path)
-        if isinstance(previous, dict) and previous.get("workspace_uuid") == workspace_uuid:
-            merged = {g["root"]: g for g in previous.get("grants", []) if isinstance(g, dict) and "root" in g}
-    except HostLaunchError:
-        pass
-    merged.update({g["root"]: g for g in grants})
-    ordered = [merged[k] for k in sorted(merged)]
-    _validate_grants(ordered)
-    write_protected(path, {"workspace_uuid": workspace_uuid, "grants": ordered})
+    installed = Path(_absolute(str(installed_root))) if installed_root else None
+    limit = _installed_pack_count(installed) if installed is not None else 0
+    platform.private_directory(path.parent)
+    with platform.file_lock(path.with_name(path.name + ".lock")):
+        previous = _read_state(path, missing_ok=True)
+        merged = {}
+        if previous is not None:
+            if (not isinstance(previous, dict) or not isinstance(previous.get("grants"), list)
+                    or not isinstance(previous.get("workspace_uuid"), str)):
+                raise HostLaunchError(f"external source owner state {path} is corrupt; refusing to overwrite it")
+            if previous["workspace_uuid"] == workspace_uuid and installed is not None:
+                for stored in previous["grants"]:
+                    current = _current_grant(installed, stored)
+                    if current is not None:
+                        merged[current["root"]] = current
+        merged.update({g["root"]: g for g in grants})
+        ordered = [merged[k] for k in sorted(merged)]
+        _validate_grants(ordered, limit=limit)
+        write_protected(path, {"workspace_uuid": workspace_uuid, "grants": ordered})
 
 
-def _validate_grants(grants):
-    if not isinstance(grants, list) or len(grants) > 16:
+def _validate_grants(grants, *, limit):
+    """``limit`` is the real installed-pack count of the selected collection."""
+    if not isinstance(grants, list) or len(grants) > limit:
         raise HostLaunchError("external source grants are invalid")
     roots = []
     for grant in grants:
@@ -364,11 +422,11 @@ class OwnerSourceCapture:
             if path.parent != _absolute(installed):
                 raise HostLaunchError("selected external source has no owner grant: it is outside the selected installed pack collection")
             derived.append(_derive_installed_grant(installed, path.name))
-        _persist_derived_grants(config["support_root"], preparation["profile"]["workspace_uuid"], derived)
+        _persist_derived_grants(config["support_root"], preparation["profile"]["workspace_uuid"], derived, installed)
         state = _read_state(self._path)
         if not isinstance(state, dict) or set(state) != {"workspace_uuid", "grants"} or state["workspace_uuid"] != preparation["profile"]["workspace_uuid"]:
             raise HostLaunchError("external source owner scope differs")
-        _validate_grants(state["grants"])
+        _validate_grants(state["grants"], limit=_installed_pack_count(installed) if installed else 0)
         self._workspace = state["workspace_uuid"]
         self._grants = []
         for extra in selected:

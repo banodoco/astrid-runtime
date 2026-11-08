@@ -28,6 +28,9 @@ TRUSTED_LOCAL_MODE = "trusted-local-isolated-source/v1"
 LIMIT = 64 * 1024 * 1024
 ENV_KEYS = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP", "XDG_RUNTIME_DIR", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "ASTRID_EXECUTION_TARGET_JSON"})
 TIMELINE_OBSERVER_FD_ENV = "ASTRID_TIMELINE_OBSERVER_FD"
+# Runtime-owned (never ambient, never profile-selected): no pack-host child may
+# write bytecode into an installed pack tree.
+BYTECODE_ENV_KEYS = frozenset({"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"})
 _COMPONENTS = {
     "host": "astrid/core/execution/generic_host.py", "core": "astrid/core",
     "sdk": "astrid/sdk", "launcher": "astrid/omp_agent.py",
@@ -80,6 +83,40 @@ def validate_host_protocol(value):
             or not _raw(value["source_closure_digest"])):
         raise HostLaunchError("selected host_protocol shape/version/module/closure is invalid")
     return json.loads(canonical(value))
+
+
+def _pack_roots(config, profile=None):
+    roots = [config.get("pack_root"), config.get("installed_pack_root")]
+    host_launch = (profile or {}).get("host_launch") if isinstance(profile, dict) else None
+    if isinstance(host_launch, dict):
+        roots += [extra.get("path") for extra in host_launch.get("additional_pack_roots") or [] if isinstance(extra, dict)]
+    return [Path(root) for root in roots if isinstance(root, str) and root]
+
+
+def _check_bytecode_prefix(prefix, roots):
+    if any(prefix.is_relative_to(root) or root.is_relative_to(prefix) for root in roots):
+        raise HostLaunchError("host bytecode cache prefix lies inside an installed pack collection")
+
+
+def bytecode_environment(support_root, config, profile=None):
+    """The fixed pack-host bytecode policy: never write, and any cache lives in
+    the private support root, outside every pack collection."""
+    prefix = _absolute(str(support_root)) / "host-bytecode"
+    _check_bytecode_prefix(prefix, _pack_roots(config, profile))
+    return {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(prefix)}
+
+
+def _validate_bytecode_environment(environment, config, profile):
+    present = BYTECODE_ENV_KEYS & set(environment)
+    if not present:
+        return environment
+    if present != BYTECODE_ENV_KEYS or environment["PYTHONDONTWRITEBYTECODE"] != "1":
+        raise HostLaunchError("host bytecode environment is not the Runtime policy")
+    prefix = environment["PYTHONPYCACHEPREFIX"]
+    if not isinstance(prefix, str) or "\0" in prefix or not Path(prefix).is_absolute() or ".." in Path(prefix).parts:
+        raise HostLaunchError("host bytecode cache prefix is not canonical absolute")
+    _check_bytecode_prefix(Path(prefix), _pack_roots(config, profile))
+    return {k: v for k, v in environment.items() if k not in BYTECODE_ENV_KEYS}
 
 
 def _absolute(value):
@@ -304,6 +341,7 @@ class HostLaunchVerifier:
     def _validate_environment(self, profile, config, environment):
         if not isinstance(environment, dict):
             raise HostLaunchError("isolated host environment contains import overrides or invalid values")
+        environment = _validate_bytecode_environment(environment, config, profile)
         observer = environment.get(TIMELINE_OBSERVER_FD_ENV)
         if observer is not None:
             _validate_timeline_observer_fd(observer)
