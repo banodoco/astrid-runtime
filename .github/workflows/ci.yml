@@ -137,6 +137,20 @@ jobs:
           python-version: "3.11"
       - run: brew install ffmpeg
       - run: python -m pip install -e '.[test]'
+      - name: Checkout published Agent alongside Runtime (darwin spawn test needs the Agent)
+        shell: bash
+        env:
+          AGENT_SHA: 4866090ed0c8cc1aa3ed8a9c1f4b0e2c6e7e5a10
+        run: |
+          agent_dir="$GITHUB_WORKSPACE/../astrid-agent"
+          git init --quiet "$agent_dir"
+          git -C "$agent_dir" remote add origin https://github.com/banodoco/astrid-agent
+          git -C "$agent_dir" fetch --depth=1 origin "$AGENT_SHA"
+          git -C "$agent_dir" checkout --detach --quiet FETCH_HEAD
+          test "$(git -C "$agent_dir" rev-parse HEAD)" = "$AGENT_SHA"
+      - name: Install published Agent from sibling checkout
+        shell: bash
+        run: python -m pip install -e "$GITHUB_WORKSPACE/../astrid-agent"
       - run: python -m pytest -q -m darwin_native
 
       - name: Save pip cache on main or int branches (C-08)
