@@ -40,6 +40,11 @@ _COMPONENTS = {
 }
 
 
+# Exact refusal shared with the Agent (astrid.core.pack.cli_manage
+# SYMLINKED_COLLECTION_REFUSAL); the offending link follows after ": ".
+SYMLINKED_COLLECTION_REFUSAL = "import materialization contains a symlink"
+
+
 class HostLaunchError(RuntimeError):
     """Selection or retained import authority is unresolved."""
 
@@ -132,7 +137,7 @@ def _no_alias(path):
     # This bounded mode disallows aliases even where they stay within a root.
     for ancestor in (path, *path.parents):
         if ancestor.is_symlink():
-            raise HostLaunchError("import materialization contains a symlink")
+            raise HostLaunchError(f"{SYMLINKED_COLLECTION_REFUSAL}: {ancestor}")
 
 
 def read_source(path, expected):
