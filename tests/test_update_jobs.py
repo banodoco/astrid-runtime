@@ -1188,3 +1188,164 @@ def test_self_update_actions_cover_every_action_the_request_path_sends():
     # prepare is the request that carries no action key.
     assert sent and (sent | {"prepare"}) <= update._SELF_UPDATE_ACTIONS
     assert "reconcile" in update._SELF_UPDATE_ACTIONS and "fail" not in update._SELF_UPDATE_ACTIONS
+
+
+OBSERVED_OPERATION_ID = "3" * 32
+# Computed on the base commit. Update status sits outside the versioned contract, so
+# observed_job must leave the generated schema digest exactly as it was.
+BASE_SCHEMA_DIGEST = "sha256:9628bb5fd6e1dbbec392dd39f2e01031622dcf52d7ccff7cd1f0ad10743dcb1c"
+
+
+def _observed(state="failed", **fields):
+    return {"operation_id": OBSERVED_OPERATION_ID, "state": state, "message": "Worker exited 2.",
+            "persisted": False, "exit_code": 2, **fields}
+
+
+def _unresolved_install(tmp_path, job_state="active", job_extra=None, journal=None):
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    home.mkdir(exist_ok=True)
+    _write(update._install_record_path(home), {
+        "owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data)})
+    job = {"operation_id": OBSERVED_OPERATION_ID, "state": job_state, "target_release": 9,
+           "message": "Update running.", **(job_extra or {})}
+    install = _write(root / "install.json", {
+        "owner": "haus.astrid.runtime", "data_root": str(data), "update_job": job})
+    if journal is not None:
+        _write(root / "update-transaction.json", journal)
+    return home, install
+
+
+@pytest.mark.parametrize("job_state, job_extra", [
+    ("active", {}),
+    ("launching", {"launch_status": "acknowledged"}),
+])
+@pytest.mark.parametrize("observed_state, expected_state, expected_outcome", [
+    ("failed", "terminal", "failed"),
+    ("recovery-needed", "recovery-needed", None),
+])
+def test_observed_dead_worker_settles_an_unresolved_job_read_only(
+        tmp_path, job_state, job_extra, observed_state, expected_state, expected_outcome):
+    home, install = _unresolved_install(tmp_path, job_state, job_extra)
+    before = hashlib.sha256(install.read_bytes()).hexdigest()
+
+    status = update.read_update_status(home, available=True, observed_job=_observed(observed_state))
+
+    assert status["state"] == expected_state
+    assert status.get("outcome") == expected_outcome
+    assert status["result"] == "Worker exited 2."
+    assert status["persisted"] is False
+    assert status["operation_id"] == OBSERVED_OPERATION_ID
+    assert hashlib.sha256(install.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize("terminal_state", ["failed", "updated", "rolled_back"])
+@pytest.mark.parametrize("observed_state", ["failed", "recovery-needed"])
+def test_observed_job_never_overrides_a_terminal_install_record(tmp_path, terminal_state, observed_state):
+    home, install = _unresolved_install(tmp_path, terminal_state)
+    before = hashlib.sha256(install.read_bytes()).hexdigest()
+    without = update.read_update_status(home, available=True)
+
+    status = update.read_update_status(home, available=True, observed_job=_observed(observed_state))
+
+    assert status == without
+    assert "persisted" not in status
+    assert hashlib.sha256(install.read_bytes()).hexdigest() == before
+    if terminal_state == "failed":
+        assert status["state"] == "terminal" and status["outcome"] == "failed"
+
+
+@pytest.mark.parametrize("job_state", ["launching", "active"])
+def test_absent_observed_job_leaves_an_unresolved_job_unchanged(tmp_path, job_state):
+    home, _install = _unresolved_install(tmp_path, job_state, {"launch_status": "acknowledged"})
+
+    status = update.read_update_status(home, available=True)
+
+    assert status["state"] == "active"
+    assert status["result"] == "Update running."
+    assert "persisted" not in status and "outcome" not in status
+    assert update.read_update_status(home, available=True, observed_job=None) == status
+
+
+def test_observed_job_for_another_operation_does_not_settle_this_job(tmp_path):
+    home, _install = _unresolved_install(tmp_path, "active")
+    other = _observed(operation_id="4" * 32)
+
+    status = update.read_update_status(home, available=True, observed_job=other)
+
+    assert status["state"] == "active"
+    assert "persisted" not in status
+
+
+def test_observed_dead_worker_is_read_only_against_pending_journal(tmp_path):
+    journal = {"step": "stopping", "operation_id": "5" * 32}
+    home, install = _unresolved_install(tmp_path, "active", journal=journal)
+    before = {path: path.read_bytes() for path in (install, install.parent / "update-transaction.json")}
+
+    status = update.read_update_status(home, available=True, observed_job=_observed("failed"))
+
+    assert status["state"] == "terminal" and status["outcome"] == "failed"
+    assert status["persisted"] is False
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def test_status_poll_shows_dead_worker_from_availability_reply(tmp_path, monkeypatch):
+    admission, calls = _probe_admission(tmp_path, monkeypatch, "linux", {
+        "available": True, "actions": sorted(update._SELF_UPDATE_ACTIONS),
+        "observed_job": _observed("failed", message="Failed: exit 2."),
+    })
+    home, install = _unresolved_install(tmp_path, "active")
+    before = hashlib.sha256(install.read_bytes()).hexdigest()
+
+    status = admission.status()
+
+    assert calls == [{"action": "availability"}]
+    assert status["state"] == "terminal" and status["outcome"] == "failed"
+    assert status["result"] == "Failed: exit 2."
+    assert status["persisted"] is False
+    assert status["self_update"] is True and status["reason"] == "none"
+    assert hashlib.sha256(install.read_bytes()).hexdigest() == before
+
+
+def test_availability_passes_observed_job_through_only_when_well_formed():
+    observed = _observed("recovery-needed")
+    admission = update.UpdateAdmission(SimpleNamespace())
+    admission._helper = lambda *_args: {"available": True, "actions": sorted(update._SELF_UPDATE_ACTIONS),
+                                        "observed_job": observed}
+
+    assert admission._status_availability(Path("/p"), Path("/a"), Path("/r")) == {
+        "available": True, "self_update": True, "observed_job": observed}
+
+
+def test_availability_without_observed_job_adds_no_key():
+    admission = update.UpdateAdmission(SimpleNamespace())
+    admission._helper = lambda *_args: {"available": False, "reason": "busy"}
+
+    assert admission._status_availability(Path("/p"), Path("/a"), Path("/r")) == {
+        "available": False, "self_update": False, "reason": "busy"}
+
+
+@pytest.mark.parametrize("observed", [
+    _observed("updated"),
+    _observed("active"),
+    _observed("failed", persisted=True),
+    _observed("failed", persisted=None),
+    _observed("failed", operation_id="not-hex"),
+    _observed("failed", message=None),
+    {"state": "failed", "message": "Worker exited 2.", "persisted": False},
+    "failed",
+])
+def test_availability_drops_malformed_observed_job(observed):
+    admission = update.UpdateAdmission(SimpleNamespace())
+    admission._helper = lambda *_args: {"available": True, "actions": [], "observed_job": observed}
+
+    assert "observed_job" not in admission._status_availability(Path("/p"), Path("/a"), Path("/r"))
+
+
+def test_observed_job_leaves_the_contract_schema_digest_unchanged():
+    from generators.generate import contract_digest
+    from runtime_protocol.contract_metadata import SCHEMA_DIGEST
+
+    assert contract_digest() == BASE_SCHEMA_DIGEST == SCHEMA_DIGEST
+    contract = Path(__file__).parents[1] / "contract"
+    assert not any("observed_job" in path.read_text(encoding="utf-8")
+                   for path in contract.rglob("*") if path.is_file())
