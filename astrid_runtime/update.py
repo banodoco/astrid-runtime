@@ -321,7 +321,7 @@ class UpdateAdmission:
             try:
                 temporary_base = Path(tempfile.gettempdir()).resolve(strict=True)
                 temporary = Path(tempfile.mkdtemp(prefix="astrid-update-", dir=temporary_base))
-                platform.private_directory(temporary)
+                platform.owner_only(temporary, directory=True)
                 with self._installer_idle(selection_path):
                     # C1 owns the blocker report and the final destructive fence.
                     # This is only its read-only preflight; no stop authority here.
