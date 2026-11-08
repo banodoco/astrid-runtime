@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 
 from runtime_protocol import platform
@@ -94,6 +95,39 @@ def _assert_autostart_supported(selected):
 _SELF_UPDATE_ACTIONS = frozenset({"availability", "reconcile", "prepare", "accept", "launch"})
 
 
+# Status reuses the helper's availability answer for this long when nothing changes, and
+# re-observes a possibly dead worker at most this often while an update job is unresolved.
+_AVAILABILITY_TTL = 300.0
+_AVAILABILITY_UNRESOLVED_TTL = 30.0
+
+
+def _stat_signature(path):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+
+
+def _availability_fingerprint(home, key):
+    """The installed state an availability answer depends on, and whether a job is unresolved.
+
+    Reads only the selection and install records; starts nothing. Any unreadable record
+    yields no fingerprint, so the answer is never reused from an unknown state.
+    """
+    try:
+        record = _install_record_path(home)
+        selected = _read_bounded_object(record) or {}
+        root = _path(selected.get("program_root"))
+    except (OSError, ValueError, TypeError, KeyError):
+        return None, False
+    marker_path = root / "install.json"
+    marker = _read_bounded_object(marker_path) or {}
+    unresolved = marker.get("update_job") is not None
+    files = (record, marker_path, root / "update-transaction.json")
+    return (key, tuple(_stat_signature(path) for path in files)), unresolved
+
+
 class UpdateAdmission:
     def __init__(self, daemon, launcher=None):
         self.daemon = daemon
@@ -101,6 +135,9 @@ class UpdateAdmission:
         # selected installation's Python helper, which owns OS job creation.
         self.launcher = launcher if launcher is not None else getattr(daemon, "update_launcher", None)
         self._lock = threading.Lock()
+        # The last helper answer and the install state it was read from. Status polls reuse
+        # it while that state is unchanged, so a steady poll starts no helper (UR-R2.4).
+        self._availability_cache = None
 
     def status(self):
         """Project update availability without admitting or reconciling an update."""
@@ -115,7 +152,7 @@ class UpdateAdmission:
             # A pending journal is status evidence, not permission for GET to
             # recover it. POST reaches the Agent's locked reconciler instead.
             selection = self._selection(allow_pending=True)
-            availability = self._status_availability(*selection[2:5])
+            availability = self._status_availability(*selection[2:5], home=home)
             self_update = availability.get("self_update") is True
             observed_job = availability.get("observed_job")
             if availability["available"] is False:
@@ -132,8 +169,27 @@ class UpdateAdmission:
         return read_update_status(home, available=available, reason=reason, self_update=self_update,
                                   observed_job=observed_job)
 
-    def _status_availability(self, python, agent, runtime):
-        """Read the Agent capability without invoking admission or recovery."""
+    def _status_availability(self, python, agent, runtime, *, home=None):
+        """Read the Agent capability without invoking admission or recovery.
+
+        The answer is reused while the install state it was read from is unchanged. While an
+        update job is unresolved it is refreshed at most every few seconds, because a dead
+        worker shows only in that answer. Otherwise it is refreshed on the bounded interval.
+        """
+        home = Path.home() if home is None else home
+        fingerprint, unresolved = _availability_fingerprint(home, (str(python), str(agent), str(runtime)))
+        now = time.monotonic()
+        cache = self._availability_cache
+        if fingerprint is not None and cache is not None and cache["fingerprint"] == fingerprint:
+            ttl = _AVAILABILITY_UNRESOLVED_TTL if unresolved else _AVAILABILITY_TTL
+            if now - cache["at"] < ttl:
+                return cache["value"]
+        value = self._probe_availability(python, agent, runtime)
+        if fingerprint is not None:
+            self._availability_cache = {"fingerprint": fingerprint, "at": now, "value": value}
+        return value
+
+    def _probe_availability(self, python, agent, runtime):
         try:
             availability = self._helper(python, agent, runtime, {"action": "availability"})
         except UpdateRefusal as refusal:
