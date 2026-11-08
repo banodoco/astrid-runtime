@@ -844,3 +844,21 @@ def test_selected_pinned_or_collection_changes_still_refuse_the_whole_launch(own
         else "installed pack differs from its derived custody grant")
     with pytest.raises(gate.HostLaunchError, match=message):
         capture.verify(preparation=f.args["preparation"], config=f.args["config"])
+
+
+@pytest.mark.integration
+def test_all_refused_collection_binds_the_agent_custody_to_built_ins_only(owner_source, monkeypatch, astrid_importable):
+    """END round 3 (a)/(b): an empty granted set is valid; the Agent custody binds with no
+    granted roots and the host boots built-ins only (no refused pack is loaded)."""
+    from astrid.core.execution import generic_host
+
+    case = owner_source
+    shutil.rmtree(case.root)
+    state = json.loads((case.collection / ".group.json").read_text()); state["admissions"] = {}
+    (case.collection / ".group.json").write_text(json.dumps(state))
+    _install_refused(case.collection)
+    seen = _prepare_unselected(case, monkeypatch)
+    handle = gate._RuntimeExternalSources(seen["sources"].payload)
+    custody = generic_host._RuntimeSourceCustody(handle)
+    custody.bind(seen["preparation"])
+    assert custody._launch_roots == [seen["builtin_root"]]
