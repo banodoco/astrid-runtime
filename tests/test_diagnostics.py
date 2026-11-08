@@ -67,11 +67,11 @@ def test_report_includes_identity_update_runtime_and_disk_details(tmp_path):
     assert "App build:" not in report
     assert "App release:" not in report
     assert "build-sha" not in report
-    assert "B1 identity: managed_by=source; release=8" in report
-    assert "Runtime support state: healthy (healthy=True)" in report
+    assert "Selection record identity: managed_by=source; release=8" in report
+    assert "This Runtime's support state: healthy (healthy=True)" in report
     assert "Last update result: rolled_back" in report
     assert "installer output" in report and "launcher output" in report
-    assert "Retained back-end copies: 5 bytes" in report
+    assert "Program versions on disk: 1 version, 5 bytes (versions folder, current version included)" in report
 
 
 def test_source_checkout_includes_owner_only_launcher_log(tmp_path):
@@ -108,7 +108,7 @@ def test_diagnostics_uses_shared_update_job_result_and_program_root_log(tmp_path
     platform.owner_only(root / "install.json")
     report = diagnostics_report(paths, {"healthy": True})
     assert "Last update result: Updated to release 9." in report
-    assert "Installer transaction log:\nworker output" in report
+    assert "Installer log (accepted-update.log, last 80 lines):\nworker output" in report
     assert f"Update log: {log}" in report
 
 
@@ -127,7 +127,7 @@ def test_runtime_log_stat_failure_is_reported_without_aborting(tmp_path, monkeyp
             raise PermissionError("patched stat denial")
         return original_stat(path, *args, **kwargs)
     monkeypatch.setattr(Path, "stat", patched_stat)
-    assert "Runtime log tail (runtime.log):\n(not available)" in diagnostics_report(paths, {"healthy": True})
+    assert "Shared Runtime log (runtime.log; written by every Runtime on this computer, last 80 lines):\n(not available)" in diagnostics_report(paths, {"healthy": True})
 
 
 def test_report_does_not_read_non_owner_only_logs(tmp_path):
@@ -165,7 +165,7 @@ def test_real_doctor_issues_are_shown_and_json_unchanged(tmp_path, monkeypatch, 
     monkeypatch.setattr(cli, "_paths", lambda _args: paths)
     assert cli.main(["doctor"]) == 1
     text = capsys.readouterr().out
-    assert "Runtime support state: unhealthy (healthy=False)" in text
+    assert "This Runtime's support state: unhealthy (healthy=False)" in text
     assert "catalog_missing" in text
     assert cli.main(["doctor", "--json"]) == 1
     assert "catalog_missing" in json.loads(capsys.readouterr().out)["issues"]
