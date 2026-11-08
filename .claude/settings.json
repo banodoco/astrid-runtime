@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip install -e:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(npm ci:*)",
+      "Bash(npm test:*)",
+      "Bash(sh tests/seccomp/run-suite.sh:*)"
+    ]
+  }
+}
