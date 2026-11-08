@@ -61,7 +61,7 @@ def test_install_state_change_refreshes_the_answer(tmp_path, monkeypatch):
 def test_unresolved_job_is_observed_at_most_every_thirty_seconds(tmp_path, monkeypatch):
     admission, launches = _admission(monkeypatch, tmp_path, "win32")
     marker = tmp_path / "program" / "install.json"
-    marker.write_text('{"owner": "installer", "update_job": {"operation_id": "x"}}', encoding="utf-8")
+    marker.write_text('{"owner": "installer", "update_job": {"operation_id": "x", "state": "active"}}', encoding="utf-8")
     clock = [1000.0]
     monkeypatch.setattr(update.time, "monotonic", lambda: clock[0])
     admission.status()
@@ -70,5 +70,42 @@ def test_unresolved_job_is_observed_at_most_every_thirty_seconds(tmp_path, monke
         admission.status()
     assert len(launches) == 1
     clock[0] += 2.0
+    admission.status()
+    assert len(launches) == 2
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_failed_probe_is_not_cached_and_clears_on_the_next_poll(tmp_path, monkeypatch, platform):
+    admission, launches = _admission(monkeypatch, tmp_path, platform)
+    healthy = subprocess.CompletedProcess([], 0, stdout='{"available": true, "actions": %s}'
+                                          % ALL_ACTIONS.__repr__().replace("'", '"'), stderr="")
+    attempts = []
+
+    def run(argv, **_kwargs):
+        attempts.append(argv[0])
+        if len(attempts) == 1:
+            raise OSError("helper could not start")
+        return healthy
+
+    monkeypatch.setattr(update.subprocess, "run", run)
+    first = admission.status()
+    assert first["available"] is False
+    second = admission.status()
+    assert second["available"] is True and second["self_update"] is True
+    assert len(attempts) == 2
+
+
+def test_settled_job_uses_the_long_refresh(tmp_path, monkeypatch):
+    admission, launches = _admission(monkeypatch, tmp_path, "darwin")
+    marker = tmp_path / "program" / "install.json"
+    marker.write_text('{"owner": "installer", "update_job": {"operation_id": "x", "state": "succeeded"}}',
+                      encoding="utf-8")
+    clock = [1000.0]
+    monkeypatch.setattr(update.time, "monotonic", lambda: clock[0])
+    admission.status()
+    clock[0] += 60.0
+    admission.status()
+    assert len(launches) == 1, "a settled job must not be re-observed every 30 seconds"
+    clock[0] += 241.0
     admission.status()
     assert len(launches) == 2

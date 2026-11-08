@@ -123,7 +123,9 @@ def _availability_fingerprint(home, key):
         return None, False
     marker_path = root / "install.json"
     marker = _read_bounded_object(marker_path) or {}
-    unresolved = marker.get("update_job") is not None
+    job = marker.get("update_job")
+    # Only a job the worker still holds is observed often; a settled job keeps the long refresh.
+    unresolved = isinstance(job, dict) and job.get("state") in _OBSERVABLE_JOB_STATES
     files = (record, marker_path, root / "update-transaction.json")
     return (key, tuple(_stat_signature(path) for path in files)), unresolved
 
@@ -184,31 +186,36 @@ class UpdateAdmission:
             ttl = _AVAILABILITY_UNRESOLVED_TTL if unresolved else _AVAILABILITY_TTL
             if now - cache["at"] < ttl:
                 return cache["value"]
-        value = self._probe_availability(python, agent, runtime)
-        if fingerprint is not None:
+        value, settled = self._probe_availability(python, agent, runtime)
+        # Only a well-formed answer from a successful helper is reused. A failed or malformed
+        # probe is re-run on the next poll, so a transient failure clears at once.
+        if settled and fingerprint is not None:
             self._availability_cache = {"fingerprint": fingerprint, "at": now, "value": value}
+        else:
+            self._availability_cache = None
         return value
 
     def _probe_availability(self, python, agent, runtime):
+        """Return (answer, settled). settled is True only for a well-formed helper reply."""
         try:
             availability = self._helper(python, agent, runtime, {"action": "availability"})
         except UpdateRefusal as refusal:
             reason = refusal.details.get("reason")
-            return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}
+            return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}, False
         except (OSError, subprocess.SubprocessError):
-            return {"available": False}
+            return {"available": False}, False
         if not isinstance(availability, dict) or type(availability.get("available")) is not bool:
-            return {"available": False}
+            return {"available": False}, False
         actions = availability.get("actions")
         supported = (isinstance(actions, list) and all(isinstance(item, str) for item in actions)
                      and _SELF_UPDATE_ACTIONS <= set(actions))
         observed_job = _observed_job(availability.get("observed_job"))
         observed = {"observed_job": observed_job} if observed_job is not None else {}
         if availability["available"]:
-            return {"available": True, "self_update": supported, **observed}
+            return {"available": True, "self_update": supported, **observed}, True
         reason = availability.get("reason")
         return {"available": False, "self_update": supported,
-                **({"reason": reason} if reason in _STATUS_REASONS else {}), **observed}
+                **({"reason": reason} if reason in _STATUS_REASONS else {}), **observed}, True
 
     def _helper(self, python, agent, runtime, payload):
         script = ("import sys; sys.path[:0]=sys.argv[1:3]; "
