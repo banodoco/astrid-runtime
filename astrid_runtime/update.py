@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import traceback
 
 from runtime_protocol import platform
 from runtime_protocol.errors import AuthorizationError, ConflictError
@@ -24,11 +27,16 @@ from runtime_protocol.lifecycle import assert_interruption_safe
 from .identity import normalize_startup_identity
 from .paths import INSTALL_RECORD_OWNER, _install_record_path
 
+_LOGGER = logging.getLogger(__name__)
+
 MANIFEST_URL = "https://astrid.haus/install-manifest.json"
 BOOTSTRAP_URL = "https://astrid.haus/install"
 WINDOWS_BOOTSTRAP_URL = "https://astrid.haus/install.ps1"
 MAX_METADATA_BYTES = 1024 * 1024
 _STATUS_REASONS = frozenset({"busy", "autostart-off", "unsupported-service-manager"})
+# GET /v1/update/status may also say these; a helper or POST refusal may not.
+# "source" is the POST refusal's own reason; "none" means the Runtime can update.
+_REPORTED_REASONS = _STATUS_REASONS | {"needs-repair", "managed-elsewhere", "source"}
 
 
 class UpdateRefusal(ConflictError):
@@ -81,6 +89,47 @@ def _assert_autostart_supported(selected):
             )
 
 
+# Every helper action the request path sends (prepare is the request with no
+# action key). Helpers that cannot list their actions are older than this
+# contract and read as not self-updating.
+_SELF_UPDATE_ACTIONS = frozenset({"availability", "reconcile", "prepare", "accept", "launch"})
+
+
+# Status reuses the helper's availability answer for this long when nothing changes, and
+# re-observes a possibly dead worker at most this often while an update job is unresolved.
+_AVAILABILITY_TTL = 300.0
+_AVAILABILITY_UNRESOLVED_TTL = 30.0
+
+
+def _stat_signature(path):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+
+
+def _availability_fingerprint(home, key):
+    """The installed state an availability answer depends on, and whether a job is unresolved.
+
+    Reads only the selection and install records; starts nothing. Any unreadable record
+    yields no fingerprint, so the answer is never reused from an unknown state.
+    """
+    try:
+        record = _install_record_path(home)
+        selected = _read_bounded_object(record) or {}
+        root = _path(selected.get("program_root"))
+    except (OSError, ValueError, TypeError, KeyError):
+        return None, False
+    marker_path = root / "install.json"
+    marker = _read_bounded_object(marker_path) or {}
+    job = marker.get("update_job")
+    # Only a job the worker still holds is observed often; a settled job keeps the long refresh.
+    unresolved = isinstance(job, dict) and job.get("state") in _OBSERVABLE_JOB_STATES
+    files = (record, marker_path, root / "update-transaction.json")
+    return (key, tuple(_stat_signature(path) for path in files)), unresolved
+
+
 class UpdateAdmission:
     def __init__(self, daemon, launcher=None):
         self.daemon = daemon
@@ -88,6 +137,9 @@ class UpdateAdmission:
         # selected installation's Python helper, which owns OS job creation.
         self.launcher = launcher if launcher is not None else getattr(daemon, "update_launcher", None)
         self._lock = threading.Lock()
+        # The last helper answer and the install state it was read from. Status polls reuse
+        # it while that state is unchanged, so a steady poll starts no helper (UR-R2.4).
+        self._availability_cache = None
 
     def status(self):
         """Project update availability without admitting or reconciling an update."""
@@ -96,41 +148,74 @@ class UpdateAdmission:
             return read_update_status(home, available=False, reason="busy")
         reason = None
         available = True
+        self_update = False
+        observed_job = None
         try:
             # A pending journal is status evidence, not permission for GET to
             # recover it. POST reaches the Agent's locked reconciler instead.
             selection = self._selection(allow_pending=True)
-            if sys.platform == "linux":
-                availability = self._status_availability(*selection[2:5])
-                if availability["available"] is False:
-                    available = False
-                    candidate = availability.get("reason")
-                    reason = candidate if candidate in _STATUS_REASONS else None
+            availability = self._status_availability(*selection[2:5], home=home)
+            self_update = availability.get("self_update") is True
+            observed_job = availability.get("observed_job")
+            if availability["available"] is False:
+                available = False
+                reason = availability.get("reason")
         except UpdateRefusal as refusal:
             available = False
             candidate = refusal.details.get("reason")
-            reason = candidate if candidate in _STATUS_REASONS else None
+            reason = "managed-elsewhere" if candidate == "pinokio" else candidate
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             available = False
         if available and _installer_lock_held(home):
             available, reason = False, "busy"
-        return read_update_status(home, available=available, reason=reason)
+        return read_update_status(home, available=available, reason=reason, self_update=self_update,
+                                  observed_job=observed_job)
 
-    def _status_availability(self, python, agent, runtime):
-        """Read the Agent capability without invoking admission or recovery."""
+    def _status_availability(self, python, agent, runtime, *, home=None):
+        """Read the Agent capability without invoking admission or recovery.
+
+        The answer is reused while the install state it was read from is unchanged. While an
+        update job is unresolved it is refreshed at most every few seconds, because a dead
+        worker shows only in that answer. Otherwise it is refreshed on the bounded interval.
+        """
+        home = Path.home() if home is None else home
+        fingerprint, unresolved = _availability_fingerprint(home, (str(python), str(agent), str(runtime)))
+        now = time.monotonic()
+        cache = self._availability_cache
+        if fingerprint is not None and cache is not None and cache["fingerprint"] == fingerprint:
+            ttl = _AVAILABILITY_UNRESOLVED_TTL if unresolved else _AVAILABILITY_TTL
+            if now - cache["at"] < ttl:
+                return cache["value"]
+        value, settled = self._probe_availability(python, agent, runtime)
+        # Only a well-formed answer from a successful helper is reused. A failed or malformed
+        # probe is re-run on the next poll, so a transient failure clears at once.
+        if settled and fingerprint is not None:
+            self._availability_cache = {"fingerprint": fingerprint, "at": now, "value": value}
+        else:
+            self._availability_cache = None
+        return value
+
+    def _probe_availability(self, python, agent, runtime):
+        """Return (answer, settled). settled is True only for a well-formed helper reply."""
         try:
             availability = self._helper(python, agent, runtime, {"action": "availability"})
         except UpdateRefusal as refusal:
             reason = refusal.details.get("reason")
-            return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}
+            return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}, False
         except (OSError, subprocess.SubprocessError):
-            return {"available": False}
+            return {"available": False}, False
         if not isinstance(availability, dict) or type(availability.get("available")) is not bool:
-            return {"available": False}
+            return {"available": False}, False
+        actions = availability.get("actions")
+        supported = (isinstance(actions, list) and all(isinstance(item, str) for item in actions)
+                     and _SELF_UPDATE_ACTIONS <= set(actions))
+        observed_job = _observed_job(availability.get("observed_job"))
+        observed = {"observed_job": observed_job} if observed_job is not None else {}
         if availability["available"]:
-            return {"available": True}
+            return {"available": True, "self_update": supported, **observed}, True
         reason = availability.get("reason")
-        return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}
+        return {"available": False, "self_update": supported,
+                **({"reason": reason} if reason in _STATUS_REASONS else {}), **observed}, True
 
     def _helper(self, python, agent, runtime, payload):
         script = ("import sys; sys.path[:0]=sys.argv[1:3]; "
@@ -299,7 +384,7 @@ class UpdateAdmission:
             try:
                 temporary_base = Path(tempfile.gettempdir()).resolve(strict=True)
                 temporary = Path(tempfile.mkdtemp(prefix="astrid-update-", dir=temporary_base))
-                platform.private_directory(temporary)
+                platform.owner_only(temporary, directory=True)
                 with self._installer_idle(selection_path):
                     # C1 owns the blocker report and the final destructive fence.
                     # This is only its read-only preflight; no stop authority here.
@@ -401,7 +486,16 @@ class UpdateAdmission:
                     shutil.rmtree(temporary, ignore_errors=True)
         except ConflictError:
             raise
-        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            # Runtime log only: the exception text must never reach the response.
+            # The step is the innermost traceback frame (function, file, line).
+            frames = traceback.extract_tb(exc.__traceback__)
+            last = frames[-1] if frames else None
+            _LOGGER.warning(
+                "update request refused as selection-or-inputs-invalid; swallowed %s: %s (step=%s at %s:%s)",
+                type(exc).__name__, " ".join(str(exc).split())[:500],
+                last.name if last else "unknown", Path(last.filename).name if last else "unknown",
+                last.lineno if last else 0)
             raise UpdateRefusal("selection-or-inputs-invalid", "The selected installation or update inputs do not match this running Astrid.") from None
         finally:
             self._lock.release()
@@ -465,13 +559,44 @@ def _terminal_success_verified(root, selected, job, transaction, state):
         return False
 
 
-def read_update_status(home=None, *, available=False, reason=None):
+_OBSERVED_STATES = frozenset({"failed", "recovery-needed"})
+# install.json states a positively dead worker can still leave unresolved.
+_OBSERVABLE_JOB_STATES = frozenset({"launching", "active"})
+
+
+def _observed_job(value):
+    """Return the Agent's observed_job when it is a well-formed, unpersisted observation, else None."""
+    if not isinstance(value, dict):
+        return None
+    operation_id = value.get("operation_id")
+    message = value.get("message")
+    if (value.get("state") not in _OBSERVED_STATES or value.get("persisted") is not False
+            or not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
+            or not isinstance(message, str)):
+        return None
+    return value
+
+
+def read_update_status(home=None, *, available=False, reason=None, self_update=False, observed_job=None):
+    """Project update status: self_update, and a reason in every state ("none" when available).
+
+    The reason is for the App to explain itself; anything not classified reads
+    needs-repair. Older Apps ignore keys they do not know. An observed_job from
+    the Agent's availability reply is applied read-only; nothing is written.
+    """
+    result = dict(_read_update_status(home, available=available, observed_job=observed_job))
+    result["self_update"] = self_update is True
+    if result["available"]:
+        result["reason"] = "none"
+    else:
+        result["reason"] = reason if reason in _REPORTED_REASONS else "needs-repair"
+    return result
+
+
+def _read_update_status(home=None, *, available=False, observed_job=None):
     """Read the authoritative accepted job and C2 journal without recovery."""
     def none():
-        result = {"available": bool(available), "state": "none"}
-        if not available and reason in _STATUS_REASONS:
-            result["reason"] = reason
-        return result
+        return {"available": bool(available), "state": "none"}
 
     def recovery_needed():
         return {"available": bool(available), "state": "recovery-needed", "result": "Recovery needed."}
@@ -507,7 +632,8 @@ def read_update_status(home=None, *, available=False, reason=None):
         if journal_corrupt or (transaction and transaction.get("step") not in {"complete", "rolled_back"}):
             return recovery_needed()
         return none()
-    state = job.get("state")
+    raw_state = job.get("state")
+    state = raw_state
     if state not in _JOB_STATES:
         state = "recovery-needed"
     operation_id = job.get("operation_id")
@@ -556,9 +682,19 @@ def read_update_status(home=None, *, available=False, reason=None):
             if (not linked or (expected_step is not None
                     and (step != expected_step or not _terminal_success_verified(root, selected, job, transaction, state)))):
                 state = "recovery-needed"
+    # A positively dead worker's observation settles only an install.json job still
+    # launching or active, for this operation. A terminal record is never overridden.
+    observed = _observed_job(observed_job)
+    if not (observed is not None and raw_state in _OBSERVABLE_JOB_STATES
+            and observed["operation_id"] == operation_id):
+        observed = None
+    else:
+        state = observed["state"]
     outcome = state if state in {"updated", "rolled_back", "failed"} else None
     api_state = "active" if state in {"accepted", "launching", "active"} else "terminal" if outcome else state
     result = "Recovery needed." if state == "recovery-needed" else job.get("result") or job.get("message") or (outcome or api_state)
+    if observed is not None:
+        result = observed["message"]
     if not isinstance(result, str):
         result = state
     result = " ".join(result.split())[:240]
@@ -566,6 +702,8 @@ def read_update_status(home=None, *, available=False, reason=None):
               "result": result}
     if outcome:
         output["outcome"] = outcome
+    if observed is not None:
+        output["persisted"] = False
     for key in ("target_release", "accepted_at"):
         if isinstance(job.get(key), (int, str)):
             output[key] = job[key]
