@@ -635,3 +635,14 @@ def test_concurrent_discovering_launches_keep_every_grant(owner_source):
     assert not errors and len(captures) == 6
     assert stored_roots(case) == expected
     assert all(sorted(c.launch_roots) == expected for c in captures)
+
+
+def test_agent_host_shape_check_of_the_capture_needs_no_collection_count(owner_source):
+    """The Agent host re-validates the launcher capture as ``_validate_grants(grants)``
+    (generic_host._RuntimeSourceCustody). A real custody spawn failed with
+    "invalid private Runtime source capture" while ``limit`` was required."""
+    grant = owner_source.grant
+    sources._validate_grants([grant])
+    sources._validate_grants([grant], limit=1)
+    with pytest.raises(gate.HostLaunchError, match="grants are invalid"):
+        sources._validate_grants([grant], limit=0)

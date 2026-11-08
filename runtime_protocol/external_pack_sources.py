@@ -295,9 +295,14 @@ def _record_discovery(support_root, workspace_uuid, installed_root, refusals):
             "refusals": list(refusals)})
 
 
-def _validate_grants(grants, *, limit):
-    """``limit`` is the real installed-pack count of the selected collection."""
-    if not isinstance(grants, list) or len(grants) > limit:
+def _validate_grants(grants, *, limit=None):
+    """``limit`` is the real installed-pack count of the selected collection.
+
+    The Agent host re-validates the shape of the launcher's private capture,
+    already bounded at capture, with ``_validate_grants(grants)``; that call
+    has no collection to count, so ``None`` applies no count bound.
+    """
+    if not isinstance(grants, list) or (limit is not None and len(grants) > limit):
         raise HostLaunchError("external source grants are invalid")
     roots = []
     for grant in grants:
