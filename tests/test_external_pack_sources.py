@@ -862,3 +862,24 @@ def test_all_refused_collection_binds_the_agent_custody_to_built_ins_only(owner_
     custody = generic_host._RuntimeSourceCustody(handle)
     custody.bind(seen["preparation"])
     assert custody._launch_roots == [seen["builtin_root"]]
+
+
+@pytest.mark.integration
+def test_agent_bind_refuses_a_selected_root_outside_the_granted_set_by_name(owner_source, monkeypatch, astrid_importable):
+    """END round 3 ruling (3): build a preparation whose digest matches, so the grant check is
+    the one exercised. Only additional_pack_roots changes; the selected profile digest is
+    recomputed from the modified profile and the Runtime payload is re-signed over it."""
+    from astrid.core.execution import generic_host
+
+    case = owner_source
+    seen = _prepare_unselected(case, monkeypatch)
+    prep = copy.deepcopy(seen["preparation"])
+    value = json.loads(seen["sources"].payload)
+    ungranted = case.collection / "ungranted"
+    prep["profile"]["host_launch"]["additional_pack_roots"] = [{"path": str(ungranted), "files": {}}]
+    value["selected_profile_digest"] = gate.raw_digest(prep["profile"])
+    payload = gate.canonical(value)
+    handle = gate._RuntimeExternalSources(payload)
+    custody = generic_host._RuntimeSourceCustody(handle)
+    with pytest.raises(generic_host.HostError, match="selected pack root is not granted by retained Runtime custody"):
+        custody.bind(prep)
