@@ -496,3 +496,142 @@ def test_verifier_refuses_any_bytecode_env_but_the_runtime_policy(owner_source, 
         verifier.verify(**{**f.args, "environment": {**f.args["environment"], **bad}})
     with pytest.raises(gate.HostLaunchError, match="inside an installed pack collection"):
         gate.bytecode_environment(case.collection, config, profile)
+
+
+# --- Plan 06 Runtime-6: launch-time discovery of every verified installed pack ---
+
+def _no_selection(case):
+    profile = case.f.args["preparation"]["profile"]
+    profile["host_launch"]["additional_pack_roots"] = []
+    case.f.record["selected_profile_digest"] = gate.raw_digest(profile)
+
+
+def _break_revision(root):
+    pin = json.loads((root / "PIN").read_text()); pin["commit"] = "f" * 40
+    (root / "PIN").write_text(json.dumps(pin) + "\n")
+
+
+def test_custody_host_with_no_selection_discovers_every_verified_installed_pack(owner_source):
+    """(a) No selection at all: every pack whose record verifies is granted,
+    captured and selectable; the one that does not verify is a named refusal."""
+    case = owner_source
+    first, second, broken = install_many(case.collection, 3)
+    _break_revision(broken)
+    _no_selection(case)
+    assert not sources._state_path(case.service.support_root).exists()
+    capture = case.capture()
+    verified = sorted(str(r) for r in (case.root, first, second))
+    assert sorted(capture.launch_roots) == verified
+    assert stored_roots(case) == verified
+    assert capture.refusals == [{"pack_id": broken.name, "root": str(broken),
+        "reason": f"installed pack {broken.name} is excluded from host discovery: "
+                  "installed pack definitions revision differs from the install source commit"}]
+    # The refusal is recorded for diagnostics, outside the grants the Agent re-reads.
+    record = sources._read_state(sources._discovery_path(case.service.support_root))
+    assert record["refusals"] == capture.refusals and record["installed_pack_root"] == str(case.collection)
+    assert set(sources._read_state(sources._state_path(case.service.support_root))) == {"workspace_uuid", "grants"}
+    # The full launch carries every verified source; selection is still owner-bound.
+    f = case.f
+    verifier = gate.TrustedLocalHostLaunchVerifier(installed_release=f.record, external_sources=capture)
+    proof = verifier.verify(**f.args)
+    _, payload = verifier.claim(proof, **f.args, binding_fd=31)
+    body = json.loads(payload)["external_pack_sources"]
+    assert sorted(s["root"] for s in body["sources"]) == verified
+    handle = gate._RuntimeExternalSources(capture.payload)
+    definition = sources._derive_installed_grant(str(case.collection), first.name)["definitions"][0]
+    args = {"scope": body["scope"], "selected_profile_digest": body["selected_profile_digest"], "definition": definition}
+    assert json.loads(handle.select(root=str(first), **args))["source"]["root"] == str(first)
+    with pytest.raises(gate.HostLaunchError, match="external selected definition has no owner grant"):
+        handle.select(root=str(broken), **args)
+
+
+def test_pack_edited_after_install_is_excluded_from_discovery_by_name(owner_source):
+    """(b) Editing an installed record (or its bytes) after install excludes only that pack."""
+    case = owner_source
+    edited, kept = install_many(case.collection, 2)
+    record = json.loads((edited / ".build" / "definitions.json").read_text())
+    record["definitions"][0]["capability_id"] = "forged"
+    (edited / ".build" / "definitions.json").write_text(json.dumps(record))
+    _no_selection(case)
+    capture = case.capture()
+    assert sorted(capture.launch_roots) == sorted([str(case.root), str(kept)])
+    assert [(r["pack_id"], r["reason"]) for r in capture.refusals] == [(edited.name,
+        f"installed pack {edited.name} is excluded from host discovery: "
+        "installed pack definitions record differs from its admission digest")]
+    # Selecting the edited pack is still refused by name, not silently dropped.
+    profile = case.f.args["preparation"]["profile"]
+    profile["host_launch"]["additional_pack_roots"] = [{"path": str(edited), "files": {"pack.json": "0" * 64}}]
+    with pytest.raises(gate.HostLaunchError, match="definitions record differs from its admission digest"):
+        case.capture()
+
+
+def test_selected_pack_is_captured_first_and_others_are_discovered(owner_source):
+    case = owner_source
+    others = install_many(case.collection, 2)
+    capture = case.capture()
+    assert capture.launch_roots == [str(case.root), *sorted(str(r) for r in others)]
+    assert capture.refusals == []
+
+
+def test_production_preparer_launches_every_discovered_root_with_no_selection(owner_source, monkeypatch):
+    """The host argv carries --pack-root for each verified installed pack, unselected."""
+    from runtime_protocol import local_worker_composition as composition
+    from runtime_protocol.local_worker import _digest
+    from tests.test_local_worker import host_only_profile_case
+
+    case = owner_source
+    first, broken = install_many(case.collection, 2)
+    _break_revision(broken)
+    selected = host_only_profile_case()
+    assert selected.host_launch is not None
+    launch_config = dict(selected.host_launch)
+    profile = replace(selected, workspace_uuid=case.service.realm["id"], support_root=case.service.support_root,
+        host_launch=launch_config, session_config_digest=_digest(launch_config))
+    config = {**launch_config, "support_root": str(case.service.support_root), "runtime_instance_id": "epoch",
+        "installed_pack_root": str(case.collection), "runtime_endpoint": "http://127.0.0.1:1",
+        "credential_file": "/support/credential", "ready_file": "/support/ready.json"}
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    class Verifier:
+        def __init__(self, *, installed_release, external_sources=None):
+            seen["sources"] = external_sources
+
+        def verify(self, *, host_argv, **_kwargs):
+            seen["argv"] = host_argv
+            raise Stop
+
+    monkeypatch.setattr(composition, "_installed_host_release", lambda *_a: None)
+    monkeypatch.setattr(gate, "TrustedLocalHostLaunchVerifier", Verifier)
+    preparer = cast(Any, composition.CrossProcessWorkerPreparer)(profile=profile, config=config, environment={})
+    with pytest.raises(Stop):
+        preparer._prepare_host_only(profile, operation_id="op", channel_id="channel")
+    argv = seen["argv"]
+    roots = [argv[i + 1] for i, value in enumerate(argv) if value == "--pack-root"]
+    assert roots == [launch_config["pack_root"], *sorted([str(case.root), str(first)])]
+    assert str(broken) not in argv
+    assert [r["pack_id"] for r in seen["sources"].refusals] == [broken.name]
+
+
+def test_concurrent_discovering_launches_keep_every_grant(owner_source):
+    """(c) Concurrent custody builds, each discovering, serialize on the grants lock."""
+    import threading
+    case = owner_source
+    roots = install_many(case.collection, 6)
+    _no_selection(case)
+    barrier = threading.Barrier(6); captures = []; errors = []
+
+    def launch_once():
+        try:
+            barrier.wait(); captures.append(case.capture())
+        except Exception as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+    threads = [threading.Thread(target=launch_once) for _ in range(6)]
+    for t in threads: t.start()
+    for t in threads: t.join(60)
+    expected = sorted(str(r) for r in [case.root, *roots])
+    assert not errors and len(captures) == 6
+    assert stored_roots(case) == expected
+    assert all(sorted(c.launch_roots) == expected for c in captures)

@@ -347,9 +347,13 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         request = host_prepare_request(operation_id=operation_id, channel_id=channel_id, owner_epoch=epoch,
             runtime_owner=owner, profile=selected, custody_scope=str(scope))
         external_sources = None
-        if profile.host_launch.get("additional_pack_roots"):
-            from .external_pack_sources import OwnerSourceCapture
+        from .external_pack_sources import OwnerSourceCapture, installed_collection_present
+        if profile.host_launch.get("additional_pack_roots") or installed_collection_present(self.config.get("installed_pack_root")):
+            # Retained custody discovers every verified installed pack at launch,
+            # not only selected ones; unverified packs are named refusals.
             external_sources = OwnerSourceCapture(preparation=request, config=self.config)
+            if not external_sources.launch_roots and not profile.host_launch.get("additional_pack_roots"):
+                external_sources = None
         parent, control_child = socket.socketpair()
         activation, activation_child = socket.socketpair()
         binding_parent, binding_child = socket.socketpair()
@@ -375,6 +379,10 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 if _pack_inventory(extra["path"]) != extra["files"]:
                     raise ConflictError("selected additional pack bytes differ")
                 argv += ["--pack-root", extra["path"]]
+            selected_roots = {extra["path"] for extra in profile.host_launch.get("additional_pack_roots", [])}
+            for root in (external_sources.launch_roots if external_sources is not None else []):
+                if root not in selected_roots:
+                    argv += ["--pack-root", root]
             from .verified_host_launch import ENV_KEYS
             # Only the reviewed launch environment crosses this private owner
             # boundary; inherited credentials, Python knobs and product roots
