@@ -110,12 +110,14 @@ class UpdateAdmission:
         reason = None
         available = True
         self_update = False
+        observed_job = None
         try:
             # A pending journal is status evidence, not permission for GET to
             # recover it. POST reaches the Agent's locked reconciler instead.
             selection = self._selection(allow_pending=True)
             availability = self._status_availability(*selection[2:5])
             self_update = availability.get("self_update") is True
+            observed_job = availability.get("observed_job")
             if availability["available"] is False:
                 available = False
                 reason = availability.get("reason")
@@ -127,7 +129,8 @@ class UpdateAdmission:
             available = False
         if available and _installer_lock_held(home):
             available, reason = False, "busy"
-        return read_update_status(home, available=available, reason=reason, self_update=self_update)
+        return read_update_status(home, available=available, reason=reason, self_update=self_update,
+                                  observed_job=observed_job)
 
     def _status_availability(self, python, agent, runtime):
         """Read the Agent capability without invoking admission or recovery."""
@@ -143,11 +146,13 @@ class UpdateAdmission:
         actions = availability.get("actions")
         supported = (isinstance(actions, list) and all(isinstance(item, str) for item in actions)
                      and _SELF_UPDATE_ACTIONS <= set(actions))
+        observed_job = _observed_job(availability.get("observed_job"))
+        observed = {"observed_job": observed_job} if observed_job is not None else {}
         if availability["available"]:
-            return {"available": True, "self_update": supported}
+            return {"available": True, "self_update": supported, **observed}
         reason = availability.get("reason")
         return {"available": False, "self_update": supported,
-                **({"reason": reason} if reason in _STATUS_REASONS else {})}
+                **({"reason": reason} if reason in _STATUS_REASONS else {}), **observed}
 
     def _helper(self, python, agent, runtime, payload):
         script = ("import sys; sys.path[:0]=sys.argv[1:3]; "
@@ -491,13 +496,32 @@ def _terminal_success_verified(root, selected, job, transaction, state):
         return False
 
 
-def read_update_status(home=None, *, available=False, reason=None, self_update=False):
+_OBSERVED_STATES = frozenset({"failed", "recovery-needed"})
+# install.json states a positively dead worker can still leave unresolved.
+_OBSERVABLE_JOB_STATES = frozenset({"launching", "active"})
+
+
+def _observed_job(value):
+    """Return the Agent's observed_job when it is a well-formed, unpersisted observation, else None."""
+    if not isinstance(value, dict):
+        return None
+    operation_id = value.get("operation_id")
+    message = value.get("message")
+    if (value.get("state") not in _OBSERVED_STATES or value.get("persisted") is not False
+            or not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
+            or not isinstance(message, str)):
+        return None
+    return value
+
+
+def read_update_status(home=None, *, available=False, reason=None, self_update=False, observed_job=None):
     """Project update status: self_update, and a reason in every state ("none" when available).
 
     The reason is for the App to explain itself; anything not classified reads
-    needs-repair. Older Apps ignore keys they do not know.
+    needs-repair. Older Apps ignore keys they do not know. An observed_job from
+    the Agent's availability reply is applied read-only; nothing is written.
     """
-    result = dict(_read_update_status(home, available=available))
+    result = dict(_read_update_status(home, available=available, observed_job=observed_job))
     result["self_update"] = self_update is True
     if result["available"]:
         result["reason"] = "none"
@@ -506,7 +530,7 @@ def read_update_status(home=None, *, available=False, reason=None, self_update=F
     return result
 
 
-def _read_update_status(home=None, *, available=False):
+def _read_update_status(home=None, *, available=False, observed_job=None):
     """Read the authoritative accepted job and C2 journal without recovery."""
     def none():
         return {"available": bool(available), "state": "none"}
@@ -545,7 +569,8 @@ def _read_update_status(home=None, *, available=False):
         if journal_corrupt or (transaction and transaction.get("step") not in {"complete", "rolled_back"}):
             return recovery_needed()
         return none()
-    state = job.get("state")
+    raw_state = job.get("state")
+    state = raw_state
     if state not in _JOB_STATES:
         state = "recovery-needed"
     operation_id = job.get("operation_id")
@@ -594,9 +619,19 @@ def _read_update_status(home=None, *, available=False):
             if (not linked or (expected_step is not None
                     and (step != expected_step or not _terminal_success_verified(root, selected, job, transaction, state)))):
                 state = "recovery-needed"
+    # A positively dead worker's observation settles only an install.json job still
+    # launching or active, for this operation. A terminal record is never overridden.
+    observed = _observed_job(observed_job)
+    if not (observed is not None and raw_state in _OBSERVABLE_JOB_STATES
+            and observed["operation_id"] == operation_id):
+        observed = None
+    else:
+        state = observed["state"]
     outcome = state if state in {"updated", "rolled_back", "failed"} else None
     api_state = "active" if state in {"accepted", "launching", "active"} else "terminal" if outcome else state
     result = "Recovery needed." if state == "recovery-needed" else job.get("result") or job.get("message") or (outcome or api_state)
+    if observed is not None:
+        result = observed["message"]
     if not isinstance(result, str):
         result = state
     result = " ".join(result.split())[:240]
@@ -604,6 +639,8 @@ def _read_update_status(home=None, *, available=False):
               "result": result}
     if outcome:
         output["outcome"] = outcome
+    if observed is not None:
+        output["persisted"] = False
     for key in ("target_release", "accepted_at"):
         if isinstance(job.get(key), (int, str)):
             output[key] = job[key]
