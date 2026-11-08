@@ -14,6 +14,7 @@ from pathlib import Path
 from .daemon import RuntimeDaemon, WORKER_SCOPES
 from .door import DEFAULT_DOOR_PORT, DoorConfig
 from .local_worker_composition import load_local_worker_composition
+from .store import selected_installed_pack_root
 from .backup import create_backup, restore_backup, structured_export
 from .errors import RuntimeErrorBase
 from .store import REALM_ADMISSION_TIMEOUT_SECONDS, RealmStore
@@ -421,6 +422,7 @@ def _main(args):
                 realm_root=Path(args.root).expanduser().resolve(),
                 support_root=Path(args.support_root).expanduser().resolve() if args.support_root else Path(args.root).expanduser().resolve() / "support",
                 runtime_instance_id="pending-startup",
+                installed_pack_root=selected_installed_pack_root(args.installed_pack_root),
             )
         from .services import load_service_configuration
         services = load_service_configuration(args.service_declaration,

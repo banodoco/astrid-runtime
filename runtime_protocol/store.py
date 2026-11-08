@@ -191,6 +191,15 @@ def _read_pack_json(directory_fd, name):
     return value, data
 
 
+def selected_installed_pack_root(explicit=None):
+    """The one installed-pack collection: admission and custody grants both derive from it.
+
+    It is the Agent's `astrid packs install` target (Path.home()/"Astrid"/"packs")
+    unless the host explicitly selects another. ASTRID_PACKS_PATH never selects it.
+    """
+    return Path(explicit).expanduser() if explicit is not None else Path.home() / "Astrid" / "packs"
+
+
 class InstalledPackAdmissions:
     """Read M1's files in one declared installed collection, without writes.
 

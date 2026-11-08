@@ -24,7 +24,7 @@ from .errors import ConflictError, NotFoundError, ProtocolError, RuntimeErrorBas
 from .server import RuntimeHTTPServer, RuntimeHandler
 from .service import RuntimeService
 from .startup_identity import capture_startup_identity
-from .store import realm_admission_fence, InstalledPackAdmissions
+from .store import realm_admission_fence, InstalledPackAdmissions, selected_installed_pack_root
 from .util import atomic_json_write, now
 
 
@@ -90,7 +90,7 @@ class RuntimeDaemon:
             # ASTRID_PACKS_PATH only extends discovery and never selects the
             # install collection; Runtime has no knowledge of the Agent's
             # --packs-root override, so it reads only this default.
-            selected_pack_root = Path.home() / "Astrid" / "packs"
+            selected_pack_root = selected_installed_pack_root()
         self.pack_admissions = (InstalledPackAdmissions(selected_pack_root)
                                 if selected_pack_root is not None else pack_admissions)
         self.instance_id = uuid.uuid4().hex

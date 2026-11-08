@@ -1249,7 +1249,7 @@ def _path(value: Any, label: str, *, directory: bool | None = None) -> Path:
     return target
 
 
-def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, realm_root: Path, support_root: Path, runtime_instance_id: str) -> LocalWorkerComposition:
+def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, realm_root: Path, support_root: Path, runtime_instance_id: str, installed_pack_root: str | Path | None = None) -> LocalWorkerComposition:
     target = _path(str(path), "path", directory=False)
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
@@ -1275,7 +1275,7 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
         raise ValidationError("additional pack declarations require host-only mode")
     if mode == "host_only_cpu":
         return _load_host_only_composition(raw, workspace_uuid=workspace_uuid, realm_root=realm_root,
-            support_root=support_root, runtime_instance_id=runtime_instance_id)
+            support_root=support_root, runtime_instance_id=runtime_instance_id, installed_pack_root=installed_pack_root)
     if "host_protocol" in raw:
         from .verified_host_launch import validate_host_protocol, HostLaunchError
         try:
@@ -1500,7 +1500,7 @@ def _retain_local_worker_composition(value, *, required=False):
     return retained
 
 
-def _load_host_only_composition(raw, *, workspace_uuid, realm_root, support_root, runtime_instance_id):
+def _load_host_only_composition(raw, *, workspace_uuid, realm_root, support_root, runtime_instance_id, installed_pack_root=None):
     from .local_worker import _digest
     prohibited = {"worker_environment", "worker_executable", "worker_artifact_digest", "engine_executable", "engine_listener_executable",
         "engine_artifact_digest", "engine_listener_artifact_digest", "engine_endpoint", "engine_launch"}
@@ -1529,7 +1529,8 @@ def _load_host_only_composition(raw, *, workspace_uuid, realm_root, support_root
         raise ValidationError("host-only selected configuration differs")
     config = {**launch, "host_python": str(executable), "runtime_endpoint": "http://127.0.0.1:0",
         "runtime_instance_id": runtime_instance_id, "credential_file": str(Path(support_root) / "credentials/astrid-pack-host.token"),
-        "support_root": str(support_root), "ready_file": str(Path(support_root) / f"worker-{profile.profile_id}-ready.json")}
+        "support_root": str(support_root),
+        **({"installed_pack_root": str(installed_pack_root)} if installed_pack_root is not None else {}), "ready_file": str(Path(support_root) / f"worker-{profile.profile_id}-ready.json")}
     return LocalWorkerComposition({profile.profile_id: profile}, CrossProcessWorkerPreparer(profile=profile, config=config,
         environment=launch["environment"], timeout_seconds=float(raw.get("worker_timeout_seconds") or 120), cleanup_timeout_seconds=2.0), OSProcessInspector(profile))
 

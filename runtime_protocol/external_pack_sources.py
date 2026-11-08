@@ -1,4 +1,20 @@
-"""Private owner grants and captured external source bytes for local launches."""
+"""Custody grants and captured external source bytes for local launches.
+
+There is exactly one production grant path: the grant for an installed pack is
+DERIVED from the same selected installed collection the Runtime already uses for
+admission (``config["installed_pack_root"]``, the daemon's ``selected_pack_root``).
+It is derived only when the install record verifies end to end:
+
+  collection/.group.json admissions[pack_id]  (packId, sourceDigest, definitionsDigest)
+    -> sha256(pack/.build/definitions.json) == definitionsDigest
+    -> definitions.json source.kind == "git" with repository, revision, tree
+    -> pack/PIN commit == definitions.revision and PIN digest == sourceDigest
+
+Every refusal is named. A source outside that collection, a local-folder
+install (no git provenance) or any edited record is refused. The derived grant
+is persisted to the private owner state (grants.json) because the Agent's
+custody check re-reads it; no caller, claim or profile can write that file.
+"""
 from __future__ import annotations
 
 import base64
@@ -12,7 +28,6 @@ import threading
 from pathlib import Path
 
 from . import platform
-from .errors import AuthorizationError
 from .verified_host_launch import (
     HostLaunchError,
     _absolute,
@@ -50,18 +65,115 @@ def _read_state(path):
         raise HostLaunchError("external source owner state is not an owner-only file") from exc
 
 
-def _write_owner_grants(service, grants, *, identity):
-    """In-process owner configuration only; never exposed as a protocol route."""
-    service._require_placement_recovery_owner(identity)
-    if identity.get("actor") != "owner":
-        raise AuthorizationError("external source configuration requires the owner")
-    if service.support_root is None:
-        raise HostLaunchError("external sources require private Runtime support state")
-    _validate_grants(grants)
-    from .local_execution_handoff import write_protected
-    path = _state_path(service.support_root)
+GROUP_STATE = ".group.json"
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_HEX40 = re.compile(r"[0-9a-f]{40}")
+
+
+def _json_file(path, label):
     _no_alias(path)
-    write_protected(path, {"workspace_uuid": service.realm["id"], "grants": grants})
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode) or path.lstat().st_size > SOURCE_LIMIT:
+            raise HostLaunchError(f"{label} is not a bounded regular file")
+        data = path.read_bytes()
+    except OSError as exc:
+        raise HostLaunchError(f"{label} is missing or unreadable") from exc
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate field")
+            result[key] = value
+        return result
+    try:
+        return json.loads(data.decode("utf-8"), object_pairs_hook=unique), data
+    except (ValueError, UnicodeError) as exc:
+        raise HostLaunchError(f"{label} is not unambiguous JSON") from exc
+
+
+def _installed_inventory(root):
+    _no_alias(root)
+    files = {}
+    for path in sorted(root.rglob("*")):
+        _no_alias(path)
+        if path.is_dir():
+            continue
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise HostLaunchError("installed pack contains a non-regular file")
+        files[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if len(files) > FILE_LIMIT:
+            raise HostLaunchError("external source inventory exceeds its bound")
+    if not files:
+        raise HostLaunchError("installed pack is empty")
+    return files
+
+
+def _derive_installed_grant(installed_root, pack_id):
+    """The single grant derivation: install record -> grant, or a named refusal."""
+    if not isinstance(pack_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", pack_id):
+        raise HostLaunchError("installed pack identity is invalid")
+    installed_root = Path(_absolute(str(installed_root)))
+    root = installed_root / pack_id
+    state, _ = _json_file(installed_root / GROUP_STATE, "installed group record")
+    admission = state.get("admissions", {}).get(pack_id) if isinstance(state, dict) and isinstance(state.get("admissions"), dict) else None
+    if (not isinstance(admission, dict) or admission.get("packId", pack_id) != pack_id
+            or not isinstance(admission.get("sourceDigest"), str) or not _HEX64.fullmatch(admission["sourceDigest"])):
+        raise HostLaunchError("installed pack admission does not verify")
+    recorded = admission.get("definitionsDigest")
+    if not isinstance(recorded, str) or not _HEX64.fullmatch(recorded):
+        raise HostLaunchError("installed pack admission binds no definitions record")
+    build = root / ".build"
+    if (build / "admission.json").exists():
+        browser, _ = _json_file(build / "admission.json", "installed pack browser admission")
+        if (not isinstance(browser, dict) or browser.get("packId") != pack_id
+                or browser.get("sourceDigest") != admission["sourceDigest"]):
+            raise HostLaunchError("installed pack admission does not verify")
+    definitions, raw = _json_file(build / "definitions.json", "installed pack definitions record")
+    if hashlib.sha256(raw).hexdigest() != recorded:
+        raise HostLaunchError("installed pack definitions record differs from its admission digest")
+    if not isinstance(definitions, dict) or definitions.get("version") != 1 or not isinstance(definitions.get("source"), dict):
+        raise HostLaunchError("installed pack definitions record is invalid")
+    source = definitions["source"]
+    if source.get("kind") == "folder":
+        raise HostLaunchError("installed pack came from a local folder and has no source repository provenance")
+    if source.get("kind") != "git" or any(source.get(k) != definitions.get(k) for k in ("repository", "revision", "tree")):
+        raise HostLaunchError("installed pack definitions source provenance is inconsistent")
+    repository, revision, tree = definitions["repository"], definitions["revision"], definitions["tree"]
+    if (not isinstance(repository, str) or not repository or not isinstance(revision, str) or not _HEX40.fullmatch(revision)
+            or not isinstance(tree, str) or not _HEX40.fullmatch(tree)):
+        raise HostLaunchError("installed pack definitions source provenance is invalid")
+    pin, _ = _json_file(root / "PIN", "installed pack PIN")
+    if not isinstance(pin, dict) or pin.get("commit") != revision:
+        raise HostLaunchError("installed pack definitions revision differs from the install source commit")
+    if pin.get("digest") not in (None, admission["sourceDigest"]):
+        raise HostLaunchError("installed pack PIN differs from its admission")
+    grant = {"repository": repository, "checkout": str(installed_root), "revision": revision,
+        "subpath": pack_id, "tree": tree, "root": str(root), "files": _installed_inventory(root),
+        "definitions": definitions.get("definitions")}
+    try:
+        _validate_grants([grant])
+    except HostLaunchError as exc:
+        raise HostLaunchError(f"installed pack definitions are invalid: {exc}") from exc
+    return grant
+
+
+def _persist_derived_grants(support_root, workspace_uuid, grants):
+    """Persist derived grants (merged by root) where the Agent re-reads them."""
+    from .local_execution_handoff import write_protected
+    path = _state_path(support_root)
+    _no_alias(path)
+    merged = {}
+    try:
+        previous = _read_state(path)
+        if isinstance(previous, dict) and previous.get("workspace_uuid") == workspace_uuid:
+            merged = {g["root"]: g for g in previous.get("grants", []) if isinstance(g, dict) and "root" in g}
+    except HostLaunchError:
+        pass
+    merged.update({g["root"]: g for g in grants})
+    ordered = [merged[k] for k in sorted(merged)]
+    _validate_grants(ordered)
+    write_protected(path, {"workspace_uuid": workspace_uuid, "grants": ordered})
 
 
 def _validate_grants(grants):
@@ -160,6 +272,11 @@ def _identity(path, *, ancestor=False):
 def _capture(grant):
     checkout = _absolute(grant["checkout"]); root = _absolute(grant["root"])
     _no_alias(checkout); _no_alias(checkout / ".git"); _no_alias(root)
+    if (checkout / GROUP_STATE).exists():
+        # Installed collection: provenance is the verified install record, not a git read.
+        if _derive_installed_grant(checkout, Path(grant["subpath"]).name) != grant:
+            raise HostLaunchError("installed pack differs from its derived custody grant")
+        return _materialize(grant, root, None)
     if _git(checkout, "rev-parse", "--show-toplevel").decode().strip() != str(checkout):
         raise HostLaunchError("external repository checkout differs")
     if _git(checkout, "config", "--no-includes", "--local", "--get", "remote.origin.url").decode().strip() != grant["repository"]:
@@ -190,6 +307,11 @@ def _capture(grant):
             else: raise HostLaunchError("external repository contains symlink or foreign materialization")
             if len(blobs) > FILE_LIMIT:
                 raise HostLaunchError("external repository inventory exceeds its bound")
+    return _materialize(grant, root, blobs)
+
+
+def _materialize(grant, root, blobs):
+    """Pin and read every file; ``blobs`` (git object ids) is None for installed packs."""
     anchors = {str(path): _identity(path, ancestor=True) for path in root.parents}
     materialization = {str(root): _identity(root)}
     actual = set()
@@ -206,7 +328,7 @@ def _capture(grant):
             actual.add(str(path.relative_to(root)))
         if len(actual) > FILE_LIMIT:
             raise HostLaunchError("external source inventory exceeds its bound")
-    if actual != set(grant["files"]) or actual != set(blobs):
+    if actual != set(grant["files"]) or (blobs is not None and actual != set(blobs)):
         raise HostLaunchError("external source inventory differs from exact repository tree")
     contents = {}; total = 0
     for relative, pin in grant["files"].items():
@@ -215,7 +337,7 @@ def _capture(grant):
         data = read_source(root / relative, pin); total += len(data)
         if total > SOURCE_LIMIT:
             raise HostLaunchError("external captured source exceeds its bound")
-        if hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest() != blobs[relative]:
+        if blobs is not None and hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest() != blobs[relative]:
             raise HostLaunchError("external source bytes differ from repository tree")
         contents[relative] = base64.b64encode(data).decode("ascii")
     if (any(_identity(Path(path)) != identity for path, identity in materialization.items())
@@ -230,12 +352,24 @@ class OwnerSourceCapture:
     def __init__(self, *, preparation, config):
         self._context = canonical({"preparation": preparation, "config": config})
         self._path = _state_path(config["support_root"])
+        selected = preparation["profile"]["host_launch"]["additional_pack_roots"]
+        # THE grant lookup: every selected source must be a pack of the selected
+        # installed collection; its grant is derived from the install record.
+        installed = config.get("installed_pack_root")
+        derived = []
+        for extra in selected:
+            if not isinstance(installed, str) or not installed:
+                raise HostLaunchError("selected external source has no owner grant: no installed pack collection is selected")
+            path = _absolute(extra["path"])
+            if path.parent != _absolute(installed):
+                raise HostLaunchError("selected external source has no owner grant: it is outside the selected installed pack collection")
+            derived.append(_derive_installed_grant(installed, path.name))
+        _persist_derived_grants(config["support_root"], preparation["profile"]["workspace_uuid"], derived)
         state = _read_state(self._path)
         if not isinstance(state, dict) or set(state) != {"workspace_uuid", "grants"} or state["workspace_uuid"] != preparation["profile"]["workspace_uuid"]:
             raise HostLaunchError("external source owner scope differs")
         _validate_grants(state["grants"])
-        self._state = canonical(state)
-        selected = preparation["profile"]["host_launch"]["additional_pack_roots"]
+        self._workspace = state["workspace_uuid"]
         self._grants = []
         for extra in selected:
             matches = [g for g in state["grants"] if g["root"] == extra["path"] and g["files"] == extra["files"]]
@@ -259,7 +393,9 @@ class OwnerSourceCapture:
     def verify(self, *, preparation, config):
         if canonical({"preparation": preparation, "config": config}) != self._context:
             raise HostLaunchError("external source launch scope changed")
-        if canonical(_read_state(self._path)) != self._state:
+        current = _read_state(self._path)
+        if (not isinstance(current, dict) or current.get("workspace_uuid") != self._workspace
+                or any(g not in current.get("grants", []) for g in self._grants)):
             raise HostLaunchError("external source owner grant changed")
         if canonical([_capture(g) for g in self._grants]) != canonical(json.loads(self.payload)["sources"]):
             raise HostLaunchError("external source changed after capture")
