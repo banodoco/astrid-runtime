@@ -160,17 +160,19 @@ def _refusal(pack_id, root, reason):
         "reason": f"installed pack {pack_id} is excluded from host discovery: {reason}"}
 
 
-def discover_installed_grants(installed_root):
+def discover_installed_grants(installed_root, names=None):
     """Launch-time discovery: a grant for every installed pack whose record verifies.
 
     Each pack directory of the selected installed collection goes through the
     single verifier (_derive_installed_grant). A pack that does not verify is
     excluded with a named refusal; it never fails discovery of the others.
+    ``names`` is the collection scan the caller already took (one count per
+    launch); without it the collection is scanned here.
     Returns (grants, refusals), both ordered by pack name.
     """
     installed_root = Path(_absolute(str(installed_root)))
     grants, refusals = [], []
-    for name in _installed_pack_names(installed_root):
+    for name in (_installed_pack_names(installed_root) if names is None else sorted(names)):
         try:
             grants.append(_derive_installed_grant(installed_root, name))
         except HostLaunchError as exc:
@@ -239,7 +241,15 @@ def _current_grant(installed_root, stored):
     return current if current["root"] == stored.get("root") else None
 
 
-def _persist_derived_grants(support_root, workspace_uuid, grants, installed_root):
+def _check_grant_count(grants, limit):
+    """The collection bound, refused by name: a pack set that grew or shrank
+    while this launch derived its grants (``packs add``/``packs remove``)."""
+    if limit is not None and isinstance(grants, list) and len(grants) > limit:
+        raise HostLaunchError(f"installed pack collection changed during launch: {len(grants)} grants "
+            f"exceed the {limit} installed packs counted at discovery; retry the launch")
+
+
+def _persist_derived_grants(support_root, workspace_uuid, grants, installed_root, *, limit=None):
     """Persist the current grants where the Agent re-reads them.
 
     The whole read-merge-write runs under an exclusive lock on a sibling lock
@@ -249,12 +259,15 @@ def _persist_derived_grants(support_root, workspace_uuid, grants, installed_root
     Grants are keyed by root. Stored grants are only history: each one is kept
     only while its root still derives from the current installed collection,
     so history can never refuse a launch. Unreadable state is a named refusal.
+    ``limit`` is the launch's one collection count (taken with its discovery
+    scan); without it the collection is counted here.
     """
     from .local_execution_handoff import write_protected
     path = _state_path(support_root)
     _no_alias(path)
     installed = Path(_absolute(str(installed_root))) if installed_root else None
-    limit = _installed_pack_count(installed) if installed is not None else 0
+    if limit is None:
+        limit = _installed_pack_count(installed) if installed is not None else 0
     platform.private_directory(path.parent)
     with platform.file_lock(path.with_name(path.name + ".lock")):
         previous = _read_state(path, missing_ok=True)
@@ -270,6 +283,7 @@ def _persist_derived_grants(support_root, workspace_uuid, grants, installed_root
                         merged[current["root"]] = current
         merged.update({g["root"]: g for g in grants})
         ordered = [merged[k] for k in sorted(merged)]
+        _check_grant_count(ordered, limit)
         _validate_grants(ordered, limit=limit)
         write_protected(path, {"workspace_uuid": workspace_uuid, "grants": ordered})
 
@@ -491,21 +505,31 @@ class OwnerSourceCapture:
             derived.append(_derive_installed_grant(installed, path.name))
         # Launch-time discovery: every installed pack whose record verifies is
         # granted at custody build, selected or not; the rest are named refusals.
-        discovered, refusals = (discover_installed_grants(installed)
-            if isinstance(installed, str) and installed else ([], []))
+        # The collection is scanned and counted ONCE, before the persist: the
+        # same count bounds the persist and the check below, so a ``packs
+        # remove`` in between cannot turn into a generic grant refusal (N1).
+        has_collection = isinstance(installed, str) and bool(installed)
+        names = _installed_pack_names(installed) if has_collection else []
+        limit = len(names)
+        discovered, refusals = (discover_installed_grants(installed, names) if has_collection else ([], []))
         workspace = preparation["profile"]["workspace_uuid"]
-        _persist_derived_grants(config["support_root"], workspace, [*derived, *discovered], installed)
+        _persist_derived_grants(config["support_root"], workspace, [*derived, *discovered], installed, limit=limit)
         state = _read_state(self._path)
         if not isinstance(state, dict) or set(state) != {"workspace_uuid", "grants"} or state["workspace_uuid"] != workspace:
             raise HostLaunchError("external source owner scope differs")
-        _validate_grants(state["grants"], limit=_installed_pack_count(installed) if installed else 0)
+        _check_grant_count(state["grants"], limit)
+        _validate_grants(state["grants"], limit=limit)
         self._workspace = state["workspace_uuid"]
+        self._support_root = config["support_root"]
+        self._installed = installed if has_collection else None
+        self._collection_identity = _identity(Path(_absolute(installed)), ancestor=True) if has_collection else None
         self._grants = []
         for extra in selected:
             matches = [g for g in state["grants"] if g["root"] == extra["path"] and g["files"] == extra["files"]]
             if len(matches) != 1:
                 raise HostLaunchError("selected external source has no owner grant")
             self._grants.append(matches[0])
+        self._selected_roots = frozenset(g["root"] for g in self._grants)
         captured = [_capture(g) for g in self._grants]
         chosen = {g["root"] for g in self._grants}
         for grant in discovered:
@@ -521,23 +545,43 @@ class OwnerSourceCapture:
                 continue
             self._grants.append(grant); captured.append(source); chosen.add(grant["root"])
         self._refusals = tuple(sorted(refusals, key=lambda r: r["pack_id"]))
-        if isinstance(installed, str) and installed:
+        if self._installed is not None:
             _record_discovery(config["support_root"], workspace, installed, self._refusals)
-        self._payload = canonical({"scope": {k: preparation[k] for k in ("operation_id", "channel_id", "owner_epoch", "custody_scope")},
-            "selected_profile_digest": raw_digest(preparation["profile"]),
-            "sources": captured})
+        self._scope = {k: preparation[k] for k in ("operation_id", "channel_id", "owner_epoch", "custody_scope")}
+        self._profile_digest = raw_digest(preparation["profile"])
+        self._captured = captured
+        self._payload = self._render_payload()
+        self._pinned = False
         self._claimed = False
         self._lock = threading.Lock()
         self.verify(preparation=preparation, config=config)
 
+    def _render_payload(self):
+        return canonical({"scope": self._scope, "selected_profile_digest": self._profile_digest,
+            "sources": self._captured})
+
     @property
     def payload(self):
+        """The captured bytes. Reading them fixes the launch set (see ``pin``)."""
+        self._pinned = True
         return self._payload
 
     @property
     def launch_roots(self):
         """Every granted root this launch carries: selected first, then discovered."""
         return [g["root"] for g in self._grants]
+
+    def pin(self, *, preparation, config):
+        """Re-verify, exclude changed unselected packs, then fix the launch set.
+
+        The host argv carries a --pack-root for each returned root and the
+        verified launch pins this payload, so after the pin no pack can be
+        dropped any more: every carried pack is then verified strictly.
+        """
+        with self._lock:
+            self.verify(preparation=preparation, config=config)
+            self._pinned = True
+            return self.launch_roots
 
     @property
     def refusals(self):
@@ -548,19 +592,59 @@ class OwnerSourceCapture:
         raise TypeError("external source captures cannot be serialized")
 
     def verify(self, *, preparation, config):
+        """Selected packs, the owner scope and the collection itself are verified
+        strictly: any change refuses the whole launch. Until the launch is pinned
+        (``pin``), an unselected discovered pack that changed after capture is
+        excluded on its own with a named refusal and the others still launch (N2);
+        once pinned, the argv and payload carry it, so it is verified strictly."""
         if canonical({"preparation": preparation, "config": config}) != self._context:
             raise HostLaunchError("external source launch scope changed")
         current = _read_state(self._path)
-        if (not isinstance(current, dict) or current.get("workspace_uuid") != self._workspace
-                or any(g not in current.get("grants", []) for g in self._grants)):
+        if not isinstance(current, dict) or current.get("workspace_uuid") != self._workspace:
             raise HostLaunchError("external source owner grant changed")
-        if canonical([_capture(g) for g in self._grants]) != canonical(json.loads(self.payload)["sources"]):
-            raise HostLaunchError("external source changed after capture")
+        if self._installed is not None:
+            try:
+                root = Path(_absolute(self._installed))
+                _no_alias(root)
+                same = _identity(root, ancestor=True) == self._collection_identity
+            except (HostLaunchError, OSError) as exc:
+                raise HostLaunchError("installed pack collection changed after capture") from exc
+            if not same:
+                raise HostLaunchError("installed pack collection changed after capture")
+        excluded = []
+        for index, (grant, source) in enumerate(zip(self._grants, self._captured)):
+            strict = self._pinned or grant["root"] in self._selected_roots
+            if grant not in current.get("grants", []):
+                if strict:
+                    raise HostLaunchError("external source owner grant changed")
+                excluded.append((index, "its owner grant changed after capture"))
+                continue
+            try:
+                same = canonical(_capture(grant)) == canonical(source)
+                reason = "it changed after capture"
+            except HostLaunchError as exc:
+                if strict:
+                    raise
+                same, reason = False, f"it changed after capture: {exc}"
+            if not same:
+                if strict:
+                    raise HostLaunchError("external source changed after capture")
+                excluded.append((index, reason))
+        if excluded:
+            dropped = {index for index, _ in excluded}
+            refusals = [*self._refusals, *(_refusal(self._grants[i]["subpath"], self._grants[i]["root"], reason)
+                for i, reason in excluded)]
+            self._grants = [g for i, g in enumerate(self._grants) if i not in dropped]
+            self._captured = [c for i, c in enumerate(self._captured) if i not in dropped]
+            self._refusals = tuple(sorted(refusals, key=lambda r: r["pack_id"]))
+            self._payload = self._render_payload()
+            _record_discovery(self._support_root, self._workspace, self._installed, self._refusals)
 
     def claim(self, *, preparation, config):
         with self._lock:
             if self._claimed:
                 raise HostLaunchError("external source capture already claimed")
             self._claimed = True
+            self._pinned = True
             self.verify(preparation=preparation, config=config)
             return self.payload

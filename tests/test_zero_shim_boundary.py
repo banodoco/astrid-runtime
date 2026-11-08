@@ -121,8 +121,15 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
     monkeypatch.setattr(module.platform, "log_dir", lambda: tmp_path / "logs")
     monkeypatch.setattr(module.platform, "spawn_tree", fake_spawn_tree)
     monkeypatch.setattr("astrid_runtime.runtime_boundary.RoleBoundCustodyBroker", FakeBroker)
-    monkeypatch.setattr("astrid_runtime.runtime_boundary.default_process_identity",
-                        lambda pid: {"pid": pid, "uid": module.platform.current_user(), "birth_id": "birth"})
+    fake_identity = lambda pid: {"pid": pid, "uid": module.platform.current_user(), "birth_id": "birth"}
+    monkeypatch.setattr("astrid_runtime.runtime_boundary.default_process_identity", fake_identity)
+    # The native (no-broker) path publishes NativeProcessCustody, which on a real
+    # Linux kernel re-observes the target and pins a pidfd token (ae36d68). The
+    # fake child (pid 123) is not a live process, so give custody the same fake
+    # incarnation the boundary saw; this test is about argv/env, not custody.
+    monkeypatch.setattr(custody, "default_process_identity", fake_identity)
+    monkeypatch.setattr(custody.process_binding, "supported", lambda: True)
+    monkeypatch.setattr(custody.linux_process_binding, "token", lambda pid: {"words": [pid]})
     monkeypatch.setattr("astrid_runtime.runtime_boundary.publish_active_capability", lambda *_a, **_k: None)
     monkeypatch.setattr("astrid_runtime.runtime_boundary.subprocess.Popen", fake_popen)
     monkeypatch.setattr(boundary, "_wait_endpoint", lambda _support, _process: "http://127.0.0.1:1")

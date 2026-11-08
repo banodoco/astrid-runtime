@@ -646,3 +646,201 @@ def test_agent_host_shape_check_of_the_capture_needs_no_collection_count(owner_s
     sources._validate_grants([grant], limit=1)
     with pytest.raises(gate.HostLaunchError, match="grants are invalid"):
         sources._validate_grants([grant], limit=0)
+
+
+# --- Plan 06 Runtime-8: B1 refused packs, N1 single count, N2 per-pack exclusion ---
+
+def _install_refused(collection):
+    """Add a folder install (no source provenance) and a pack whose admission
+    binds the wrong definitionsDigest, keeping every admission in one record."""
+    admissions = json.loads((collection / ".group.json").read_text())["admissions"]
+    folder = install_pack(collection, "folderpack", source={"kind": "folder", "path": "/somewhere"})
+    admissions.update(json.loads((collection / ".group.json").read_text())["admissions"])
+    digest = install_pack(collection, "baddigest", tamper_digest=True)
+    admissions.update(json.loads((collection / ".group.json").read_text())["admissions"])
+    state = json.loads((collection / ".group.json").read_text()); state["admissions"] = admissions
+    (collection / ".group.json").write_text(json.dumps(state))
+    return folder, digest
+
+
+_REFUSED_REASONS = {
+    "baddigest": "installed pack baddigest is excluded from host discovery: "
+                 "installed pack definitions record differs from its admission digest",
+    "folderpack": "installed pack folderpack is excluded from host discovery: "
+                  "installed pack came from a local folder and has no source repository provenance",
+}
+
+
+def _prepare_unselected(case, monkeypatch):
+    """Drive the production custody build (CrossProcessWorkerPreparer._prepare_host_only)
+    with no selection up to the verifier; return what the verifier was handed."""
+    from runtime_protocol import local_worker_composition as composition
+    from runtime_protocol.local_worker import _digest
+    from tests.test_local_worker import host_only_profile_case
+
+    selected = host_only_profile_case()
+    assert selected.host_launch is not None and not selected.host_launch.get("additional_pack_roots")
+    launch_config = dict(selected.host_launch)
+    profile = replace(selected, workspace_uuid=case.service.realm["id"], support_root=case.service.support_root,
+        host_launch=launch_config, session_config_digest=_digest(launch_config))
+    config = {**launch_config, "support_root": str(case.service.support_root), "runtime_instance_id": "epoch",
+        "installed_pack_root": str(case.collection), "runtime_endpoint": "http://127.0.0.1:1",
+        "credential_file": "/support/credential", "ready_file": "/support/ready.json"}
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    class Verifier:
+        def __init__(self, *, installed_release, external_sources=None):
+            seen["sources"] = external_sources
+
+        def verify(self, *, preparation, host_argv, **_kwargs):
+            seen.update(argv=host_argv, preparation=preparation)
+            raise Stop
+
+    monkeypatch.setattr(composition, "_installed_host_release", lambda *_a: None)
+    monkeypatch.setattr(gate, "TrustedLocalHostLaunchVerifier", Verifier)
+    preparer = cast(Any, composition.CrossProcessWorkerPreparer)(profile=profile, config=config, environment={})
+    with pytest.raises(Stop):
+        preparer._prepare_host_only(profile, operation_id="op", channel_id="channel")
+    seen["pack_roots"] = [seen["argv"][i + 1] for i, v in enumerate(seen["argv"]) if v == "--pack-root"]
+    seen["builtin_root"] = launch_config["pack_root"]
+    return seen
+
+
+def test_refused_installed_packs_keep_custody_stay_out_of_argv_and_are_named(owner_source, monkeypatch):
+    """B1 ruling (a)+(b): with no selection the Runtime keeps OwnerSourceCapture whenever the
+    installed collection is present; refused packs get no --pack-root and are named in
+    discovery.json with their reasons."""
+    case = owner_source
+    folder, digest = _install_refused(case.collection)
+    seen = _prepare_unselected(case, monkeypatch)
+    capture = seen["sources"]
+    assert capture is not None  # (a) custody kept
+    assert seen["pack_roots"] == [seen["builtin_root"], str(case.root)]  # granted pack only
+    for refused in (folder, digest):  # (b) never a launch root, never anywhere in argv
+        assert str(refused) not in seen["argv"]
+    named = {r["pack_id"]: r["reason"] for r in capture.refusals}
+    assert named == _REFUSED_REASONS
+    record = sources._read_state(sources._discovery_path(case.service.support_root))
+    assert record["installed_pack_root"] == str(case.collection)
+    assert {r["pack_id"]: (r["root"], r["reason"]) for r in record["refusals"]} == {
+        "baddigest": (str(digest), _REFUSED_REASONS["baddigest"]),
+        "folderpack": (str(folder), _REFUSED_REASONS["folderpack"])}
+    assert [s["root"] for s in json.loads(capture.payload)["sources"]] == [str(case.root)]
+
+
+def test_collection_with_only_refused_packs_still_keeps_custody(owner_source, monkeypatch):
+    """B1 ruling (a): no launch root at all, and custody is still kept (not the bare host)."""
+    case = owner_source
+    shutil.rmtree(case.root)
+    state = json.loads((case.collection / ".group.json").read_text()); state["admissions"] = {}
+    (case.collection / ".group.json").write_text(json.dumps(state))
+    folder, digest = _install_refused(case.collection)
+    seen = _prepare_unselected(case, monkeypatch)
+    capture = seen["sources"]
+    assert capture is not None and capture.launch_roots == []
+    assert seen["pack_roots"] == [seen["builtin_root"]]
+    assert str(folder) not in seen["argv"] and str(digest) not in seen["argv"]
+    assert {r["pack_id"]: r["reason"] for r in capture.refusals} == _REFUSED_REASONS
+
+
+@pytest.mark.integration
+def test_agent_host_built_from_the_custody_argv_does_not_load_refused_packs(owner_source, monkeypatch, astrid_importable):
+    """B1 ruling (c): the Agent host constructed the way `generic_host run --register`
+    does (personal_collection=True), under the Runtime's custody handle, keeps exactly the
+    argv roots; the personal collection (where the refused packs live) is not added."""
+    from astrid.core.execution import generic_host
+
+    case = owner_source
+    folder, digest = _install_refused(case.collection)
+    monkeypatch.setenv("HOME", str(case.collection.parents[1]))
+    monkeypatch.delenv("ASTRID_PACKS_PATH", raising=False)
+    seen = _prepare_unselected(case, monkeypatch)
+    handle = gate._RuntimeExternalSources(seen["sources"].payload)
+    custody = generic_host._RuntimeSourceCustody(handle)
+    custody.bind(seen["preparation"])
+    monkeypatch.setattr(generic_host, "_runtime_external_sources", custody)
+    host = generic_host.GenericPackHost(pack_roots=seen["pack_roots"], personal_collection=True)
+    roots = {str(root) for root in host.pack_roots}
+    assert str(case.root) in roots
+    assert str(case.collection) not in roots
+    assert not any(str(r) == str(p) or str(r).startswith(str(p) + "/") for r in roots for p in (folder, digest))
+    assert not {str(record.source_root) for record in host.capabilities.values()} & {str(folder), str(digest)}
+
+
+def test_pack_removed_between_persist_and_check_is_a_named_exclusion_not_a_grant_refusal(owner_source, monkeypatch):
+    """N1: the collection is counted once, before the persist. A ``packs remove`` after the
+    persist used to recount and refuse the launch with "external source grants are invalid"."""
+    case = owner_source
+    removed, kept = install_many(case.collection, 2)
+    _no_selection(case)
+    real_persist = sources._persist_derived_grants
+
+    def persist_then_remove(*args, **kwargs):
+        real_persist(*args, **kwargs)
+        shutil.rmtree(removed)  # `astrid packs remove` lands here
+    monkeypatch.setattr(sources, "_persist_derived_grants", persist_then_remove)
+    capture = case.capture()
+    assert sorted(capture.launch_roots) == sorted([str(case.root), str(kept)])
+    assert [r["pack_id"] for r in capture.refusals] == [removed.name]
+    assert capture.refusals[0]["reason"].startswith(f"installed pack {removed.name} is excluded from host discovery: ")
+
+
+def test_grant_count_overflow_is_refused_by_name(owner_source):
+    """N1: a pack set that grew past the launch's one count names the cause."""
+    case = owner_source
+    grant = sources._derive_installed_grant(str(case.collection), "tool")
+    other = dict(grant, root=str(case.collection / "other"), subpath="other")
+    with pytest.raises(gate.HostLaunchError, match="installed pack collection changed during launch: 2 grants exceed the 1 installed packs"):
+        sources._persist_derived_grants(case.service.support_root, case.service.realm["id"], [grant, other],
+            str(case.collection), limit=1)
+
+
+@pytest.mark.parametrize("change", ["bytes", "removed", "record"])
+def test_unselected_pack_changed_after_capture_is_excluded_by_name_and_others_launch(owner_source, change):
+    """N2: one changed unselected pack no longer blocks the launch; it is excluded on its own."""
+    case = owner_source; f = case.f
+    changed, kept = install_many(case.collection, 2)
+    capture = case.capture()  # "tool" stays selected
+    assert capture.launch_roots == [str(case.root), str(changed), str(kept)]
+    if change == "bytes":
+        (changed / "action.py").write_bytes(b"ANSWER = 8\n")
+    elif change == "removed":
+        shutil.rmtree(changed)
+    else:
+        record = json.loads((changed / ".build" / "definitions.json").read_text())
+        record["definitions"][0]["capability_id"] = "forged"
+        (changed / ".build" / "definitions.json").write_text(json.dumps(record))
+    roots = capture.pin(preparation=f.args["preparation"], config=f.args["config"])
+    assert roots == [str(case.root), str(kept)]
+    assert [r["pack_id"] for r in capture.refusals] == [changed.name]
+    assert capture.refusals[0]["reason"].startswith(f"installed pack {changed.name} is excluded from host discovery: it changed after capture")
+    record = sources._read_state(sources._discovery_path(case.service.support_root))
+    assert [r["pack_id"] for r in record["refusals"]] == [changed.name]
+    verifier = gate.TrustedLocalHostLaunchVerifier(installed_release=f.record, external_sources=capture)
+    proof = verifier.verify(**f.args)
+    _, payload = verifier.claim(proof, **f.args, binding_fd=31)
+    assert [s["root"] for s in json.loads(payload)["external_pack_sources"]["sources"]] == [str(case.root), str(kept)]
+
+
+@pytest.mark.parametrize("edge", ["selected", "pinned", "collection"])
+def test_selected_pinned_or_collection_changes_still_refuse_the_whole_launch(owner_source, edge, tmp_path):
+    """N2: the whole-launch refusal stays for a selected pack, for any pack the pinned launch
+    carries, and for the collection itself."""
+    case = owner_source; f = case.f
+    other, = install_many(case.collection, 1)
+    capture = case.capture()
+    if edge == "pinned":
+        capture.pin(preparation=f.args["preparation"], config=f.args["config"])
+    if edge == "selected":
+        (case.root / "action.py").write_bytes(b"ANSWER = 8\n")
+    elif edge == "pinned":
+        (other / "action.py").write_bytes(b"ANSWER = 8\n")
+    else:
+        moved = tmp_path / "moved"; case.collection.rename(moved); shutil.copytree(moved, case.collection)
+    message = ("installed pack collection changed after capture" if edge == "collection"
+        else "installed pack differs from its derived custody grant")
+    with pytest.raises(gate.HostLaunchError, match=message):
+        capture.verify(preparation=f.args["preparation"], config=f.args["config"])

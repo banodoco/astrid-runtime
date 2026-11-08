@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -126,13 +127,17 @@ def test_cleanup_escalates_only_on_retained_wait_timeout(consumer):
         session = NativeHostSession.__new__(NativeHostSession)
         session.retained, session.broker, session.timeout = retained, broker, 1
         session.control, session.activation = control, activation
+        session.observer_read_fd = None  # set by __init__ (timeline observer); reap_host closes it
         assert session.reap_host() == -9
     else:
         preparer = CrossProcessWorkerPreparer.__new__(CrossProcessWorkerPreparer)
         preparer.cleanup_timeout_seconds = 1
         preparer._rpc = Mock(return_value={"host_exit_code": 0, "host_result": {"status": "cleaned"}})
+        # _PreparedWorker's terminal-shutdown fields: _relay_abort_locked closes under
+        # cleanup_resolution_lock and refuses an abandoned cleanup.
         handle = SimpleNamespace(closed=False, retained=retained, broker=broker,
-                                 worker=retained.child, control=control)
+                                 worker=retained.child, control=control,
+                                 cleanup_resolution_lock=threading.Lock(), cleanup_abandoned=False)
         preparer._active = handle
         preparer._relay_abort_locked(handle)
         assert handle.closed

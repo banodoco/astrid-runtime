@@ -381,7 +381,9 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     raise ConflictError("selected additional pack bytes differ")
                 argv += ["--pack-root", extra["path"]]
             selected_roots = {extra["path"] for extra in profile.host_launch.get("additional_pack_roots", [])}
-            for root in (external_sources.launch_roots if external_sources is not None else []):
+            # Pin the launch set: an unselected pack that changed since capture is
+            # excluded by name here; the argv and payload then carry exactly these.
+            for root in (external_sources.pin(preparation=request, config=self.config) if external_sources is not None else []):
                 if root not in selected_roots:
                     argv += ["--pack-root", root]
             from .verified_host_launch import ENV_KEYS

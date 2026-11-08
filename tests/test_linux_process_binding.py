@@ -106,10 +106,13 @@ def test_real_host_broker_constructs_on_linux_and_custody_branches_stay_in_one_m
     )
     assert broker.role == "host"
     # Allow-list guard: custody_broker gained no sys.platform branch; the Linux
-    # branches go through process_binding.LINUX. Base had 26; this head has 25.
+    # branches go through process_binding.LINUX. Main 61e2c30 has 27; this head
+    # has 26. The 26th is main's own deliberate Darwin-only branch (0915593,
+    # retain_post_exec_connection, "Fix Darwin ready custody without task port"),
+    # merged in e4dd120; it is not a Linux branch, so the bound counts it.
     from pathlib import Path
     source = Path(custody_broker.__file__).read_text(encoding="utf-8")
-    assert source.count("sys.platform") <= 25
+    assert source.count("sys.platform") <= 26
 
 
 def test_missing_or_denied_boot_id_fails_closed_for_token_and_signal(monkeypatch):
