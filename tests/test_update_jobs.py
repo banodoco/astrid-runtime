@@ -65,7 +65,7 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
             assert (selected_python, selected_agent, selected_runtime) == (python, agent, runtime)
             if payload == {"action": "availability"}:
                 availability_queries.append(payload)
-                return {"available": True}
+                return {"available": True, "actions": sorted(update._SELF_UPDATE_ACTIONS)}
             if payload.get("action") == "reconcile":
                 return {"disposition": "prepare-new"}
             calls.append(payload)
@@ -74,7 +74,7 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
                 _write(marker, {**record, "update_job": job})
                 return job
             if payload.get("action") == "launch":
-                return {"launch_status": "started"}
+                return {"launch_status": "acknowledged"}
             result = {"release": 5}
             for name in ("manifest", "bootstrap"):
                 path = Path(payload["directory"]) / name
@@ -92,7 +92,7 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
             for _ in range(2):
                 response = world.call("/api/runtime/v1/update/status")
                 assert response.status == 200
-                assert response.json() == {"available": True, "state": "none"}
+                assert response.json() == {"available": True, "state": "none", "self_update": True}
             assert calls == [] and marker.read_bytes() == before
 
             # GET only observes durable evidence. It must not admit, launch,
@@ -154,7 +154,7 @@ def test_status_reads_authoritative_job_and_c2_journal_without_recovery(tmp_path
     assert update.read_update_status(home) == {
         "available": False, "state": "recovery-needed", "operation_id": "11111111111111111111111111111111",
         "result": "Recovery needed.", "target_release": 9,
-        "log_path": str(root / "logs/update.log"),
+        "log_path": str(root / "logs/update.log"), "self_update": False, "reason": "needs-repair",
     }
     fresh = subprocess.run(
         [sys.executable, "-c", "import json,sys; from astrid_runtime.update import read_update_status; print(json.dumps(read_update_status(sys.argv[1])))", str(home)],
@@ -414,6 +414,7 @@ def test_status_reports_pending_c2_even_without_f1_job(tmp_path):
     _write(root / "update-transaction.json", {"step": "stopping"})
     assert update.read_update_status(home) == {
         "available": False, "state": "recovery-needed", "result": "Recovery needed.",
+        "self_update": False, "reason": "needs-repair",
     }
 
 
@@ -427,7 +428,7 @@ def test_status_projects_only_allowlisted_selection_reasons(tmp_path, monkeypatc
         update.UpdateRefusal(reason, "selection refusal")))
     admission._helper = lambda *_args: pytest.fail("GET must not admit or launch an update")
 
-    assert admission.status() == {"available": False, "reason": reason, "state": "none"}
+    assert admission.status() == {"available": False, "reason": reason, "state": "none", "self_update": False}
 
 
 def test_status_omits_noncontract_selection_reason(tmp_path, monkeypatch):
@@ -438,7 +439,8 @@ def test_status_omits_noncontract_selection_reason(tmp_path, monkeypatch):
     monkeypatch.setattr(admission, "_selection", lambda **_kwargs: (_ for _ in ()).throw(
         update.UpdateRefusal("updater-unavailable", "selection refusal")))
 
-    assert admission.status() == {"available": False, "state": "none"}
+    assert admission.status() == {
+        "available": False, "reason": "needs-repair", "state": "none", "self_update": False}
 
 
 def test_status_projects_linux_service_manager_reason_without_admission(tmp_path, monkeypatch):
@@ -457,7 +459,7 @@ def test_status_projects_linux_service_manager_reason_without_admission(tmp_path
 
     admission._helper = helper
     assert admission.status() == {
-        "available": False, "reason": "unsupported-service-manager", "state": "none"}
+        "available": False, "reason": "unsupported-service-manager", "state": "none", "self_update": False}
     assert calls == [{"action": "availability"}]
 
 
@@ -475,7 +477,7 @@ def test_status_preserves_allowlisted_service_manager_refusal(tmp_path, monkeypa
 
     admission._helper = helper
     assert admission.status() == {
-        "available": False, "reason": "unsupported-service-manager", "state": "none"}
+        "available": False, "reason": "unsupported-service-manager", "state": "none", "self_update": False}
 
 
 @pytest.mark.parametrize(
@@ -545,7 +547,8 @@ def test_status_projects_availability_probe_failures_as_unavailable_without_side
 
         monkeypatch.setattr(update.subprocess, "run", run)
 
-    assert admission.status() == {"available": False, "state": "none"}
+    assert admission.status() == {
+        "available": False, "reason": "needs-repair", "state": "none", "self_update": False}
     assert calls == [{"action": "availability"}]
     assert {path: path.read_bytes() for path in status_sources} == status_sources
 
@@ -557,7 +560,8 @@ def test_status_projects_busy_while_an_update_request_owns_admission(tmp_path, m
     admission = update.UpdateAdmission(SimpleNamespace())
     admission._lock.acquire()
     try:
-        assert admission.status() == {"available": False, "reason": "busy", "state": "none"}
+        assert admission.status() == {
+            "available": False, "reason": "busy", "state": "none", "self_update": False}
     finally:
         admission._lock.release()
 
@@ -929,7 +933,7 @@ def test_production_launcher_uses_selected_python_helper_once(tmp_path, monkeypa
     def helper(python, agent, runtime, payload, **kwargs):
         if payload.get("action") == "launch":
             calls.append((python, agent, runtime, payload))
-            return {"state": "active", "launch_status": "started", "job_name": "job-1"}
+            return {"state": "active", "launch_status": "acknowledged", "job_name": "job-1"}
         return real_helper(python, agent, runtime, payload, **kwargs)
 
     admission._helper = helper
@@ -1076,7 +1080,7 @@ def test_post_update_terminal_result_line_reads_back_through_status(tmp_path, mo
 
         def helper(python, agent, runtime, payload, **kwargs):
             if payload.get("action") == "launch":
-                return {"launch_status": "started"}
+                return {"launch_status": "acknowledged"}
             return real_helper(python, agent, runtime, payload, **kwargs)
 
         admission._helper = helper
@@ -1095,3 +1099,84 @@ def test_post_update_terminal_result_line_reads_back_through_status(tmp_path, mo
         assert status["result"] == "line one line two"
     finally:
         world.stop()
+
+
+def _probe_admission(tmp_path, monkeypatch, platform, reply):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
+    monkeypatch.setattr(update.sys, "platform", platform)
+    admission = update.UpdateAdmission(SimpleNamespace())
+    admission._selection = lambda **_kwargs: (None, {}, Path("/python"), Path("/agent"), Path("/runtime"), 1)
+    calls = []
+
+    def helper(_python, _agent, _runtime, payload):
+        calls.append(payload)
+        return reply
+
+    admission._helper = helper
+    return admission, calls
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+def test_self_update_is_true_when_helper_lists_its_actions_on_every_os(tmp_path, monkeypatch, platform):
+    admission, calls = _probe_admission(
+        tmp_path, monkeypatch, platform,
+        {"available": True, "actions": ["availability", "reconcile", "prepare", "accept", "fail", "launch"]})
+
+    assert admission.status() == {"available": True, "state": "none", "self_update": True}
+    assert calls == [{"action": "availability"}]
+
+
+@pytest.mark.parametrize("reply", [
+    {"available": True},
+    {"available": True, "actions": ["availability"]},
+    {"available": True, "actions": "accept"},
+])
+def test_self_update_is_false_for_helpers_that_cannot_list_their_actions(tmp_path, monkeypatch, reply):
+    admission, _calls = _probe_admission(tmp_path, monkeypatch, "darwin", reply)
+
+    assert admission.status() == {"available": True, "state": "none", "self_update": False}
+
+
+@pytest.mark.parametrize("managed_by, message", [("pinokio", "Pinokio"), ("source", "source")])
+def test_status_reads_managed_elsewhere_for_pinokio_and_source(tmp_path, monkeypatch, managed_by, message):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
+    daemon = SimpleNamespace(startup_identity={"managed_by": managed_by})
+    monkeypatch.setattr(update, "normalize_startup_identity", lambda identity: identity)
+    admission = update.UpdateAdmission(daemon)
+    admission._helper = lambda *_args: pytest.fail("GET must not probe a managed-elsewhere install")
+
+    assert admission.status() == {
+        "available": False, "reason": "managed-elsewhere", "state": "none", "self_update": False}
+
+
+@pytest.mark.parametrize("failure", [
+    ValueError("selected workspace does not match the live owner"),
+    update.UpdateRefusal("recovery-needed", "The installer must recover first."),
+    OSError("unreadable"),
+])
+def test_status_reads_needs_repair_for_unclassified_causes(tmp_path, monkeypatch, failure):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
+    admission = update.UpdateAdmission(SimpleNamespace())
+    monkeypatch.setattr(admission, "_selection", lambda **_kwargs: (_ for _ in ()).throw(failure))
+
+    assert admission.status() == {
+        "available": False, "reason": "needs-repair", "state": "none", "self_update": False}
+
+
+def test_status_emits_reason_in_a_non_none_state(tmp_path):
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    _write(home / ".local/share/astrid-install.json", {
+        "owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data)})
+    _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": {
+        "operation_id": "a" * 32, "state": "accepted"}})
+
+    status = update.read_update_status(home, reason="busy", self_update=True)
+
+    assert status["state"] == "recovery-needed"
+    assert status["reason"] == "busy" and status["self_update"] is True
