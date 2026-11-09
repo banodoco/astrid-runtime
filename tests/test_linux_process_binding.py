@@ -13,7 +13,7 @@ from runtime_protocol import linux_process_binding as lpb
 from runtime_protocol import platform
 
 from tests.lanes import requires_linux_tree_custody
-pytestmark = requires_linux_tree_custody
+pytestmark = [requires_linux_tree_custody, pytest.mark.needs_real_pidfd]
 
 
 def _sleeper():

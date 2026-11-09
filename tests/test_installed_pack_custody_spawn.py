@@ -63,6 +63,15 @@ def _source_repository(root):
     return root
 
 
+def _installed_record(name, site):
+    """RECORD of the installed dist-info; ambient sys.path entries (a checkout's *.egg-info) have none."""
+    for dist in metadata.Distribution.discover(name=name, path=[str(site)]):
+        record = dist.read_text("RECORD")
+        if record is not None:
+            return record
+    raise AssertionError(f"{name} has no installed RECORD beneath {site}")
+
+
 def _worker_profile(base, support, python):
     from astrid.core.gateway.dispatch import compose_profile_handoff
     from runtime_protocol.local_worker import _digest
@@ -70,7 +79,7 @@ def _worker_profile(base, support, python):
     from runtime_protocol.verified_host_launch import raw_digest, source_checkout_closure
 
     site = Path(sysconfig.get_paths()["purelib"]).resolve()
-    records = {name: hashlib.sha256(metadata.distribution(name).read_text("RECORD").encode()).hexdigest()
+    records = {name: hashlib.sha256(_installed_record(name, site).encode()).hexdigest()
         for name in ("astrid", "astrid-runtime")}
     kernel = python.resolve()
     kernel_digest = "sha256:" + hashlib.sha256(kernel.read_bytes()).hexdigest()

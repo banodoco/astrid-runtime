@@ -14,7 +14,7 @@ from astrid_runtime import custody_broker as custody
 from runtime_protocol import platform, process_binding
 
 from tests.lanes import requires_linux_tree_custody
-pytestmark = requires_linux_tree_custody
+pytestmark = [requires_linux_tree_custody, pytest.mark.needs_real_pidfd]
 
 
 @pytest.fixture

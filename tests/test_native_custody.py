@@ -651,6 +651,7 @@ def _linux_reparent_custody_proof(root):
         else:
             raise AssertionError("failed to reap all owned children")
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_publish_release_and_adopted_signal_use_guard(tmp_path, processes, monkeypatch):
     if sys.platform == "linux":
         return _linux_test_native_custody_publish_release_and_adopted_signal_use_guard(tmp_path, processes)
@@ -659,18 +660,21 @@ def test_native_custody_publish_release_and_adopted_signal_use_guard(tmp_path, p
 
 @pytest.mark.parametrize('mutation,match', [('target', 'differs from the selected owner'), ('version', 'differs from the selected owner')])
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_rejects_wrong_target_or_version(tmp_path, monkeypatch, processes, mutation, match):
     if sys.platform == "linux":
         return _linux_test_native_custody_rejects_wrong_target_or_version(tmp_path, monkeypatch, processes, mutation, match)
     return _portable_test_native_custody_rejects_wrong_target_or_version(tmp_path, monkeypatch, mutation, match)
 
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_rejects_another_live_controller_while_owned(tmp_path, monkeypatch, processes):
     if sys.platform == "linux":
         return _linux_test_native_custody_rejects_another_live_controller_while_owned(tmp_path, monkeypatch, processes)
     return _portable_test_native_custody_rejects_another_live_controller_while_owned(tmp_path, monkeypatch)
 
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_recovers_when_prior_controller_is_proven_absent(tmp_path, monkeypatch, processes):
     if sys.platform == "linux":
         return _linux_test_native_custody_recovers_when_prior_controller_is_proven_absent(tmp_path, monkeypatch, processes)
@@ -679,12 +683,14 @@ def test_native_custody_recovers_when_prior_controller_is_proven_absent(tmp_path
 
 @requires_posix_file_modes_native_custody
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_rejects_unsafe_owner_file(tmp_path, monkeypatch, processes):
     if sys.platform == "linux":
         return _linux_test_native_custody_rejects_unsafe_owner_file(tmp_path, monkeypatch, processes)
     return _portable_test_native_custody_rejects_unsafe_owner_file(tmp_path, monkeypatch)
 
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_wraps_platform_identity_drift_without_signaling(tmp_path, monkeypatch, processes):
     if sys.platform == "linux":
         return _linux_test_native_custody_wraps_platform_identity_drift_without_signaling(tmp_path, monkeypatch, processes)
@@ -694,6 +700,7 @@ def test_native_custody_wraps_platform_identity_drift_without_signaling(tmp_path
 @pytest.mark.parametrize('operation', ['release', 'signal'])
 @pytest.mark.parametrize('field', ['parent_pid', 'process_group', 'session_id'])
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_preserves_controller_after_metadata_changes(tmp_path, monkeypatch, processes, operation, field):
     if sys.platform == "linux":
         return _linux_test_native_custody_preserves_controller_after_metadata_changes(tmp_path, monkeypatch, processes, operation, field)
@@ -702,6 +709,7 @@ def test_native_custody_preserves_controller_after_metadata_changes(tmp_path, mo
 
 @pytest.mark.parametrize('field', ['pid', 'uid', 'birth_id'])
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_rejects_each_different_live_controller_incarnation(tmp_path, monkeypatch, processes, field):
     if sys.platform == "linux":
         return _linux_test_native_custody_rejects_each_different_live_controller_incarnation(tmp_path, monkeypatch, processes, field)
@@ -710,6 +718,7 @@ def test_native_custody_rejects_each_different_live_controller_incarnation(tmp_p
 
 @pytest.mark.parametrize('actor', [None, {}, [], {'pid': True, 'uid': 0, 'birth_id': 'birth'}, {'pid': 0, 'uid': 0, 'birth_id': 'birth'}, {'pid': 1, 'uid': False, 'birth_id': 'birth'}, {'pid': 1, 'uid': -1, 'birth_id': 'birth'}, {'pid': 1, 'uid': 0, 'birth_id': ''}, {'pid': 1, 'uid': 0, 'birth_id': None}])
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_rejects_unavailable_or_malformed_actor(tmp_path, monkeypatch, processes, actor):
     if sys.platform == "linux":
         return _linux_test_native_custody_rejects_unavailable_or_malformed_actor(tmp_path, monkeypatch, processes, actor)
@@ -718,12 +727,14 @@ def test_native_custody_rejects_unavailable_or_malformed_actor(tmp_path, monkeyp
 
 @pytest.mark.parametrize('controller', [None, {}, [], {'pid': 'unknown'}])
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_rejects_missing_or_malformed_persisted_controller(tmp_path, monkeypatch, processes, controller):
     if sys.platform == "linux":
         return _linux_test_native_custody_rejects_missing_or_malformed_persisted_controller(tmp_path, monkeypatch, processes, controller)
     return _portable_test_native_custody_rejects_missing_or_malformed_persisted_controller(tmp_path, monkeypatch, controller)
 
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_unknown_prior_controller_observation_does_not_adopt(tmp_path, monkeypatch, processes):
     if sys.platform == "linux":
         return _linux_test_native_custody_unknown_prior_controller_observation_does_not_adopt(tmp_path, monkeypatch, processes)
@@ -732,6 +743,7 @@ def test_native_custody_unknown_prior_controller_observation_does_not_adopt(tmp_
 
 @requires_linux_tree_custody
 
+@pytest.mark.needs_real_pidfd
 def test_native_custody_real_reparented_controller_signals_and_releases(tmp_path):
     if sys.platform == "linux":
         return _linux_test_native_custody_real_reparented_controller_signals_and_releases(tmp_path)

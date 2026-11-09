@@ -12,6 +12,7 @@ from tests.lanes import requires_posix_file_modes_native_custody
 
 
 @requires_posix_file_modes_native_custody
+@pytest.mark.needs_real_pidfd
 def test_public_native_scope_is_refused_without_publishing_custody(tmp_path: Path):
     scope = tmp_path / "PUBLIC_NATIVE"
     scope.mkdir(mode=0o700)
