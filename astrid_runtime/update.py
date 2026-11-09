@@ -82,13 +82,17 @@ def _json(path, snapshots):
     return value
 
 
-def _assert_autostart_supported(selected):
+def _assert_autostart_supported(selected, *, post=False):
     # The saved choice is the Agent's choices.autostart, which the Agent validates as a bool. Absent means
-    # no refusal. A malformed saved value is needs-repair, never read as on.
+    # no refusal. A malformed saved value is never read as on. Status (GET) reports it as needs-repair;
+    # POST may not say needs-repair, so it refuses with its own unreadable-selection reason.
     choices = selected.get("choices") if isinstance(selected, dict) else None
     if choices is None:
         return
     if not isinstance(choices, dict) or ("autostart" in choices and type(choices["autostart"]) is not bool):
+        if post:
+            raise UpdateRefusal("selection-or-inputs-invalid",
+                                "The selected installation or update inputs do not match this running Astrid.")
         raise UpdateRefusal("needs-repair", "The saved install choices are unreadable; repair the installation.")
     if choices.get("autostart") is False:
         raise UpdateRefusal(
@@ -434,7 +438,7 @@ class UpdateAdmission:
                 raise UpdateRefusal("busy", "The update reconciliation did not grant preparation; no job was launched.",
                                     remediation=remediation or "M1")
 
-            _assert_autostart_supported(selected_record)
+            _assert_autostart_supported(selected_record, post=True)
             temporary = None
             accepted = False
             operation_id = None

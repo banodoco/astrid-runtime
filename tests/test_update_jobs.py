@@ -955,6 +955,30 @@ def test_post_refuses_saved_autostart_off_choice_before_preparation_or_launch(tm
     assert prepared == []
 
 
+# Reasons only GET /v1/update/status may say (update._REPORTED_REASONS beyond the helper and
+# POST reasons). A POST /v1/update refusal must never carry one.
+_GET_ONLY_REASONS = {"needs-repair", "managed-elsewhere"}
+
+
+@pytest.mark.parametrize("choices", [{"autostart": "off"}, {"autostart": 0}, {"autostart": None}, "off", ["autostart"]],
+                         ids=["string-off", "zero", "null", "not-a-dict-string", "not-a-dict-list"])
+def test_post_with_malformed_saved_choices_refuses_with_a_post_legal_reason(tmp_path, monkeypatch, choices):
+    """POST never says needs-repair (a GET-only reason). Malformed saved choices are selection-or-inputs-invalid."""
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("must not launch"))
+    selection_path, snapshots, python, agent, runtime, installed = admission._selection()
+    selected = json.loads(snapshots[selection_path])
+    selected["choices"] = choices
+    snapshots[selection_path] = json.dumps(selected).encode()
+    admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
+    reason = error.value.details["reason"]
+    assert reason not in _GET_ONLY_REASONS
+    assert reason == "selection-or-inputs-invalid"
+    assert error.value.message == "The selected installation or update inputs do not match this running Astrid."
+    assert prepared == []
+
+
 def test_production_launcher_uses_selected_python_helper_once(tmp_path, monkeypatch):
     admission, accepted, prepared = _admission_fixture(tmp_path, monkeypatch, None)
     selection_path, snapshots, python, agent, runtime, installed = admission._selection()
