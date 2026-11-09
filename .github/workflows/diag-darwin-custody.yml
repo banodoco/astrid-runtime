@@ -1,22 +1,36 @@
-# TEMPORARY diagnostic. Never merge. Runs only the darwin custody-spawn test and keeps its artifacts.
+# TEMPORARY diagnostic. Never merge. Runs only the custody-spawn test and keeps its artifacts.
 name: diag-darwin-custody
 on:
   push:
     branches: [diag/darwin-custody-spawn]
 jobs:
   diag:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-latest, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, mode: editable, tag: mac-r12-editable}
+          - {os: macos-latest, agent: 4866090edcce7df31d1f0e03cf2354b878e94105, mode: wheel, tag: mac-4866-wheel}
+          - {os: macos-latest, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, mode: wheel, tag: mac-r12-wheel}
+          - {os: ubuntu-latest, agent: 4866090edcce7df31d1f0e03cf2354b878e94105, mode: editable, tag: linux-4866-editable}
+          - {os: ubuntu-latest, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, mode: editable, tag: linux-r12-editable}
+          - {os: ubuntu-latest, agent: 4866090edcce7df31d1f0e03cf2354b878e94105, mode: wheel, tag: linux-4866-wheel}
+          - {os: ubuntu-latest, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, mode: wheel, tag: linux-r12-wheel}
+    name: ${{ matrix.tag }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: brew install ffmpeg
-      - run: python -m pip install -e '.[test]'
-      - name: Checkout published Agent alongside Runtime
+      - name: Install Runtime (editable or wheel)
+        shell: bash
+        run: |
+          if [ "${{ matrix.mode }}" = editable ]; then python -m pip install -e '.[test]'; else python -m pip install '.[test]'; fi
+      - name: Checkout the Agent alongside Runtime
         shell: bash
         env:
-          AGENT_SHA: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9
+          AGENT_SHA: ${{ matrix.agent }}
         run: |
           agent_dir="$GITHUB_WORKSPACE/../astrid-agent"
           git init --quiet "$agent_dir"
@@ -29,18 +43,22 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --no-input --require-hashes -r "$GITHUB_WORKSPACE/../astrid-agent/requirements/runtime.lock"
           python -m pip install --disable-pip-version-check --no-input --no-deps "$GITHUB_WORKSPACE/../astrid-agent"
+      - name: Allow the darwin_native lane to run off macOS (diag only)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: sed -i 's/if _DARWIN_NATIVE.applies(CURRENT) and item/if False and item/' tests/lanes.py
       - name: Run only the custody-spawn test with a kept base temp
-        run: python -m pytest -vv -rA -s -m darwin_native tests/test_installed_pack_custody_spawn.py --basetemp="$RUNNER_TEMP/diag-basetemp" -p no:xdist 2>&1 | tee "$RUNNER_TEMP/pytest-output.txt"
+        shell: bash
+        run: python -m pytest -vv -rA -s -m darwin_native tests/test_installed_pack_custody_spawn.py --basetemp="$RUNNER_TEMP/diag-basetemp" -p no:xdist 2>&1 | tee "$RUNNER_TEMP/pytest-output.txt"; exit ${PIPESTATUS[0]}
+        continue-on-error: true
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diag-darwin-custody
+          name: diag-${{ matrix.tag }}
           path: |
             ${{ runner.temp }}/pytest-output.txt
             ${{ runner.temp }}/diag-basetemp/**/runtime.log
             ${{ runner.temp }}/diag-basetemp/**/host-argv.jsonl
             ${{ runner.temp }}/diag-basetemp/**/start-response.json
-            ${{ runner.temp }}/diag-basetemp/**/discovery.json
-            ${{ runner.temp }}/diag-basetemp/**/boot-manifest.json
           if-no-files-found: warn
