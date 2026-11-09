@@ -417,7 +417,10 @@ def _pending_journal_install(tmp_path):
     return home
 
 
-@pytest.mark.parametrize("reason", [*_POLICY_REASONS, "busy", "needs-repair", None])
+# source and managed-elsewhere are identity refusals POST gives before recovery; they are echoed
+# (test_an_install_another_tool_updates_echoes_posts_reason_even_when_recovery_is_needed).
+@pytest.mark.parametrize("reason", [*(r for r in _POLICY_REASONS if r not in {"source", "managed-elsewhere"}),
+                                    "busy", "needs-repair", None])
 @pytest.mark.parametrize("available", [False, True])
 def test_recovery_needed_status_reads_busy_m1_whatever_reason_it_was_given(tmp_path, reason, available):
     home = _pending_journal_install(tmp_path)
@@ -440,4 +443,29 @@ def test_a_policy_reason_is_kept_when_no_recovery_is_needed(tmp_path, reason):
     status = update.read_update_status(home, available=False, reason=reason)
     assert status["state"] == "none"
     assert status["reason"] == reason
+    assert "remediation" not in status
+
+
+@pytest.mark.parametrize("managed_by, post_reason, get_reason", [
+    ("source", "source", "source"),
+    ("pinokio", "pinokio", "managed-elsewhere"),
+], ids=["source", "pinokio"])
+def test_an_install_another_tool_updates_echoes_posts_reason_even_when_recovery_is_needed(
+        tmp_path, monkeypatch, managed_by, post_reason, get_reason):
+    """M-INT ruling: POST refuses a source or Pinokio Runtime by identity before any recovery.
+
+    Status echoes that reason (managed-elsewhere is GET's name for pinokio) with no remediation,
+    even when an unfinished journal makes the state recovery-needed.
+    """
+    admission, root = _real_install(tmp_path, monkeypatch, None)
+    monkeypatch.setattr(update, "normalize_startup_identity",
+                        lambda _value: {"release": 0, "managed_by": managed_by})
+    (root / "update-transaction.json").write_text(json.dumps({"step": "switched"}), encoding="utf-8")
+    from runtime_protocol.errors import ConflictError
+    with pytest.raises(ConflictError) as refused:
+        admission.request()
+    assert refused.value.details["reason"] == post_reason
+    status = admission.status()
+    assert status["state"] == "recovery-needed"
+    assert status["reason"] == get_reason
     assert "remediation" not in status

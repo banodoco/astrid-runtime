@@ -669,7 +669,8 @@ def read_update_status(home=None, *, available=False, reason=None, self_update=F
     the Agent's availability reply is applied read-only; nothing is written.
 
     State recovery-needed says what POST /v1/update says for the same cause, never a policy
-    reason such as autostart-off: busy with remediation M1 (wait while another request holds
+    reason such as autostart-off. A source or Pinokio Runtime keeps source or managed-elsewhere,
+    which POST refuses with before any recovery. Otherwise: busy with remediation M1 (wait while another request holds
     the update lock), as the route normalizes a recovery refusal; or needs-repair where
     install.json, the journal or the selection is unreadable or mismatched, which POST
     refuses as selection-or-inputs-invalid.
@@ -678,7 +679,10 @@ def read_update_status(home=None, *, available=False, reason=None, self_update=F
     cause = result.pop("_cause", None)
     result["self_update"] = self_update is True
     if result.get("state") == "recovery-needed":
-        if cause == "unreadable" or selection_unreadable:
+        if reason in {"source", "managed-elsewhere"}:
+            # POST refuses a source or Pinokio Runtime by identity, before any recovery.
+            result["reason"] = reason
+        elif cause == "unreadable" or selection_unreadable:
             result["reason"] = "needs-repair"
         else:
             result["reason"] = "busy"
