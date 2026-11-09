@@ -24,7 +24,7 @@ from .errors import ConflictError, NotFoundError, ProtocolError, RuntimeErrorBas
 from .server import RuntimeHTTPServer, RuntimeHandler
 from .service import RuntimeService
 from .startup_identity import capture_startup_identity
-from .store import realm_admission_fence
+from .store import realm_admission_fence, InstalledPackAdmissions
 from .util import atomic_json_write, now
 
 
@@ -55,7 +55,7 @@ def _authority_path(value, label):
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, authoring_profile=None, services=None, log_directory=None, runtime_checkout=None, agent_checkout=None, _local_worker_composition=None, _local_worker_composition_required=False):
+    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, door=None, authoring_profile=None, services=None, log_directory=None, runtime_checkout=None, agent_checkout=None, pack_admissions=None, installed_pack_root=None, _local_worker_composition=None, _local_worker_composition_required=False):
         from .local_worker_composition import _retain_local_worker_composition
         self._local_worker_composition = _retain_local_worker_composition(
             _local_worker_composition, required=_local_worker_composition_required)
@@ -80,6 +80,16 @@ class RuntimeDaemon:
         if authoring_profile not in (None, "neutral", "astrid"):
             raise ValueError("unsupported authoring profile")
         self.authoring_profile = authoring_profile
+        # The installer owns committed presence; all startup paths retain its reader.
+        if pack_admissions is not None and installed_pack_root is not None:
+            raise ValueError("select either an installed pack collection or an admission reader")
+        selected_pack_root = installed_pack_root
+        if pack_admissions is None and selected_pack_root is None and agent_checkout:
+            # SourceProfile already declares this installed Agent root in both
+            # foreground and child CLI startup; match Agent's canonical root.
+            selected_pack_root = Path(agent_checkout) / "astrid" / "packs"
+        self.pack_admissions = (InstalledPackAdmissions(selected_pack_root)
+                                if selected_pack_root is not None else pack_admissions)
         self.instance_id = uuid.uuid4().hex
         self._identity_runtime_checkout = runtime_checkout
         self._identity_agent_checkout = agent_checkout
@@ -287,7 +297,7 @@ class RuntimeDaemon:
         process_control.announce(self.process_signalling)
         provider = self._load_installed_timeline_commit_provider()
         epoch_floor = self._read_epoch_floor()
-        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor, admission_timeout=self.admission_timeout, _admission_fd=self._replacement_admission_fd, _local_worker_composition=self._local_worker_composition, _local_worker_composition_required=self._local_worker_composition_required)
+        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor, admission_timeout=self.admission_timeout, _admission_fd=self._replacement_admission_fd, pack_admissions=self.pack_admissions, _local_worker_composition=self._local_worker_composition, _local_worker_composition_required=self._local_worker_composition_required)
         if provider is not None:
             register = getattr(self.service, "register_timeline_commit_provider", None)
             if not callable(register):

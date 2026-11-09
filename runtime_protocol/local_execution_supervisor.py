@@ -42,6 +42,21 @@ class RelayError(RuntimeError):
     """A bounded delegated transition lacks exact identity or custody."""
 
 
+class RetainedWaitTimeout(RelayError):
+    """A retained child has not exited within the wait budget."""
+
+
+def runtime_owner_record(native_observation: Mapping[str, Any], epoch: str) -> dict[str, Any]:
+    """Project a native Runtime observation into the exact owner contract."""
+    return {
+        "pid": native_observation["pid"],
+        "uid": native_observation["uid"],
+        "birth_id": native_observation["birth_id"],
+        "runtime_instance_id": epoch,
+        "coordinator_epoch": epoch,
+    }
+
+
 def canonical_json(value: object) -> bytes:
     try:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -968,7 +983,7 @@ class RetainedProcess:
             if result is not None:
                 return result
             if time.monotonic() >= deadline:
-                raise RelayError("retained child exit remains unresolved")
+                raise RetainedWaitTimeout("retained child exit remains unresolved")
             time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
 
@@ -1156,7 +1171,7 @@ class NativeHostSession:
             self.broker.signal(runtime_platform.TERM, expected_pid=self.retained.child.pid)
             try:
                 result = self.retained.wait(min(self.timeout, 5.0))
-            except RelayError:
+            except RetainedWaitTimeout:
                 self.broker.signal(runtime_platform.KILL, expected_pid=self.retained.child.pid)
                 result = self.retained.wait(min(self.timeout, 5.0))
         self.control.close()
