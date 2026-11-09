@@ -86,6 +86,7 @@ def _assert_autostart_supported(selected, *, post=False):
     # The saved choice is the Agent's choices.autostart, which the Agent validates as a bool. Absent means
     # no refusal. A malformed saved value is never read as on. Status (GET) reports it as needs-repair;
     # POST may not say needs-repair, so it refuses with its own unreadable-selection reason.
+    # preferences.autostart is not read: no released Agent wrote it to the selection record.
     choices = selected.get("choices") if isinstance(selected, dict) else None
     if choices is None:
         return

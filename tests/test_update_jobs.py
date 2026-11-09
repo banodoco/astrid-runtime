@@ -979,6 +979,35 @@ def test_post_with_malformed_saved_choices_refuses_with_a_post_legal_reason(tmp_
     assert prepared == []
 
 
+@pytest.mark.parametrize("legacy", [False, "off", "OFF"], ids=["false", "string-off", "string-upper-off"])
+def test_legacy_preferences_autostart_is_not_a_saved_choice(tmp_path, monkeypatch, legacy):
+    """No released Agent wrote preferences.autostart into the install selection record (R6).
+
+    The Agent history (banodoco/astrid-agent, every ref) has readers of that key in the update
+    guard and test fixtures that injected it, but no installer, CLI or served-installer code that
+    wrote it; the Agent itself dropped the reads in 671c125fb ("nothing wrote that key"). The only
+    saved choice is choices.autostart, so a stray preferences key neither refuses nor is read as off.
+    """
+    admission, _accepted, prepared = _admission_fixture(tmp_path, monkeypatch, None)
+    selection_path, snapshots, python, agent, runtime, installed = admission._selection()
+    selected = json.loads(snapshots[selection_path])
+    selected["preferences"] = {"autostart": legacy}
+    snapshots[selection_path] = json.dumps(selected).encode()
+    selection_path.write_bytes(snapshots[selection_path])
+    admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)
+    real_helper = admission._helper
+
+    def helper(python, agent, runtime, payload, **kwargs):
+        if payload.get("action") == "launch":
+            return {"state": "active", "launch_status": "acknowledged", "job_name": "job-1"}
+        return real_helper(python, agent, runtime, payload, **kwargs)
+
+    admission._helper = helper
+    result = admission.request()
+    assert result["accepted"] is True
+    assert prepared and prepared[0].exists()
+
+
 def test_production_launcher_uses_selected_python_helper_once(tmp_path, monkeypatch):
     admission, accepted, prepared = _admission_fixture(tmp_path, monkeypatch, None)
     selection_path, snapshots, python, agent, runtime, installed = admission._selection()
