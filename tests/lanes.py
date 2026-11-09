@@ -184,13 +184,20 @@ DECLARED_XFAILS = {
     "timeline-public-s2-historical-audio": DeclaredXfail(
         "timeline-public-s2-historical-audio",
         ("tests/test_timeline_public_s2_mixed_cli_journey.py::test_public_cli_stale_trim_rebases_label_lost_ack_restart_retry_and_undo[historical-audio]",),
-        _xfail_reason("timeline-public-s2-historical-audio", "M2 historical audio capture: /tmp/claude-0/-home-user-repo/7dc61be1-7066-52e0-a5d0-94f90e61430a/scratchpad/orch/design/runtime-public-s2-literal-journey.md#original-audio-requirement"),
+        _xfail_reason("timeline-public-s2-historical-audio",
+                      "M2 historical audio capture: the public CLI trim of the original music-bed audio clip is "
+                      "refused before POST ('clip.trim applies to media clips'); held until the CLI captures the "
+                      "original audio film before POST"),
         "tests.test_timeline_public_s2_mixed_cli_journey.HistoricalAudioCaptureGap",
     ),
     "installed-pair-source-closure": DeclaredXfail(
         "installed-pair-source-closure",
         ("tests/test_installed_pack_custody_spawn.py::test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungranted",),
-        _xfail_reason("installed-pair-source-closure", "Plan 38; proof run 42602337622"),
+        _xfail_reason("installed-pair-source-closure",
+                      "the Agent and Runtime measure different source-closure digests for an installed pair, so "
+                      "the darwin custody spawn is refused as 'differs from original launch'; proven by CI run "
+                      "42602337622 (darwin-native job 129109610936 at 49a062c raised KnownSourceClosureMismatch "
+                      "under the strict xfail); fixed by astrid-dev Plan 38"),
         "tests.test_installed_pack_custody_spawn.KnownSourceClosureMismatch",
     ),
     "p1-top-level-text-hook": DeclaredXfail(
