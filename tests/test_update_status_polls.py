@@ -254,3 +254,63 @@ def test_explicit_update_keeps_the_windows_upgrade_unsupported_reason(monkeypatc
     with pytest.raises(update.UpdateRefusal) as refusal:
         admission._helper(Path("/python"), Path("/agent"), Path("/runtime"), {"action": "launch"})
     assert refusal.value.details["reason"] == "windows-upgrade-unsupported"
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_interrupted_terminal_update_with_autostart_off_reads_recovery_needed_and_busy(tmp_path, monkeypatch, platform):
+    """R13b: recovery-needed never carries a policy reason. The App keys recovery copy off the state.
+
+    A user with autostart off updates from a terminal; an interrupted install-line update leaves a
+    non-terminal journal and no app job. Status says recovery-needed with reason busy, the same
+    normalization POST applies to a recovery refusal (runtime_protocol/server.py), not autostart-off.
+    """
+    admission, launches, _queries = _no_pointer_admission(
+        monkeypatch, tmp_path, platform, login_task=True, choices={"autostart": False})
+    (tmp_path / "program" / "update-transaction.json").write_text(json.dumps({"step": "switched"}), encoding="utf-8")
+    status = admission.status()
+    assert status["state"] == "recovery-needed"
+    assert status["reason"] == "busy"
+    assert launches == []
+
+
+_POLICY_REASONS = ["autostart-off", "unsupported-service-manager", "windows-upgrade-unsupported",
+                   "managed-elsewhere", "source"]
+
+
+def _pending_journal_install(tmp_path, monkeypatch):
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    for folder in (home, root, data):
+        folder.mkdir()
+    record = update._install_record_path(home)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"owner": update.INSTALL_RECORD_OWNER, "program_root": str(root),
+                                  "data_root": str(data)}), encoding="utf-8")
+    (root / "install.json").write_text(json.dumps({"owner": update.INSTALL_RECORD_OWNER, "data_root": str(data)}),
+                                       encoding="utf-8")
+    (root / "update-transaction.json").write_text(json.dumps({"step": "stopping"}), encoding="utf-8")
+    return home
+
+
+@pytest.mark.parametrize("reason", _POLICY_REASONS)
+def test_recovery_needed_status_reads_busy_in_place_of_a_policy_reason(tmp_path, monkeypatch, reason):
+    home = _pending_journal_install(tmp_path, monkeypatch)
+    status = update.read_update_status(home, available=False, reason=reason)
+    assert status["state"] == "recovery-needed"
+    assert status["reason"] == "busy"
+
+
+@pytest.mark.parametrize("reason", ["busy", None])
+def test_recovery_needed_status_keeps_busy_and_needs_repair(tmp_path, monkeypatch, reason):
+    home = _pending_journal_install(tmp_path, monkeypatch)
+    status = update.read_update_status(home, available=False, reason=reason)
+    assert status["state"] == "recovery-needed"
+    assert status["reason"] == ("busy" if reason == "busy" else "needs-repair")
+
+
+@pytest.mark.parametrize("reason", _POLICY_REASONS)
+def test_a_policy_reason_is_kept_when_no_recovery_is_needed(tmp_path, monkeypatch, reason):
+    home = tmp_path / "home"
+    home.mkdir()
+    status = update.read_update_status(home, available=False, reason=reason)
+    assert status["state"] == "none"
+    assert status["reason"] == reason

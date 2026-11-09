@@ -652,6 +652,10 @@ def read_update_status(home=None, *, available=False, reason=None, self_update=F
         result["reason"] = "none"
     else:
         result["reason"] = reason if reason in _REPORTED_REASONS else "needs-repair"
+        # The App shows recovery copy for state recovery-needed, so that state never carries a
+        # policy reason (autostart-off and the like). It reads busy, as POST reports a recovery refusal.
+        if result.get("state") == "recovery-needed" and result["reason"] not in {"busy", "needs-repair"}:
+            result["reason"] = "busy"
     return result
 
 
