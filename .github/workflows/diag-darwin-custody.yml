@@ -49,6 +49,9 @@ jobs:
           else
             python -m pip install --no-input "$agent_dir"
           fi
+      - name: Print the exception the host swallows (installed copy only; keeps RECORD consistent)
+        shell: bash
+        run: python harness/tests/diag_patch_host.py
       - name: Prepare the harness dir (tests/ + pyproject only, so the installed Runtime is what imports)
         shell: bash
         run: |
