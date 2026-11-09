@@ -28,7 +28,7 @@ jobs:
       - name: Checkout published Agent alongside Runtime
         shell: bash
         env:
-          AGENT_SHA: e425903f7a9fa5b82973281d15054c0716b46e2d
+          AGENT_SHA: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9
         run: |
           agent_dir="$GITHUB_WORKSPACE/../astrid-agent"
           git init --quiet "$agent_dir"
@@ -136,7 +136,9 @@ jobs:
         with:
           python-version: "3.11"
       - run: brew install ffmpeg
-      - run: python -m pip install -e '.[test]'
+      # Non-editable: the host-only spawn test needs the installed pair (runtime_protocol and astrid in the
+      # same site-packages), the layout the verified launcher's import mapping covers.
+      - run: python -m pip install '.[test]'
       - name: Checkout published Agent alongside Runtime (darwin spawn test needs the Agent)
         shell: bash
         env:

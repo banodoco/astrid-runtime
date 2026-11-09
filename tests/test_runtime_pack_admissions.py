@@ -12,6 +12,7 @@ import pytest
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError, ValidationError
 from runtime_protocol.store import RealmStore
+from tests.lanes import requires_case_sensitive_filesystem
 from tests.test_runtime_pack_assets import (
     ENTRY_PATH,
     PACK_ID,
@@ -439,7 +440,10 @@ READER_REFUSALS = {
 }
 
 
-@pytest.mark.parametrize("kind", sorted(READER_REFUSALS))
+@pytest.mark.parametrize("kind", [
+    pytest.param(kind, marks=requires_case_sensitive_filesystem) if kind == "folder_identities_collide" else kind
+    for kind in sorted(READER_REFUSALS)
+])
 def test_installed_reader_refusal_kind(tmp_path, monkeypatch, kind):
     error, message = READER_REFUSALS[kind]
     reader = _reader_refusal(tmp_path, monkeypatch, kind)

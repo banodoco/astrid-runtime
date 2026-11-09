@@ -16,6 +16,24 @@ from runtime_protocol import windows_handoff
 from tests.lanes import requires_windows_runtime_venv
 
 
+def _selected_agent_checkout():
+    """The sibling published Agent checkout that ``down`` must select as shutdown owner."""
+    agent = Path(__file__).resolve().parents[2] / "astrid-agent"
+    return agent if (agent / "astrid" / "__init__.py").is_file() else None
+
+
+def test_runtime_checkout_is_not_a_selectable_shutdown_owner():
+    # Regression (b005394): ``down`` imports ``astrid.services`` from the manifest's
+    # source_checkout, so the Runtime checkout can never stand in for the Agent.
+    from astrid_runtime.selected_source import selected_shutdown_owner
+    root = Path(__file__).resolve().parents[1]
+    assert not (root / "astrid").exists()
+    with pytest.raises(BootstrapError, match="missing beneath"):
+        with selected_shutdown_owner(str(root)):
+            pass  # pragma: no cover
+    assert _selected_agent_checkout() is None or _selected_agent_checkout() != root
+
+
 @pytest.mark.parametrize("selected_venv", [True, False])
 def test_windows_daemon_launch_preserves_selected_python(tmp_path, monkeypatch, selected_venv):
     base = tmp_path / "base"
@@ -192,10 +210,13 @@ def test_windows_update_backup_up_uses_the_actual_venv_interpreter(tmp_path, mon
         child._runtime_job.close()
 
     checkout = Path(__file__).resolve().parents[1]
+    agent = _selected_agent_checkout()
+    if agent is None:
+        pytest.skip("published Agent checkout is not a sibling of this Runtime checkout")
     manifest = tmp_path / "source-profile.json"
     manifest.write_text(json.dumps({
         "profile": "astrid", "runtime_checkout": str(checkout),
-        "source_checkout": str(checkout), "runtime_environment": str(environment),
+        "source_checkout": str(agent), "runtime_environment": str(environment),
     }), encoding="utf-8")
     data = tmp_path / "support"
 
