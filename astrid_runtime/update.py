@@ -111,9 +111,9 @@ _WINDOWS_TASK_NAME = "Astrid Runtime"
 def _windows_login_task_exists():
     """Whether the Astrid sign-in task exists: the Agent's Service.login_service_exists() on win32.
 
-    Mirrored, not imported: the Agent's R0 predicate (r0_stop.is_r0_installation) decides with
-    this query. Same PowerShell query and count rule: only an explicit 0 or 1 is an answer, and
-    anything else raises, so a doubtful query never reads as absence.
+    The source of this predicate is astrid/installer/service.py (Agent repo, login_service_exists);
+    this copy is mirrored, not imported, so it must change with that method. Only an explicit 0 or 1
+    is an answer, and anything else raises, so a doubtful query never reads as absence.
     """
     executable = (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell"
                   / "v1.0" / "powershell.exe")
