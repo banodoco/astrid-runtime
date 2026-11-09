@@ -190,6 +190,11 @@ def test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungrante
     status, started = call("POST", "/v1/control/local-worker/start",
         {"profile_id": "astrid", "expected_workspace_uuid": realm_id})
 
+    # DIAG (temporary): surface the start response and Runtime log before the argv read.
+    (base / "start-response.json").write_text(json.dumps({"status": status, "body": started}, default=str))
+    print("DIAG start status:", status, "body:", started)
+    print("DIAG runtime.log tail:\n" + log_tail())
+    print("DIAG argv_record exists:", argv_record.exists())
     # (1) The verified host argv carries the granted installed root, never the refused one.
     launches = [json.loads(line) for line in argv_record.read_text().splitlines()]
     assert launches, "custody build handed no argv to the verified launcher:\n" + log_tail()
