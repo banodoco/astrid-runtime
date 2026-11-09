@@ -1,4 +1,5 @@
-# TEMPORARY diagnostic. Never merge. Runs only the custody-spawn test and keeps its artifacts.
+# TEMPORARY diagnostic. Never merge. Runs the custody-spawn test against each release pair's
+# own INSTALLED (non-editable) Runtime + Agent, using this branch's tests/ as the harness only.
 name: diag-darwin-custody
 on:
   push:
@@ -8,54 +9,65 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {os: macos-latest, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, mode: editable, tag: mac-r12-editable}
-          - {os: macos-latest, agent: 4866090edcce7df31d1f0e03cf2354b878e94105, mode: wheel, tag: mac-4866-wheel}
-          - {os: macos-latest, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, mode: wheel, tag: mac-r12-wheel}
-          - {os: ubuntu-latest, agent: 4866090edcce7df31d1f0e03cf2354b878e94105, mode: editable, tag: linux-4866-editable}
-          - {os: ubuntu-latest, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, mode: editable, tag: linux-r12-editable}
-          - {os: ubuntu-latest, agent: 4866090edcce7df31d1f0e03cf2354b878e94105, mode: wheel, tag: linux-4866-wheel}
-          - {os: ubuntu-latest, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, mode: wheel, tag: linux-r12-wheel}
-    name: ${{ matrix.tag }}
+        os: [macos-latest, ubuntu-latest]
+        pair:
+          - {name: R10, agent: 72462b04fa036736eb7fc9cb654def5f4ea2158c, runtime: 52ec0578963847693a0df758d9bc1d55325f518f}
+          - {name: R11, agent: a105de3a4852cb61b9647dfe2c920118bd29f272, runtime: 4f5477cb0f5b03d28bec991a1fe34edcd8fc309f}
+          - {name: R12, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, runtime: 744cf24874ea851f95949a706725aba19d18222f}
+    name: ${{ matrix.pair.name }} ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout harness (this branch, tests only)
+        uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout the pair's Runtime
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.pair.runtime }}
+          path: runtime
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install Runtime (editable or wheel)
+      - name: Install the pair's Runtime NON-editably
         shell: bash
-        run: |
-          if [ "${{ matrix.mode }}" = editable ]; then python -m pip install -e '.[test]'; else python -m pip install '.[test]'; fi
-      - name: Checkout the Agent alongside Runtime
+        run: python -m pip install './runtime[test]'
+      - name: Install the pair's Agent non-editably
         shell: bash
         env:
-          AGENT_SHA: ${{ matrix.agent }}
+          AGENT_SHA: ${{ matrix.pair.agent }}
         run: |
-          agent_dir="$GITHUB_WORKSPACE/../astrid-agent"
+          agent_dir="$GITHUB_WORKSPACE/astrid-agent"
           git init --quiet "$agent_dir"
           git -C "$agent_dir" remote add origin https://github.com/banodoco/astrid-agent
           git -C "$agent_dir" fetch --depth=1 origin "$AGENT_SHA"
           git -C "$agent_dir" checkout --detach --quiet FETCH_HEAD
           test "$(git -C "$agent_dir" rev-parse HEAD)" = "$AGENT_SHA"
-      - name: Install the Agent's locked dependencies, then the Agent non-editably
+          echo "Runtime lock source_commit: $(python -c "import json;print(json.load(open('$agent_dir/runtime.lock.json'))['source_commit'])")"
+          if [ -f "$agent_dir/requirements/runtime.lock" ]; then
+            python -m pip install --no-input --require-hashes -r "$agent_dir/requirements/runtime.lock"
+            python -m pip install --no-input --no-deps "$agent_dir"
+          else
+            python -m pip install --no-input "$agent_dir"
+          fi
+      - name: Prepare the harness dir (tests/ + pyproject only, so the installed Runtime is what imports)
         shell: bash
         run: |
-          python -m pip install --disable-pip-version-check --no-input --require-hashes -r "$GITHUB_WORKSPACE/../astrid-agent/requirements/runtime.lock"
-          python -m pip install --disable-pip-version-check --no-input --no-deps "$GITHUB_WORKSPACE/../astrid-agent"
-      - name: Allow the darwin_native lane to run off macOS (diag only)
-        if: runner.os != 'macOS'
-        shell: bash
-        run: sed -i 's/if _DARWIN_NATIVE.applies(CURRENT) and item/if False and item/' tests/lanes.py
+          mkdir -p "$RUNNER_TEMP/h"
+          cp -R harness/tests harness/pyproject.toml "$RUNNER_TEMP/h/"
+          if [ "$RUNNER_OS" != macOS ]; then sed -i 's/if _DARWIN_NATIVE.applies(CURRENT) and item/if False and item/' "$RUNNER_TEMP/h/tests/lanes.py"; fi
       - name: Run only the custody-spawn test with a kept base temp
         shell: bash
-        run: python -m pytest -vv -rA -s -m darwin_native tests/test_installed_pack_custody_spawn.py --basetemp="$RUNNER_TEMP/diag-basetemp" -p no:xdist 2>&1 | tee "$RUNNER_TEMP/pytest-output.txt"; exit ${PIPESTATUS[0]}
+        working-directory: ${{ runner.temp }}/h
         continue-on-error: true
+        run: |
+          python -c "import runtime_protocol,astrid,sys;print('runtime_protocol from',runtime_protocol.__file__);print('astrid from',astrid.__file__)"
+          python -m pytest -vv -rA -s -m darwin_native tests/test_installed_pack_custody_spawn.py --basetemp="$RUNNER_TEMP/diag-basetemp" -p no:xdist 2>&1 | tee "$RUNNER_TEMP/pytest-output.txt"; exit ${PIPESTATUS[0]}
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diag-${{ matrix.tag }}
+          name: diag-${{ matrix.pair.name }}-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/pytest-output.txt
             ${{ runner.temp }}/diag-basetemp/**/runtime.log
