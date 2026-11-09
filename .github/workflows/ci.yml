@@ -136,7 +136,9 @@ jobs:
         with:
           python-version: "3.11"
       - run: brew install ffmpeg
-      - run: python -m pip install -e '.[test]'
+      # Non-editable: the host-only spawn test needs the installed pair (runtime_protocol and astrid in the
+      # same site-packages), the layout the verified launcher's import mapping covers.
+      - run: python -m pip install '.[test]'
       - name: Checkout published Agent alongside Runtime (darwin spawn test needs the Agent)
         shell: bash
         env:

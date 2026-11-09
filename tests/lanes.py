@@ -187,6 +187,12 @@ DECLARED_XFAILS = {
         _xfail_reason("timeline-public-s2-historical-audio", "M2 historical audio capture: /tmp/claude-0/-home-user-repo/7dc61be1-7066-52e0-a5d0-94f90e61430a/scratchpad/orch/design/runtime-public-s2-literal-journey.md#original-audio-requirement"),
         "tests.test_timeline_public_s2_mixed_cli_journey.HistoricalAudioCaptureGap",
     ),
+    "installed-pair-source-closure": DeclaredXfail(
+        "installed-pair-source-closure",
+        ("tests/test_installed_pack_custody_spawn.py::test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungranted",),
+        _xfail_reason("installed-pair-source-closure", "Agent/Runtime source-closure digests disagree for installed pairs; fixed by astrid-dev Plan 38"),
+        "tests.test_installed_pack_custody_spawn.KnownSourceClosureMismatch",
+    ),
     "p1-top-level-text-hook": DeclaredXfail(
         "p1-top-level-text-hook",
         ("tests/test_timeline_visual_fields.py::test_supported_top_level_type_on_retains_original_roundtrip_expectations",),
