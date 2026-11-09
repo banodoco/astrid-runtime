@@ -83,12 +83,18 @@ def _json(path, snapshots):
 
 
 def _assert_autostart_supported(selected):
-    # The saved choice is the Agent's choices.autostart, a bool it validates on write. Absent means no refusal.
+    # The saved choice is the Agent's choices.autostart, which the Agent validates as a bool. Absent means
+    # no refusal. A malformed saved value is needs-repair, never read as on.
     choices = selected.get("choices") if isinstance(selected, dict) else None
-    if isinstance(choices, dict) and choices.get("autostart") is False:
+    if choices is None:
+        return
+    if not isinstance(choices, dict) or ("autostart" in choices and type(choices["autostart"]) is not bool):
+        raise UpdateRefusal("needs-repair", "The saved install choices are unreadable; repair the installation.")
+    if choices.get("autostart") is False:
         raise UpdateRefusal(
             "autostart-off",
-            "In-app update is unavailable while saved autostart is off; this installer cannot preserve that choice yet.",
+            "In-app update is unavailable while start at sign-in is off. "
+            "Update from a terminal instead; your choice stays off.",
         )
 
 
