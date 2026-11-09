@@ -240,7 +240,7 @@ requires_linux_tree_custody = _declare(
 ).mark()
 requires_case_sensitive_filesystem = _declare(
     "case-sensitive-filesystem", "sys_platform in ('darwin', 'win32')",
-    "the test creates two folders whose names differ only by case", ("unit",),
+    "the collision can't exist on a case-insensitive filesystem; it still runs on Linux", ("unit",),
 ).mark()
 requires_posix_inherited_descriptors = _declare(
     "posix-inherited-descriptors", "os_name == 'nt'",
