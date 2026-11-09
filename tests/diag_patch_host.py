@@ -19,10 +19,10 @@ path.write_text(text, encoding="utf-8")
 data = path.read_bytes()
 digest = "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
 for record in site.glob("astrid-*.dist-info/RECORD"):
-    rows = list(csv.reader(record.read_text(newline="").splitlines()))
+    rows = list(csv.reader(open(record, newline="", encoding="utf-8").read().splitlines()))
     for row in rows:
         if row and row[0] == target:
             row[1], row[2] = digest, str(len(data))
     out = io.StringIO(); csv.writer(out, lineterminator="\n").writerows(rows)
-    record.write_text(out.getvalue())
+    open(record, "w", newline="", encoding="utf-8").write(out.getvalue())
 print("patched", path)
