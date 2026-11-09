@@ -115,8 +115,14 @@ def _receipt(paths: RuntimePaths) -> dict[str, Any]:
     return value if value.get("format") == RECEIPT_FORMAT and isinstance(value.get("kind"), str) else {}
 
 
-def _storage_move(paths: RuntimePaths, record: dict[str, Any]) -> tuple[str, list[Path]]:
-    """The R0 to R1 storage move as the installer records it, and the retained R0 data roots."""
+_MOVE_DONE = "finished; the old copy is kept"
+
+
+def _storage_move(paths: RuntimePaths, record: dict[str, Any]) -> tuple[str, str, list[Path]]:
+    """The R0 to R1 storage move: a plain line, the installer's own terms, and the retained R0 data roots.
+
+    The plain line is for the summary; the journal and phase wording is for Raw detail.
+    """
     journal_path = _install_record_path(paths.home).with_name(HANDOFF_JOURNAL)
     journal = _read_json(journal_path)
     archived = _install_record_path(paths.home).with_name(HANDOFF_ARCHIVE)
@@ -124,16 +130,18 @@ def _storage_move(paths: RuntimePaths, record: dict[str, Any]) -> tuple[str, lis
     if journal:
         phase = journal.get("phase") if isinstance(journal.get("phase"), str) else "unknown"
         old = _path_of(journal.get("r0_data_root"))
-        text = (f"phase {phase}, journal still authoritative (not normalised)" if phase == "complete"
-                else f"phase {phase} (in progress or rolled back)")
-        return text, [old] if old else []
+        if phase == "complete":
+            plain, text = _MOVE_DONE, f"phase {phase}, journal still authoritative (not normalised)"
+        else:
+            plain, text = "started but not finished", f"phase {phase} (in progress or rolled back)"
+        return plain, text, [old] if old else []
     if "r1_data_root" in record:
         old = _path_of(record.get("data_root"))
-        return "finished, selection not normalised (no journal found)", [old] if old else []
+        return _MOVE_DONE, "finished, selection not normalised (no journal found)", [old] if old else []
     if retained is not None:
         state = "journal archived" if archived.is_file() and not archived.is_symlink() else "no archived journal found"
-        return f"finished and normalised ({state}); the old workspace copy is kept", [retained]
-    return "none recorded", []
+        return _MOVE_DONE, f"finished and normalised ({state}); the old workspace copy is kept", [retained]
+    return "none recorded", "none recorded", []
 
 
 def _runtime_at(root: Path) -> dict[str, Any] | None:
@@ -240,7 +248,7 @@ def diagnostics_report(
     healthy = support.get("healthy", support.get("ok", "unknown"))
     state = support.get("state") or ("healthy" if healthy is True else "unhealthy" if healthy is False else "unknown")
     receipt = _receipt(paths)
-    move, retained_roots = _storage_move(paths, record)
+    move, move_detail, retained_roots = _storage_move(paths, record)
     active_root = paths.app_support
     roots = [active_root, *(root for root in retained_roots if root != active_root)]
 
@@ -303,9 +311,9 @@ def diagnostics_report(
         _row("Latest release", latest_text),
         _row("Last update", last_rows[0] if last_rows else last_line),
         *(_row("", extra) for extra in last_rows[1:]),
-        _row("Storage move", move),
+        _row("Moving your projects", move),
         _row("Runtimes found", f"{len(running)} running" + (" (should be 1)" if len(running) > 1 else "")),
-        *(_row("", f"· {root} · {_release(found['release'])} · instance {found['instance'] or '?'} · pid {found['pid'] or '?'} · "
+        *(_row("", f"· {root} · {_release(found['release'])} · "
                + ("running" if found["alive"] else "not running" if found["alive"] is False else "running state unknown")
                + (" (selected)" if root == active_root else " (not selected; old workspace copy)"))
           for root, found in runtimes),
@@ -316,6 +324,9 @@ def diagnostics_report(
         f"Selection record identity: managed_by={identity.get('managed_by', record.get('managed_by', 'unknown'))}; release={identity.get('release', 'unknown')}",
         f"Active data root: {active_root}",
         *(f"Retained old workspace copy: {root}" for root in retained_roots if root != active_root),
+        f"Storage move: {move_detail}",
+        *(f"Runtime at {root}: instance {found['instance'] or '?'} · pid {found['pid'] or '?'}"
+          for root, found in runtimes),
         f"Free disk space: {free if free is not None else 'unknown'} bytes",
         f"This Runtime's support state: {state} (healthy={healthy})",
         f"Last installer run ({RECEIPT_NAME}): " + (json.dumps(receipt, sort_keys=True) if receipt else "(not available)"),

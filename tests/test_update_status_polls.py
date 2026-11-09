@@ -5,6 +5,7 @@ read is a cost with no state change behind it, so repeated polls reuse the last 
 """
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import subprocess
 
 import pytest
@@ -12,6 +13,79 @@ import pytest
 from astrid_runtime import update
 
 ALL_ACTIONS = sorted(update._SELF_UPDATE_ACTIONS | {"availability"})
+
+
+def _no_pointer_admission(monkeypatch, tmp_path, platform, *, login_task):
+    """Status through the real _selection for an install with no program/current pointer.
+
+    Nothing in the selection is stubbed except identity normalization. The Windows
+    sign-in task query (PowerShell) and the helper are fakes that record their launches.
+    """
+    home, data, realm = tmp_path / "home", tmp_path / "data", tmp_path / "realm"
+    agent, runtime, program = tmp_path / "agent", tmp_path / "runtime", tmp_path / "program"
+    for folder in (home, data, realm, agent, runtime, program):
+        folder.mkdir()
+    monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
+    monkeypatch.setattr(update.sys, "platform", platform)
+    monkeypatch.setattr(update, "normalize_startup_identity", lambda _value: {"release": 0, "managed_by": None})
+    (program / "install.json").write_text(
+        json.dumps({"owner": update.INSTALL_RECORD_OWNER, "data_root": str(data)}), encoding="utf-8")
+    record = update._install_record_path(home)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({
+        "owner": update.INSTALL_RECORD_OWNER, "program_root": str(program), "data_root": str(data),
+        "realm_root": str(realm), "realm_id": "realm-1"}), encoding="utf-8")
+    daemon = SimpleNamespace(
+        startup_identity={}, startup_identity_instance_id=1, instance_id=1, root=realm,
+        support_root=data / "runtime", service=SimpleNamespace(realm={"id": "realm-1"}),
+        _identity_agent_checkout=str(agent), _identity_runtime_checkout=str(runtime))
+    admission = update.UpdateAdmission(daemon)
+    launches, queries = [], []
+
+    def run(argv, **_kwargs):
+        if str(argv[0]).endswith("powershell.exe"):
+            queries.append(argv[0])
+            return subprocess.CompletedProcess(argv, 0, stdout="ASTRID_TASK_COUNT=%d\n" % int(login_task), stderr="")
+        launches.append(argv[0])
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(
+            {"available": False, "reason": "windows-upgrade-unsupported", "actions": ALL_ACTIONS}), stderr="")
+
+    monkeypatch.setattr(update.subprocess, "run", run)
+    return admission, launches, queries
+
+
+def test_win32_r0_no_current_pointer_with_login_task_reports_windows_upgrade_unsupported_once(tmp_path, monkeypatch):
+    """Windows R0 with no program/current pointer and the sign-in task: the helper answers, once (Plan 29 card 4)."""
+    admission, launches, queries = _no_pointer_admission(monkeypatch, tmp_path, "win32", login_task=True)
+    for _ in range(20):
+        status = admission.status()
+        assert status["available"] is False
+        assert status["reason"] == "windows-upgrade-unsupported"
+    assert len(launches) == 1, "the helper must be launched once across steady polls"
+    assert len(queries) == 1, "the sign-in task query must not run on every poll"
+
+
+def test_win32_no_current_pointer_without_login_task_stays_needs_repair(tmp_path, monkeypatch):
+    admission, launches, queries = _no_pointer_admission(monkeypatch, tmp_path, "win32", login_task=False)
+    for _ in range(20):
+        assert admission.status()["reason"] == "needs-repair"
+    assert launches == []
+    assert len(queries) <= 1, "the negative sign-in task answer must be reused, not queried per poll"
+
+
+def test_win32_no_current_pointer_with_pending_journal_stays_needs_repair(tmp_path, monkeypatch):
+    admission, launches, _queries = _no_pointer_admission(monkeypatch, tmp_path, "win32", login_task=True)
+    (tmp_path / "program" / "update-transaction.json").write_text('{"step": "switched"}', encoding="utf-8")
+    assert admission.status()["reason"] == "needs-repair"
+    assert launches == []
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_non_windows_no_current_pointer_stays_needs_repair(tmp_path, monkeypatch, platform):
+    admission, launches, queries = _no_pointer_admission(monkeypatch, tmp_path, platform, login_task=True)
+    for _ in range(3):
+        assert admission.status()["reason"] == "needs-repair"
+    assert launches == [] and queries == []
 
 
 def _admission(monkeypatch, tmp_path, platform):
@@ -109,3 +183,43 @@ def test_settled_job_uses_the_long_refresh(tmp_path, monkeypatch):
     clock[0] += 241.0
     admission.status()
     assert len(launches) == 2
+
+
+WINDOWS_REFUSAL = ("Upgrading from an earlier Windows version isn't supported yet. "
+                   "Your data was kept; reinstall to get the new version.")
+
+
+def _windows_unsupported_reply(kind):
+    import json
+    if kind == "availability":
+        return 0, json.dumps({"available": False, "reason": "windows-upgrade-unsupported", "actions": ALL_ACTIONS})
+    return 1, json.dumps({"reason": "windows-upgrade-unsupported", "message": WINDOWS_REFUSAL})
+
+
+@pytest.mark.parametrize("kind", ["availability", "refusal"])
+def test_status_reports_windows_upgrade_unsupported_from_the_helper(tmp_path, monkeypatch, kind):
+    """The App shows a line with no retry command only when status.reason says so (Plan 29 R11 card 4)."""
+    admission, launches = _admission(monkeypatch, tmp_path, "win32")
+    code, stdout = _windows_unsupported_reply(kind)
+
+    def run(argv, **_kwargs):
+        launches.append(argv[0])
+        return subprocess.CompletedProcess(argv, code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(update.subprocess, "run", run)
+    status = admission.status()
+    assert status["available"] is False
+    assert status["reason"] == "windows-upgrade-unsupported"
+    for _ in range(20):
+        assert admission.status()["reason"] == "windows-upgrade-unsupported"
+    assert len(launches) == 1, "a steady windows-upgrade-unsupported answer must not start a helper per poll"
+
+
+def test_explicit_update_keeps_the_windows_upgrade_unsupported_reason(monkeypatch):
+    admission = update.UpdateAdmission(SimpleNamespace())
+    code, stdout = _windows_unsupported_reply("refusal")
+    monkeypatch.setattr(update.subprocess, "run",
+                        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, code, stdout=stdout, stderr=""))
+    with pytest.raises(update.UpdateRefusal) as refusal:
+        admission._helper(Path("/python"), Path("/agent"), Path("/runtime"), {"action": "launch"})
+    assert refusal.value.details["reason"] == "windows-upgrade-unsupported"
