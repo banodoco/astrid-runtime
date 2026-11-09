@@ -84,9 +84,9 @@ def _worker_profile(base, support, python):
     kernel = python.resolve()
     kernel_digest = "sha256:" + hashlib.sha256(kernel.read_bytes()).hexdigest()
     boot = support / "astrid-host" / "boot-manifest.json"
-    compose_profile_handoff(boot, support_root=support)
+    handoff = compose_profile_handoff(boot, support_root=support)  # its "sha256" is the stamped pin the host verifies
     launch = {"source_checkout": str(site), "pack_root": str(site / "astrid" / "packs"), "boot_manifest_path": str(boot),
-        "boot_manifest_hash": "sha256:" + hashlib.sha256(boot.read_bytes()).hexdigest(), "capability_matrix": None,
+        "boot_manifest_hash": "sha256:" + handoff["sha256"], "capability_matrix": None,
         "environment": {}, "max_concurrency": 2}
     profile = {"execution_mode": "host_only_cpu", "profile_id": "astrid", "machine_id": _owner_machine_id(),
         "host_executable": str(python), "host_artifact_digest": kernel_digest, "host_os_executable": str(kernel),
