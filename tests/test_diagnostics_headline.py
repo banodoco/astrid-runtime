@@ -84,7 +84,11 @@ def test_hannah_release1_handoff_complete_not_updated(machine):
     assert "Latest release           Release 10" in head
     assert "update · Release 1 → Release 1 · not-updated (installer-bug) · exit 3" in head
     assert "Why: the installer finished without installing the new release." in head
-    assert "phase complete, journal still authoritative (not normalised)" in head
+    # The summary says it plainly; the journal and phase wording is raw detail (Plan 29 R11 card 6).
+    assert "Moving your projects     finished; the old copy is kept" in head
+    for internal in ("journal", "normalised", "not normalised", "authoritative", "phase"):
+        assert internal not in head
+    assert "Storage move: phase complete, journal still authoritative (not normalised)" in raw
     assert "2 running (should be 1)" not in head  # R1 publishes no discovery in this fixture
     assert "disk or database full" in head and "database or disk is full" in head
     assert "service pack-host restarted 16 times (last exit 1)" in head
@@ -124,6 +128,9 @@ def test_two_runtimes_for_one_workspace_are_a_problem(machine):
     assert "Runtimes found           2 running (should be 1)" in head
     assert "2 Astrid Runtimes are running for one workspace (should be 1)" in head
     assert "(selected)" in head and "(not selected; old workspace copy)" in head
+    # Instance ids and process ids are for support, under the rule.
+    assert "instance" not in head and "pid" not in head
+    assert f"pid {os.getpid()}" in raw and "instance r1-1" in raw
     assert "- other-runtime-running" in raw
 
 
@@ -142,7 +149,9 @@ def test_normalised_install_after_update_is_ok(machine, monkeypatch):
     assert lines[0] == ("Astrid diagnostics: OK. Installed: Release 10. Latest: Release 10. "
                         "Last update: Astrid updated: Release 1 → Release 10.")
     head = "\n".join(lines)
-    assert "finished and normalised (journal archived); the old workspace copy is kept" in head
+    assert "Moving your projects     finished; the old copy is kept" in head
+    assert "journal" not in head and "normalised" not in head
+    assert "Storage move: finished and normalised (journal archived); the old workspace copy is kept" in raw
     assert "Problems                 none detected" in head
     assert f"Retained old workspace copy: {roots['r0']}".replace(str(home), "~") in raw
     assert "Free disk space: 53687091200 bytes" in raw
