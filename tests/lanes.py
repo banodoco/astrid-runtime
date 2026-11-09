@@ -238,6 +238,10 @@ requires_linux_tree_custody = _declare(
     "linux-tree-custody", "sys_platform != 'linux'",
     "Linux waitid WNOWAIT process-group custody", ("unit", "portability-lifecycle", "integration"),
 ).mark()
+requires_case_sensitive_filesystem = _declare(
+    "case-sensitive-filesystem", "sys_platform in ('darwin', 'win32')",
+    "the collision can't exist on a case-insensitive filesystem; it still runs on Linux", ("unit",),
+).mark()
 requires_posix_inherited_descriptors = _declare(
     "posix-inherited-descriptors", "os_name == 'nt'",
     "relay integration requires POSIX inherited descriptors", ("integration",),

@@ -17,7 +17,7 @@ from test_local_execution_supervisor import _prepare_case
 from test_local_worker import host_only_profile_case, profile_case
 
 from tests.lanes import requires_linux_tree_custody
-pytestmark = requires_linux_tree_custody
+pytestmark = [requires_linux_tree_custody, pytest.mark.needs_real_pidfd]
 
 SLEEPER = [sys.executable, '-I', '-c', 'import time; time.sleep(60)']
 
