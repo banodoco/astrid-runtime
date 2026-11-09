@@ -254,3 +254,190 @@ def test_explicit_update_keeps_the_windows_upgrade_unsupported_reason(monkeypatc
     with pytest.raises(update.UpdateRefusal) as refusal:
         admission._helper(Path("/python"), Path("/agent"), Path("/runtime"), {"action": "launch"})
     assert refusal.value.details["reason"] == "windows-upgrade-unsupported"
+
+
+# R13b. The App shows recovery copy whenever status says state recovery-needed. Status works out
+# that state from install.json and the journal, apart from the refusal reason, so it could say
+# recovery-needed with autostart-off. M-INT's ruling: for each recovery-needed cause, GET says what
+# POST says. POST normalizes a recovery refusal to reason busy with remediation M1
+# (runtime_protocol/server.py _update_refusal); it refuses an unreadable install.json or journal
+# as selection-or-inputs-invalid, whose GET counterpart is needs-repair.
+
+_POLICY_REASONS = ["autostart-off", "unsupported-service-manager", "windows-upgrade-unsupported",
+                   "managed-elsewhere", "source"]
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_interrupted_terminal_update_with_autostart_off_reads_recovery_needed_and_busy(tmp_path, monkeypatch, platform):
+    """A user with autostart off updates from a terminal and the install-line update is interrupted.
+
+    That leaves a non-terminal journal and no app job. Status says recovery-needed with reason
+    busy and remediation M1, as POST does, never autostart-off.
+    """
+    monkeypatch.setattr(update.sys, "platform", platform)
+    admission, root = _real_install(tmp_path, monkeypatch, {"autostart": False})
+    (root / "update-transaction.json").write_text(json.dumps({"step": "switched"}), encoding="utf-8")
+    status = admission.status()
+    assert status["state"] == "recovery-needed"
+    assert status["reason"] == "busy"
+    assert status["remediation"] == "M1"
+
+
+def test_no_pointer_install_with_a_pending_journal_reads_needs_repair_like_post(tmp_path, monkeypatch):
+    """With no version pointer POST cannot select a version, so status says needs-repair, not busy."""
+    admission, _launches, _queries = _no_pointer_admission(
+        monkeypatch, tmp_path, "win32", login_task=True, choices={"autostart": False})
+    (tmp_path / "program" / "update-transaction.json").write_text(json.dumps({"step": "switched"}), encoding="utf-8")
+    status = admission.status()
+    assert (status["state"], status["reason"], status.get("remediation")) == ("recovery-needed", "needs-repair", None)
+
+
+def _real_install(tmp_path, monkeypatch, choices):
+    """An installed release-4 Astrid that the real _selection accepts, for GET and POST alike."""
+    home, data, realm, root = (tmp_path / name for name in ("home", "data", "realm", "program"))
+    folder = root / "versions" / "old"
+    agent, runtime, python = folder / "agent", folder / "runtime", folder / "bin" / "python"
+    for path in (home, data, realm, agent, runtime, python.parent):
+        path.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    identity = {"release": 4, "managed_by": None}
+
+    def write(path, value):
+        path.write_text(json.dumps(value), encoding="utf-8")
+
+    write(folder / "profile.json", {"profile": "astrid", "source_checkout": str(agent), "runtime_checkout": str(runtime)})
+    write(folder / "version.json", {"root": str(folder), "python": str(python),
+                                    "profile": str(folder / "profile.json"), "identity": identity})
+    write(folder / "manifest.json", {"release": 4})
+    (root / "current").write_text("old\n", encoding="utf-8")
+    write(root / "install.json", {"owner": update.INSTALL_RECORD_OWNER, "data_root": str(data)})
+    selected = {"owner": update.INSTALL_RECORD_OWNER, "program_root": str(root), "data_root": str(data),
+                "realm_root": str(realm), "realm_id": "realm-1"}
+    if choices is not None:
+        selected["choices"] = choices
+    record = update._install_record_path(home)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    write(record, selected)
+    monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
+    daemon = SimpleNamespace(
+        startup_identity=identity, startup_identity_instance_id=1, instance_id=1, root=realm,
+        support_root=data / "runtime", service=SimpleNamespace(realm={"id": "realm-1"}),
+        _identity_agent_checkout=str(agent), _identity_runtime_checkout=str(runtime))
+    admission = update.UpdateAdmission(daemon)
+    # The Agent's availability answer does not read the journal; it says an update is possible.
+    admission._status_availability = lambda *_args, **_kwargs: {"available": True, "self_update": True}
+
+    def agent_helper(_python, _agent, _runtime, payload, **_kwargs):
+        # The Agent's locked reconciler refuses any unresolved job or unfinished journal with
+        # reason busy (astrid/installer/update_job.py reconcile); Runtime's _helper raises it so.
+        assert payload.get("action") == "reconcile", "POST must not get past reconciliation here"
+        raise update.UpdateRefusal("busy", "The installer must recover its pending update first.")
+
+    admission._helper = agent_helper
+    return admission, root
+
+
+def _post_answer(admission):
+    """POST /v1/update's public refusal, through the route's own normalization."""
+    from runtime_protocol.errors import ConflictError
+    from runtime_protocol.server import RuntimeHandler
+    route = SimpleNamespace(_update_operation_id=RuntimeHandler._update_operation_id,
+                            _update_uncertain=lambda *_args: pytest.fail("not an uncertain result"))
+    with pytest.raises(ConflictError) as refused:
+        try:
+            admission.request()
+        except ConflictError as refusal:
+            RuntimeHandler._update_refusal(route, refusal)
+    details = refused.value.details
+    # selection-or-inputs-invalid is POST's own reason; status says needs-repair for that cause.
+    reason = "needs-repair" if details["reason"] == "selection-or-inputs-invalid" else details["reason"]
+    return reason, details.get("remediation")
+
+
+def _cause(root, name):
+    def write(path, value):
+        path.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
+    install = json.loads((root / "install.json").read_text(encoding="utf-8"))
+    job = {"operation_id": "a" * 32, "format": "astrid-update-job/v1"}
+    if name == "unfinished-journal":
+        write(root / "update-transaction.json", {"step": "switched"})
+    elif name == "journal-without-step":
+        write(root / "update-transaction.json", {"format": "astrid-install-update/v1"})
+    elif name == "unreadable-journal":
+        write(root / "update-transaction.json", "{not json")
+    elif name == "unacknowledged-job":
+        write(root / "install.json", {**install, "update_job": {**job, "state": "accepted"}})
+    elif name == "unknown-job-state":
+        write(root / "install.json", {**install, "update_job": {**job, "state": "mystery"}})
+    elif name == "unreadable-install-record":
+        write(root / "install.json", "{not json")
+    elif name == "mismatched-install-record":
+        write(root / "install.json", {**install, "data_root": str(root / "elsewhere")})
+    elif name == "unreadable-selection":
+        # Neither status nor POST can select a version; the journal still says recovery-needed.
+        (root / "current").unlink()
+        write(root / "update-transaction.json", {"step": "switched"})
+    else:
+        raise AssertionError(name)
+
+
+_CAUSES = {
+    "unfinished-journal": ("busy", "M1"),
+    "journal-without-step": ("busy", "M1"),
+    "unknown-job-state": ("busy", "M1"),
+    "unacknowledged-job": ("busy", "M1"),
+    "unreadable-journal": ("needs-repair", None),
+    "unreadable-install-record": ("needs-repair", None),
+    "mismatched-install-record": ("needs-repair", None),
+    "unreadable-selection": ("needs-repair", None),
+}
+
+
+@pytest.mark.parametrize("choices", [None, {"autostart": False}], ids=["autostart-unset", "autostart-off"])
+@pytest.mark.parametrize("cause", sorted(_CAUSES))
+def test_status_says_what_post_says_for_each_recovery_needed_cause(tmp_path, monkeypatch, cause, choices):
+    admission, root = _real_install(tmp_path, monkeypatch, choices)
+    _cause(root, cause)
+    status = admission.status()
+    assert status["state"] == "recovery-needed"
+    assert (status["reason"], status.get("remediation")) == _post_answer(admission) == _CAUSES[cause]
+
+
+def _pending_journal_install(tmp_path):
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    for folder in (home, root, data):
+        folder.mkdir()
+    record = update._install_record_path(home)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"owner": update.INSTALL_RECORD_OWNER, "program_root": str(root),
+                                  "data_root": str(data)}), encoding="utf-8")
+    (root / "install.json").write_text(json.dumps({"owner": update.INSTALL_RECORD_OWNER, "data_root": str(data)}),
+                                       encoding="utf-8")
+    (root / "update-transaction.json").write_text(json.dumps({"step": "stopping"}), encoding="utf-8")
+    return home
+
+
+@pytest.mark.parametrize("reason", [*_POLICY_REASONS, "busy", "needs-repair", None])
+@pytest.mark.parametrize("available", [False, True])
+def test_recovery_needed_status_reads_busy_m1_whatever_reason_it_was_given(tmp_path, reason, available):
+    home = _pending_journal_install(tmp_path)
+    status = update.read_update_status(home, available=available, reason=reason)
+    assert status["state"] == "recovery-needed"
+    assert (status["reason"], status["remediation"]) == ("busy", "M1")
+
+
+def test_recovery_needed_status_waits_while_an_update_request_is_being_prepared(tmp_path):
+    # POST answers update-busy (remediation wait) while another request holds the lock.
+    home = _pending_journal_install(tmp_path)
+    status = update.read_update_status(home, available=False, reason="busy", remediation="wait")
+    assert (status["state"], status["reason"], status["remediation"]) == ("recovery-needed", "busy", "wait")
+
+
+@pytest.mark.parametrize("reason", _POLICY_REASONS)
+def test_a_policy_reason_is_kept_when_no_recovery_is_needed(tmp_path, reason):
+    home = tmp_path / "home"
+    home.mkdir()
+    status = update.read_update_status(home, available=False, reason=reason)
+    assert status["state"] == "none"
+    assert status["reason"] == reason
+    assert "remediation" not in status

@@ -155,7 +155,8 @@ def test_status_reads_authoritative_job_and_c2_journal_without_recovery(tmp_path
     assert update.read_update_status(home) == {
         "available": False, "state": "recovery-needed", "operation_id": "11111111111111111111111111111111",
         "result": "Recovery needed.", "target_release": 9,
-        "log_path": str(root / "logs/update.log"), "self_update": False, "reason": "needs-repair",
+        # R13b ruling: recovery-needed reads busy with remediation M1, as POST reports it.
+        "log_path": str(root / "logs/update.log"), "self_update": False, "reason": "busy", "remediation": "M1",
     }
     fresh = subprocess.run(
         [sys.executable, "-c", "import json,sys; from astrid_runtime.update import read_update_status; print(json.dumps(read_update_status(sys.argv[1])))", str(home)],
@@ -415,7 +416,8 @@ def test_status_reports_pending_c2_even_without_f1_job(tmp_path):
     _write(root / "update-transaction.json", {"step": "stopping"})
     assert update.read_update_status(home) == {
         "available": False, "state": "recovery-needed", "result": "Recovery needed.",
-        "self_update": False, "reason": "needs-repair",
+        # R13b ruling: recovery-needed reads busy with remediation M1, as POST reports it.
+        "self_update": False, "reason": "busy", "remediation": "M1",
     }
 
 
