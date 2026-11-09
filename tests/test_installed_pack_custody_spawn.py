@@ -146,7 +146,8 @@ def test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungrante
     with log_path.open("w") as log:
         runtime = owned_process_groups.popen([str(python), "-c", RECORDING_RUNTIME, str(argv_record), "start",
             "--root", str(realm), "--support-root", str(support), "--realm-id", realm_id, "--worker-profile", str(profile)],
-            env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+            cwd=str(base))  # not the checkout: its *.egg-info would shadow the installed dist-info
 
     def stop_runtime():
         # Graceful first, so the Runtime retires its custody host; the group kill follows.
