@@ -322,7 +322,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             raise
 
     def _prepare_host_only(self, profile, *, operation_id, channel_id):
-        from .local_execution_supervisor import host_prepare_request, RetainedProcess
+        from .local_execution_supervisor import host_prepare_request, runtime_owner_record, RetainedProcess
         from .render_observer import TIMELINE_OBSERVER_FD_ENV, close_observer, open_host_observer
         from .verified_host_launch import TrustedLocalHostLaunchVerifier, canonical
         from astrid_runtime.custody_broker import RoleBoundCustodyBroker, default_process_identity, custody_wrapper_argv
@@ -340,16 +340,20 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         # in the observation and never enter the strict owner record.
         if any(native_owner.get(k) is None for k in ("pid", "uid", "birth_id")):
             raise ConflictError("host-only original Runtime owner is unavailable")
-        owner = {"pid": native_owner["pid"], "uid": native_owner["uid"], "birth_id": native_owner["birth_id"],
-                 "runtime_instance_id": epoch, "coordinator_epoch": epoch}
+        owner = runtime_owner_record(native_owner, epoch)
         if not operation_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in operation_id):
             raise ConflictError("host-only operation identity is invalid")
         scope = profile.support_root / "local-execution-custody" / operation_id
         request = host_prepare_request(operation_id=operation_id, channel_id=channel_id, owner_epoch=epoch,
             runtime_owner=owner, profile=selected, custody_scope=str(scope))
         external_sources = None
-        if profile.host_launch.get("additional_pack_roots"):
-            from .external_pack_sources import OwnerSourceCapture
+        from .external_pack_sources import OwnerSourceCapture, installed_collection_present
+        if profile.host_launch.get("additional_pack_roots") or installed_collection_present(self.config.get("installed_pack_root")):
+            # Retained custody discovers every verified installed pack at launch,
+            # not only selected ones; unverified packs are named refusals.
+            # Keep custody whenever the installed collection is present, even with no
+            # launch roots: the personal root then always goes through custody, so
+            # a refused pack is never loaded by the host outside it (END round 3, B1).
             external_sources = OwnerSourceCapture(preparation=request, config=self.config)
         parent, control_child = socket.socketpair()
         activation, activation_child = socket.socketpair()
@@ -376,6 +380,12 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 if _pack_inventory(extra["path"]) != extra["files"]:
                     raise ConflictError("selected additional pack bytes differ")
                 argv += ["--pack-root", extra["path"]]
+            selected_roots = {extra["path"] for extra in profile.host_launch.get("additional_pack_roots", [])}
+            # Pin the launch set: an unselected pack that changed since capture is
+            # excluded by name here; the argv and payload then carry exactly these.
+            for root in (external_sources.pin(preparation=request, config=self.config) if external_sources is not None else []):
+                if root not in selected_roots:
+                    argv += ["--pack-root", root]
             from .verified_host_launch import ENV_KEYS
             # Only the reviewed launch environment crosses this private owner
             # boundary; inherited credentials, Python knobs and product roots
@@ -392,6 +402,10 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             # Fixed product roots are owner-selected, not ambient authority.
             environment.update(ASTRID_OUTPUT_ROOT=str(profile.support_root / "host-output"), ASTRID_RUNTIME_DATA_ROOT=str(profile.realm_root))
             Path(environment["ASTRID_OUTPUT_ROOT"]).mkdir(parents=True, exist_ok=True)
+            # Installed pack trees are never written: no bytecode, and any
+            # cache prefix is the private support root, outside every collection.
+            from .verified_host_launch import bytecode_environment
+            environment.update(bytecode_environment(profile.support_root, self.config, selected))
             release = _installed_host_release(profile, self.config)
             verifier = (TrustedLocalHostLaunchVerifier(installed_release=release, external_sources=external_sources)
                 if external_sources is not None else TrustedLocalHostLaunchVerifier(installed_release=release))
@@ -490,7 +504,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 if self._active is handle: self._active = None
 
     def _prepare_relay(self, profile, *, operation_id, channel_id):
-        from .local_execution_supervisor import host_prepare_request, RetainedProcess
+        from .local_execution_supervisor import host_prepare_request, runtime_owner_record, RetainedProcess
         from astrid_runtime.custody_broker import RoleBoundCustodyBroker, default_process_identity, custody_wrapper_argv
         if self._active is not None:
             self.abort(self._active)
@@ -501,8 +515,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         owner = default_process_identity(os.getpid())
         if owner is None or not isinstance(epoch, str) or not epoch:
             raise ConflictError("Runtime launch owner identity is unavailable")
-        owner.update(runtime_instance_id=epoch, coordinator_epoch=epoch)
-        owner.pop("parent_pid", None)
+        owner = runtime_owner_record(owner, epoch)
         # Operation IDs originate in Runtime. Reject path syntax before using
         # one to select this private, launch-specific protected scope.
         if not isinstance(operation_id, str) or not operation_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in operation_id):
@@ -563,6 +576,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             return self._relay_abort_locked(handle)
 
     def _relay_abort_locked(self, handle):
+        from .local_execution_supervisor import RetainedWaitTimeout
         if handle.closed:
             return
         response = self._rpc(handle, {"version": "runtime.local-execution-control/v1", "command": "abort"})
@@ -572,7 +586,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             handle.broker.signal(runtime_platform.TERM, expected_pid=handle.worker.pid)
             try:
                 handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
-            except BaseException:
+            except RetainedWaitTimeout:
                 handle.broker.signal(runtime_platform.KILL, expected_pid=handle.worker.pid)
                 handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
         with handle.cleanup_resolution_lock:
@@ -1250,7 +1264,7 @@ def _path(value: Any, label: str, *, directory: bool | None = None) -> Path:
     return target
 
 
-def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, realm_root: Path, support_root: Path, runtime_instance_id: str) -> LocalWorkerComposition:
+def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, realm_root: Path, support_root: Path, runtime_instance_id: str, installed_pack_root: str | Path | None = None) -> LocalWorkerComposition:
     target = _path(str(path), "path", directory=False)
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
@@ -1276,7 +1290,7 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
         raise ValidationError("additional pack declarations require host-only mode")
     if mode == "host_only_cpu":
         return _load_host_only_composition(raw, workspace_uuid=workspace_uuid, realm_root=realm_root,
-            support_root=support_root, runtime_instance_id=runtime_instance_id)
+            support_root=support_root, runtime_instance_id=runtime_instance_id, installed_pack_root=installed_pack_root)
     if "host_protocol" in raw:
         from .verified_host_launch import validate_host_protocol, HostLaunchError
         try:
@@ -1501,7 +1515,7 @@ def _retain_local_worker_composition(value, *, required=False):
     return retained
 
 
-def _load_host_only_composition(raw, *, workspace_uuid, realm_root, support_root, runtime_instance_id):
+def _load_host_only_composition(raw, *, workspace_uuid, realm_root, support_root, runtime_instance_id, installed_pack_root=None):
     from .local_worker import _digest
     prohibited = {"worker_environment", "worker_executable", "worker_artifact_digest", "engine_executable", "engine_listener_executable",
         "engine_artifact_digest", "engine_listener_artifact_digest", "engine_endpoint", "engine_launch"}
@@ -1530,7 +1544,8 @@ def _load_host_only_composition(raw, *, workspace_uuid, realm_root, support_root
         raise ValidationError("host-only selected configuration differs")
     config = {**launch, "host_python": str(executable), "runtime_endpoint": "http://127.0.0.1:0",
         "runtime_instance_id": runtime_instance_id, "credential_file": str(Path(support_root) / "credentials/astrid-pack-host.token"),
-        "support_root": str(support_root), "ready_file": str(Path(support_root) / f"worker-{profile.profile_id}-ready.json")}
+        "support_root": str(support_root),
+        **({"installed_pack_root": str(installed_pack_root)} if installed_pack_root is not None else {}), "ready_file": str(Path(support_root) / f"worker-{profile.profile_id}-ready.json")}
     return LocalWorkerComposition({profile.profile_id: profile}, CrossProcessWorkerPreparer(profile=profile, config=config,
         environment=launch["environment"], timeout_seconds=float(raw.get("worker_timeout_seconds") or 120), cleanup_timeout_seconds=2.0), OSProcessInspector(profile))
 

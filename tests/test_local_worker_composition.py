@@ -436,7 +436,9 @@ def test_prepared_relay_and_custody_launches_keep_utf8_flags(tmp_path, monkeypat
     monkeypatch.setattr(composition, "_actual_executable", lambda _pid: profile.worker_executable)
     monkeypatch.setattr(composition, "_file_digest", lambda _path: profile.worker_artifact_digest)
     monkeypatch.setattr(supervisor, "host_prepare_request", lambda **_kwargs: {})
-    monkeypatch.setattr(custody, "default_process_identity", lambda _pid: {"pid": 1, "birth_id": "owner"})
+    monkeypatch.setattr(custody, "default_process_identity", lambda _pid: {
+        "pid": 1, "uid": runtime_platform.current_user(), "birth_id": "owner",
+    })
 
     class Broker:
         def __init__(self, **_kwargs):
@@ -955,7 +957,11 @@ def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_withou
             assert not os.get_blocking(captures['observer'])
             assert fcntl.fcntl(captures['observer'], fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
             assert handle.observer_read_fd is not None and stat.S_ISFIFO(os.fstat(handle.observer_read_fd).st_mode)
-        assert not set(env)&{'PYTHONPATH','PYTHONHOME','PYTHONDONTWRITEBYTECODE','ASTRID_RUNTIME_OWNER_TOKEN','ASTRID_EXECUTION_TARGET_JSON'}
+        assert not set(env)&{'PYTHONPATH','PYTHONHOME','ASTRID_RUNTIME_OWNER_TOKEN','ASTRID_EXECUTION_TARGET_JSON'}
+        # Bytecode policy is Runtime-owned, never the ambient value: no writes,
+        # and the cache prefix is the private support root, outside every pack root.
+        assert env['PYTHONDONTWRITEBYTECODE']=='1' and env['PYTHONPYCACHEPREFIX']==str(profile.support_root/'host-bytecode')
+        assert not Path(env['PYTHONPYCACHEPREFIX']).is_relative_to(config['pack_root'])
     finally:
         handle.control.close();handle.activation.close()
         os.close(captures['observer']);os.close(handle.observer_read_fd)
@@ -1054,3 +1060,15 @@ def test_host_only_owner_projection_is_exactly_five_fields_and_strict_validator_
     for extra in ('process_group', 'session_id', 'parent_pid'):
         with pytest.raises(RelayError):
             host_prepare_request(runtime_owner={**owner, extra: 1}, **base)
+
+
+def test_runtime_owner_record_projects_native_observation_to_exact_contract_fields():
+    from runtime_protocol.local_execution_supervisor import runtime_owner_record, RUNTIME_OWNER_FIELDS
+
+    native = {'pid': 123, 'uid': 456, 'birth_id': 'owner-birth',
+              'parent_pid': 1, 'process_group': 4321, 'session_id': 8765}
+    assert runtime_owner_record(native, 'epoch') == {
+        'pid': 123, 'uid': 456, 'birth_id': 'owner-birth',
+        'runtime_instance_id': 'epoch', 'coordinator_epoch': 'epoch',
+    }
+    assert set(runtime_owner_record(native, 'epoch')) == RUNTIME_OWNER_FIELDS

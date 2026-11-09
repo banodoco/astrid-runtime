@@ -1221,9 +1221,11 @@ class ForegroundRuntimeBoundary(LocalRuntimeBoundary):
                 door = DoorConfig(origin=settings.origin, port=settings.port, credential_file=credential)
             composition = None
             if source_profile.worker_profile:
+                from runtime_protocol.store import selected_installed_pack_root
                 composition = load_local_worker_composition(source_profile.worker_profile,
                     workspace_uuid=realm_id, realm_root=root, support_root=support,
-                    runtime_instance_id="pending-startup")
+                    runtime_instance_id="pending-startup",
+                    installed_pack_root=selected_installed_pack_root())
             services = load_service_configuration(getattr(source_profile, "service_declaration", None),
                 python=sys.executable, source_checkout=getattr(source_profile, "source_checkout", ""))
             daemon = RuntimeDaemon(root, support_root=support, display_name=self._display_name,

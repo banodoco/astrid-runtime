@@ -555,11 +555,20 @@ def main(argv: list[str] | None = None) -> int:
             config = _config(args, paths)
             boundary = LocalRuntimeBoundary()
             if args.command == "down":
-                # down validates and prepares the selected owner inside its
-                # fence, including the already-stopped case: C1 validates a
-                # retained completed-stop marker (or safely refuses) instead
-                # of requiring discovery here.
-                _emit(down(paths, boundary), json_mode=args.json)
+                source = config.resolve_source_profile(paths)
+                from .selected_source import selected_shutdown_owner
+
+                # Keep selected imports active through lazy owner preparation
+                # and the stop callback inside down's existing shutdown fence.
+                with selected_shutdown_owner(source.source_checkout) as prepare:
+                    owner = (_read_support_json(paths.discovery_path)
+                             or _read_support_json(paths.instance_lock_path) or {})
+                    stop_manager = prepare(
+                        support_root=paths.runtime_support,
+                        source_checkout=Path(source.source_checkout),
+                        runtime_instance_id=owner.get("runtime_instance_id"),
+                    )
+                    _emit(down(paths, boundary, stop_manager=stop_manager), json_mode=args.json)
                 return 0
             source = config.resolve_source_profile(paths)
             catalog = _read_catalog(paths)

@@ -19,6 +19,8 @@ import math
 from runtime_protocol.dirfd import filesystem as os
 from runtime_protocol import platform
 from runtime_protocol import process_control
+from runtime_protocol import process_binding
+from runtime_protocol import linux_process_binding
 from pathlib import Path
 import shutil
 import socket
@@ -113,9 +115,18 @@ def _send_frame(connection: socket.socket, value: Mapping[str, object]) -> None:
     connection.sendall(encoded)
 
 
-def _read_frame(connection: socket.socket) -> dict[str, object]:
+def _read_frame(connection: socket.socket, *, deadline: float | None = None) -> dict[str, object]:
+    if deadline is None:
+        timeout = connection.gettimeout()
+        if timeout is not None:
+            deadline = time.monotonic() + timeout
     raw = bytearray()
     while not raw.endswith(b"\n"):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CustodyError("custody frame timed out")
+            connection.settimeout(remaining)
         part = connection.recv(min(4096, FRAME_LIMIT + 1 - len(raw)))
         if not part:
             raise CustodyError("custody peer closed before a complete frame")
@@ -127,6 +138,8 @@ def _read_frame(connection: socket.socket) -> dict[str, object]:
     value = json.loads(bytes(raw[:-1]).decode("utf-8"))
     if not isinstance(value, dict):
         raise CustodyError("custody frame is not an object")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise CustodyError("custody frame timed out")
     return value
 
 
@@ -144,6 +157,8 @@ def _token_from_words(words: Sequence[int]) -> _AuditToken:
 
 
 def audit_token_details(words: Sequence[int]) -> dict[str, object]:
+    if process_binding.LINUX:
+        return linux_process_binding.details(words)
     if sys.platform == "win32":
         return platform.handoff_token_details(list(words))
     if sys.platform != "darwin":
@@ -164,6 +179,8 @@ def audit_token_details(words: Sequence[int]) -> dict[str, object]:
 
 
 def _peer_token(connection: socket.socket) -> dict[str, object]:
+    if process_binding.LINUX:
+        return linux_process_binding.peer_token(connection)
     if sys.platform == "win32":
         return platform.handoff_peer_token(connection)
     if sys.platform != "darwin":
@@ -178,6 +195,8 @@ def _peer_token(connection: socket.socket) -> dict[str, object]:
 
 def current_process_audit_token(pid: int) -> dict[str, object]:
     """Read a live Darwin audit token or native Windows creation identity."""
+    if process_binding.LINUX:
+        return linux_process_binding.token(pid)
 
     if sys.platform == "win32":
         return platform.handoff_token(pid)
@@ -233,6 +252,8 @@ def current_process_audit_token(pid: int) -> dict[str, object]:
 
 
 def signal_audit_token(words: Sequence[int], signum: int) -> None:
+    if process_binding.LINUX:
+        return linux_process_binding.signal(words, signum)
     if int(signum) not in _admitted_signals():
         raise CustodyError("custody signal is outside the admitted set")
     if sys.platform == "win32":
@@ -263,13 +284,65 @@ def _write_all(descriptor: int, value: bytes) -> None:
         offset += written
 
 
+def _mkdir_owner_only(path: Path, *, parents: bool = False, exist_ok: bool = False) -> None:
+    """Create directories one at a time and restrict only directories we made."""
+    path = Path(path)
+    if not parents:
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            if not exist_ok:
+                raise
+        else:
+            platform.owner_only(path, directory=True)
+        return
+
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    if current.exists() and not current.is_dir():
+        raise NotADirectoryError(str(current))
+    if not missing and not exist_ok:
+        raise FileExistsError(str(path))
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            # Another creator won the race. It is not ours to chmod.
+            if directory == path and not exist_ok:
+                raise
+            continue
+        platform.owner_only(directory, directory=True)
+
+
+def _validate_private_directory(path: Path, *, label: str = "custody directory") -> None:
+    """Reject unsafe existing parents without changing permissions we do not own."""
+    try:
+        observed = os.lstat(path)
+    except OSError as exc:
+        raise CustodyError(f"{label} is unavailable") from exc
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+        raise CustodyError(f"{label} is not a real directory")
+    if os.name == "nt":
+        if not platform.is_owner_only(path):
+            raise CustodyError(f"{label} is not owner-only")
+        return
+    if observed.st_uid != platform.current_user() or observed.st_mode & 0o022:
+        raise CustodyError(f"{label} is not privately owned")
+
+
 def _atomic_owner_json(path: Path, value: Mapping[str, object]) -> None:
     if platform.sys.platform == "win32":
         from .io import atomic_write_json
         atomic_write_json(path, dict(value))
         return
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    platform.owner_only(path.parent)
+    _mkdir_owner_only(path.parent, parents=True, exist_ok=True)
+    _validate_private_directory(path.parent, label="custody file parent")
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(name)
     try:
@@ -290,7 +363,7 @@ def _append_owner_jsonl(path: Path, value: Mapping[str, object]) -> None:
 
     if not path.is_absolute() or path.is_symlink():
         raise CustodyError("custody authority journal path is unsafe")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _mkdir_owner_only(path.parent, parents=True, exist_ok=True)
     parent = os.lstat(path.parent)
     if (
         stat.S_ISLNK(parent.st_mode)
@@ -325,9 +398,9 @@ def _open_authority_scope_lock(scope_root: Path) -> int:
     if not root.is_absolute() or root.is_symlink():
         raise CustodyError("custody authority scope is unsafe")
     if sys.platform == "win32":
-        platform.private_directory(root)
+        _mkdir_owner_only(root, parents=True, exist_ok=True)
     else:
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _mkdir_owner_only(root, parents=True, exist_ok=True)
     observed_root = os.lstat(root)
     if (
         not stat.S_ISDIR(observed_root.st_mode)
@@ -964,7 +1037,7 @@ class RoleBoundCustodyBroker:
     ) -> None:
         if not role or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in role):
             raise CustodyError("custody role is invalid")
-        if sys.platform not in ("darwin", "win32"):
+        if not process_binding.supported():
             raise CustodyError("Darwin audit-token custody is unavailable")
         self.role = role
         self.identity_provider = identity_provider
@@ -983,8 +1056,13 @@ class RoleBoundCustodyBroker:
         self._authority_scope_guard = threading.Lock()
         self.run_id = _digest_bytes(os.urandom(32))
         if sys.platform == "win32":
-            platform.private_directory(ledger_root.parent)
-        ledger_root.mkdir(parents=True, exist_ok=False, mode=0o700)
+            _mkdir_owner_only(ledger_root.parent, parents=True, exist_ok=True)
+            if not platform.is_owner_only(ledger_root.parent):
+                raise CustodyError("custody ledger parent is not owner-only")
+        else:
+            _mkdir_owner_only(ledger_root.parent, parents=True, exist_ok=True)
+            _validate_private_directory(ledger_root.parent, label="custody ledger parent")
+        _mkdir_owner_only(ledger_root, parents=True, exist_ok=False)
         platform.owner_only(ledger_root)
         self.root = ledger_root
         self.journal_path = ledger_root / "custody.journal.jsonl"
@@ -1007,7 +1085,7 @@ class RoleBoundCustodyBroker:
                 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 listener.bind(str(self.socket_path))
                 platform.owner_only(self.socket_path)
-                listener.listen(1)
+                listener.listen(8)
                 listener.settimeout(timeout)
             else:
                 _atomic_owner_json(self.socket_path, {"endpoint": listener.endpoint})
@@ -1298,16 +1376,59 @@ class RoleBoundCustodyBroker:
         self.chain_head = str(event["event_digest"])
         _atomic_owner_json(self.ledger_path, {**snapshot, "chain_digest": self.chain_head})
 
+    def _accept_registration(self, *, deadline: float) -> tuple[socket.socket, dict[str, object]]:
+        """Accept until one connection presents a valid registration frame from its own kernel peer.
+
+        A stray or failing connection is closed and the broker keeps accepting until the deadline,
+        so an unrelated same-user connection cannot starve the real child. Only the connection that
+        passes the frame and peer checks is returned; binding still happens in _serve as before.
+        """
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CustodyError("custody registration timed out")
+            self.listener.settimeout(remaining)
+            try:
+                connection, _ = self.listener.accept()
+            except (socket.timeout, TimeoutError) as exc:
+                raise CustodyError("custody registration timed out") from exc
+            try:
+                frame = _read_frame(connection, deadline=min(deadline, time.monotonic() + 2.0))
+                required = {"version", "command", "run_id", "role", "pid", "ppid", "argv_digest"}
+                if (
+                    set(frame) != required
+                    or frame["version"] != PROTOCOL_VERSION
+                    or frame["command"] != "register_pre_exec"
+                    or frame["run_id"] != self.run_id
+                    or frame["role"] != self.role
+                    or frame["ppid"] != self.launch_parent.verify()["pid"]
+                    or isinstance(frame["pid"], bool)
+                    or not isinstance(frame["pid"], int)
+                    or frame["pid"] <= 0
+                ):
+                    raise CustodyError("custody registration frame is invalid")
+                pre = _peer_token(connection)
+                if pre["pid"] != frame["pid"] or pre["uid"] != platform.current_user():
+                    raise CustodyError("custody registration kernel identity differs")
+                return connection, frame
+            except (CustodyError, OSError, ValueError, UnicodeDecodeError, linux_process_binding.LinuxBindingError):
+                # Expected peer refusals (including a peer that exited before its identity was read)
+                # reject only this connection; the broker keeps accepting until the deadline.
+                connection.close()
+                continue
+            except BaseException:
+                connection.close()
+                raise
+
     def _serve(self) -> None:
         connection: socket.socket | None = None
         try:
+            deadline = time.monotonic() + self.timeout
             if sys.platform == "win32":
-                deadline = time.monotonic() + self.timeout
                 connection, _ = self.listener.accept_child(self.launch_parent.verify(), deadline=deadline)
+                frame = _read_frame(connection, deadline=deadline)
             else:
-                connection, _ = self.listener.accept()
-            connection.settimeout(self.timeout)
-            frame = _read_frame(connection)
+                connection, frame = self._accept_registration(deadline=deadline)
             required = {"version", "command", "run_id", "role", "pid", "ppid", "argv_digest"}
             if (
                 set(frame) != required
@@ -1329,6 +1450,8 @@ class RoleBoundCustodyBroker:
                 raise CustodyError("pre-exec process identity is unavailable")
             if before.get("parent_pid") != self.launch_parent.verify()["pid"]:
                 raise CustodyError("registered process does not have the authenticated launch parent")
+            if time.monotonic() >= deadline:
+                raise CustodyError("custody registration timed out")
             self.sequence = 1
             self.registration = {
                 "pid": frame["pid"], "identity": dict(before),
@@ -1337,6 +1460,8 @@ class RoleBoundCustodyBroker:
                 "pre_exec_pidversion": pre["pidversion"],
                 "audit_token_words": pre["words"],
             }
+            if time.monotonic() >= deadline:
+                raise CustodyError("custody registration timed out")
             # Pending cleanup ownership is durable before registration can ACK
             # and let exec proceed. It conveys no destructive signal authority.
             self.role_authority.bind_pending(actor=self.cleanup_actor, admission_id=self.run_id,
@@ -1373,7 +1498,7 @@ class RoleBoundCustodyBroker:
             post: dict[str, object] | None = None
             while time.monotonic() < deadline:
                 candidate = _peer_token(connection)
-                if candidate["pidversion"] != pre["pidversion"] or sys.platform == "win32":
+                if candidate["pidversion"] != pre["pidversion"] or sys.platform == "win32" or not process_binding.ROTATES_ON_EXEC:
                     post = candidate
                     break
                 time.sleep(0.005)
@@ -1407,7 +1532,7 @@ class RoleBoundCustodyBroker:
                         "state": "post-exec-authority-validated",
                         "registration_before_exec": True,
                         "pre_post_exec_incarnation_bound": True,
-                        "signal_primitive": "proc_signal_with_audittoken",
+                        "signal_primitive": process_binding.PRIMITIVE,
                     },
                 })
                 _append_owner_jsonl(self.authority_journal, {
@@ -1691,7 +1816,7 @@ def signal_sealed_capability(
     ):
         raise CustodyError("Runtime custody capability changed during signal")
     return {
-        "ok": True, "kind": "proc_signal_with_audittoken", "signal": int(signum),
+        "ok": True, "kind": process_binding.PRIMITIVE, "signal": int(signum),
         "role": loaded["reference"]["role"], "pid": expected_identity["pid"],
         "birth_id": expected_identity["birth_id"],
         "audit_token_sha256": loaded["registration"]["audit_token_sha256"],
@@ -1734,8 +1859,22 @@ class NativeProcessCustody:
         record = {"version": NATIVE_CAPABILITY_VERSION, "role": "runtime_owner",
                   "target": self.identity, "controller": controller,
                   "state": "owned"}
-        if sys.platform == "darwin":
+        if process_binding.LINUX:
+            if not process_binding.supported():
+                raise CustodyError("Linux pidfd custody is unavailable")
+            try:
+                observed = default_process_identity(int(self.identity["pid"]))
+                if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
+                    raise CustodyError("native Runtime incarnation changed")
+                linux_process_binding.token(int(self.identity["pid"]))
+                observed = default_process_identity(int(self.identity["pid"]))
+                if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
+                    raise CustodyError("native Runtime incarnation changed")
+            except (linux_process_binding.LinuxBindingError, OSError) as exc:
+                raise CustodyError(str(exc)) from exc
+        elif sys.platform == "darwin":
             record["audit_token_words"] = current_process_audit_token(int(self.identity["pid"]))["words"]
+        _validate_private_directory(self.path.parent, label="native custody parent")
         with platform.file_lock(self.lock):
             _atomic_owner_json(self.path, record)
 
@@ -1748,6 +1887,7 @@ class NativeProcessCustody:
         return record
 
     def release(self):
+        _validate_private_directory(self.path.parent, label="native custody parent")
         with platform.file_lock(self.lock):
             record = self._read()
             actor = _native_controller_incarnation(default_process_identity(os.getpid()))
@@ -1760,6 +1900,7 @@ class NativeProcessCustody:
     def signal(self, signum, *, validate=None):
         if signum not in (platform.TERM, platform.KILL):
             raise CustodyError("native Runtime signal is outside the admitted set")
+        _validate_private_directory(self.path.parent, label="native custody parent")
         # This may run in a separate controller process; it follows the
         # setting in the same Runtime support folder.
         process_control.configure_from(self.path.parent)
@@ -1776,11 +1917,21 @@ class NativeProcessCustody:
                 validate()
             record["controller"], record["state"] = actor, "owned"
             _atomic_owner_json(self.path, record)
-            if sys.platform == "darwin":
+            if process_binding.LINUX or sys.platform == "darwin":
                 observed = default_process_identity(int(self.identity["pid"]))
                 if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
                     raise CustodyError("native Runtime incarnation changed")
-                signal_audit_token(record["audit_token_words"], signum)
+                try:
+                    if process_binding.LINUX:
+                        words = linux_process_binding.token(int(self.identity["pid"]))["words"]
+                        observed = default_process_identity(int(self.identity["pid"]))
+                        if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
+                            raise CustodyError("native Runtime incarnation changed")
+                    else:
+                        words = record["audit_token_words"]
+                    signal_audit_token(words, signum)
+                except (linux_process_binding.LinuxBindingError, OSError, KeyError, TypeError) as exc:
+                    raise CustodyError(str(exc)) from exc
             else:
                 try:
                     platform.signal_process(self.identity, signum)

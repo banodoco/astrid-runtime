@@ -2986,7 +2986,7 @@ def test_restart_cli_preserves_named_lifecycle_blockers(monkeypatch, tmp_path, c
     assert payload["error"]["details"]["unreleased_reservations"][0]["resource_key"] == "gpu:0"
 
 
-def test_down_cli_dispatches_completed_stop_without_discovery(monkeypatch, tmp_path, capsys):
+def test_down_cli_dispatches_completed_stop_without_discovery(monkeypatch, tmp_path, capsys, selected_agent_stub):
     from astrid_runtime import cli
 
     home = tmp_path / "home"
@@ -3003,7 +3003,7 @@ def test_down_cli_dispatches_completed_stop_without_discovery(monkeypatch, tmp_p
     paths.instance_lock_path.write_text(json.dumps({"state": "completed_stop"}))
     manifest = tmp_path / "source-profile.json"
     manifest.write_text(json.dumps({
-        "profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": "/source",
+        "profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": str(selected_agent_stub),
     }))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("ASTRID_RUNTIME_DATA_ROOT", str(data_root))
@@ -3021,6 +3021,10 @@ def test_down_cli_dispatches_completed_stop_without_discovery(monkeypatch, tmp_p
     assert cli.main(["down", "--data-root", str(data_root), "--json"]) == 0
     assert called == [True]
     assert json.loads(capsys.readouterr().out)["status"] == "stopped"
+    # down selected the manifest's Agent checkout and prepared its owner with no
+    # discovery (the completed-stop marker carries no runtime_instance_id).
+    assert sys.modules["astrid.services"].CALLS == [{"support_root": paths.runtime_support,
+        "source_checkout": selected_agent_stub, "runtime_instance_id": None}]
 
 
 class StaleOwnerTests(unittest.TestCase):
