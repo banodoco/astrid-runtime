@@ -105,6 +105,33 @@ _AVAILABILITY_TTL = 300.0
 _AVAILABILITY_UNRESOLVED_TTL = 30.0
 
 
+_WINDOWS_TASK_NAME = "Astrid Runtime"
+
+
+def _windows_login_task_exists():
+    """Whether the Astrid sign-in task exists: the Agent's Service.login_service_exists() on win32.
+
+    Mirrored, not imported: the Agent's R0 predicate (r0_stop.is_r0_installation) decides with
+    this query. Same PowerShell query and count rule: only an explicit 0 or 1 is an answer, and
+    anything else raises, so a doubtful query never reads as absence.
+    """
+    executable = (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell"
+                  / "v1.0" / "powershell.exe")
+    script = ("$ErrorActionPreference='Stop'; $tasks=@(Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | "
+              "Where-Object { $_.TaskName -eq '" + _WINDOWS_TASK_NAME + "' -and $_.TaskPath -eq '\\' }); "
+              "\"ASTRID_TASK_COUNT=$($tasks.Count)\"")
+    result = subprocess.run([str(executable), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                             "-Command", script], capture_output=True, text=True, timeout=60, check=False)
+    if result.returncode:
+        raise ValueError("The Astrid sign-in task query failed.")
+    output = result.stdout.strip()
+    if output == "ASTRID_TASK_COUNT=0":
+        return False
+    if output == "ASTRID_TASK_COUNT=1":
+        return True
+    raise ValueError("The Astrid sign-in task query was ambiguous or malformed.")
+
+
 def _stat_signature(path):
     try:
         info = os.stat(path, follow_symlinks=False)
@@ -157,7 +184,7 @@ class UpdateAdmission:
         try:
             # A pending journal is status evidence, not permission for GET to
             # recover it. POST reaches the Agent's locked reconciler instead.
-            selection = self._selection(allow_pending=True)
+            selection = self._selection(allow_pending=True, windows_task_only=True)
             availability = self._status_availability(*selection[2:5], home=home)
             self_update = availability.get("self_update") is True
             observed_job = availability.get("observed_job")
@@ -189,7 +216,18 @@ class UpdateAdmission:
         if fingerprint is not None and cache is not None and cache["fingerprint"] == fingerprint:
             ttl = _AVAILABILITY_UNRESOLVED_TTL if unresolved else _AVAILABILITY_TTL
             if now - cache["at"] < ttl:
+                if cache["value"] is None:  # cached: no version pointer and no sign-in task
+                    raise ValueError("no selected version and no Windows sign-in task")
                 return cache["value"]
+        if python is None:
+            # Windows R0 with no version pointer (see _selection): the helper answers only when the
+            # sign-in task exists. The negative answer is cached like a settled one, so steady
+            # polls start neither PowerShell nor the helper.
+            if not _windows_login_task_exists():
+                if fingerprint is not None:
+                    self._availability_cache = {"fingerprint": fingerprint, "at": now, "value": None}
+                raise ValueError("no selected version and no Windows sign-in task")
+            python = Path(sys.executable)
         value, settled = self._probe_availability(python, agent, runtime)
         # Only a well-formed answer from a successful helper is reused. A failed or malformed
         # probe is re-run on the next poll, so a transient failure clears at once.
@@ -247,7 +285,7 @@ class UpdateAdmission:
             raise UpdateRefusal(failure_reason, failure_message)
         return value
 
-    def _selection(self, *, allow_pending=False, require_autostart=True):
+    def _selection(self, *, allow_pending=False, require_autostart=True, windows_task_only=False):
         daemon = self.daemon
         identity = normalize_startup_identity(daemon.startup_identity)
         if identity["managed_by"] == "source":
@@ -279,7 +317,16 @@ class UpdateAdmission:
             transaction = _json(journal, snapshots)
             if not allow_pending and transaction.get("step") not in {"complete", "rolled_back"}:
                 raise UpdateRefusal("recovery-needed", "The installer must recover its pending update first. Run the install line.")
-        pointer = _bytes(root / "current")
+        try:
+            pointer = _bytes(root / "current")
+        except FileNotFoundError:
+            # A Windows R0 install has no version pointer. Status may hand it to the helper, which
+            # refuses the upgrade; the sign-in task check runs there, on a cache miss. Any other
+            # case, and any pending journal, refuses as before.
+            if not windows_task_only or sys.platform != "win32" or journal.exists() or journal.is_symlink():
+                raise
+            return (selection_path, snapshots, None, _path(daemon._identity_agent_checkout),
+                    _path(daemon._identity_runtime_checkout), 0)
         snapshots[root / "current"] = pointer
         name = pointer.decode("utf-8").strip()
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
