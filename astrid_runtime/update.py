@@ -33,7 +33,11 @@ MANIFEST_URL = "https://astrid.haus/install-manifest.json"
 BOOTSTRAP_URL = "https://astrid.haus/install"
 WINDOWS_BOOTSTRAP_URL = "https://astrid.haus/install.ps1"
 MAX_METADATA_BYTES = 1024 * 1024
-_STATUS_REASONS = frozenset({"busy", "autostart-off", "unsupported-service-manager"})
+_STATUS_REASONS = frozenset({"busy", "autostart-off", "unsupported-service-manager",
+                             "windows-upgrade-unsupported"})
+# Helper refusals that describe a steady install state, not a failed probe. Status reuses
+# them like a normal availability answer, so a steady poll starts no helper (UR-R2.4).
+_SETTLED_REFUSAL_REASONS = frozenset({"windows-upgrade-unsupported"})
 # GET /v1/update/status may also say these; a helper or POST refusal may not.
 # "source" is the POST refusal's own reason; "none" means the Runtime can update.
 _REPORTED_REASONS = _STATUS_REASONS | {"needs-repair", "managed-elsewhere", "source"}
@@ -201,7 +205,8 @@ class UpdateAdmission:
             availability = self._helper(python, agent, runtime, {"action": "availability"})
         except UpdateRefusal as refusal:
             reason = refusal.details.get("reason")
-            return {"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})}, False
+            return ({"available": False, **({"reason": reason} if reason in _STATUS_REASONS else {})},
+                    reason in _SETTLED_REFUSAL_REASONS)
         except (OSError, subprocess.SubprocessError):
             return {"available": False}, False
         if not isinstance(availability, dict) or type(availability.get("available")) is not bool:

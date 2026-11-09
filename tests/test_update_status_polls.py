@@ -109,3 +109,43 @@ def test_settled_job_uses_the_long_refresh(tmp_path, monkeypatch):
     clock[0] += 241.0
     admission.status()
     assert len(launches) == 2
+
+
+WINDOWS_REFUSAL = ("Upgrading from an earlier Windows version isn't supported yet. "
+                   "Your data was kept; reinstall to get the new version.")
+
+
+def _windows_unsupported_reply(kind):
+    import json
+    if kind == "availability":
+        return 0, json.dumps({"available": False, "reason": "windows-upgrade-unsupported", "actions": ALL_ACTIONS})
+    return 1, json.dumps({"reason": "windows-upgrade-unsupported", "message": WINDOWS_REFUSAL})
+
+
+@pytest.mark.parametrize("kind", ["availability", "refusal"])
+def test_status_reports_windows_upgrade_unsupported_from_the_helper(tmp_path, monkeypatch, kind):
+    """The App shows a line with no retry command only when status.reason says so (Plan 29 R11 card 4)."""
+    admission, launches = _admission(monkeypatch, tmp_path, "win32")
+    code, stdout = _windows_unsupported_reply(kind)
+
+    def run(argv, **_kwargs):
+        launches.append(argv[0])
+        return subprocess.CompletedProcess(argv, code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(update.subprocess, "run", run)
+    status = admission.status()
+    assert status["available"] is False
+    assert status["reason"] == "windows-upgrade-unsupported"
+    for _ in range(20):
+        assert admission.status()["reason"] == "windows-upgrade-unsupported"
+    assert len(launches) == 1, "a steady windows-upgrade-unsupported answer must not start a helper per poll"
+
+
+def test_explicit_update_keeps_the_windows_upgrade_unsupported_reason(monkeypatch):
+    admission = update.UpdateAdmission(SimpleNamespace())
+    code, stdout = _windows_unsupported_reply("refusal")
+    monkeypatch.setattr(update.subprocess, "run",
+                        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, code, stdout=stdout, stderr=""))
+    with pytest.raises(update.UpdateRefusal) as refusal:
+        admission._helper(Path("/python"), Path("/agent"), Path("/runtime"), {"action": "launch"})
+    assert refusal.value.details["reason"] == "windows-upgrade-unsupported"
