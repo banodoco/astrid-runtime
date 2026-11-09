@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-14, macos-15]
         pair:
           - {name: R10, agent: 72462b04fa036736eb7fc9cb654def5f4ea2158c, runtime: 52ec0578963847693a0df758d9bc1d55325f518f}
           - {name: R11, agent: a105de3a4852cb61b9647dfe2c920118bd29f272, runtime: 4f5477cb0f5b03d28bec991a1fe34edcd8fc309f}
