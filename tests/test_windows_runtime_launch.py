@@ -22,10 +22,14 @@ def _selected_agent_checkout():
     return agent if (agent / "astrid" / "__init__.py").is_file() else None
 
 
-def test_runtime_checkout_is_not_a_selectable_shutdown_owner():
+def test_runtime_checkout_is_not_a_selectable_shutdown_owner(monkeypatch):
     # Regression (b005394): ``down`` imports ``astrid.services`` from the manifest's
     # source_checkout, so the Runtime checkout can never stand in for the Agent.
     from astrid_runtime.selected_source import selected_shutdown_owner
+    # An earlier test in this process may already have imported a Runtime-owned package such as
+    # astrid_runtime_client; selection refuses such modules first. Drop them for this test only.
+    for name in [name for name in list(sys.modules) if name.split(".", 1)[0] in {"astrid", "astrid_runtime_client"}]:
+        monkeypatch.delitem(sys.modules, name)
     root = Path(__file__).resolve().parents[1]
     assert not (root / "astrid").exists()
     with pytest.raises(BootstrapError, match="missing beneath"):
