@@ -664,7 +664,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             from astrid_runtime.paths import RuntimePaths
             paths = RuntimePaths.current(data_root=self.runtime.support_root.parent if self.runtime.support_root else None)
             support = self.runtime.doctor()
-            report = diagnostics_report(paths, support)
+            daemon = getattr(self.server, "daemon_runtime", None)
+            # The running owner's startup snapshot names the live release; the
+            # selection record only names what the installer last selected.
+            report = diagnostics_report(
+                paths, support,
+                live_identity=getattr(daemon, "startup_identity", None) if daemon is not None else None,
+                services=daemon.service_status() if daemon is not None else None)
             return self._send(200, {"report": report})
         if path == ["v1", "realm", "tombstone"] and method == "POST":
             self._identity("admin")

@@ -1,0 +1,83 @@
+{
+  "_source": "Record shapes copied from astrid-agent PR #319 (head 2b4038ad): tests/fixtures/field_states.py handed_off_release1_r0_live, astrid/installer/boundary_handoff.py (_records, _normalised_records, journal) and astrid/installer/outcome.py (Outcome.record). Placeholders {r0}, {r1} and {program} are absolute paths filled in by the test; {pid} is a live process id.",
+  "handed_off_release1_r0_live": {
+    "_note": "Hannah's Mac on 8 Nov 2026 before UR-15: a complete copy-only storage move landed on Release 1, the journal is still authoritative, the selection still names R0 with r1_data_root beside it, and an R0-era Runtime is running again against the retained R0 data and failing with SQLITE_FULL.",
+    "selection": {
+      "owner": "haus.astrid.runtime",
+      "program_root": "{program}",
+      "data_root": "{r0}",
+      "r1_data_root": "{r1}",
+      "realm_id": "r0",
+      "realm_root": "{r0}/runtime/realms/r0",
+      "r1_realm_root": "{r1}/runtime/realms/r0",
+      "managed_by": null,
+      "identity": {"release": 1, "managed_by": null}
+    },
+    "journal": {
+      "version": 1,
+      "phase": "complete",
+      "program_root": "{program}",
+      "r0_data_root": "{r0}",
+      "r1_data_root": "{r1}",
+      "realm_id": "r0"
+    },
+    "r0_discovery": {
+      "pid": "{pid}",
+      "runtime_instance_id": "r0-era-runtime-disk-full",
+      "active_realm": "r0",
+      "identity": {"release": 0, "managed_by": null},
+      "door_endpoint": "http://127.0.0.1:17340"
+    },
+    "r0_runtime_log": "Traceback (most recent call last):\nsqlite3.OperationalError: database or disk is full\n",
+    "live_identity": {"release": 1, "managed_by": null},
+    "services": [{"name": "pack-host", "state": "running", "last_exit": 1, "restart_count": 16}]
+  },
+  "receipt_not_updated": {
+    "format": "astrid-last-run/v1",
+    "kind": "not-updated",
+    "still": 1,
+    "start": 1,
+    "target": 10,
+    "reason": "installer-bug",
+    "mode": "update",
+    "exit_code": 3,
+    "reason_line": "the installer finished without installing the new release. This is a bug in Astrid, not something you did.",
+    "headline": "Astrid did NOT update. It is still Release 1; Release 10 is available.",
+    "finished_at": 1794177480
+  },
+  "normalised_after_update": {
+    "_note": "The same machine after a UR-15 installer: the journal is archived, the selection names R1 with R0 kept as provenance, and the receipt says Release 1 to Release 10.",
+    "selection": {
+      "owner": "haus.astrid.runtime",
+      "program_root": "{program}",
+      "data_root": "{r1}",
+      "retained_r0_data_root": "{r0}",
+      "realm_id": "r0",
+      "realm_root": "{r1}/runtime/realms/r0",
+      "managed_by": null,
+      "identity": {"release": 10, "managed_by": null}
+    },
+    "archive": {
+      "version": 1,
+      "phase": "complete",
+      "program_root": "{program}",
+      "r0_data_root": "{r0}",
+      "r1_data_root": "{r1}",
+      "realm_id": "r0"
+    },
+    "receipt": {
+      "format": "astrid-last-run/v1",
+      "kind": "updated",
+      "still": 10,
+      "start": 1,
+      "target": 10,
+      "reason": null,
+      "mode": "update",
+      "exit_code": 0,
+      "reason_line": null,
+      "headline": "Astrid updated: Release 1 → Release 10.",
+      "finished_at": 1794181080
+    },
+    "live_identity": {"release": 10, "managed_by": null}
+  }
+}

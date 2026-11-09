@@ -142,7 +142,7 @@ def test_diagnostics_route_is_narrow_and_owner_authenticated(tmp_path):
         reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
         assert reply.status == 200, reply.body
         assert "Astrid diagnostics" in reply.json()["report"]
-        assert "Runtime support state: ready (healthy=True)" in reply.json()["report"]
+        assert "This Runtime's support state: ready (healthy=True)" in reply.json()["report"]
         assert "App build:" not in reply.json()["report"]
         assert "App release:" not in reply.json()["report"]
         assert world.call(f"{API_RUNTIME}/v1/diagnostics/anything").status == 404
@@ -159,7 +159,7 @@ def test_diagnostics_download_reports_real_doctor_issues(tmp_path):
         reply = world.call(f"{API_RUNTIME}/v1/diagnostics")
         assert reply.status == 200, reply.body
         report = reply.json()["report"]
-        assert "Runtime support state: unhealthy (healthy=False)" in report
+        assert "This Runtime's support state: unhealthy (healthy=False)" in report
         assert "catalog_invalid" in report
     finally:
         world.stop()
