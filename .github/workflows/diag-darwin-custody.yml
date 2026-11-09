@@ -70,6 +70,6 @@ jobs:
           path: |
             ${{ runner.temp }}/pytest-output.txt
             ${{ runner.temp }}/diag-basetemp/**/runtime.log
-            ${{ runner.temp }}/diag-basetemp/**/host-argv.jsonl
+            ${{ runner.temp }}/diag-basetemp/**/host-argv.jsonl*
             ${{ runner.temp }}/diag-basetemp/**/start-response.json
           if-no-files-found: warn

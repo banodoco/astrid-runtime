@@ -16,7 +16,30 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_installed_pack_custody_spawn import RECORDING_RUNTIME, _worker_profile
+from tests.test_installed_pack_custody_spawn import _worker_profile
+
+# Same as the custody-spawn test's recorder, plus: log every control frame the Runtime receives from the host.
+RECORDING_RUNTIME = """
+import json, runpy, sys
+from runtime_protocol import verified_host_launch as gate
+from runtime_protocol import local_worker_composition as lwc
+record = sys.argv.pop(1)
+original = gate.TrustedLocalHostLaunchVerifier.verify
+def verify(self, *, host_argv, **kwargs):
+    with open(record, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(list(host_argv)) + "\\n")
+    return original(self, host_argv=host_argv, **kwargs)
+gate.TrustedLocalHostLaunchVerifier.verify = verify
+real_receive = lwc._frame_receive
+def receive(channel):
+    value = real_receive(channel)
+    with open(record + ".frames", "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(value, sort_keys=True, default=str) + "\\n")
+    return value
+lwc._frame_receive = receive
+sys.argv[0] = "runtime_protocol"
+runpy.run_module("runtime_protocol", run_name="__main__", alter_sys=True)
+"""
 
 
 @pytest.mark.darwin_native
@@ -69,5 +92,7 @@ def test_diag_host_only_spawn_with_builtin_packs(tmp_path, owned_process_groups)
     spawned = argv_record.exists()
     (base / "start-response.json").write_text(json.dumps({"status": status, "body": body, "spawned": spawned}))
     print("DIAG2 spawned:", spawned, "start status:", status, "body:", body[:400])
+    frames = Path(str(argv_record) + ".frames")
+    print("DIAG2 host control frames:", frames.read_text() if frames.exists() else "<none>")
     print("DIAG2 runtime.log tail:\n" + log_path.read_text(errors="replace")[-3000:])
     assert status == 200, (status, body)
