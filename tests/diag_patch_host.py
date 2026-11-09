@@ -12,8 +12,9 @@ match = pattern.search(text)
 if not match:
     sys.exit("diag patch: dispatch handler not found")
 indent = match.group(3)
-inject = (f"{indent}import traceback as _tb, sys as _sys\n"
-          f"{indent}print('DIAGHOST dispatch failed for command', frame.get('command'), file=_sys.stderr); _tb.print_exc(); _sys.stderr.flush()\n")
+inject = ("import traceback as _tb, sys as _sys\n"
+          + indent + "print('DIAGHOST dispatch failed for command', frame.get('command'), file=_sys.stderr); _tb.print_exc(); _sys.stderr.flush()\n"
+          + indent)
 text = text[:match.start(4)] + inject + text[match.start(4):]
 path.write_text(text, encoding="utf-8")
 data = path.read_bytes()
