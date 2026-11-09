@@ -246,6 +246,11 @@ def test_pending_request_is_the_final_correlated_request_and_shutdown_is_determi
                 }
             if "capture_anchor" in value:
                 value["capture_anchor"] = {"utc": "normalized", "at_ms": 0.0}
+            # The output byte count is the encoded size of the summary, which includes observer_cpu_ms,
+            # so its length varies with sampler CPU time. The same count is dropped from final retention below.
+            if isinstance(value.get("retention"), dict) and isinstance(value["retention"].get("output"), dict):
+                value["retention"] = {**value["retention"], "output": {
+                    key: item for key, item in value["retention"]["output"].items() if key != "bytes"}}
             normalized.append(value)
         return normalized
     assert without_restart_identity(first_events) == without_restart_identity(second_events)
