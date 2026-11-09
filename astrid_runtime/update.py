@@ -83,14 +83,13 @@ def _json(path, snapshots):
 
 
 def _assert_autostart_supported(selected):
-    preferences = selected.get("preferences") if isinstance(selected, dict) else None
-    if isinstance(preferences, dict):
-        autostart = preferences.get("autostart")
-        if autostart is False or (isinstance(autostart, str) and autostart.casefold() == "off"):
-            raise UpdateRefusal(
-                "autostart-off",
-                "In-app update is unavailable while saved autostart is off; this installer cannot preserve that choice yet.",
-            )
+    # The saved choice is the Agent's choices.autostart, a bool it validates on write. Absent means no refusal.
+    choices = selected.get("choices") if isinstance(selected, dict) else None
+    if isinstance(choices, dict) and choices.get("autostart") is False:
+        raise UpdateRefusal(
+            "autostart-off",
+            "In-app update is unavailable while saved autostart is off; this installer cannot preserve that choice yet.",
+        )
 
 
 # Every helper action the request path sends (prepare is the request with no
