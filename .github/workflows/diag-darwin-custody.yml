@@ -62,7 +62,7 @@ jobs:
         continue-on-error: true
         run: |
           python -c "import runtime_protocol,astrid,sys;print('runtime_protocol from',runtime_protocol.__file__);print('astrid from',astrid.__file__)"
-          python -m pytest -vv -rA -s -m darwin_native tests/test_installed_pack_custody_spawn.py --basetemp="$RUNNER_TEMP/diag-basetemp" -p no:xdist 2>&1 | tee "$RUNNER_TEMP/pytest-output.txt"; exit ${PIPESTATUS[0]}
+          python -m pytest -vv -rA -s -m darwin_native tests/test_diag_host_spawn.py tests/test_installed_pack_custody_spawn.py --basetemp="$RUNNER_TEMP/diag-basetemp" -p no:xdist 2>&1 | tee "$RUNNER_TEMP/pytest-output.txt"; exit ${PIPESTATUS[0]}
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
