@@ -115,12 +115,12 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
                 journal.unlink()
             _write(marker, record)
         assert all(query == {"action": "availability"} for query in availability_queries)
-        record["preferences"] = {"autostart": False}
+        record["choices"] = {"autostart": False}
         _write(selected, record)
         assert world.call("/api/runtime/v1/update/status").json() == {
             "available": False, "reason": "autostart-off", "state": "none", "self_update": False}
         assert calls == [] and marker.read_bytes() == before
-        del record["preferences"]
+        del record["choices"]
         _write(selected, record)
         _write(folder / "manifest.json", {"release": 3})
         assert world.call("/api/runtime/v1/update/status").json()["available"] is False
@@ -939,12 +939,11 @@ def test_update_route_preserves_frozen_accepted_response(tmp_path):
         world.stop()
 
 
-@pytest.mark.parametrize("choice", [False, "off"])
-def test_explicit_autostart_off_refuses_before_preparation_or_launch(tmp_path, monkeypatch, choice):
+def test_post_refuses_saved_autostart_off_choice_before_preparation_or_launch(tmp_path, monkeypatch):
     admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("must not launch"))
     selection_path, snapshots, python, agent, runtime, installed = admission._selection()
     selected = json.loads(snapshots[selection_path])
-    selected["preferences"] = {"autostart": choice}
+    selected["choices"] = {"autostart": False}
     snapshots[selection_path] = json.dumps(selected).encode()
     admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)
     with pytest.raises(update.UpdateRefusal) as error:
@@ -957,7 +956,7 @@ def test_production_launcher_uses_selected_python_helper_once(tmp_path, monkeypa
     admission, accepted, prepared = _admission_fixture(tmp_path, monkeypatch, None)
     selection_path, snapshots, python, agent, runtime, installed = admission._selection()
     selected = json.loads(snapshots[selection_path])
-    selected["preferences"] = {"autostart": "on"}
+    selected["choices"] = {"autostart": True}
     snapshots[selection_path] = json.dumps(selected).encode()
     selection_path.write_bytes(snapshots[selection_path])
     admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)

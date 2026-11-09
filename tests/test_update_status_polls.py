@@ -15,7 +15,7 @@ from astrid_runtime import update
 ALL_ACTIONS = sorted(update._SELF_UPDATE_ACTIONS | {"availability"})
 
 
-def _no_pointer_admission(monkeypatch, tmp_path, platform, *, login_task):
+def _no_pointer_admission(monkeypatch, tmp_path, platform, *, login_task, choices=None):
     """Status through the real _selection for an install with no program/current pointer.
 
     Nothing in the selection is stubbed except identity normalization. The Windows
@@ -32,9 +32,12 @@ def _no_pointer_admission(monkeypatch, tmp_path, platform, *, login_task):
         json.dumps({"owner": update.INSTALL_RECORD_OWNER, "data_root": str(data)}), encoding="utf-8")
     record = update._install_record_path(home)
     record.parent.mkdir(parents=True, exist_ok=True)
-    record.write_text(json.dumps({
+    selected = {
         "owner": update.INSTALL_RECORD_OWNER, "program_root": str(program), "data_root": str(data),
-        "realm_root": str(realm), "realm_id": "realm-1"}), encoding="utf-8")
+        "realm_root": str(realm), "realm_id": "realm-1"}
+    if choices is not None:
+        selected["choices"] = choices
+    record.write_text(json.dumps(selected), encoding="utf-8")
     daemon = SimpleNamespace(
         startup_identity={}, startup_identity_instance_id=1, instance_id=1, root=realm,
         support_root=data / "runtime", service=SimpleNamespace(realm={"id": "realm-1"}),
@@ -86,6 +89,24 @@ def test_non_windows_no_current_pointer_stays_needs_repair(tmp_path, monkeypatch
     for _ in range(3):
         assert admission.status()["reason"] == "needs-repair"
     assert launches == [] and queries == []
+
+
+def test_status_refuses_saved_autostart_off_choice_before_the_windows_handoff(tmp_path, monkeypatch):
+    """choices.autostart false refuses status with autostart-off, ahead of the R0 handoff (Plan 29 R12)."""
+    admission, launches, queries = _no_pointer_admission(
+        monkeypatch, tmp_path, "win32", login_task=True, choices={"autostart": False})
+    for _ in range(3):
+        assert admission.status()["reason"] == "autostart-off"
+    assert launches == [] and queries == []
+
+
+@pytest.mark.parametrize("choices", [None, {"autostart": True}], ids=["absent", "on"])
+def test_status_does_not_refuse_an_absent_or_on_autostart_choice(tmp_path, monkeypatch, choices):
+    """With the guard passed, the Windows R0 handoff answers as before (Plan 29 R12)."""
+    admission, launches, _queries = _no_pointer_admission(
+        monkeypatch, tmp_path, "win32", login_task=True, choices=choices)
+    assert admission.status()["reason"] == "windows-upgrade-unsupported"
+    assert len(launches) == 1
 
 
 def _admission(monkeypatch, tmp_path, platform):
