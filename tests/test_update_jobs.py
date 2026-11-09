@@ -949,6 +949,9 @@ def test_post_refuses_saved_autostart_off_choice_before_preparation_or_launch(tm
     with pytest.raises(update.UpdateRefusal) as error:
         admission.request()
     assert error.value.details["reason"] == "autostart-off"
+    assert error.value.message == (
+        "In-app update is unavailable while start at sign-in is off. "
+        "Update from a terminal instead; your choice stays off.")
     assert prepared == []
 
 

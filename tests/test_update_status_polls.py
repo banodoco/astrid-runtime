@@ -100,6 +100,16 @@ def test_status_refuses_saved_autostart_off_choice_before_the_windows_handoff(tm
     assert launches == [] and queries == []
 
 
+@pytest.mark.parametrize("value", ["off", 0, None], ids=["string-off", "zero", "null"])
+def test_status_reports_needs_repair_for_a_non_boolean_autostart_choice(tmp_path, monkeypatch, value):
+    """The Agent's validator accepts only booleans. A malformed saved value is needs-repair, never a silent on."""
+    admission, launches, _queries = _no_pointer_admission(
+        monkeypatch, tmp_path, "win32", login_task=True, choices={"autostart": value})
+    for _ in range(3):
+        assert admission.status()["reason"] == "needs-repair"
+    assert launches == []
+
+
 @pytest.mark.parametrize("choices", [None, {"autostart": True}], ids=["absent", "on"])
 def test_status_does_not_refuse_an_absent_or_on_autostart_choice(tmp_path, monkeypatch, choices):
     """With the guard passed, the Windows R0 handoff answers as before (Plan 29 R12)."""
