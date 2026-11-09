@@ -87,9 +87,23 @@ def test_xfail_reason_does_not_authorize_a_different_node_or_contract(sandbox, v
 
 
 def test_xfail_declarations_are_immutable_and_semantic():
-    # Nine: 09a106f0 declared p1-top-level-text-hook as the ninth strict xfail.
-    assert len(lanes.DECLARED_XFAILS) == 9
-    assert all(spec.strict is True and spec.nodeids and spec.reason and spec.raises for spec in lanes.DECLARED_XFAILS.values())
+    # The exact declared xfails by name and reason. Adding, removing or rewording one fails here until this
+    # list changes too; a bare count cannot catch a swap. Plan 38's E1 removes the xfail and its entry together.
+    expected = {
+        'runtime-domains-publication': '[declared-xfail:runtime-domains-publication] RT02/D04 held: legacy timeline publication (update_timeline) is retired (410); restored by the /v1 commit replacement',
+        'runtime-domains-update': '[declared-xfail:runtime-domains-update] direct timeline update writer remains retired',
+        'runtime-exact-idempotency': '[declared-xfail:runtime-exact-idempotency] RT02 held: direct shot writes are retired (410); the reference half is the KEPT catalog (RK01)',
+        'second-client-core': '[declared-xfail:second-client-core] RT02/D04 held: direct shot writes and legacy timeline publication are retired (410); the actor is ported with their replacements',
+        'snapshot-legacy-certification': '[declared-xfail:snapshot-legacy-certification] ledger: no row id yet (PLAN 2026-10-20 capture certification); valid legacy capture is not re-certified until Agent project_capture lands',
+        'stage1-runtime-contract': '[declared-xfail:stage1-runtime-contract] ledger D04: direct timeline writes retired; awaiting commit-path replacement',
+        'timeline-clip-replacement': '[declared-xfail:timeline-clip-replacement] ledger D04: direct clip replacement retired; awaiting commit-path replacement',
+        'timeline-public-s2-historical-audio': '[declared-xfail:timeline-public-s2-historical-audio] M2 historical audio capture: /tmp/claude-0/-home-user-repo/7dc61be1-7066-52e0-a5d0-94f90e61430a/scratchpad/orch/design/runtime-public-s2-literal-journey.md#original-audio-requirement',
+        'installed-pair-source-closure': '[declared-xfail:installed-pair-source-closure] Plan 38; proof run 42602337622',
+        'p1-top-level-text-hook': '[declared-xfail:p1-top-level-text-hook] P1 top-level text-hook restoration requirement',
+    }
+    assert {name: spec.reason for name, spec in lanes.DECLARED_XFAILS.items()} == expected
+    assert all(spec.strict is True and spec.nodeids and spec.reason and spec.raises
+               for spec in lanes.DECLARED_XFAILS.values())
 
 
 def _foreign_helper() -> str:

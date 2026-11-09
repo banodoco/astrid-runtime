@@ -190,7 +190,7 @@ DECLARED_XFAILS = {
     "installed-pair-source-closure": DeclaredXfail(
         "installed-pair-source-closure",
         ("tests/test_installed_pack_custody_spawn.py::test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungranted",),
-        _xfail_reason("installed-pair-source-closure", "Agent/Runtime source-closure digests disagree for installed pairs; fixed by astrid-dev Plan 38"),
+        _xfail_reason("installed-pair-source-closure", "Plan 38; proof run 42602337622"),
         "tests.test_installed_pack_custody_spawn.KnownSourceClosureMismatch",
     ),
     "p1-top-level-text-hook": DeclaredXfail(
