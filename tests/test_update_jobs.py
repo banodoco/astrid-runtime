@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
+import re
 import os
 from pathlib import Path
 import shutil
@@ -65,7 +66,7 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
             assert (selected_python, selected_agent, selected_runtime) == (python, agent, runtime)
             if payload == {"action": "availability"}:
                 availability_queries.append(payload)
-                return {"available": True}
+                return {"available": True, "actions": sorted(update._SELF_UPDATE_ACTIONS)}
             if payload.get("action") == "reconcile":
                 return {"disposition": "prepare-new"}
             calls.append(payload)
@@ -74,7 +75,7 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
                 _write(marker, {**record, "update_job": job})
                 return job
             if payload.get("action") == "launch":
-                return {"launch_status": "started"}
+                return {"launch_status": "acknowledged"}
             result = {"release": 5}
             for name in ("manifest", "bootstrap"):
                 path = Path(payload["directory"]) / name
@@ -92,7 +93,7 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
             for _ in range(2):
                 response = world.call("/api/runtime/v1/update/status")
                 assert response.status == 200
-                assert response.json() == {"available": True, "state": "none"}
+                assert response.json() == {"available": True, "state": "none", "self_update": True, "reason": "none"}
             assert calls == [] and marker.read_bytes() == before
 
             # GET only observes durable evidence. It must not admit, launch,
@@ -117,7 +118,7 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
         record["preferences"] = {"autostart": False}
         _write(selected, record)
         assert world.call("/api/runtime/v1/update/status").json() == {
-            "available": False, "reason": "autostart-off", "state": "none"}
+            "available": False, "reason": "autostart-off", "state": "none", "self_update": False}
         assert calls == [] and marker.read_bytes() == before
         del record["preferences"]
         _write(selected, record)
@@ -154,7 +155,7 @@ def test_status_reads_authoritative_job_and_c2_journal_without_recovery(tmp_path
     assert update.read_update_status(home) == {
         "available": False, "state": "recovery-needed", "operation_id": "11111111111111111111111111111111",
         "result": "Recovery needed.", "target_release": 9,
-        "log_path": str(root / "logs/update.log"),
+        "log_path": str(root / "logs/update.log"), "self_update": False, "reason": "needs-repair",
     }
     fresh = subprocess.run(
         [sys.executable, "-c", "import json,sys; from astrid_runtime.update import read_update_status; print(json.dumps(read_update_status(sys.argv[1])))", str(home)],
@@ -414,6 +415,7 @@ def test_status_reports_pending_c2_even_without_f1_job(tmp_path):
     _write(root / "update-transaction.json", {"step": "stopping"})
     assert update.read_update_status(home) == {
         "available": False, "state": "recovery-needed", "result": "Recovery needed.",
+        "self_update": False, "reason": "needs-repair",
     }
 
 
@@ -427,7 +429,7 @@ def test_status_projects_only_allowlisted_selection_reasons(tmp_path, monkeypatc
         update.UpdateRefusal(reason, "selection refusal")))
     admission._helper = lambda *_args: pytest.fail("GET must not admit or launch an update")
 
-    assert admission.status() == {"available": False, "reason": reason, "state": "none"}
+    assert admission.status() == {"available": False, "reason": reason, "state": "none", "self_update": False}
 
 
 def test_status_omits_noncontract_selection_reason(tmp_path, monkeypatch):
@@ -438,7 +440,8 @@ def test_status_omits_noncontract_selection_reason(tmp_path, monkeypatch):
     monkeypatch.setattr(admission, "_selection", lambda **_kwargs: (_ for _ in ()).throw(
         update.UpdateRefusal("updater-unavailable", "selection refusal")))
 
-    assert admission.status() == {"available": False, "state": "none"}
+    assert admission.status() == {
+        "available": False, "reason": "needs-repair", "state": "none", "self_update": False}
 
 
 def test_status_projects_linux_service_manager_reason_without_admission(tmp_path, monkeypatch):
@@ -457,7 +460,7 @@ def test_status_projects_linux_service_manager_reason_without_admission(tmp_path
 
     admission._helper = helper
     assert admission.status() == {
-        "available": False, "reason": "unsupported-service-manager", "state": "none"}
+        "available": False, "reason": "unsupported-service-manager", "state": "none", "self_update": False}
     assert calls == [{"action": "availability"}]
 
 
@@ -475,7 +478,7 @@ def test_status_preserves_allowlisted_service_manager_refusal(tmp_path, monkeypa
 
     admission._helper = helper
     assert admission.status() == {
-        "available": False, "reason": "unsupported-service-manager", "state": "none"}
+        "available": False, "reason": "unsupported-service-manager", "state": "none", "self_update": False}
 
 
 @pytest.mark.parametrize(
@@ -545,7 +548,8 @@ def test_status_projects_availability_probe_failures_as_unavailable_without_side
 
         monkeypatch.setattr(update.subprocess, "run", run)
 
-    assert admission.status() == {"available": False, "state": "none"}
+    assert admission.status() == {
+        "available": False, "reason": "needs-repair", "state": "none", "self_update": False}
     assert calls == [{"action": "availability"}]
     assert {path: path.read_bytes() for path in status_sources} == status_sources
 
@@ -557,7 +561,8 @@ def test_status_projects_busy_while_an_update_request_owns_admission(tmp_path, m
     admission = update.UpdateAdmission(SimpleNamespace())
     admission._lock.acquire()
     try:
-        assert admission.status() == {"available": False, "reason": "busy", "state": "none"}
+        assert admission.status() == {
+            "available": False, "reason": "busy", "state": "none", "self_update": False}
     finally:
         admission._lock.release()
 
@@ -882,6 +887,39 @@ def test_update_route_h5_returns_uncertain_acknowledgement(tmp_path, monkeypatch
         world.stop()
 
 
+def test_update_route_logs_swallowed_oserror_but_keeps_public_refusal(tmp_path, monkeypatch, caplog):
+    world = start_door_world(tmp_path)
+    try:
+        admission, _, _prepared = _admission_fixture(tmp_path, monkeypatch, None)
+        admission.daemon = world.daemon
+        real_helper = admission._helper
+
+        def failing_prepare(python, agent, runtime, payload, **kwargs):
+            if "action" not in payload:
+                raise OSError("secret-disk-detail unreadable")
+            return real_helper(python, agent, runtime, payload, **kwargs)
+
+        admission._helper = failing_prepare
+        world.daemon.update_admission = admission
+
+        with caplog.at_level("WARNING", logger=update.__name__):
+            response = world.call("/api/runtime/v1/update", "POST", body=b"")
+
+        assert response.status == 409
+        body = response.json()
+        assert body["code"] == "conflict"
+        assert body["message"] == "The selected installation or update inputs do not match this running Astrid."
+        assert body["details"]["reason"] == "selection-or-inputs-invalid"
+        raw = json.dumps(body)
+        assert "secret-disk-detail" not in raw and "OSError" not in raw
+        messages = [r.getMessage() for r in caplog.records if r.name == update.__name__]
+        assert len(messages) == 1
+        assert "swallowed OSError: secret-disk-detail unreadable" in messages[0]
+        assert "step=failing_prepare at test_update_jobs.py:" in messages[0]
+    finally:
+        world.stop()
+
+
 def test_update_route_preserves_frozen_accepted_response(tmp_path):
     world = start_door_world(tmp_path)
     accepted = {
@@ -929,7 +967,7 @@ def test_production_launcher_uses_selected_python_helper_once(tmp_path, monkeypa
     def helper(python, agent, runtime, payload, **kwargs):
         if payload.get("action") == "launch":
             calls.append((python, agent, runtime, payload))
-            return {"state": "active", "launch_status": "started", "job_name": "job-1"}
+            return {"state": "active", "launch_status": "acknowledged", "job_name": "job-1"}
         return real_helper(python, agent, runtime, payload, **kwargs)
 
     admission._helper = helper
@@ -1076,7 +1114,7 @@ def test_post_update_terminal_result_line_reads_back_through_status(tmp_path, mo
 
         def helper(python, agent, runtime, payload, **kwargs):
             if payload.get("action") == "launch":
-                return {"launch_status": "started"}
+                return {"launch_status": "acknowledged"}
             return real_helper(python, agent, runtime, payload, **kwargs)
 
         admission._helper = helper
@@ -1095,3 +1133,277 @@ def test_post_update_terminal_result_line_reads_back_through_status(tmp_path, mo
         assert status["result"] == "line one line two"
     finally:
         world.stop()
+
+
+def _probe_admission(tmp_path, monkeypatch, platform, reply):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
+    monkeypatch.setattr(update.sys, "platform", platform)
+    admission = update.UpdateAdmission(SimpleNamespace())
+    admission._selection = lambda **_kwargs: (None, {}, Path("/python"), Path("/agent"), Path("/runtime"), 1)
+    calls = []
+
+    def helper(_python, _agent, _runtime, payload):
+        calls.append(payload)
+        return reply
+
+    admission._helper = helper
+    return admission, calls
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+def test_self_update_is_true_when_helper_lists_its_actions_on_every_os(tmp_path, monkeypatch, platform):
+    admission, calls = _probe_admission(
+        tmp_path, monkeypatch, platform,
+        {"available": True, "actions": ["availability", "reconcile", "prepare", "accept", "fail", "launch"]})
+
+    assert admission.status() == {"available": True, "state": "none", "self_update": True, "reason": "none"}
+    assert calls == [{"action": "availability"}]
+
+
+@pytest.mark.parametrize("reply", [
+    {"available": True},
+    {"available": True, "actions": ["availability"]},
+    {"available": True, "actions": "accept"},
+])
+def test_self_update_is_false_for_helpers_that_cannot_list_their_actions(tmp_path, monkeypatch, reply):
+    admission, _calls = _probe_admission(tmp_path, monkeypatch, "darwin", reply)
+
+    assert admission.status() == {"available": True, "state": "none", "self_update": False, "reason": "none"}
+
+
+@pytest.mark.parametrize("managed_by, reason", [("pinokio", "managed-elsewhere"), ("source", "source")])
+def test_status_reads_managed_elsewhere_for_pinokio_and_source_for_source(tmp_path, monkeypatch, managed_by, reason):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
+    daemon = SimpleNamespace(startup_identity={"managed_by": managed_by})
+    monkeypatch.setattr(update, "normalize_startup_identity", lambda identity: identity)
+    admission = update.UpdateAdmission(daemon)
+    admission._helper = lambda *_args: pytest.fail("GET must not probe a managed-elsewhere install")
+
+    assert admission.status() == {
+        "available": False, "reason": reason, "state": "none", "self_update": False}
+
+
+@pytest.mark.parametrize("failure", [
+    ValueError("selected workspace does not match the live owner"),
+    update.UpdateRefusal("recovery-needed", "The installer must recover first."),
+    OSError("unreadable"),
+])
+def test_status_reads_needs_repair_for_unclassified_causes(tmp_path, monkeypatch, failure):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(update.Path, "home", classmethod(lambda _cls: home))
+    admission = update.UpdateAdmission(SimpleNamespace())
+    monkeypatch.setattr(admission, "_selection", lambda **_kwargs: (_ for _ in ()).throw(failure))
+
+    assert admission.status() == {
+        "available": False, "reason": "needs-repair", "state": "none", "self_update": False}
+
+
+def test_status_emits_reason_in_a_non_none_state(tmp_path):
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    _write(home / ".local/share/astrid-install.json", {
+        "owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data)})
+    _write(root / "install.json", {"owner": "haus.astrid.runtime", "data_root": str(data), "update_job": {
+        "operation_id": "a" * 32, "state": "accepted"}})
+
+    status = update.read_update_status(home, reason="busy", self_update=True)
+
+    assert status["state"] == "recovery-needed"
+    assert status["reason"] == "busy" and status["self_update"] is True
+
+
+def test_self_update_actions_cover_every_action_the_request_path_sends():
+    sent = set(re.findall(r'"action":\s*"([a-z-]+)"', Path(update.__file__).read_text()))
+    # prepare is the request that carries no action key.
+    assert sent and (sent | {"prepare"}) <= update._SELF_UPDATE_ACTIONS
+    assert "reconcile" in update._SELF_UPDATE_ACTIONS and "fail" not in update._SELF_UPDATE_ACTIONS
+
+
+def test_update_request_makes_temporary_folder_owner_only_not_validate_only(tmp_path, monkeypatch):
+    world = start_door_world(tmp_path)
+    try:
+        admission, _, _prepared = _admission_fixture(tmp_path, monkeypatch, None)
+        admission.daemon = world.daemon
+        calls = {"owner_only": [], "private_directory": []}
+        real_owner_only = update.platform.owner_only
+
+        def recording_owner_only(path, *args, **kwargs):
+            calls["owner_only"].append((path, kwargs))
+            return real_owner_only(path, *args, **kwargs)
+
+        monkeypatch.setattr(update.platform, "owner_only", recording_owner_only)
+        monkeypatch.setattr(update.platform, "private_directory",
+                            lambda path: calls["private_directory"].append(Path(path)))
+        world.daemon.update_admission = admission
+
+        world.call("/api/runtime/v1/update", "POST", body=b"")
+
+        folders = [(p, kw) for p, kw in calls["owner_only"] if isinstance(p, Path) and p.name.startswith("astrid-update-")]
+        assert folders and all(kw.get("directory") is True for _, kw in folders)
+        assert not calls["private_directory"]
+    finally:
+        world.stop()
+
+OBSERVED_OPERATION_ID = "3" * 32
+# Computed on the base commit. Update status sits outside the versioned contract, so
+# observed_job must leave the generated schema digest exactly as it was.
+BASE_SCHEMA_DIGEST = "sha256:9628bb5fd6e1dbbec392dd39f2e01031622dcf52d7ccff7cd1f0ad10743dcb1c"
+
+
+def _observed(state="failed", **fields):
+    return {"operation_id": OBSERVED_OPERATION_ID, "state": state, "message": "Worker exited 2.",
+            "persisted": False, "exit_code": 2, **fields}
+
+
+def _unresolved_install(tmp_path, job_state="active", job_extra=None, journal=None):
+    home, root, data = tmp_path / "home", tmp_path / "program", tmp_path / "data"
+    home.mkdir(exist_ok=True)
+    _write(update._install_record_path(home), {
+        "owner": "haus.astrid.runtime", "program_root": str(root), "data_root": str(data)})
+    job = {"operation_id": OBSERVED_OPERATION_ID, "state": job_state, "target_release": 9,
+           "message": "Update running.", **(job_extra or {})}
+    install = _write(root / "install.json", {
+        "owner": "haus.astrid.runtime", "data_root": str(data), "update_job": job})
+    if journal is not None:
+        _write(root / "update-transaction.json", journal)
+    return home, install
+
+
+@pytest.mark.parametrize("job_state, job_extra", [
+    ("active", {}),
+    ("launching", {"launch_status": "acknowledged"}),
+])
+@pytest.mark.parametrize("observed_state, expected_state, expected_outcome", [
+    ("failed", "terminal", "failed"),
+    ("recovery-needed", "recovery-needed", None),
+])
+def test_observed_dead_worker_settles_an_unresolved_job_read_only(
+        tmp_path, job_state, job_extra, observed_state, expected_state, expected_outcome):
+    home, install = _unresolved_install(tmp_path, job_state, job_extra)
+    before = hashlib.sha256(install.read_bytes()).hexdigest()
+
+    status = update.read_update_status(home, available=True, observed_job=_observed(observed_state))
+
+    assert status["state"] == expected_state
+    assert status.get("outcome") == expected_outcome
+    assert status["result"] == "Worker exited 2."
+    assert status["persisted"] is False
+    assert status["operation_id"] == OBSERVED_OPERATION_ID
+    assert hashlib.sha256(install.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize("terminal_state", ["failed", "updated", "rolled_back"])
+@pytest.mark.parametrize("observed_state", ["failed", "recovery-needed"])
+def test_observed_job_never_overrides_a_terminal_install_record(tmp_path, terminal_state, observed_state):
+    home, install = _unresolved_install(tmp_path, terminal_state)
+    before = hashlib.sha256(install.read_bytes()).hexdigest()
+    without = update.read_update_status(home, available=True)
+
+    status = update.read_update_status(home, available=True, observed_job=_observed(observed_state))
+
+    assert status == without
+    assert "persisted" not in status
+    assert hashlib.sha256(install.read_bytes()).hexdigest() == before
+    if terminal_state == "failed":
+        assert status["state"] == "terminal" and status["outcome"] == "failed"
+
+
+@pytest.mark.parametrize("job_state", ["launching", "active"])
+def test_absent_observed_job_leaves_an_unresolved_job_unchanged(tmp_path, job_state):
+    home, _install = _unresolved_install(tmp_path, job_state, {"launch_status": "acknowledged"})
+
+    status = update.read_update_status(home, available=True)
+
+    assert status["state"] == "active"
+    assert status["result"] == "Update running."
+    assert "persisted" not in status and "outcome" not in status
+    assert update.read_update_status(home, available=True, observed_job=None) == status
+
+
+def test_observed_job_for_another_operation_does_not_settle_this_job(tmp_path):
+    home, _install = _unresolved_install(tmp_path, "active")
+    other = _observed(operation_id="4" * 32)
+
+    status = update.read_update_status(home, available=True, observed_job=other)
+
+    assert status["state"] == "active"
+    assert "persisted" not in status
+
+
+def test_observed_dead_worker_is_read_only_against_pending_journal(tmp_path):
+    journal = {"step": "stopping", "operation_id": "5" * 32}
+    home, install = _unresolved_install(tmp_path, "active", journal=journal)
+    before = {path: path.read_bytes() for path in (install, install.parent / "update-transaction.json")}
+
+    status = update.read_update_status(home, available=True, observed_job=_observed("failed"))
+
+    assert status["state"] == "terminal" and status["outcome"] == "failed"
+    assert status["persisted"] is False
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def test_status_poll_shows_dead_worker_from_availability_reply(tmp_path, monkeypatch):
+    admission, calls = _probe_admission(tmp_path, monkeypatch, "linux", {
+        "available": True, "actions": sorted(update._SELF_UPDATE_ACTIONS),
+        "observed_job": _observed("failed", message="Failed: exit 2."),
+    })
+    home, install = _unresolved_install(tmp_path, "active")
+    before = hashlib.sha256(install.read_bytes()).hexdigest()
+
+    status = admission.status()
+
+    assert calls == [{"action": "availability"}]
+    assert status["state"] == "terminal" and status["outcome"] == "failed"
+    assert status["result"] == "Failed: exit 2."
+    assert status["persisted"] is False
+    assert status["self_update"] is True and status["reason"] == "none"
+    assert hashlib.sha256(install.read_bytes()).hexdigest() == before
+
+
+def test_availability_passes_observed_job_through_only_when_well_formed():
+    observed = _observed("recovery-needed")
+    admission = update.UpdateAdmission(SimpleNamespace())
+    admission._helper = lambda *_args: {"available": True, "actions": sorted(update._SELF_UPDATE_ACTIONS),
+                                        "observed_job": observed}
+
+    assert admission._status_availability(Path("/p"), Path("/a"), Path("/r")) == {
+        "available": True, "self_update": True, "observed_job": observed}
+
+
+def test_availability_without_observed_job_adds_no_key():
+    admission = update.UpdateAdmission(SimpleNamespace())
+    admission._helper = lambda *_args: {"available": False, "reason": "busy"}
+
+    assert admission._status_availability(Path("/p"), Path("/a"), Path("/r")) == {
+        "available": False, "self_update": False, "reason": "busy"}
+
+
+@pytest.mark.parametrize("observed", [
+    _observed("updated"),
+    _observed("active"),
+    _observed("failed", persisted=True),
+    _observed("failed", persisted=None),
+    _observed("failed", operation_id="not-hex"),
+    _observed("failed", message=None),
+    {"state": "failed", "message": "Worker exited 2.", "persisted": False},
+    "failed",
+])
+def test_availability_drops_malformed_observed_job(observed):
+    admission = update.UpdateAdmission(SimpleNamespace())
+    admission._helper = lambda *_args: {"available": True, "actions": [], "observed_job": observed}
+
+    assert "observed_job" not in admission._status_availability(Path("/p"), Path("/a"), Path("/r"))
+
+
+def test_observed_job_leaves_the_contract_schema_digest_unchanged():
+    from generators.generate import contract_digest
+    from runtime_protocol.contract_metadata import SCHEMA_DIGEST
+
+    assert contract_digest() == BASE_SCHEMA_DIGEST == SCHEMA_DIGEST
+    contract = Path(__file__).parents[1] / "contract"
+    assert not any("observed_job" in path.read_text(encoding="utf-8")
+                   for path in contract.rglob("*") if path.is_file())
