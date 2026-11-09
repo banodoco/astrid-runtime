@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.astrid_checkout import astrid_importable  # noqa: F401  (fixture)
+from tests.astrid_checkout import astrid_importable, selected_agent_stub  # noqa: F401  (fixtures)
 from tests.lanes import pytest_collection_modifyitems, pytest_configure  # noqa: F401  (lanes)
 from tests.process_groups import ProcessGroups
 

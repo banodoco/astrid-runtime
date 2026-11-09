@@ -14,6 +14,7 @@ from pathlib import Path
 from .daemon import RuntimeDaemon, WORKER_SCOPES
 from .door import DEFAULT_DOOR_PORT, DoorConfig
 from .local_worker_composition import load_local_worker_composition
+from .store import selected_installed_pack_root
 from .backup import create_backup, restore_backup, structured_export
 from .errors import RuntimeErrorBase
 from .store import REALM_ADMISSION_TIMEOUT_SECONDS, RealmStore
@@ -55,6 +56,7 @@ def _parser():
     start.add_argument("--owner-lock")
     start.add_argument("--runtime-checkout")
     start.add_argument("--agent-checkout")
+    start.add_argument("--installed-pack-root", help="absolute installed pack collection; defaults to ~/Astrid/packs, where `astrid packs install` writes")
     start.add_argument("--bootstrap-token-file")
     start.add_argument("--admission-timeout", type=float, help="bounded startup integrity budget in seconds")
     start.add_argument("--worker-profile", help="absolute installed local Worker composition profile")
@@ -420,6 +422,7 @@ def _main(args):
                 realm_root=Path(args.root).expanduser().resolve(),
                 support_root=Path(args.support_root).expanduser().resolve() if args.support_root else Path(args.root).expanduser().resolve() / "support",
                 runtime_instance_id="pending-startup",
+                installed_pack_root=selected_installed_pack_root(args.installed_pack_root),
             )
         from .services import load_service_configuration
         services = load_service_configuration(args.service_declaration,
@@ -446,6 +449,7 @@ def _main(args):
             runtime_checkout=runtime_checkout,
             agent_checkout=agent_checkout,
             authoring_profile=args.authoring_profile,
+            installed_pack_root=args.installed_pack_root,
         ).start()
     except KeyboardInterrupt:
         raise

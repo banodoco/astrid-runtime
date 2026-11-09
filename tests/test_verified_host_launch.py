@@ -711,3 +711,22 @@ def test_read_source_still_rejects_over_import_bound(tmp_path):
     _write_sized(big, gate.LIMIT + 1024 * 1024)
     with pytest.raises(gate.HostLaunchError):
         gate.read_source(big, hashlib.sha256(big.read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize("where", ["file", "ancestor"])
+def test_symlink_refusal_keeps_exact_agent_prefix_and_names_the_link(tmp_path, where):
+    """The refusal starts with the exact string shared with the Agent's
+    SYMLINKED_COLLECTION_REFUSAL and then names the offending link."""
+    assert gate.SYMLINKED_COLLECTION_REFUSAL == "import materialization contains a symlink"
+    real = tmp_path / "real"; (real / "pkg").mkdir(parents=True)
+    (real / "pkg" / "mod.py").write_bytes(b"ANSWER = 7\n")
+    pin = hashlib.sha256(b"ANSWER = 7\n").hexdigest()
+    if where == "file":
+        link = tmp_path / "mod.py"; link.symlink_to(real / "pkg" / "mod.py"); target = link
+    else:
+        link = tmp_path / "collection"; link.symlink_to(real); target = link / "pkg" / "mod.py"
+    with pytest.raises(gate.HostLaunchError) as refusal:
+        gate.read_source(target, pin)
+    message = str(refusal.value)
+    assert message.startswith(gate.SYMLINKED_COLLECTION_REFUSAL + ": ")
+    assert message == f"{gate.SYMLINKED_COLLECTION_REFUSAL}: {link}"

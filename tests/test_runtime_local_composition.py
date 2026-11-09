@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 import json
 
 import pytest
@@ -105,7 +106,8 @@ def test_startup_paths_retain_owner_selection_before_lifecycle(tmp_path, monkeyp
                     owner_lock=support / "instance.lock", source_profile=source)
         assert len(loaded) == len(owners) == len(services) == 1
         assert loaded[0][1] == {"workspace_uuid": "realm", "realm_root": root,
-            "support_root": support, "runtime_instance_id": "pending-startup"}
+            "support_root": support, "runtime_instance_id": "pending-startup",
+            "installed_pack_root": Path.home() / "Astrid" / "packs"}
         owner, service = owners[0], services[0]
         retained = service._local_worker_composition
         assert retained is owner._local_worker_composition

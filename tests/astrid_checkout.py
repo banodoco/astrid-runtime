@@ -33,3 +33,41 @@ def astrid_importable(monkeypatch):
         if not str(getattr(sys.modules[name], "__file__", "") or "").startswith(str(astrid_checkout())):
             monkeypatch.delitem(sys.modules, name)
     return astrid_checkout()
+
+
+_STUB_SERVICES = '''"""Minimal selected Agent for Runtime `down` dispatch tests."""
+CALLS = []
+
+
+def prepare_pack_host_shutdown(*, support_root, source_checkout, runtime_instance_id):
+    CALLS.append({"support_root": support_root, "source_checkout": source_checkout,
+                  "runtime_instance_id": runtime_instance_id})
+    return None
+'''
+
+
+def _agent_module(name: str) -> bool:
+    return name.split(".", 1)[0] in {"astrid", "astrid_runtime_client"}
+
+
+@pytest.fixture
+def selected_agent_stub(tmp_path, monkeypatch):
+    """A real, symlink-free selected Agent checkout defining only the shutdown helper.
+
+    CLI ``down`` selects the manifest's Agent (``selected_shutdown_owner``) and
+    refuses an already imported foreign Agent, so unit tests that dispatch
+    ``down`` need a selected checkout but not the full Astrid one. Foreign
+    cached Agent modules are hidden for the test and restored after it; the
+    stub's own modules never outlive it.
+    """
+    root = (tmp_path / "selected-agent").resolve()
+    (root / "astrid").mkdir(parents=True)
+    (root / "astrid" / "__init__.py").write_text("")
+    (root / "astrid" / "services.py").write_text(_STUB_SERVICES)
+    for name in [n for n in sys.modules if _agent_module(n)]:
+        monkeypatch.delitem(sys.modules, name)
+    yield root
+    for name in [n for n in sys.modules if _agent_module(n)]:
+        origin = getattr(sys.modules[name], "__file__", None) or ""
+        if origin.startswith(str(root)):
+            del sys.modules[name]
