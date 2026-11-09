@@ -115,12 +115,12 @@ def test_production_daemon_door_advertises_and_executes_selected_updater(tmp_pat
                 journal.unlink()
             _write(marker, record)
         assert all(query == {"action": "availability"} for query in availability_queries)
-        record["preferences"] = {"autostart": False}
+        record["choices"] = {"autostart": False}
         _write(selected, record)
         assert world.call("/api/runtime/v1/update/status").json() == {
             "available": False, "reason": "autostart-off", "state": "none", "self_update": False}
         assert calls == [] and marker.read_bytes() == before
-        del record["preferences"]
+        del record["choices"]
         _write(selected, record)
         _write(folder / "manifest.json", {"release": 3})
         assert world.call("/api/runtime/v1/update/status").json()["available"] is False
@@ -155,7 +155,8 @@ def test_status_reads_authoritative_job_and_c2_journal_without_recovery(tmp_path
     assert update.read_update_status(home) == {
         "available": False, "state": "recovery-needed", "operation_id": "11111111111111111111111111111111",
         "result": "Recovery needed.", "target_release": 9,
-        "log_path": str(root / "logs/update.log"), "self_update": False, "reason": "needs-repair",
+        # R13b ruling: recovery-needed reads busy with remediation M1, as POST reports it.
+        "log_path": str(root / "logs/update.log"), "self_update": False, "reason": "busy", "remediation": "M1",
     }
     fresh = subprocess.run(
         [sys.executable, "-c", "import json,sys; from astrid_runtime.update import read_update_status; print(json.dumps(read_update_status(sys.argv[1])))", str(home)],
@@ -415,7 +416,8 @@ def test_status_reports_pending_c2_even_without_f1_job(tmp_path):
     _write(root / "update-transaction.json", {"step": "stopping"})
     assert update.read_update_status(home) == {
         "available": False, "state": "recovery-needed", "result": "Recovery needed.",
-        "self_update": False, "reason": "needs-repair",
+        # R13b ruling: recovery-needed reads busy with remediation M1, as POST reports it.
+        "self_update": False, "reason": "busy", "remediation": "M1",
     }
 
 
@@ -939,25 +941,80 @@ def test_update_route_preserves_frozen_accepted_response(tmp_path):
         world.stop()
 
 
-@pytest.mark.parametrize("choice", [False, "off"])
-def test_explicit_autostart_off_refuses_before_preparation_or_launch(tmp_path, monkeypatch, choice):
+def test_post_refuses_saved_autostart_off_choice_before_preparation_or_launch(tmp_path, monkeypatch):
     admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("must not launch"))
     selection_path, snapshots, python, agent, runtime, installed = admission._selection()
     selected = json.loads(snapshots[selection_path])
-    selected["preferences"] = {"autostart": choice}
+    selected["choices"] = {"autostart": False}
     snapshots[selection_path] = json.dumps(selected).encode()
     admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)
     with pytest.raises(update.UpdateRefusal) as error:
         admission.request()
     assert error.value.details["reason"] == "autostart-off"
+    assert error.value.message == (
+        "In-app update is unavailable while start at sign-in is off. "
+        "Update from a terminal instead; your choice stays off.")
     assert prepared == []
+
+
+# Reasons only GET /v1/update/status may say (update._REPORTED_REASONS beyond the helper and
+# POST reasons). A POST /v1/update refusal must never carry one.
+_GET_ONLY_REASONS = {"needs-repair", "managed-elsewhere"}
+
+
+@pytest.mark.parametrize("choices", [{"autostart": "off"}, {"autostart": 0}, {"autostart": None}, "off", ["autostart"]],
+                         ids=["string-off", "zero", "null", "not-a-dict-string", "not-a-dict-list"])
+def test_post_with_malformed_saved_choices_refuses_with_a_post_legal_reason(tmp_path, monkeypatch, choices):
+    """POST never says needs-repair (a GET-only reason). Malformed saved choices are selection-or-inputs-invalid."""
+    admission, _, prepared = _admission_fixture(tmp_path, monkeypatch, lambda job: pytest.fail("must not launch"))
+    selection_path, snapshots, python, agent, runtime, installed = admission._selection()
+    selected = json.loads(snapshots[selection_path])
+    selected["choices"] = choices
+    snapshots[selection_path] = json.dumps(selected).encode()
+    admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)
+    with pytest.raises(update.UpdateRefusal) as error:
+        admission.request()
+    reason = error.value.details["reason"]
+    assert reason not in _GET_ONLY_REASONS
+    assert reason == "selection-or-inputs-invalid"
+    assert error.value.message == "The selected installation or update inputs do not match this running Astrid."
+    assert prepared == []
+
+
+@pytest.mark.parametrize("legacy", [False, "off", "OFF"], ids=["false", "string-off", "string-upper-off"])
+def test_legacy_preferences_autostart_is_not_a_saved_choice(tmp_path, monkeypatch, legacy):
+    """No released Agent wrote preferences.autostart into the install selection record (R6).
+
+    The Agent history (banodoco/astrid-agent, every ref) has readers of that key in the update
+    guard and test fixtures that injected it, but no installer, CLI or served-installer code that
+    wrote it; the Agent itself dropped the reads in 671c125fb ("nothing wrote that key"). The only
+    saved choice is choices.autostart, so a stray preferences key neither refuses nor is read as off.
+    """
+    admission, _accepted, prepared = _admission_fixture(tmp_path, monkeypatch, None)
+    selection_path, snapshots, python, agent, runtime, installed = admission._selection()
+    selected = json.loads(snapshots[selection_path])
+    selected["preferences"] = {"autostart": legacy}
+    snapshots[selection_path] = json.dumps(selected).encode()
+    selection_path.write_bytes(snapshots[selection_path])
+    admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)
+    real_helper = admission._helper
+
+    def helper(python, agent, runtime, payload, **kwargs):
+        if payload.get("action") == "launch":
+            return {"state": "active", "launch_status": "acknowledged", "job_name": "job-1"}
+        return real_helper(python, agent, runtime, payload, **kwargs)
+
+    admission._helper = helper
+    result = admission.request()
+    assert result["accepted"] is True
+    assert prepared and prepared[0].exists()
 
 
 def test_production_launcher_uses_selected_python_helper_once(tmp_path, monkeypatch):
     admission, accepted, prepared = _admission_fixture(tmp_path, monkeypatch, None)
     selection_path, snapshots, python, agent, runtime, installed = admission._selection()
     selected = json.loads(snapshots[selection_path])
-    selected["preferences"] = {"autostart": "on"}
+    selected["choices"] = {"autostart": True}
     snapshots[selection_path] = json.dumps(selected).encode()
     selection_path.write_bytes(snapshots[selection_path])
     admission._selection = lambda **_kwargs: (selection_path, snapshots, python, agent, runtime, installed)

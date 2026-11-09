@@ -82,15 +82,25 @@ def _json(path, snapshots):
     return value
 
 
-def _assert_autostart_supported(selected):
-    preferences = selected.get("preferences") if isinstance(selected, dict) else None
-    if isinstance(preferences, dict):
-        autostart = preferences.get("autostart")
-        if autostart is False or (isinstance(autostart, str) and autostart.casefold() == "off"):
-            raise UpdateRefusal(
-                "autostart-off",
-                "In-app update is unavailable while saved autostart is off; this installer cannot preserve that choice yet.",
-            )
+def _assert_autostart_supported(selected, *, post=False):
+    # The saved choice is the Agent's choices.autostart, which the Agent validates as a bool. Absent means
+    # no refusal. A malformed saved value is never read as on. Status (GET) reports it as needs-repair;
+    # POST may not say needs-repair, so it refuses with its own unreadable-selection reason.
+    # preferences.autostart is not read: no released Agent wrote it to the selection record.
+    choices = selected.get("choices") if isinstance(selected, dict) else None
+    if choices is None:
+        return
+    if not isinstance(choices, dict) or ("autostart" in choices and type(choices["autostart"]) is not bool):
+        if post:
+            raise UpdateRefusal("selection-or-inputs-invalid",
+                                "The selected installation or update inputs do not match this running Astrid.")
+        raise UpdateRefusal("needs-repair", "The saved install choices are unreadable; repair the installation.")
+    if choices.get("autostart") is False:
+        raise UpdateRefusal(
+            "autostart-off",
+            "In-app update is unavailable while start at sign-in is off. "
+            "Update from a terminal instead; your choice stays off.",
+        )
 
 
 # Every helper action the request path sends (prepare is the request with no
@@ -176,15 +186,34 @@ class UpdateAdmission:
         """Project update availability without admitting or reconciling an update."""
         home = Path.home()
         if self._lock.locked():
-            return read_update_status(home, available=False, reason="busy")
+            # POST answers update-busy here, which the route reports as busy with remediation wait.
+            return read_update_status(home, available=False, reason="busy", remediation="wait")
         reason = None
+        remediation = None
         available = True
         self_update = False
         observed_job = None
+        selection_unreadable = False
         try:
             # A pending journal is status evidence, not permission for GET to
             # recover it. POST reaches the Agent's locked reconciler instead.
-            selection = self._selection(allow_pending=True, windows_task_only=True)
+            try:
+                selection = self._selection(allow_pending=True, windows_task_only=True)
+            except (OSError, ValueError, KeyError, TypeError):
+                # POST cannot read this selection either (selection-or-inputs-invalid).
+                selection_unreadable = True
+                raise
+            except UpdateRefusal as refusal:
+                if refusal.details.get("reason") == "autostart-off":
+                    # POST checks autostart only after it has read the selection, so whether
+                    # POST could read it is asked without the autostart guard. Read-only.
+                    try:
+                        self._selection(allow_pending=True, require_autostart=False, windows_task_only=True)
+                    except (OSError, ValueError, KeyError, TypeError):
+                        selection_unreadable = True
+                    except UpdateRefusal:
+                        pass
+                raise
             availability = self._status_availability(*selection[2:5], home=home)
             self_update = availability.get("self_update") is True
             observed_job = availability.get("observed_job")
@@ -198,9 +227,11 @@ class UpdateAdmission:
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             available = False
         if available and _installer_lock_held(home):
-            available, reason = False, "busy"
+            # POST answers installer-busy here (busy with remediation wait).
+            available, reason, remediation = False, "busy", "wait"
         return read_update_status(home, available=available, reason=reason, self_update=self_update,
-                                  observed_job=observed_job)
+                                  observed_job=observed_job, remediation=remediation,
+                                  selection_unreadable=selection_unreadable)
 
     def _status_availability(self, python, agent, runtime, *, home=None):
         """Read the Agent capability without invoking admission or recovery.
@@ -429,7 +460,7 @@ class UpdateAdmission:
                 raise UpdateRefusal("busy", "The update reconciliation did not grant preparation; no job was launched.",
                                     remediation=remediation or "M1")
 
-            _assert_autostart_supported(selected_record)
+            _assert_autostart_supported(selected_record, post=True)
             temporary = None
             accepted = False
             operation_id = None
@@ -629,16 +660,34 @@ def _observed_job(value):
     return value
 
 
-def read_update_status(home=None, *, available=False, reason=None, self_update=False, observed_job=None):
+def read_update_status(home=None, *, available=False, reason=None, self_update=False, observed_job=None,
+                       remediation=None, selection_unreadable=False):
     """Project update status: self_update, and a reason in every state ("none" when available).
 
     The reason is for the App to explain itself; anything not classified reads
     needs-repair. Older Apps ignore keys they do not know. An observed_job from
     the Agent's availability reply is applied read-only; nothing is written.
+
+    State recovery-needed says what POST /v1/update says for the same cause, never a policy
+    reason such as autostart-off. A source or Pinokio Runtime keeps source or managed-elsewhere,
+    which POST refuses with before any recovery. Otherwise: busy with remediation M1 (wait while another request holds
+    the update lock), as the route normalizes a recovery refusal; or needs-repair where
+    install.json, the journal or the selection is unreadable or mismatched, which POST
+    refuses as selection-or-inputs-invalid.
     """
     result = dict(_read_update_status(home, available=available, observed_job=observed_job))
+    cause = result.pop("_cause", None)
     result["self_update"] = self_update is True
-    if result["available"]:
+    if result.get("state") == "recovery-needed":
+        if reason in {"source", "managed-elsewhere"}:
+            # POST refuses a source or Pinokio Runtime by identity, before any recovery.
+            result["reason"] = reason
+        elif cause == "unreadable" or selection_unreadable:
+            result["reason"] = "needs-repair"
+        else:
+            result["reason"] = "busy"
+            result["remediation"] = "wait" if remediation == "wait" else "M1"
+    elif result["available"]:
         result["reason"] = "none"
     else:
         result["reason"] = reason if reason in _REPORTED_REASONS else "needs-repair"
@@ -650,8 +699,10 @@ def _read_update_status(home=None, *, available=False, observed_job=None):
     def none():
         return {"available": bool(available), "state": "none"}
 
-    def recovery_needed():
-        return {"available": bool(available), "state": "recovery-needed", "result": "Recovery needed."}
+    def recovery_needed(cause="update"):
+        # _cause is private: read_update_status drops it after choosing the reason.
+        return {"available": bool(available), "state": "recovery-needed", "result": "Recovery needed.",
+                "_cause": cause}
 
     home = Path(home) if home is not None else Path.home()
     selected = _read_bounded_object(_install_record_path(home)) or {}
@@ -670,19 +721,21 @@ def _read_update_status(home=None, *, available=False, observed_job=None):
         return none()
     install = _read_bounded_object(install_path)
     if install is None:
-        return recovery_needed()
+        return recovery_needed("unreadable")
     if (install.get("owner") != INSTALL_RECORD_OWNER
             or install.get("data_root") != selected.get("data_root")):
-        return recovery_needed()
+        return recovery_needed("unreadable")
     job = install.get("update_job")
     journal_path = root / "update-transaction.json"
     journal_exists = journal_path.exists() or journal_path.is_symlink()
     transaction = _read_bounded_object(journal_path) if journal_exists else None
     journal_corrupt = (journal_exists and (transaction is None
                        or not isinstance(transaction.get("step"), str) or not transaction.get("step")))
+    # POST cannot read an unreadable journal (selection-or-inputs-invalid); the Agent reconciles the rest.
+    cause = "unreadable" if journal_exists and transaction is None else "update"
     if not isinstance(job, dict):
         if journal_corrupt or (transaction and transaction.get("step") not in {"complete", "rolled_back"}):
-            return recovery_needed()
+            return recovery_needed(cause)
         return none()
     raw_state = job.get("state")
     state = raw_state
@@ -813,6 +866,7 @@ def _read_update_status(home=None, *, available=False, observed_job=None):
             pass
     if state == "none":
         output.pop("result", None)
+    output["_cause"] = cause
     return output
 
 

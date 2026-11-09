@@ -229,9 +229,9 @@ def _views(client, fixture, capsys, document, clip_id):
 @pytest.mark.parametrize("journey_film", [
     pytest.param("historical-audio", marks=pytest.mark.xfail(
         strict=True, raises=HistoricalAudioCaptureGap,
-        reason="[declared-xfail:timeline-public-s2-historical-audio] M2 historical audio capture: /tmp/claude-0/-home-user-repo/"
-               "7dc61be1-7066-52e0-a5d0-94f90e61430a/scratchpad/orch/design/"
-               "runtime-public-s2-literal-journey.md#original-audio-requirement",
+        reason="[declared-xfail:timeline-public-s2-historical-audio] M2 historical audio capture: the public CLI "
+               "trim of the original music-bed audio clip is refused before POST ('clip.trim applies to media "
+               "clips'); held until the CLI captures the original audio film before POST",
     )),
     "literal-media",
 ], indirect=True)

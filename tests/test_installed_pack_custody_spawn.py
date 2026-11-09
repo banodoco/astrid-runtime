@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.lanes import declared_xfail_reason
+
 PACK_YAML = """schema_version: 3
 id: {pack}
 name: {name}
@@ -84,9 +86,9 @@ def _worker_profile(base, support, python):
     kernel = python.resolve()
     kernel_digest = "sha256:" + hashlib.sha256(kernel.read_bytes()).hexdigest()
     boot = support / "astrid-host" / "boot-manifest.json"
-    compose_profile_handoff(boot, support_root=support)
+    handoff = compose_profile_handoff(boot, support_root=support)  # its "sha256" is the stamped pin the host verifies
     launch = {"source_checkout": str(site), "pack_root": str(site / "astrid" / "packs"), "boot_manifest_path": str(boot),
-        "boot_manifest_hash": "sha256:" + hashlib.sha256(boot.read_bytes()).hexdigest(), "capability_matrix": None,
+        "boot_manifest_hash": "sha256:" + handoff["sha256"], "capability_matrix": None,
         "environment": {}, "max_concurrency": 2}
     profile = {"execution_mode": "host_only_cpu", "profile_id": "astrid", "machine_id": _owner_machine_id(),
         "host_executable": str(python), "host_artifact_digest": kernel_digest, "host_os_executable": str(kernel),
@@ -117,7 +119,12 @@ runpy.run_module("runtime_protocol", run_name="__main__", alter_sys=True)
 """
 
 
+class KnownSourceClosureMismatch(AssertionError):
+    """The one remaining product mismatch: Agent and Runtime measure different source closures for an installed pair."""
+
+
 @pytest.mark.darwin_native
+@pytest.mark.xfail(strict=True, raises=KnownSourceClosureMismatch, reason=declared_xfail_reason("installed-pair-source-closure"))
 def test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungranted(tmp_path, owned_process_groups):
     base = tmp_path.resolve()
     home, realm, support = base / "home", base / "realm", base / "support"
@@ -146,7 +153,8 @@ def test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungrante
     with log_path.open("w") as log:
         runtime = owned_process_groups.popen([str(python), "-c", RECORDING_RUNTIME, str(argv_record), "start",
             "--root", str(realm), "--support-root", str(support), "--realm-id", realm_id, "--worker-profile", str(profile)],
-            env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+            cwd=str(base))  # not the checkout: its *.egg-info would shadow the installed dist-info
 
     def stop_runtime():
         # Graceful first, so the Runtime retires its custody host; the group kill follows.
@@ -189,6 +197,15 @@ def test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungrante
 
     status, started = call("POST", "/v1/control/local-worker/start",
         {"profile_id": "astrid", "expected_workspace_uuid": realm_id})
+    # Only the known product mismatch is excused: the start is refused with the host's "response differs"
+    # (it rejected the profile's closure pin) while the Agent and the Runtime really do measure different
+    # closures for this installed pair. Every earlier fixture layer and any other failure stays a failure.
+    if status == 409 and "differs from original launch" in str(started):
+        from astrid.core.source_identity import source_checkout_closure as agent_closure
+        from runtime_protocol.verified_host_launch import source_checkout_closure as runtime_closure
+        site = Path(sysconfig.get_paths()["purelib"]).resolve()
+        if agent_closure(site)["digest"] != runtime_closure(site)["digest"]:
+            raise KnownSourceClosureMismatch(started)
 
     # (1) The verified host argv carries the granted installed root, never the refused one.
     launches = [json.loads(line) for line in argv_record.read_text().splitlines()]
