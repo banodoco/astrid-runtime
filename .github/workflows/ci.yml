@@ -3,6 +3,7 @@ name: CI
 
 on:
   push:
+    branches-ignore: ['diag/**']
   pull_request:
   workflow_dispatch:
     inputs:

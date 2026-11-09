@@ -9,12 +9,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]
-        pair:
-          - {name: R10, agent: 72462b04fa036736eb7fc9cb654def5f4ea2158c, runtime: 52ec0578963847693a0df758d9bc1d55325f518f}
-          - {name: R11, agent: a105de3a4852cb61b9647dfe2c920118bd29f272, runtime: 4f5477cb0f5b03d28bec991a1fe34edcd8fc309f}
-          - {name: R12, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, runtime: 744cf24874ea851f95949a706725aba19d18222f}
-    name: ${{ matrix.pair.name }} ${{ matrix.os }}
+        include:
+          - {os: macos-15, pair: R10, agent: 72462b04fa036736eb7fc9cb654def5f4ea2158c, runtime: 52ec0578963847693a0df758d9bc1d55325f518f, tests: "tests/test_diag_host_spawn.py"}
+          - {os: macos-15, pair: R11, agent: a105de3a4852cb61b9647dfe2c920118bd29f272, runtime: 4f5477cb0f5b03d28bec991a1fe34edcd8fc309f, tests: "tests/test_diag_host_spawn.py tests/test_installed_pack_custody_spawn.py"}
+          - {os: macos-15, pair: R12, agent: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9, runtime: 744cf24874ea851f95949a706725aba19d18222f, tests: "tests/test_diag_host_spawn.py tests/test_installed_pack_custody_spawn.py"}
+    name: ${{ matrix.pair }} ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout harness (this branch, tests only)
@@ -24,7 +23,7 @@ jobs:
       - name: Checkout the pair's Runtime
         uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.pair.runtime }}
+          ref: ${{ matrix.runtime }}
           path: runtime
       - uses: actions/setup-python@v5
         with:
@@ -35,7 +34,7 @@ jobs:
       - name: Install the pair's Agent non-editably
         shell: bash
         env:
-          AGENT_SHA: ${{ matrix.pair.agent }}
+          AGENT_SHA: ${{ matrix.agent }}
         run: |
           agent_dir="$GITHUB_WORKSPACE/astrid-agent"
           git init --quiet "$agent_dir"
@@ -62,12 +61,12 @@ jobs:
         continue-on-error: true
         run: |
           python -c "import runtime_protocol,astrid,sys;print('runtime_protocol from',runtime_protocol.__file__);print('astrid from',astrid.__file__)"
-          python -m pytest -vv -rA -s -m darwin_native tests/test_diag_host_spawn.py tests/test_installed_pack_custody_spawn.py --basetemp="$RUNNER_TEMP/diag-basetemp" -p no:xdist 2>&1 | tee "$RUNNER_TEMP/pytest-output.txt"; exit ${PIPESTATUS[0]}
+          python -m pytest -vv -rA -s -m darwin_native ${{ matrix.tests }} --basetemp="$RUNNER_TEMP/diag-basetemp" -p no:xdist 2>&1 | tee "$RUNNER_TEMP/pytest-output.txt"; exit ${PIPESTATUS[0]}
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diag-${{ matrix.pair.name }}-${{ matrix.os }}
+          name: diag-${{ matrix.pair }}-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/pytest-output.txt
             ${{ runner.temp }}/diag-basetemp/**/runtime.log
