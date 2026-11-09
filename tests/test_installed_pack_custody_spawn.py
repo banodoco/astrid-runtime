@@ -76,7 +76,8 @@ def _worker_profile(base, support, python):
     from astrid.core.gateway.dispatch import compose_profile_handoff
     from runtime_protocol.local_worker import _digest
     from runtime_protocol.local_worker_composition import _owner_machine_id
-    from runtime_protocol.verified_host_launch import raw_digest, source_checkout_closure
+    from astrid.core.source_identity import source_checkout_closure  # the Agent's closure covers an installed pair's Runtime packages too
+    from runtime_protocol.verified_host_launch import raw_digest
 
     site = Path(sysconfig.get_paths()["purelib"]).resolve()
     records = {name: hashlib.sha256(_installed_record(name, site).encode()).hexdigest()
