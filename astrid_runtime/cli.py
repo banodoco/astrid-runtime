@@ -316,7 +316,8 @@ def _typed_health(paths: RuntimePaths) -> Mapping[str, Any]:
 
 def _observe_pack_host(paths: RuntimePaths, *, instance: str, session: str, epoch: int, expected_endpoint: str) -> Mapping[str, Any]:
     """Observe only the resident pack host, bound to the caller's Runtime identity."""
-    if not instance or not session or isinstance(epoch, bool) or epoch <= 0:
+    if (not instance or not session or len(instance) > 4096 or len(session) > 4096
+            or isinstance(epoch, bool) or epoch <= 0):
         raise ValueError("invalid Runtime identity")
     _validate_support_paths(paths)
     discovery = _read_support_json(paths.discovery_path) or {}
@@ -359,7 +360,8 @@ def _observe_pack_host(paths: RuntimePaths, *, instance: str, session: str, epoc
                          observed.source_digest, observed.dependency_digest)):
         raise ValueError("invalid observation")
     # Untrusted registration metadata must not echo the owner bearer.
-    if token in json.dumps(result):
+    serialized = json.dumps(result, indent=2, sort_keys=True)
+    if token in serialized or len(serialized.encode("utf-8")) > 60 * 1024:
         raise ValueError("invalid observation")
     return result
 

@@ -102,7 +102,7 @@ def test_observer_rejects_replaced_discovery(live, capsys, monkeypatch):
     assert daemon.token not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("change", ["executor_session", "executor_epoch", "health_session", "credential_in_result"])
+@pytest.mark.parametrize("change", ["executor_session", "executor_epoch", "health_session", "credential_in_result", "oversized", "malformed"])
 def test_observer_rejects_changed_evidence(live, capsys, monkeypatch, change):
     from dataclasses import replace
     import astrid_runtime_client
@@ -127,6 +127,10 @@ def test_observer_rejects_changed_evidence(live, capsys, monkeypatch, change):
                 return replace(value, runtime_epoch=value.runtime_epoch + 1)
             if change == "credential_in_result":
                 return replace(value, source_epoch=daemon.token)
+            if change == "oversized":
+                return replace(value, source_epoch="x" * 4097)
+            if change == "malformed":
+                return None
             return value
 
     monkeypatch.setattr(astrid_runtime_client, "WorkspaceClient", AlteredClient)
@@ -134,3 +138,23 @@ def test_observer_rejects_changed_evidence(live, capsys, monkeypatch, change):
     output = capsys.readouterr().out
     assert json.loads(output)["ok"] is False
     assert daemon.token not in output
+
+
+def test_many_capabilities_have_bounded_output(live, capsys, monkeypatch):
+    from dataclasses import replace
+    import astrid_runtime_client
+    _, _, _, args = live
+    real_client = astrid_runtime_client.WorkspaceClient
+    class ManyCapabilities:
+        def __init__(self, *args, **kwargs):
+            self.client = real_client(*args, **kwargs)
+        def health(self):
+            return self.client.health()
+        def get_executor(self, executor_id):
+            value = self.client.get_executor(executor_id)
+            return replace(value, capabilities=value.capabilities * 10000)
+    monkeypatch.setattr(astrid_runtime_client, "WorkspaceClient", ManyCapabilities)
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    assert len(output.encode()) < 65536
+    assert len(json.loads(output)["capabilities"]) <= 1
