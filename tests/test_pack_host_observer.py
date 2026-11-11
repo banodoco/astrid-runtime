@@ -158,3 +158,64 @@ def test_many_capabilities_have_bounded_output(live, capsys, monkeypatch):
     output = capsys.readouterr().out
     assert len(output.encode()) < 65536
     assert len(json.loads(output)["capabilities"]) <= 1
+
+
+def test_cli_data_root_is_parent_of_runtime(live, capsys, monkeypatch):
+    from astrid_runtime.paths import RuntimePaths
+    paths, daemon, _, args = live
+    monkeypatch.setattr(cli, "_paths", lambda parsed: RuntimePaths.current(paths.home, data_root=parsed.data_root))
+    assert cli.main(args + ["--data-root", str(paths.app_support)]) == 0
+    assert json.loads(capsys.readouterr().out)["executor_id"] == "astrid-pack-host"
+    assert cli.main(args + ["--data-root", str(paths.runtime_support)]) == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_observer_never_follows_cross_port_redirect(live, capsys, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    paths, daemon, _, args = live
+    received = []
+    origin_received = []
+    class Sink(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+        def log_message(self, *args):
+            pass
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+    class Redirect(BaseHTTPRequestHandler):
+        def do_GET(self):
+            origin_received.append(self.headers.get("Authorization"))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{sink.server_port}/capture")
+            self.end_headers()
+        def log_message(self, *args):
+            pass
+    origin = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    threads = [Thread(target=server.serve_forever, daemon=True) for server in (sink, origin)]
+    for thread in threads:
+        thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{origin.server_port}"
+        args[args.index("--endpoint") + 1] = endpoint
+        original = cli._read_support_json
+        def discovery(path):
+            value = original(path)
+            if path == paths.discovery_path:
+                return {**value, "endpoint": endpoint}
+            return value
+        monkeypatch.setattr(cli, "_read_support_json", discovery)
+        assert cli.main(args) == 1
+        output = capsys.readouterr().out
+        assert json.loads(output) == {"ok": False, "error": "pack host observation unavailable"}
+        assert daemon.token not in output
+        assert origin_received == ["Bearer " + daemon.token]
+        assert received == []
+    finally:
+        for server in (origin, sink):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join()

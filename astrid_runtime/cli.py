@@ -314,6 +314,25 @@ def _typed_health(paths: RuntimePaths) -> Mapping[str, Any]:
     return _json_value(value)
 
 
+class _NoObserverRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _observer_transport(endpoint: str):
+    """Bind owner-bearing observation requests to one validated authority."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoObserverRedirects())
+
+    def request(method, path, headers, body):
+        if method != "GET" or path not in ("/v1/health", "/v1/executors/astrid-pack-host") or body is not None:
+            raise ValueError("invalid observer request")
+        req = urllib.request.Request(endpoint + path, headers=headers, method=method)
+        with opener.open(req, timeout=5) as response:
+            return response.status, dict(response.headers), response.read(1024 * 1024 + 1)
+
+    return request
+
+
 def _observe_pack_host(paths: RuntimePaths, *, instance: str, session: str, epoch: int, expected_endpoint: str) -> Mapping[str, Any]:
     """Observe only the resident pack host, bound to the caller's Runtime identity."""
     if (not instance or not session or len(instance) > 4096 or len(session) > 4096
@@ -327,7 +346,7 @@ def _observe_pack_host(paths: RuntimePaths, *, instance: str, session: str, epoc
     from astrid_runtime_client import WorkspaceClient
 
     token = _credential(paths, advise_start=False)
-    client = WorkspaceClient(endpoint, token, timeout=5)
+    client = WorkspaceClient(endpoint, token, timeout=5, transport=_observer_transport(endpoint))
 
     def check_health() -> None:
         health = client.health()
