@@ -257,3 +257,40 @@ def test_observer_does_not_read_oversized_http_error(live, capsys, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_leaf_envelope_has_actual_process_identity(live, capsys, monkeypatch):
+    import os
+    from astrid_runtime import pack_host_observer
+
+    import sys
+    monkeypatch.setattr(sys, "addaudithook", lambda hook: None)
+    _, _, _, args = live
+    assert pack_host_observer.main(args[1:]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert set(result) == {"observer_pid", "observer_parent_pid", "observation"}
+    assert result["observer_pid"] == os.getpid()
+    assert result["observer_parent_pid"] == os.getppid()
+    assert result["observation"]["executor_id"] == "astrid-pack-host"
+
+
+def test_leaf_refuses_foreign_identity(live, capsys, monkeypatch):
+    from astrid_runtime import pack_host_observer
+
+    import sys
+    monkeypatch.setattr(sys, "addaudithook", lambda hook: None)
+    _, daemon, _, args = live
+    args[args.index("--runtime-instance-id") + 1] = "foreign"
+    assert pack_host_observer.main(args[1:]) == 1
+    output = capsys.readouterr().out
+    assert json.loads(output) == {"ok": False, "error": "pack host observation unavailable"}
+    assert daemon.token not in output
+
+
+def test_leaf_process_creation_guard():
+    from astrid_runtime.pack_host_observer import _deny_process_creation
+
+    for event in ("subprocess.Popen", "os.fork", "os.forkpty", "os.posix_spawn", "os.spawn", "os.exec", "os.system", "pty.spawn"):
+        with pytest.raises(RuntimeError, match="process creation refused"):
+            _deny_process_creation(event, ())
+    _deny_process_creation("open", ())
