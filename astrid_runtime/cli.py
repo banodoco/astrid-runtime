@@ -92,6 +92,7 @@ def parser() -> argparse.ArgumentParser:
     observe.add_argument("--runtime-instance-id", required=True)
     observe.add_argument("--runtime-session-id", required=True)
     observe.add_argument("--runtime-epoch", required=True, type=int)
+    observe.add_argument("--endpoint", required=True)
 
     tasks = sub.add_parser("tasks", help="manage named Runtime tasks")
     tasks_sub = tasks.add_subparsers(dest="tasks_command", required=True)
@@ -313,18 +314,19 @@ def _typed_health(paths: RuntimePaths) -> Mapping[str, Any]:
     return _json_value(value)
 
 
-def _observe_pack_host(paths: RuntimePaths, *, instance: str, session: str, epoch: int) -> Mapping[str, Any]:
+def _observe_pack_host(paths: RuntimePaths, *, instance: str, session: str, epoch: int, expected_endpoint: str) -> Mapping[str, Any]:
     """Observe only the resident pack host, bound to the caller's Runtime identity."""
     if not instance or not session or isinstance(epoch, bool) or epoch <= 0:
         raise ValueError("invalid Runtime identity")
     _validate_support_paths(paths)
     discovery = _read_support_json(paths.discovery_path) or {}
     endpoint = _validate_loopback_endpoint(str(discovery.get("endpoint") or ""))
-    if discovery.get("runtime_instance_id") != instance:
+    if discovery.get("runtime_instance_id") != instance or expected_endpoint != endpoint:
         raise ValueError("Runtime identity mismatch")
     from astrid_runtime_client import WorkspaceClient
 
-    client = WorkspaceClient(endpoint, _credential(paths, advise_start=False), timeout=5)
+    token = _credential(paths, advise_start=False)
+    client = WorkspaceClient(endpoint, token, timeout=5)
 
     def check_health() -> None:
         health = client.health()
@@ -341,7 +343,7 @@ def _observe_pack_host(paths: RuntimePaths, *, instance: str, session: str, epoc
     current = _read_support_json(paths.discovery_path) or {}
     if current.get("runtime_instance_id") != instance or current.get("endpoint") != discovery.get("endpoint"):
         raise ValueError("Runtime discovery changed")
-    return {
+    result = {
         "executor_id": observed.executor_id,
         "readiness": observed.readiness,
         "runtime_epoch": observed.runtime_epoch,
@@ -349,8 +351,17 @@ def _observe_pack_host(paths: RuntimePaths, *, instance: str, session: str, epoc
         "source_epoch": observed.source_epoch,
         "source_digest": observed.source_digest,
         "dependency_digest": observed.dependency_digest,
-        "capabilities": [{"status": "ready"} for cap in observed.capabilities if cap.status == "ready"],
+        "capabilities": ([{"status": "ready"}]
+                         if any(cap.status == "ready" for cap in observed.capabilities) else []),
     }
+    if any(value is not None and (not isinstance(value, str) or len(value) > 4096)
+           for value in (observed.readiness, observed.source_epoch,
+                         observed.source_digest, observed.dependency_digest)):
+        raise ValueError("invalid observation")
+    # Untrusted registration metadata must not echo the owner bearer.
+    if token in json.dumps(result):
+        raise ValueError("invalid observation")
+    return result
 
 
 def _start_local_worker(paths: RuntimePaths, *, profile_id: str, expected_workspace_uuid: str) -> Mapping[str, Any]:
@@ -558,7 +569,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "observe-pack-host":
         try:
             result = _observe_pack_host(paths, instance=args.runtime_instance_id,
-                                        session=args.runtime_session_id, epoch=args.runtime_epoch)
+                                        session=args.runtime_session_id, epoch=args.runtime_epoch,
+                                        expected_endpoint=args.endpoint)
         except Exception:
             # Neither credentials nor untrusted server errors cross this boundary.
             _emit({"ok": False, "error": "pack host observation unavailable"}, json_mode=True)
