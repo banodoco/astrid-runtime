@@ -8282,9 +8282,14 @@ class RuntimeService:
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
     def executor_observation(self, executor_id, *, identity):
-        """Return one exact registered executor for owner-side observation."""
-        if self._require_placement_recovery_owner(identity) != "owner":
-            raise AuthorizationError("executor observation requires the Runtime owner")
+        """Return one registered executor to the owner or its exact worker."""
+        actor = identity.get("actor") if isinstance(identity, dict) else None
+        scopes = identity.get("scopes") if isinstance(identity, dict) else None
+        if not (isinstance(actor, str) and actor and isinstance(scopes, list) and (
+            (actor == "owner" and "admin" in scopes)
+            or (actor == executor_id and "worker:execute" in scopes)
+        )):
+            raise AuthorizationError("executor observation requires owner or exact worker authority")
         if not isinstance(executor_id, str) or not executor_id:
             raise ValidationError("executor_id is required")
         with self.store._mutex:

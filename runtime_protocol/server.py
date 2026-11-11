@@ -1437,9 +1437,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 raise ProtocolError("Idempotency-Key header is required")
             return self._send(201, self.runtime.register_executor(self._body(), idempotency_key=key, identity=identity))
         if len(path) == 3 and path[:2] == ["v1", "executors"] and method == "GET":
-            identity = self._identity("admin")
-            if identity.get("actor") != "owner":
-                raise AuthorizationError("exact executor observation requires the Runtime owner")
+            identity = self._identity("worker:execute")
+            actor = identity.get("actor") if isinstance(identity, dict) else None
+            scopes = identity.get("scopes") if isinstance(identity, dict) else None
+            if not (isinstance(actor, str) and actor and isinstance(scopes, list) and (
+                (actor == "owner" and "admin" in scopes)
+                or (actor == path[2] and "worker:execute" in scopes)
+            )):
+                raise AuthorizationError("executor observation requires owner or exact worker authority")
             return self._send(200, self.runtime.executor_observation(path[2], identity=identity))
         if len(path) == 3 and path[:2] == ["v1", "runs"] and method == "GET":
             self._identity("tasks:read")
