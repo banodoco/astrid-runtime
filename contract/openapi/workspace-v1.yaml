@@ -815,7 +815,7 @@ paths:
     get:
       operationId: getExecutor
       parameters: [ { name: executor_id, in: path, required: true, schema: { type: string, minLength: 1 } } ]
-      responses: { '200': { description: Exact executor observed by the owner with admin scope or by its matching worker actor with explicit worker:execute scope, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+      responses: { '200': { description: Exact owner-observed executor, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
   /v1/control/tasks/{task_id}/settlement:
     get:
       operationId: getTaskSettlement

@@ -40,6 +40,9 @@ def test_executor_observation_http_authority(tmp_path):
             with pytest.raises(RuntimeError) as denied:
                 api.request("GET", path, headers=headers)
             assert denied.value.status == 401
+
+        owner_token, _ = daemon.credentials.provision("owner", ["admin"], rotate=True)
+        assert Api(daemon.endpoint, owner_token).request("GET", "/v1/executors/worker-a") == expected
     finally:
         daemon.stop()
 
@@ -51,6 +54,8 @@ def test_executor_observation_service_rejects_missing_and_forged_authority(tmp_p
     try:
         for identity in (
             None, {}, {"actor": None, "scopes": ["worker:execute"]},
+            {"actor": "worker-a", "scopes": "worker:execute"},
+            {"actor": "worker-a", "scopes": None},
             {"actor": "worker-a", "scopes": []},
             {"actor": "worker-a", "scopes": ["admin"]},
             {"actor": "other", "scopes": ["admin", "worker:execute"]},
