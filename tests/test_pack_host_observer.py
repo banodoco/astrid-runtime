@@ -294,3 +294,32 @@ def test_leaf_process_creation_guard():
         with pytest.raises(RuntimeError, match="process creation refused"):
             _deny_process_creation(event, ())
     _deny_process_creation("open", ())
+
+
+def test_leaf_observation_does_not_create_processes(live, capsys, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    import threading
+    from astrid_runtime import pack_host_observer
+
+    # The live fixture is already running; any process creation during this
+    # observation is a defect, including on the failure path.
+    def forbidden(*args, **kwargs):
+        pytest.fail("observer attempted to create or replace a process")
+    monkeypatch.setattr(sys, "addaudithook", lambda hook: None)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    original_start = threading.Thread.start
+    def guarded_start(thread, *args, **kwargs):
+        if threading.current_thread() is threading.main_thread():
+            forbidden()
+        return original_start(thread, *args, **kwargs)
+    monkeypatch.setattr(threading.Thread, "start", guarded_start)
+    for name in ("fork", "forkpty", "posix_spawn", "posix_spawnp", "system", "execv", "execve", "spawnv", "spawnve"):
+        if hasattr(os, name):
+            monkeypatch.setattr(os, name, forbidden)
+    _, _, _, args = live
+    assert pack_host_observer.main(args[1:]) == 0
+    capsys.readouterr()
+    args[args.index("--runtime-instance-id") + 1] = "foreign"
+    assert pack_host_observer.main(args[1:]) == 1
