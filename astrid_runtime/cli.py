@@ -87,6 +87,12 @@ def parser() -> argparse.ArgumentParser:
     start_worker.add_argument("--profile", default="astrid", choices=["astrid"])
     start_worker.add_argument("--expected-workspace-uuid", required=True)
 
+    observe = sub.add_parser("observe-pack-host", help="observe the selected Runtime's pack host")
+    _read_args(observe)
+    observe.add_argument("--runtime-instance-id", required=True)
+    observe.add_argument("--runtime-session-id", required=True)
+    observe.add_argument("--runtime-epoch", required=True, type=int)
+
     tasks = sub.add_parser("tasks", help="manage named Runtime tasks")
     tasks_sub = tasks.add_subparsers(dest="tasks_command", required=True)
     clear = tasks_sub.add_parser("clear", help="cancel and settle exact named task ids")
@@ -307,6 +313,46 @@ def _typed_health(paths: RuntimePaths) -> Mapping[str, Any]:
     return _json_value(value)
 
 
+def _observe_pack_host(paths: RuntimePaths, *, instance: str, session: str, epoch: int) -> Mapping[str, Any]:
+    """Observe only the resident pack host, bound to the caller's Runtime identity."""
+    if not instance or not session or isinstance(epoch, bool) or epoch <= 0:
+        raise ValueError("invalid Runtime identity")
+    _validate_support_paths(paths)
+    discovery = _read_support_json(paths.discovery_path) or {}
+    endpoint = _validate_loopback_endpoint(str(discovery.get("endpoint") or ""))
+    if discovery.get("runtime_instance_id") != instance:
+        raise ValueError("Runtime identity mismatch")
+    from astrid_runtime_client import WorkspaceClient
+
+    client = WorkspaceClient(endpoint, _credential(paths, advise_start=False), timeout=5)
+
+    def check_health() -> None:
+        health = client.health()
+        if (health.status != "ok" or health.runtime_instance_id != instance
+                or health.runtime_session_id != session or health.runtime_epoch != epoch):
+            raise ValueError("Runtime identity mismatch")
+
+    check_health()
+    observed = client.get_executor("astrid-pack-host")
+    if (observed.executor_id != "astrid-pack-host" or observed.runtime_session_id != session
+            or observed.runtime_epoch != epoch):
+        raise ValueError("executor identity mismatch")
+    check_health()
+    current = _read_support_json(paths.discovery_path) or {}
+    if current.get("runtime_instance_id") != instance or current.get("endpoint") != discovery.get("endpoint"):
+        raise ValueError("Runtime discovery changed")
+    return {
+        "executor_id": observed.executor_id,
+        "readiness": observed.readiness,
+        "runtime_epoch": observed.runtime_epoch,
+        "runtime_session_id": observed.runtime_session_id,
+        "source_epoch": observed.source_epoch,
+        "source_digest": observed.source_digest,
+        "dependency_digest": observed.dependency_digest,
+        "capabilities": [{"status": "ready"} for cap in observed.capabilities if cap.status == "ready"],
+    }
+
+
 def _start_local_worker(paths: RuntimePaths, *, profile_id: str, expected_workspace_uuid: str) -> Mapping[str, Any]:
     _validate_support_paths(paths)
     discovery = _read_support_json(paths.discovery_path)
@@ -463,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         _emit({"ok": False, "error": str(exc)}, json_mode=True)
         return 1
-    if args.command not in {"workspace", "doctor", "status", "tasks"}:
+    if args.command not in {"workspace", "doctor", "status", "tasks", "observe-pack-host"}:
         # Any other command may stop or signal the Runtime it manages, so it
         # follows the installed process-control setting from the start.
         try:
@@ -509,6 +555,16 @@ def main(argv: list[str] | None = None) -> int:
             from .diagnostics import diagnostics_report
             print(diagnostics_report(paths, result))
         return 0 if result["healthy"] else 1
+    if args.command == "observe-pack-host":
+        try:
+            result = _observe_pack_host(paths, instance=args.runtime_instance_id,
+                                        session=args.runtime_session_id, epoch=args.runtime_epoch)
+        except Exception:
+            # Neither credentials nor untrusted server errors cross this boundary.
+            _emit({"ok": False, "error": "pack host observation unavailable"}, json_mode=True)
+            return 1
+        _emit(result, json_mode=True)
+        return 0
     if args.command == "tasks" and args.tasks_command == "clear":
         from .task_clear import clear_tasks
 
