@@ -327,8 +327,13 @@ def _observer_transport(endpoint: str):
         if method != "GET" or path not in ("/v1/health", "/v1/executors/astrid-pack-host") or body is not None:
             raise ValueError("invalid observer request")
         req = urllib.request.Request(endpoint + path, headers=headers, method=method)
-        with opener.open(req, timeout=5) as response:
-            return response.status, dict(response.headers), response.read(1024 * 1024 + 1)
+        try:
+            with opener.open(req, timeout=5) as response:
+                return response.status, dict(response.headers), response.read(1024 * 1024 + 1)
+        except urllib.error.HTTPError as exc:
+            # Do not let the generated client consume an unbounded error body.
+            exc.close()
+            raise ValueError("observer request failed") from None
 
     return request
 

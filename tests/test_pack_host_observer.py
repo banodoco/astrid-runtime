@@ -219,3 +219,41 @@ def test_observer_never_follows_cross_port_redirect(live, capsys, monkeypatch):
             server.server_close()
         for thread in threads:
             thread.join()
+
+
+def test_observer_does_not_read_oversized_http_error(live, capsys, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+    import urllib.error
+
+    paths, daemon, _, args = live
+    reads = []
+    class ErrorResponse(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(503)
+            self.send_header("Content-Length", str(100 * 1024 * 1024))
+            self.end_headers()
+            self.wfile.write(b"error-body")
+        def log_message(self, *args):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ErrorResponse)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        args[args.index("--endpoint") + 1] = endpoint
+        original = cli._read_support_json
+        def discovery(path):
+            value = original(path)
+            return {**value, "endpoint": endpoint} if path == paths.discovery_path else value
+        monkeypatch.setattr(cli, "_read_support_json", discovery)
+        monkeypatch.setattr(urllib.error.HTTPError, "read", lambda *a, **kw: reads.append(True), raising=False)
+        assert cli.main(args) == 1
+        assert reads == []
+        output = capsys.readouterr().out
+        assert json.loads(output) == {"ok": False, "error": "pack host observation unavailable"}
+        assert daemon.token not in output
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
