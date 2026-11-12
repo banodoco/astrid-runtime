@@ -465,10 +465,11 @@ class AttemptFence:
 class ClaimWaiting:
     task: Task
     waiting_reason: str
+    waiting_details: Mapping[str, Any] | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "ClaimWaiting":
-        return cls(task=Task.from_json(value["task"]), waiting_reason=str(value["waiting_reason"]))
+        return cls(task=Task.from_json(value["task"]), waiting_reason=str(value["waiting_reason"]), waiting_details=value.get("waiting_details"))
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)

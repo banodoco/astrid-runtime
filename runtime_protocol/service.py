@@ -8461,6 +8461,8 @@ class RuntimeService:
             result = None
         elif value["task"]["status"] != "running":
             result = {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
+            if value.get("waiting_details") is not None:
+                result["waiting_details"] = value["waiting_details"]
         else:
             task = value["task"]
             fence = int(task.get("lease_fence") or task.get("attempt") or 1)
@@ -9305,7 +9307,7 @@ class RuntimeService:
                         # The CAS row retains the first ingest's filename.
                         # Each association still needs its own exact receipt;
                         # retain the recorded filename for legacy normalization.
-                        if has_project_owner or not any(self._is_authorized_generic_output(
+                        if stage_path is None and (has_project_owner or not any(self._is_authorized_generic_output(
                             digest,
                             size,
                             media_type,
@@ -9317,7 +9319,7 @@ class RuntimeService:
                             task_row=task_row,
                             project_id=project_id,
                             lease_body=lease_body,
-                        ) for recorded_filename in (output.get("filename", name), existing["original_name"])):
+                        ) for recorded_filename in (output.get("filename", name), existing["original_name"]))):
                             raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 elif project_id and stage_path is None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
                     raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})

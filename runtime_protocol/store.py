@@ -3879,7 +3879,10 @@ class RealmStore:
         return f"waiting_for_{safe or 'resource'}"
 
     def _set_waiting_reason(self, task_id, reason):
-        self.conn.execute("UPDATE tasks SET waiting_reason=?, updated_at=? WHERE id=? AND status='queued'", (reason, now(), task_id))
+        task = self.conn.execute("SELECT run_id, status, waiting_reason FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task and task["status"] == "queued" and task["waiting_reason"] != reason:
+            self.conn.execute("UPDATE tasks SET waiting_reason=?, updated_at=? WHERE id=?", (reason, now(), task_id))
+            self._append_event(task["run_id"], task_id, "task.waiting_reason_changed", {"previous_reason": task["waiting_reason"], "waiting_reason": reason})
 
     def _release_reservations(self, task_id, lease_token=None, *, released_at=None):
         timestamp = released_at or now()
@@ -4377,49 +4380,44 @@ class RealmStore:
                     "SELECT project_id FROM runs WHERE id=?", (task["run_id"],)
                 ).fetchone()[0]
                 self._validate_spec_snapshot_refs(task_spec, task_project)
-                waiting_reason = None
-                if not executor:
-                    waiting_reason = "waiting_for_worker"
-                elif executor["readiness"] != "ready":
-                    waiting_reason = "waiting_for_worker"
-                elif not capability and task["capability_digest"] is not None:
-                    # A task admitted before its executor advertises the
-                    # capability remains queued, never claimable, until a
-                    # matching registration arrives.
-                    waiting_reason = "capability_unavailable"
-                elif capability and capability["status"] != "ready":
-                    waiting_reason = "capability_unavailable"
-                elif not self.storage_preflight(task["capability"], storage_estimate=task_spec.get("storage_estimate"))["ok"]:
-                    waiting_reason = "insufficient_storage"
-                elif task["capability"] not in self._executor_capability_ids(executor):
-                    waiting_reason = "waiting_for_worker"
-                elif not self._executor_live(executor):
-                    waiting_reason = "waiting_for_worker"
-                elif task["capability_digest"] is not None and (not capability or capability["definition_digest"] != task["capability_digest"]):
-                    waiting_reason = "capability_unavailable"
-                elif (self._executor_capability(executor, task["capability"]) or {}).get("status", "ready") != "ready":
-                    waiting_reason = "waiting_for_worker"
-                elif not execution_facts_match(
-                    task_spec.get("required_facts", {"exact": {}, "minimum": {}}),
-                    (self._executor_capability(executor, task["capability"]) or {}).get(
-                        "verified_facts", {"exact": {}, "minimum": {}
-                    }),
-                ):
-                    waiting_reason = "waiting_for_executor_facts"
-                else:
-                    active = self.conn.execute("SELECT COUNT(*) FROM tasks WHERE executor_id=? AND status='running'", (executor_id,)).fetchone()[0]
-                    if active >= executor["max_concurrency"]:
-                        waiting_reason = "waiting_for_worker"
-                    else:
-                        available = set(json.loads(executor["resource_keys_json"]))
-                        for key in self._required_resource_keys(task["capability"]):
-                            if key not in available:
-                                waiting_reason = self._waiting_for_resource(key)
-                                break
-                            occupied = self.conn.execute("SELECT 1 FROM reservations WHERE executor_id=? AND resource_key=? AND released_at IS NULL LIMIT 1", (executor_id, key)).fetchone()
-                            if occupied:
-                                waiting_reason = self._waiting_for_resource(key)
-                                break
+                blockers = []
+                def add(reason, **details):
+                    blockers.append({"reason": reason, **details})
+                def holder(row):
+                    expires = row["lease_expires_at"]
+                    try:
+                        expired = datetime.fromisoformat(expires) <= datetime.now(timezone.utc) if expires else None
+                    except (TypeError, ValueError):
+                        expired = None
+                    return {"holder_task_id": row["id"], "holder_state": row["status"], "lease_expired": expired}
+                if not executor or executor["readiness"] != "ready":
+                    add("waiting_for_worker")
+                if (not capability and task["capability_digest"] is not None) or (capability and capability["status"] != "ready"):
+                    add("capability_unavailable")
+                if not self.storage_preflight(task["capability"], storage_estimate=task_spec.get("storage_estimate"))["ok"]:
+                    add("insufficient_storage")
+                if executor:
+                    if task["capability"] not in self._executor_capability_ids(executor) or not self._executor_live(executor):
+                        add("waiting_for_worker")
+                    if task["capability_digest"] is not None and (not capability or capability["definition_digest"] != task["capability_digest"]):
+                        add("capability_unavailable")
+                    descriptor = self._executor_capability(executor, task["capability"]) or {}
+                    if descriptor.get("status", "ready") != "ready":
+                        add("waiting_for_worker")
+                    if not execution_facts_match(task_spec.get("required_facts", {"exact": {}, "minimum": {}}), descriptor.get("verified_facts", {"exact": {}, "minimum": {}})):
+                        add("waiting_for_executor_facts")
+                    active = self.conn.execute("SELECT id, status, lease_expires_at FROM tasks WHERE executor_id=? AND status='running' ORDER BY id", (executor_id,)).fetchall()
+                    if len(active) >= executor["max_concurrency"]:
+                        for row in active:
+                            add("waiting_for_worker", **holder(row))
+                    available = set(json.loads(executor["resource_keys_json"]))
+                    for key in self._required_resource_keys(task["capability"]):
+                        if key not in available:
+                            add(self._waiting_for_resource(key), resource_key=key)
+                        for row in self.conn.execute("SELECT t.id, t.status, t.lease_expires_at FROM reservations r JOIN tasks t ON t.id=r.task_id WHERE r.executor_id=? AND r.resource_key=? AND r.released_at IS NULL ORDER BY t.id", (executor_id, key)):
+                            add(self._waiting_for_resource(key), resource_key=key, **holder(row))
+                # Prefer the held execution slot over a transient storage shortage.
+                waiting_reason = next((b["reason"] for b in blockers if b["reason"] == "waiting_for_worker" and "holder_task_id" in b), blockers[0]["reason"] if blockers else None)
                 # Preflight may read snapshots or storage before authority is
                 # granted. Recheck the existing hard bounds after that work so
                 # a task cannot acquire a fresh attempt past its deadline.
@@ -4428,7 +4426,9 @@ class RealmStore:
                     return self._fail_task_in_transaction(task, failure, attempt_id=task["attempt_id"])
                 if waiting_reason:
                     self._set_waiting_reason(task_id, waiting_reason)
-                    return self.get_task(task_id)
+                    value = self.get_task(task_id)
+                    value["waiting_details"] = {"blockers": blockers}
+                    return value
                 timestamp = now()
                 fence = int(task["lease_fence"] or 0) + 1
                 deadline = self._task_lease_deadline(task, LEASE_SECONDS, claimed_at=timestamp).isoformat(timespec="milliseconds")
@@ -4452,6 +4452,8 @@ class RealmStore:
                 self.conn.execute("UPDATE executors SET runtime_epoch=?, last_seen_at=? WHERE id=?", (epoch, timestamp, executor_id))
                 for key in self._required_resource_keys(task["capability"]):
                     self.conn.execute("INSERT INTO reservations(task_id, resource_key, lease_token, created_at, released_at, executor_id, fence, lease_expires_at, runtime_epoch) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?) ON CONFLICT(task_id, resource_key) DO UPDATE SET lease_token=excluded.lease_token, created_at=excluded.created_at, released_at=NULL, executor_id=excluded.executor_id, fence=excluded.fence, lease_expires_at=excluded.lease_expires_at, runtime_epoch=excluded.runtime_epoch", (task_id, key, lease_token, timestamp, executor_id, fence, deadline, epoch))
+                if task["waiting_reason"] is not None:
+                    self._append_event(task["run_id"], task_id, "task.waiting_reason_changed", {"previous_reason": task["waiting_reason"], "waiting_reason": None})
                 self._append_event(task["run_id"], task_id, "task.claimed", {"executor_id": executor_id, "attempt": task["attempt"] + 1, "fence": fence, "resource_keys": self._required_resource_keys(task["capability"])})
                 return self.get_task(task_id)
 
