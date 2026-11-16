@@ -73,6 +73,7 @@ def main() -> int:
         "-m", "not integration and not darwin_native and not live and not needs_real_pidfd",
         *sys.argv[1:],
     ]
+    env["PATH"] = f"{workspace / 'packages/typescript/node_modules/.bin'}{os.pathsep}{env.get('PATH', '')}"
     result = subprocess.run(command, cwd=workspace, env=env, preexec_fn=drop_privileges, check=False)
     return result.returncode
 
