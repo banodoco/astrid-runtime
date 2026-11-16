@@ -266,6 +266,40 @@ def _emit_ready(result: BootstrapResult, *, json_mode: bool) -> None:
         print(f"\nOpen {result.door_origin}")
 
 
+def _managed_source(paths: RuntimePaths, config: BootstrapConfig) -> Path | None:
+    """Identify the selected managed source, failing closed for mismatches."""
+    from .paths import _install_record_path
+
+    source = config.resolve_source_profile(paths)
+    checkout = Path(source.source_checkout)
+    # A version-shaped path stays managed even if metadata is broken: never
+    # downgrade a damaged installation into a generic process launch.
+    version_shaped = any(parent.parent.name == "versions" for parent in (checkout, *checkout.parents))
+    record_path = _install_record_path(paths.home)
+    record = _read_support_json(record_path) or {}
+    selected_data = record.get("r1_data_root") or record.get("data_root")
+    selected = bool(record.get("owner") == "haus.astrid.runtime" and selected_data
+                    and Path(str(selected_data)) == paths.app_support)
+    if not version_shaped and not selected:
+        return None
+    if not version_shaped:
+        raise BootstrapError("Selected managed installation does not match the source profile; repair the installation")
+    return checkout
+
+
+def _managed_lifecycle(paths: RuntimePaths, config: BootstrapConfig, action: str, *, wait: bool = False):
+    """Route managed owners through their selected product, never shell launch state."""
+    from .selected_source import selected_managed_lifecycle
+    checkout = _managed_source(paths, config)
+    if checkout is None:
+        return None
+    with selected_managed_lifecycle(str(checkout)) as lifecycle:
+        result = lifecycle(action=action, source_checkout=checkout, data_root=paths.app_support, wait=wait)
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise BootstrapError("Managed lifecycle controller did not confirm the requested operation")
+    return result
+
+
 def _credential(paths: RuntimePaths, *, advise_start: bool = True) -> str:
     # Product traffic uses the Astrid-scoped credential in app support.  An
     # operator command needs the daemon-issued owner credential, which is
@@ -451,7 +485,7 @@ def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: 
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         paths = _paths(args)
@@ -522,6 +556,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         config = _config(args, paths)
         try:
+            if _managed_source(paths, config) is not None:
+                # Only the canonical service launcher enters in-process after
+                # installation admission. This is not a public CLI flag.
+                expected = {"data_root": str(paths.app_support), "profile": str(config.source_manifest)}
+                if managed_launch != expected:
+                    raise BootstrapError("Managed Astrid must be started by its installation service")
             return _run_foreground(paths, config, json_mode=args.json)
         except Exception as exc:
             _emit({"ok": False, "error": str(exc), "log": str(platform.log_dir(paths.home) / "runtime.log")}, json_mode=True)
@@ -529,6 +569,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "up":
         config = _config(args, paths)
         try:
+            managed = _managed_lifecycle(paths, config, "up", wait=args.wait)
+            if managed is not None:
+                _emit(managed, json_mode=args.json)
+                return 0
             if args.wait and config.door is None:
                 raise BootstrapError("up --wait requires the browser door; enable --hosted-origin")
             boundary = LocalRuntimeBoundary()
@@ -569,6 +613,10 @@ def main(argv: list[str] | None = None) -> int:
                         runtime_instance_id=owner.get("runtime_instance_id"),
                     )
                     _emit(down(paths, boundary, stop_manager=stop_manager), json_mode=args.json)
+                return 0
+            managed = _managed_lifecycle(paths, config, "restart")
+            if managed is not None:
+                _emit(managed, json_mode=args.json)
                 return 0
             source = config.resolve_source_profile(paths)
             catalog = _read_catalog(paths)

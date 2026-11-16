@@ -63,3 +63,21 @@ def selected_shutdown_owner(source_checkout: str):
         yield helper
     finally:
         sys.meta_path.remove(selected)
+
+
+@contextmanager
+def selected_managed_lifecycle(source_checkout: str):
+    """Select the installed product's lifecycle entry point without ambient imports."""
+    selected = _SelectedAgent(Path(source_checkout).expanduser())
+    for name, module in tuple(sys.modules.items()):
+        if selected.owns(name):
+            selected.verify(name, getattr(module, "__file__", None), getattr(module, "__path__", None))
+    sys.meta_path.insert(0, selected)
+    try:
+        product = import_module("astrid.services")
+        helper = getattr(product, "managed_runtime_lifecycle", None)
+        if not callable(helper) or getattr(helper, "__module__", None) != product.__name__:
+            raise BootstrapError("Selected managed installation does not provide a lifecycle controller; update or repair the installation")
+        yield helper
+    finally:
+        sys.meta_path.remove(selected)

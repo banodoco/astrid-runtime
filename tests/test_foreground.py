@@ -141,6 +141,7 @@ def test_wait_for_door_reports_deadline_and_last_reason(tmp_path, monkeypatch):
 def test_up_wait_requires_browser_door_and_emits_refusal(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_paths", lambda _args: RuntimePaths.sandbox(tmp_path / "support"))
     monkeypatch.setattr(cli, "_config", lambda *_: cli.BootstrapConfig(door=None))
+    monkeypatch.setattr(cli, "_managed_lifecycle", lambda *_args, **_kwargs: None)
     assert cli.main(["up", "--wait", "--hosted-origin", "off", "--json"]) == 1
     assert "requires the browser door" in capsys.readouterr().out
 
@@ -152,6 +153,7 @@ def test_up_wait_returns_only_after_matching_door_is_ready(tmp_path, monkeypatch
     boundary = _Boundary()
     monkeypatch.setattr(cli, "_paths", lambda _args: paths)
     monkeypatch.setattr(cli, "_config", lambda *_: cli.BootstrapConfig(door=DoorSettings(ORIGIN, 17340)))
+    monkeypatch.setattr(cli, "_managed_lifecycle", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "LocalRuntimeBoundary", lambda: boundary)
     monkeypatch.setattr(cli, "bootstrap", lambda *_: result)
     monkeypatch.setattr(cli, "_wait_for_door", lambda *_: boundary.check_running())
@@ -277,6 +279,7 @@ def test_run_command_routes_to_in_process_foreground_owner(tmp_path, monkeypatch
             return True
         def set(self): self.stopped = True
     monkeypatch.setattr(cli, "_paths", lambda _args: paths)
+    monkeypatch.setattr(cli, "_managed_source", lambda *_args: None)
     monkeypatch.setattr(cli, "_config", lambda *_: config)
     monkeypatch.setattr(cli.threading, "Event", FakeEvent)
     monkeypatch.setattr(cli, "ForegroundRuntimeBoundary", lambda: boundary)
@@ -315,6 +318,7 @@ def test_run_command_accepts_disabled_hosted_door_and_stays_foreground(tmp_path,
             self.stopped = True
 
     monkeypatch.setattr(cli, "_paths", lambda _args: paths)
+    monkeypatch.setattr(cli, "_managed_source", lambda *_args: None)
     monkeypatch.setattr(cli, "_config", lambda *_: config)
     monkeypatch.setattr(cli.process_control, "configure_from", lambda _support: None)
     monkeypatch.setattr(cli.threading, "Event", FakeEvent)
