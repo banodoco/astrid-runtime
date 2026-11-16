@@ -2,7 +2,7 @@
 name: CI
 
 on:
-  # Pushes start CI on main, release mains, int/ branches and Release 14 Plan 39. Pull requests run for every base branch.
+  # Pushes start CI only on main, release mains and int/ integration branches. Pull requests run for every base branch.
   push:
     branches: [main, "release/*/main", "int/**", "release/14/plan-39"]
   pull_request:
@@ -95,12 +95,16 @@ jobs:
 
   unit:
     runs-on: ${{ matrix.os }}
+    env:
+      ASTRID_CHECKOUT: ${{ github.workspace }}/../astrid-agent
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Restore pip cache (C-08)
         id: c08-runtime-ci-4
         uses: actions/cache/restore@v4
@@ -110,6 +114,43 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Select pinned Agent revision
+        id: astrid-pin
+        env:
+          AGENT_OVERRIDE: ${{ inputs.agent_sha }}
+        shell: bash
+        run: |
+          sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
+          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Agent revision must be a full 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Checkout pinned Agent
+        shell: bash
+        env:
+          AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
+        run: |
+          git init --quiet "$ASTRID_CHECKOUT"
+          git -C "$ASTRID_CHECKOUT" remote add origin https://github.com/banodoco/astrid-agent
+          git -C "$ASTRID_CHECKOUT" fetch --no-tags origin "$AGENT_SHA"
+          git -C "$ASTRID_CHECKOUT" checkout --detach --quiet "$AGENT_SHA"
+          test "$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)" = "$AGENT_SHA"
+      - name: Record effective Runtime and Agent checkouts
+        shell: bash
+        run: |
+          runtime_sha=$(git rev-parse HEAD)
+          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
+          echo "Runtime: $runtime_sha"
+          echo "Agent: $agent_sha"
+          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+        working-directory: packages/typescript
+      - name: Add locked TypeScript compiler to PATH
+        run: echo "$GITHUB_WORKSPACE/packages/typescript/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Install system media tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
@@ -118,6 +159,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ffmpeg
       - run: python -m pip install -e '.[test]'
+      - run: python -m pip install -e "$ASTRID_CHECKOUT"
       - name: Run unit tests
         shell: bash
         run: mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/unit.xml" -n 2
@@ -218,6 +260,8 @@ jobs:
 
   boundary:
     runs-on: ubuntu-latest
+    env:
+      ASTRID_CHECKOUT: ${{ github.workspace }}/../astrid-agent
     steps:
       - uses: actions/checkout@v4
       - name: Restore pip cache (C-08)
@@ -229,10 +273,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Select pinned Agent revision
+        id: astrid-pin
+        env:
+          AGENT_OVERRIDE: ${{ inputs.agent_sha }}
+        shell: bash
+        run: |
+          sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
+          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Agent revision must be a full 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Checkout pinned Agent
+        shell: bash
+        env:
+          AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
+        run: |
+          git init --quiet "$ASTRID_CHECKOUT"
+          git -C "$ASTRID_CHECKOUT" remote add origin https://github.com/banodoco/astrid-agent
+          git -C "$ASTRID_CHECKOUT" fetch --depth=1 --no-tags origin "$AGENT_SHA"
+          git -C "$ASTRID_CHECKOUT" checkout --detach --quiet FETCH_HEAD
+          test "$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)" = "$AGENT_SHA"
+      - name: Record effective Runtime and Agent checkouts
+        shell: bash
+        run: |
+          runtime_sha=$(git rev-parse HEAD)
+          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
+          echo "Runtime: $runtime_sha"
+          echo "Agent: $agent_sha"
+          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - run: python -m pip install -e '.[test]'
+      - run: python -m pip install -e "$ASTRID_CHECKOUT"
       - run: python -m pytest -q tests/test_second_client_e2e.py -m ""
 
       - name: Save pip cache on main or int branches (C-08)
@@ -246,8 +321,42 @@ jobs:
     # Sandbox mode under a seccomp profile that denies what NVIDIA OpenShell's
     # does: pidfd_open (ENOSYS), pidfd_send_signal and process-group kill (EPERM).
     runs-on: ubuntu-latest
+    env:
+      ASTRID_CHECKOUT: ${{ github.workspace }}/../astrid-agent
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select pinned Agent revision
+        id: astrid-pin
+        env:
+          AGENT_OVERRIDE: ${{ inputs.agent_sha }}
+        shell: bash
+        run: |
+          sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
+          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Agent revision must be a full 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Checkout pinned Agent
+        shell: bash
+        env:
+          AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
+        run: |
+          git init --quiet "$ASTRID_CHECKOUT"
+          git -C "$ASTRID_CHECKOUT" remote add origin https://github.com/banodoco/astrid-agent
+          git -C "$ASTRID_CHECKOUT" fetch --no-tags origin "$AGENT_SHA"
+          git -C "$ASTRID_CHECKOUT" checkout --detach --quiet "$AGENT_SHA"
+          test "$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)" = "$AGENT_SHA"
+      - name: Record effective Runtime and Agent checkouts
+        shell: bash
+        run: |
+          runtime_sha=$(git rev-parse HEAD)
+          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
+          echo "Runtime: $runtime_sha"
+          echo "Agent: $agent_sha"
+          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Run sandbox process-control tests
         run: mkdir -p "$TEST_RESULTS_DIR" && ASTRID_TEST_RESULTS_DIR="$TEST_RESULTS_DIR" sh tests/seccomp/run-suite.sh -rA --junitxml=/test-results/sandbox-process-control.xml
         shell: bash

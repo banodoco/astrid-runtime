@@ -42,7 +42,13 @@ def tree(root):
 
 
 def extract_executable(ref, destination):
-    raw = subprocess.check_output(["git", "archive", ref], cwd=REPO)
+    try:
+        raw = subprocess.check_output(["git", "archive", ref], cwd=REPO)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"cannot archive required commit {ref} from {REPO}; fetch this SHA "
+            f"or full history with `git -C {REPO} fetch origin {ref}`"
+        ) from exc
     destination.mkdir()
     with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
         archive.extractall(destination, filter="data")

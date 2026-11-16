@@ -23,6 +23,7 @@ from runtime_protocol.timeline_commit import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+TSC = ROOT / "packages/typescript/node_modules/.bin/tsc"
 SCHEMA = json.loads((ROOT / "contract/schemas/timeline-commit.json").read_text())
 DIGEST = "sha256:" + "a" * 64
 
@@ -762,7 +763,7 @@ def test_generated_typescript_commit_contract(tmp_path):
     output = tmp_path / "client"
     subprocess.run(
         [
-            "tsc",
+            str(TSC),
             "-p",
             str(ROOT / "packages/typescript/tsconfig.json"),
             "--outDir",
