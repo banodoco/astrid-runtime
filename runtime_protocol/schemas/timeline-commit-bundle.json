@@ -674,14 +674,24 @@
               }
             }
           ],
-          "description": "Bounded raw clip fields. Set hold in source seconds; explicitly remove hold, asset or incoming transition. Clear removes presence, never sets null/empty. Asset assignment requires the scoped clip.swap-media or occurrence.swap-media; transition authoring is outside v1.",
+          "description": "Bounded raw clip fields. Set hold in source seconds; set fit, position, size, crop and opacity independently; explicitly remove supported fields with clear. Clear removes presence, never sets null/empty. Asset assignment requires the scoped clip.swap-media or occurrence.swap-media; transition authoring is outside v1.",
           "properties": {
             "clear": {
               "items": {
                 "enum": [
                   "hold",
                   "asset",
-                  "transition"
+                  "transition",
+                  "fit",
+                  "x",
+                  "y",
+                  "width",
+                  "height",
+                  "cropTop",
+                  "cropBottom",
+                  "cropLeft",
+                  "cropRight",
+                  "opacity"
                 ]
               },
               "type": "array",
@@ -690,9 +700,54 @@
             "values": {
               "additionalProperties": false,
               "properties": {
+                "cropBottom": {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "cropLeft": {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "cropRight": {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "cropTop": {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "fit": {
+                  "enum": [
+                    "contain",
+                    "cover"
+                  ]
+                },
+                "height": {
+                  "exclusiveMinimum": 0,
+                  "type": "number"
+                },
                 "hold": {
                   "description": "Positive finite source seconds; timeline duration is hold/speed.",
                   "exclusiveMinimum": 0,
+                  "type": "number"
+                },
+                "opacity": {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "width": {
+                  "exclusiveMinimum": 0,
+                  "type": "number"
+                },
+                "x": {
+                  "type": "number"
+                },
+                "y": {
                   "type": "number"
                 }
               },
@@ -3220,11 +3275,23 @@
               }
             }
           ],
-          "description": "Set raw track.label or explicitly remove it. Null is not a label. Unmentioned fields survive.",
+          "description": "Set bounded raw track appearance fields or explicitly remove them. Null is not a value. Unmentioned fields survive.",
           "properties": {
             "clear": {
               "items": {
-                "const": "label"
+                "anyOf": [
+                  {
+                    "const": "label"
+                  },
+                  {
+                    "enum": [
+                      "fit",
+                      "scale",
+                      "opacity",
+                      "blendMode"
+                    ]
+                  }
+                ]
               },
               "type": "array",
               "uniqueItems": true
@@ -3232,8 +3299,36 @@
             "values": {
               "additionalProperties": false,
               "properties": {
+                "blendMode": {
+                  "enum": [
+                    "normal",
+                    "multiply",
+                    "screen",
+                    "overlay",
+                    "darken",
+                    "lighten",
+                    "soft-light",
+                    "hard-light"
+                  ]
+                },
+                "fit": {
+                  "enum": [
+                    "cover",
+                    "contain",
+                    "manual"
+                  ]
+                },
                 "label": {
                   "type": "string"
+                },
+                "opacity": {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "scale": {
+                  "exclusiveMinimum": 0,
+                  "type": "number"
                 }
               },
               "type": "object"
@@ -6109,6 +6204,13 @@
               },
               "type": "object"
             },
+            "fit": {
+              "enum": [
+                "contain",
+                "cover"
+              ],
+              "type": "string"
+            },
             "from": {
               "type": "number"
             },
@@ -6359,6 +6461,15 @@
             "properties": {
               "app": {
                 "additionalProperties": {},
+                "properties": {
+                  "clipPlacementVersion": {
+                    "const": 1,
+                    "type": "integer"
+                  },
+                  "scaleAppliesToPositionedClips": {
+                    "type": "boolean"
+                  }
+                },
                 "type": "object"
               },
               "blendMode": {

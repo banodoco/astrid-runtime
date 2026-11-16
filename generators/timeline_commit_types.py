@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -33,6 +34,27 @@ def render() -> dict[str, str]:
         "$defs"
     ]
     definitions = {**agent, **runtime}
+
+    for schema in definitions.values():
+        properties = schema.get("properties", {})
+        values = properties.get("values", {})
+        value_properties = values.get("properties")
+        if not value_properties or not isinstance(schema.get("anyOf"), list):
+            continue
+        for branch in schema.get("anyOf", []):
+            selected = branch.get("properties", {}).get("values", {})
+            if selected.get("minProperties") == 1:
+                selected.update(copy.deepcopy(values))
+                selected["minProperties"] = 1
+                # minProperties is not representable by TypedDict on its own.
+                # This equivalent finite union keeps generated DTOs from
+                # admitting an empty appearance edit.
+                selected["anyOf"] = [
+                    {"type": "object", "properties": copy.deepcopy(value_properties),
+                     "required": [key], "additionalProperties": False}
+                    for key in value_properties
+                ]
+
     # Resolve the imported Agent aliases without maintaining a second leaf schema.
     for name, schema in list(definitions.items()):
         if schema.get("$ref", "").startswith("edit-command.json#/$defs/"):
