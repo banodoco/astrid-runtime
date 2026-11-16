@@ -3,6 +3,8 @@ name: Nightly
 on:
   schedule:
     - cron: "0 3 * * *"
+  push:
+    branches: ["release/14/plan-39"]
   workflow_dispatch:
     inputs:
       agent_sha:
@@ -56,7 +58,40 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: python -m pip install -e '.[test]'
       - run: python -m pip install -e "$ASTRID_CHECKOUT"
-      - run: python -m pytest -q -m integration
+      - name: Run nightly integration tests
+        shell: bash
+        run: mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/nightly-integration.xml" -m integration
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-nightly-all-${{ runner.os }}
+      - name: Summarize test result XML
+        if: always()
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-nightly-all-${{ runner.os }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
+          if not files:
+              print('JUnit: no XML files; no test result available')
+              raise SystemExit(1)
+          root = ET.parse(files[0]).getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
+          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
+          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
+          print(line)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(line + '\n')
+          PY
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-nightly-integration-all-${{ runner.os }}
+          path: ${{ runner.temp }}/test-results-nightly-all-${{ runner.os }}/*.xml
+          retention-days: 90
+          if-no-files-found: warn
       - name: Save pip cache on main or int branches (C-08)
         if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-nightly-1.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
