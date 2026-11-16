@@ -13,12 +13,14 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 from collections import deque
 from contextlib import contextmanager
 from functools import wraps
 from typing import cast
 
+from . import platform as runtime_platform
 from .errors import ConflictError, ProtocolError, ValidationError
 from .idempotency import command_result
 from .timeline_commit_validation import detached, digest
@@ -368,12 +370,18 @@ class TimelineCommitStore:
     def _memo_failure(self, version):
         if version[4] is None:
             return "installed runtime package directory owner is unavailable"
-        for name, value in zip(("DB", "WAL", "SHM", "store directory"), version[3]):
+        database = self.store.db_path
+        paths = (database, str(database) + "-wal", str(database) + "-shm", database.parent)
+        for index, (name, value) in enumerate(zip(("DB", "WAL", "SHM", "store directory"), version[3])):
             if value is None:
                 if name in ("WAL", "SHM"):
                     continue
                 return f"{name} is missing"
-            if value[-1] & 0o022:
+            if sys.platform == "win32":
+                # st_mode is always 0o666 on Windows; the object's DACL decides access.
+                if not runtime_platform.is_owner_only(paths[index]):
+                    return f"{name} is accessible to other Windows accounts"
+            elif value[-1] & 0o022:
                 return f"{name} is group/world-writable"
             if value[-2] not in (0, version[4]):
                 return f"{name} owner uid {value[-2]} differs from root and installed runtime package owner uid {version[4]}"

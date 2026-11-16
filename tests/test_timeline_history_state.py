@@ -5,6 +5,7 @@ import copy
 import os
 import shutil
 import sqlite3
+import stat
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
@@ -18,6 +19,7 @@ import test_timeline_request_verification as verification_cases
 from test_timeline_commit_authentication import body, provider
 from test_timeline_commit_port import commit, rows
 
+from runtime_protocol import platform as runtime_platform
 from runtime_protocol import timeline_commit_store as store_module
 from runtime_protocol.errors import AuthorizationError, ProtocolError, RuntimeErrorBase
 from runtime_protocol.service import RuntimeService
@@ -474,6 +476,62 @@ def test_writable_store_fully_verifies_every_request(service, monkeypatch, caplo
     commits, publication, expected, calls = warm(service, monkeypatch)
     path = protection_path(service, component)
     path.chmod(path.stat().st_mode | write_bit)
+    for count in range(2, 5):
+        caplog.clear()
+        assert commits.history_entry(service.test_project, "main", publication) == expected
+        assert calls == {publication: count}
+        assert [record.getMessage() for record in caplog.records] == [
+            f"timeline history memo disabled; full verification for this request: {component} is group/world-writable"]
+
+
+def witness_windows_modes(monkeypatch, service, components=("DB", "WAL", "SHM", "store directory")):
+    """Report 0o666 for the given protected paths, as Windows st_mode does."""
+    original = os.stat
+    targets = {str(protection_path(service, component)) for component in components}
+
+    def changed(target, *args, **kwargs):
+        value = original(target, *args, **kwargs)
+        if str(target) in targets:
+            fields = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
+            return SimpleNamespace(**{**fields, "st_mode": stat.S_IFMT(value.st_mode) | 0o666})
+        return value
+
+    monkeypatch.setattr(os, "stat", changed)
+
+
+def test_windows_dacl_protected_store_keeps_memo_despite_posix_mode(service, monkeypatch, caplog):
+    commits, publication, expected, calls = warm(service, monkeypatch)
+    checked = []
+    monkeypatch.setattr(store_module.sys, "platform", "win32")
+    monkeypatch.setattr(runtime_platform, "is_owner_only", lambda path, **kwargs: checked.append(str(path)) or True)
+    witness_windows_modes(monkeypatch, service)
+    for _ in range(3):
+        assert commits.history_entry(service.test_project, "main", publication) == expected
+    assert calls == {publication: 2}
+    assert not caplog.records
+    assert {str(protection_path(service, c)) for c in ("DB", "WAL", "SHM", "store directory")} <= set(checked)
+
+
+@pytest.mark.parametrize("component", ["DB", "WAL", "SHM", "store directory"])
+def test_windows_accessible_store_fully_verifies_every_request(service, monkeypatch, caplog, component):
+    commits, publication, expected, calls = warm(service, monkeypatch)
+    target = str(protection_path(service, component))
+    monkeypatch.setattr(store_module.sys, "platform", "win32")
+    monkeypatch.setattr(runtime_platform, "is_owner_only", lambda path, **kwargs: str(path) != target)
+    witness_windows_modes(monkeypatch, service)
+    for count in range(2, 5):
+        caplog.clear()
+        assert commits.history_entry(service.test_project, "main", publication) == expected
+        assert calls == {publication: count}
+        assert [record.getMessage() for record in caplog.records] == [
+            f"timeline history memo disabled; full verification for this request: {component} is accessible to other Windows accounts"]
+
+
+@pytest.mark.parametrize("component", ["DB", "WAL", "SHM", "store directory"])
+def test_posix_mode_bits_still_decide_memo_regardless_of_dacl(service, monkeypatch, caplog, component):
+    commits, publication, expected, calls = warm(service, monkeypatch)
+    monkeypatch.setattr(runtime_platform, "is_owner_only", lambda path, **kwargs: True)
+    witness_windows_modes(monkeypatch, service, (component,))
     for count in range(2, 5):
         caplog.clear()
         assert commits.history_entry(service.test_project, "main", publication) == expected
