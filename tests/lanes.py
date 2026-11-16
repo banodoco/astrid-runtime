@@ -143,12 +143,6 @@ DECLARED_XFAILS = {
         _xfail_reason("runtime-domains-update", "direct timeline update writer remains retired"),
         "tests.test_runtime_domains._RetiredTimelineUpdate",
     ),
-    "runtime-exact-idempotency": DeclaredXfail(
-        "runtime-exact-idempotency",
-        ("tests/test_runtime_exact_idempotency.py::test_timeline_shot_and_reference_creation_are_keyed_durable_and_non_overwriting",),
-        _xfail_reason("runtime-exact-idempotency", "RT02 held: direct shot writes are retired (410); the reference half is the KEPT catalog (RK01)"),
-        "astrid_runtime_client.generated.ApiError",
-    ),
     "second-client-core": DeclaredXfail(
         "second-client-core",
         ("tests/test_second_client_e2e.py::test_second_client_core_journey_is_executable",),
