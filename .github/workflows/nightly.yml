@@ -58,7 +58,7 @@ jobs:
       - run: python -m pip install -e "$ASTRID_CHECKOUT"
       - run: python -m pytest -q -m integration
       - name: Save pip cache on main or int branches (C-08)
-        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/')) && steps.c08-runtime-nightly-1.outputs.cache-hit != 'true' }}
+        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-nightly-1.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
