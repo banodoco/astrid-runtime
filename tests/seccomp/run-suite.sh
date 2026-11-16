@@ -1,20 +1,64 @@
 #!/bin/sh
 # Run the test suite in sandbox process-control mode inside a container whose
-# seccomp profile denies what OpenShell's does (see README.md). CI's
+# seccomp profile denies what NVIDIA OpenShell's does (see README.md). CI's
 # sandbox-process-control job runs this; extra arguments go to pytest.
+# Optional ASTRID_CHECKOUT is mounted read-only, then copied into the owned
+# workspace with its .git history. Optional ASTRID_TEST_RESULTS_DIR is mounted
+# read/write at /test-results for JUnit output.
 #   sh tests/seccomp/run-suite.sh [pytest args...]
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
-results_dir=${ASTRID_TEST_RESULTS_DIR:-$root/test-results}
-mkdir -p "$results_dir"
-exec docker run --rm --security-opt "seccomp=$root/tests/seccomp/openshell-like.json" \
-    -v "$root":/src:ro -v "$results_dir":/test-results python:3.11 sh -ec '
-        apt-get update -qq && apt-get install -y -qq ffmpeg nodejs npm >/dev/null
-        useradd -m ci
-        chown -R ci /test-results
-        cp -a /src /home/ci/w && chown -R ci /home/ci/w
-        exec su ci -c "cd /home/ci/w && python -m venv /home/ci/v \
-            && /home/ci/v/bin/pip install -q -e .[test] -e packages/python \
-            && /home/ci/v/bin/python -m pytest -q -n 2 --process-control=sandbox \
-               -m \"not integration and not darwin_native and not live and not needs_real_pidfd\" $*"
-    ' sh "$@"
+agent_checkout=${ASTRID_CHECKOUT:-}
+results_dir=${ASTRID_TEST_RESULTS_DIR:-}
+
+if [ -n "$agent_checkout" ]; then
+    case "$agent_checkout" in
+        /*) ;;
+        *) echo "ASTRID_CHECKOUT must be an absolute path" >&2; exit 2 ;;
+    esac
+    agent_checkout=$(CDPATH= cd -- "$agent_checkout" && pwd -P) || {
+        echo "ASTRID_CHECKOUT is not a readable directory: $ASTRID_CHECKOUT" >&2
+        exit 2
+    }
+    if [ ! -f "$agent_checkout/astrid/core/execution/generic_host.py" ]; then
+        echo "ASTRID_CHECKOUT does not contain the pinned Astrid source: $agent_checkout" >&2
+        exit 2
+    fi
+fi
+
+if [ -n "$results_dir" ]; then
+    case "$results_dir" in
+        /*) ;;
+        *) echo "ASTRID_TEST_RESULTS_DIR must be an absolute path" >&2; exit 2 ;;
+    esac
+    mkdir -p "$results_dir"
+    results_dir=$(CDPATH= cd -- "$results_dir" && pwd -P) || {
+        echo "ASTRID_TEST_RESULTS_DIR is not a writable directory: $ASTRID_TEST_RESULTS_DIR" >&2
+        exit 2
+    }
+    if [ ! -w "$results_dir" ]; then
+        echo "ASTRID_TEST_RESULTS_DIR is not writable: $results_dir" >&2
+        exit 2
+    fi
+fi
+
+python3 - "$root" "$agent_checkout" "$results_dir" "$@" <<'PY'
+import subprocess
+import sys
+
+root, agent_checkout, results_dir, *pytest_args = sys.argv[1:]
+cmd = [
+    "docker", "run", "--rm",
+    "--security-opt", f"seccomp={root}/tests/seccomp/openshell-like.json",
+    "-v", f"{root}:/src:ro",
+]
+if agent_checkout:
+    cmd.extend((
+        "--mount", f"type=bind,source={agent_checkout},target=/astrid-agent,readonly",
+        "-e", "ASTRID_AGENT_MOUNT=/astrid-agent",
+    ))
+if results_dir:
+    cmd.extend(("--mount", f"type=bind,source={results_dir},target=/test-results"))
+cmd.extend(("python:3.11", "python", "/src/tests/seccomp/container-entrypoint.py", *pytest_args))
+raise SystemExit(subprocess.run(cmd, check=False).returncode)
+PY

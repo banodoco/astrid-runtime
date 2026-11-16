@@ -17,6 +17,7 @@ from runtime_protocol.timeline_commit_validation import validate_commit_value
 
 service = support.service
 ROOT = Path(__file__).resolve().parents[1]
+TSC = ROOT / "packages/typescript/node_modules/.bin/tsc"
 DIGEST = "sha256:" + "a" * 64
 PIN = {"document_id": "pack", "version": 1, "content_digest": DIGEST}
 MEDIA = {"asset": "asset", "generation_id": "g", "variant_id": "v",
@@ -90,6 +91,6 @@ def test_python_package_exports_native_args_and_nested_row_type():
 
 def test_typescript_package_exports_native_args_and_open_rows():
     subprocess.run([
-        "tsc", "--noEmit", "--strict", "--module", "NodeNext", "--target", "ES2022",
+        str(TSC), "--noEmit", "--strict", "--module", "NodeNext", "--target", "ES2022",
         str(ROOT / "tests/fixtures/timeline-bundle2-types.mts"),
     ], check=True)

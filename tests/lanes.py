@@ -17,7 +17,9 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import NamedTuple
+from urllib.parse import urlparse
 
 import pytest
 
@@ -41,7 +43,8 @@ LANE_MARKERS = {
 # is false. Test modules never call pytest's skip APIs (tests/test_skip_policy.py);
 # they use the ``requires_*`` marks below. The guard further down fails the run
 # on any skip whose reason does not carry a registered ``[declared:NAME]`` tag,
-# on any xfail, and prints every skip by test name.
+# on any xfail that does not match an exact strict declaration, and prints every
+# skip by test name.
 #
 # ``skip_when`` is executable: a Python expression over ``sys_platform`` and
 # ``os_name`` that is true on the hosts where the test is skipped. The mark is
@@ -118,6 +121,9 @@ class DeclaredXfail:
     reason: str
     raises: str
     strict: bool = True
+    issue: str | None = None
+    owner: str | None = None
+    expires: str | None = None
 
 
 def _xfail_reason(name: str, reason: str) -> str:
@@ -207,6 +213,64 @@ DECLARED_XFAILS = {
         "runtime_protocol.errors.RuntimeErrorBase",
     ),
 }
+
+MAX_DECLARED_XFAIL_TESTS = 10
+MAX_XFAIL_DAYS = 14
+
+
+def declared_xfail_errors(
+    declarations: dict[str, DeclaredXfail] | None = None, *, today: date | None = None
+) -> list[str]:
+    """Return policy violations without changing the registry or blocking collection."""
+    entries = DECLARED_XFAILS if declarations is None else declarations
+    today = date.today() if today is None else today
+    errors: list[str] = []
+    quarantined_count = sum(len(entry.nodeids) for entry in entries.values())
+    if quarantined_count > MAX_DECLARED_XFAIL_TESTS:
+        errors.append(
+            f"{quarantined_count} quarantined test node IDs exceed the limit of {MAX_DECLARED_XFAIL_TESTS}"
+        )
+
+    seen: set[str] = set()
+    for name, entry in entries.items():
+        prefix = f"{name}: "
+        if not entry.nodeids:
+            errors.append(f"{prefix}missing exact test node ID")
+        for nodeid in entry.nodeids:
+            if "::" not in nodeid or not nodeid.strip():
+                errors.append(f"{prefix}invalid exact test node ID {nodeid!r}")
+            if nodeid in seen:
+                errors.append(f"{prefix}duplicate test node ID {nodeid!r}")
+            seen.add(nodeid)
+        if not entry.reason.strip():
+            errors.append(f"{prefix}missing reason")
+        if not entry.raises.strip():
+            errors.append(f"{prefix}missing exception contract")
+        if entry.strict is not True:
+            errors.append(f"{prefix}strict must be true")
+
+        if not isinstance(entry.issue, str) or not entry.issue.strip():
+            errors.append(f"{prefix}missing issue URL")
+        else:
+            parsed_issue = urlparse(entry.issue)
+            if (
+                parsed_issue.scheme != "https"
+                or not parsed_issue.netloc
+                or not re.search(r"/issues/\d+/?$", parsed_issue.path)
+            ):
+                errors.append(f"{prefix}invalid issue URL")
+        if not isinstance(entry.owner, str) or not entry.owner.strip():
+            errors.append(f"{prefix}missing owner")
+        if not isinstance(entry.expires, str) or not entry.expires.strip():
+            errors.append(f"{prefix}missing expiry")
+        else:
+            try:
+                expiry = date.fromisoformat(entry.expires)
+            except ValueError:
+                expiry = None
+            if expiry is None or expiry <= today or expiry > today + timedelta(days=MAX_XFAIL_DAYS):
+                errors.append(f"{prefix}expiry must be a future ISO date within {MAX_XFAIL_DAYS} days")
+    return errors
 
 
 def _exception_name(exception_type) -> str | None:
