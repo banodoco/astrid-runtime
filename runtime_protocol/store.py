@@ -2030,9 +2030,9 @@ class RealmStore:
             (project_id, digest),
         ).fetchone()
         if row is None:
-            raise ConflictError("prepared scene object is not associated with the task project", details={"object_id": object_id})
+            raise ConflictError(f"prepared scene object {object_id} is not associated with the task project", details={"object_id": object_id})
         if row["media_type"] != media_type or (expected_size is not None and row["size"] != expected_size):
-            raise ConflictError("prepared scene object metadata does not match its package", details={"object_id": object_id})
+            raise ConflictError(f"prepared scene object {object_id} metadata does not match its package", details={"object_id": object_id})
         root_fd = prefix_fd = fd = None
         try:
             root_fd = os.open(self.cas_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -2040,23 +2040,29 @@ class RealmStore:
             fd = os.open(digest[2:], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=prefix_fd)
             metadata = os.fstat(fd)
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != row["size"] or metadata.st_size > 64 * 1024 * 1024:
-                raise ConflictError("prepared scene object size or file integrity failed", details={"object_id": object_id})
+                raise ConflictError(f"prepared scene object {object_id} size or file integrity failed", details={"object_id": object_id})
             chunks = []
             while block := os.read(fd, 1024 * 1024):
                 chunks.append(block)
             data = b"".join(chunks)
             if len(data) != row["size"] or hashlib.sha256(data).hexdigest() != digest:
-                raise ConflictError("prepared scene object digest or size integrity failed", details={"object_id": object_id})
+                raise ConflictError(f"prepared scene object {object_id} digest or size integrity failed", details={"object_id": object_id})
             return data
         except OSError as exc:
-            raise ConflictError("prepared scene object bytes are missing or inaccessible", details={"object_id": object_id}) from exc
+            raise ConflictError(f"prepared scene object {object_id} bytes are missing or inaccessible", details={"object_id": object_id}) from exc
         finally:
             for value in (fd, prefix_fd, root_fd):
                 if value is not None:
                     os.close(value)
 
     def _freeze_prepared_scene_objects(self, project_id, config, ordered_input_ids):
-        """Derive only the current self-contained package/HTML scene closure."""
+        """Derive only the current self-contained package/HTML scene closure.
+
+        The package and its entry object are always verified against the CAS.
+        An inline ``html`` copy is optional: when present it must equal the
+        verified entry bytes; when absent the verified entry object is the
+        only source of the HTML.
+        """
         def reject_json_constant(value):
             raise ValueError(f"invalid JSON constant {value}")
 
@@ -2104,7 +2110,7 @@ class RealmStore:
                     raise ValidationError("prepared scene entry must not be empty")
                 verified[package_id] = (package_body, html, entry, len(package_bytes))
             package_body, html, entry, package_size = verified[package_id]
-            if scene.get("packageBody") != package_body or scene.get("html") != html:
+            if scene.get("packageBody") != package_body or ("html" in scene and scene["html"] != html):
                 raise ConflictError("prepared scene inline envelope disagrees with immutable package or entry bytes")
             for object_id in (package_id, entry["object_id"]):
                 if object_id not in ordered_input_ids:

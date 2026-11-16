@@ -596,7 +596,7 @@ def test_canonical_scene_package_contract_rejected(canonical_scene, mutation):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("packageBody", "{}"), ("html", "<html>caller replacement</html>"),
+    ("packageBody", "{}"), ("html", "<html>caller replacement</html>"), ("html", None),
     ("revision", _digest("different-revision")),
     ("source", {"objectId": _digest("unreachable"), "revision": _digest("unreachable")}),
 ])
@@ -605,6 +605,73 @@ def test_canonical_scene_envelope_must_match_immutable_objects(canonical_scene, 
     f["envelope"][field] = value
     _publish(f)
     _assert_rejected(f, _request(f))
+
+
+@pytest.mark.parametrize("inline_html", [True, False])
+def test_canonical_scene_html_is_optional_and_freezes_the_same_objects(canonical_scene, inline_html):
+    f = canonical_scene
+    if not inline_html:
+        del f["envelope"]["html"]
+    _publish(f)
+    spec = f["service"].create_task(_request(f))["task"]["spec"]
+    authority = spec["spec"]["inputs"]["timeline_authority"]
+    package_id, entry_id = f["package"]["object_id"], f["entry"]["object_id"]
+    package_size = len(f["envelope"]["packageBody"].encode())
+    assert authority["scene_objects"] == [
+        {"clip_id": clip_id, "package_object_id": package_id, "package_size": package_size,
+         "entry_object_id": entry_id, "entry_size": len(f["html"].encode())}
+        for clip_id in ("scene-a", "scene-b")
+    ]
+    canonical = [oid for oid in spec["input_object_ids"] if oid != spec["spec"]["timeline_snapshot_ref"]["digest"]]
+    assert set(canonical) == {package_id, entry_id, f["audio"]["object_id"]}
+
+
+@pytest.mark.parametrize("damage", ["unowned", "missing", "digest", "size", "media_type"])
+def test_canonical_scene_without_inline_html_refuses_unverified_entry_object(canonical_scene, damage):
+    f = canonical_scene
+    del f["envelope"]["html"]
+    _publish(f)
+    entry_id = f["entry"]["object_id"]
+    digest = entry_id.removeprefix("sha256:")
+    conn = f["service"].store.conn
+    path = f["service"].cas.path_for(digest)
+    if damage == "unowned":
+        other = f["service"].create_project({"slug": "other-entry", "name": "Other"}, idempotency_key="other-entry")
+        f["service"].ingest(other["id"], path.read_bytes(), idempotency_key="other-entry-object")
+        conn.execute("DELETE FROM project_objects WHERE project_id=? AND digest=?", (f["project"], digest))
+    elif damage == "missing":
+        path.unlink()
+    elif damage == "digest":
+        data = path.read_bytes()
+        path.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    elif damage == "size":
+        conn.execute("UPDATE objects SET size=size+1 WHERE digest=?", (digest,))
+    elif damage == "media_type":
+        conn.execute("UPDATE objects SET media_type='application/octet-stream' WHERE digest=?", (digest,))
+    _assert_rejected(f, _request(f), ConflictError, match=entry_id)
+
+
+def test_canonical_large_scene_commit_without_inline_html_stays_under_body_limit(canonical_scene):
+    f = canonical_scene
+    html = "<!doctype html><html><body>" + "x" * 600_000 + "</body></html>"
+    entry = f["service"].ingest(f["project"], html.encode(), media_type="text/html", original_name="scene.html", idempotency_key="entry-large")["data"]
+    body = copy.deepcopy(f["package_body"])
+    body["entry"] = {"object_id": entry["object_id"], "digest": entry["digest"], "media_type": "text/html", "size": len(html.encode()), "filename": "scene.html"}
+    f["html"] = html
+    _set_package(f, body)
+    del f["envelope"]["html"]
+    parent = _publication(f)["parent_composition"]
+    limit = 1024 * 1024
+    # Two clips each carry the 600 KB scene when inline, so only the reference-only shape fits.
+    assert len(canonical_json(parent).encode()) < limit
+    inline = copy.deepcopy(parent)
+    for clip in inline["clips"]:
+        if clip.get("clipType") == "haus.astrid.liveScene":
+            clip["app"]["liveScene"]["html"] = html
+    assert len(canonical_json(inline).encode()) > limit
+    _publish(f)
+    spec = f["service"].create_task(_request(f))["task"]["spec"]
+    assert spec["spec"]["inputs"]["timeline_authority"]["scene_objects"][0]["entry_size"] == len(html.encode())
 
 
 def test_canonical_conflicting_populated_clip_lists_fail_closed(canonical_scene):
