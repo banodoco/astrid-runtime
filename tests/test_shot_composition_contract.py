@@ -148,6 +148,40 @@ def test_pinned_compiled_timeline_schema_remains_strict() -> None:
     assert list(Draft7Validator(canonical).iter_errors(role_config))
 
 
+def test_canonical_clip_fit_and_track_placement_markers_are_closed_and_validated() -> None:
+    canonical = json.loads(TIMELINE_SCHEMA_PATH.read_text(encoding="utf-8"))
+    validator = Draft7Validator(canonical)
+    valid = {
+        "tracks": [{
+            "id": "video", "kind": "visual", "label": "Video",
+            "fit": "contain",
+            "app": {
+                "clipPlacementVersion": 1,
+                "scaleAppliesToPositionedClips": True,
+                "existingAppField": {"keep": None},
+            },
+        }],
+        "clips": [{"id": "clip", "at": 0, "track": "video", "fit": "cover"}],
+    }
+    assert not list(validator.iter_errors(valid))
+
+    clip = {"id": "clip", "at": 0, "track": "video"}
+    for fit in ("manual", "stretch", None):
+        candidate = copy.deepcopy(valid)
+        candidate["clips"][0] = {**clip, "fit": fit}
+        assert list(validator.iter_errors(candidate))
+
+    for version in (0, 2, True, "1"):
+        candidate = copy.deepcopy(valid)
+        candidate["tracks"][0]["app"]["clipPlacementVersion"] = version
+        assert list(validator.iter_errors(candidate))
+
+    for scale_marker in (0, 1, "true"):
+        candidate = copy.deepcopy(valid)
+        candidate["tracks"][0]["app"]["scaleAppliesToPositionedClips"] = scale_marker
+        assert list(validator.iter_errors(candidate))
+
+
 def test_standalone_timeline_schema_validates_meta_without_registry() -> None:
     canonical = json.loads(TIMELINE_SCHEMA_PATH.read_text(encoding="utf-8"))
     config = {
@@ -184,6 +218,12 @@ def test_materialized_timeline_schema_provenance_and_compatible_raw_field_reuse(
     assert provenance["role_extension"]["source_commit"] == "3bd1d019715de79cd54aa208cf26de10427c29d5"
     assert provenance["role_extension"]["source_artifact_sha256"] == provenance["base_sha256"]
     assert provenance["runtime_meta_extension"]["owner"] == "astrid-runtime"
+    assert provenance["runtime_appearance_extension"]["owner"] == "astrid-runtime"
+    assert provenance["runtime_appearance_extension"]["properties"] == [
+        "TimelineConfig.clips[].fit",
+        "TimelineConfig.tracks[].app.clipPlacementVersion",
+        "TimelineConfig.tracks[].app.scaleAppliesToPositionedClips",
+    ]
     assert raw_role == {"$ref": "timeline-config.schema.json#/properties/tracks/items/properties/role"}
 
 

@@ -175,6 +175,9 @@ def test_schema_owned_values_preserve_opaque_null_absence_and_defaults():
         {"values": {"label": "Picture é 🎬"}, "clear": []},
         {"values": {"label": ""}, "clear": []},
         {"values": {}, "clear": ["label"]},
+        {"values": {"fit": "cover", "scale": 1.25, "opacity": 0.5,
+                     "blendMode": "screen"}, "clear": []},
+        {"values": {}, "clear": ["fit", "scale", "opacity", "blendMode"]},
     ],
 )
 @pytest.mark.parametrize("before", [{"state": "absent"}, {"state": "present", "value": "Old"}])
@@ -207,12 +210,61 @@ def test_packaged_track_set_accepts_labels_and_clear_without_changing_input(args
         {"values": {}, "clear": ["volume"]},
         {"values": {}, "clear": ["label", "label"]},
         {"values": {"label": "Picture"}, "clear": [], "unknown": None},
+        {"values": {"fit": "manual-ish"}, "clear": []},
+        {"values": {"scale": 0}, "clear": []},
+        {"values": {"scale": -1}, "clear": []},
+        {"values": {"opacity": -0.01}, "clear": []},
+        {"values": {"opacity": 1.01}, "clear": []},
+        {"values": {"blendMode": "unknown"}, "clear": []},
+        {"values": {}, "clear": ["fit", "fit"]},
     ],
 )
 def test_packaged_track_set_rejects_malformed_args(args):
     value = request()
     value["commands"][0].update(
         op="track.set", select="parent/track:picture", args=args
+    )
+    with pytest.raises(ValidationError):
+        validate_commit_value(value, "CommitRequest")
+
+
+@pytest.mark.parametrize("args", [
+    {"values": {"fit": "contain", "x": 10, "y": -4, "width": 1280,
+                "height": 720, "cropTop": 0.1, "cropBottom": 0.2,
+                "cropLeft": 0, "cropRight": 1, "opacity": 0.75}, "clear": []},
+    {"values": {"fit": "cover"}, "clear": []},
+    {"values": {}, "clear": ["fit", "x", "y", "width", "height", "cropTop",
+                               "cropBottom", "cropLeft", "cropRight", "opacity"]},
+    {"values": {"hold": 2}, "clear": ["fit"]},
+])
+def test_packaged_clip_set_accepts_appearance_values_and_clear(args):
+    value = request()
+    value["commands"][0].update(
+        op="clip.set", select="parent/clip:c", args=copy.deepcopy(args)
+    )
+    original = copy.deepcopy(value)
+    validate_commit_value(value, "CommitRequest")
+    assert value == original
+
+
+@pytest.mark.parametrize("args", [
+    {},
+    {"values": {"fit": "manual"}, "clear": []},
+    {"values": {"width": 0}, "clear": []},
+    {"values": {"width": -1}, "clear": []},
+    {"values": {"height": 0}, "clear": []},
+    {"values": {"cropTop": -0.01}, "clear": []},
+    {"values": {"cropBottom": 1.01}, "clear": []},
+    {"values": {"cropLeft": "0.2"}, "clear": []},
+    {"values": {"opacity": -0.01}, "clear": []},
+    {"values": {"opacity": 1.01}, "clear": []},
+    {"values": {"zoom": 2}, "clear": []},
+    {"values": {}, "clear": ["zoom"]},
+])
+def test_packaged_clip_set_rejects_invalid_appearance_args(args):
+    value = request()
+    value["commands"][0].update(
+        op="clip.set", select="parent/clip:c", args=args
     )
     with pytest.raises(ValidationError):
         validate_commit_value(value, "CommitRequest")
