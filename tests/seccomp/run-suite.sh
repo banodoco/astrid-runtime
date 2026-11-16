@@ -5,10 +5,13 @@
 #   sh tests/seccomp/run-suite.sh [pytest args...]
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
+results_dir=${ASTRID_TEST_RESULTS_DIR:-$root/test-results}
+mkdir -p "$results_dir"
 exec docker run --rm --security-opt "seccomp=$root/tests/seccomp/openshell-like.json" \
-    -v "$root":/src:ro python:3.11 sh -ec '
+    -v "$root":/src:ro -v "$results_dir":/test-results python:3.11 sh -ec '
         apt-get update -qq && apt-get install -y -qq ffmpeg nodejs npm >/dev/null
         useradd -m ci
+        chown -R ci /test-results
         cp -a /src /home/ci/w && chown -R ci /home/ci/w
         exec su ci -c "cd /home/ci/w && python -m venv /home/ci/v \
             && /home/ci/v/bin/pip install -q -e .[test] -e packages/python \

@@ -2,9 +2,9 @@
 name: CI
 
 on:
-  # Pushes start CI only on main, release mains and int/ integration branches. Pull requests run for every base branch.
+  # Pushes start CI on main, release mains, int/ branches and Release 14 Plan 39. Pull requests run for every base branch.
   push:
-    branches: [main, "release/*/main", "int/**"]
+    branches: [main, "release/*/main", "int/**", "release/14/plan-39"]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -118,7 +118,40 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ffmpeg
       - run: python -m pip install -e '.[test]'
-      - run: python -m pytest -q -n 2
+      - name: Run unit tests
+        shell: bash
+        run: mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/unit.xml" -n 2
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
+      - name: Summarize test result XML
+        if: always()
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
+          if not files:
+              print('JUnit: no XML files; no test result available')
+              raise SystemExit(1)
+          root = ET.parse(files[0]).getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
+          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
+          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
+          print(line)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(line + '\n')
+          PY
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-unit-all-${{ matrix.os }}
+          path: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}/*.xml
+          retention-days: 90
+          if-no-files-found: warn
 
       - name: Save pip cache on main or int branches (C-08)
         if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-ci-4.outputs.cache-hit != 'true' }}
@@ -215,7 +248,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sh tests/seccomp/run-suite.sh
+      - name: Run sandbox process-control tests
+        run: mkdir -p "$TEST_RESULTS_DIR" && ASTRID_TEST_RESULTS_DIR="$TEST_RESULTS_DIR" sh tests/seccomp/run-suite.sh -rA --junitxml=/test-results/sandbox-process-control.xml
+        shell: bash
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-sandbox-process-control
+      - name: Summarize test result XML
+        if: always()
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-sandbox-process-control
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
+          if not files:
+              print('JUnit: no XML files; no test result available')
+              raise SystemExit(1)
+          root = ET.parse(files[0]).getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
+          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
+          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
+          print(line)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(line + '\n')
+          PY
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-sandbox-process-control-all-${{ runner.os }}
+          path: ${{ runner.temp }}/test-results-sandbox-process-control/*.xml
+          retention-days: 90
+          if-no-files-found: warn
 
   portability-lifecycle:
     env:
@@ -270,8 +336,10 @@ jobs:
       - run: python -m pip install -e '.[test]'
       - run: python -m pip install -e packages/python
       - run: python -m pip install -e "$ASTRID_CHECKOUT"
-      - run: >-
-          python -m pytest -q -m ""
+      - name: Run portability lifecycle tests
+        shell: bash
+        run: >-
+          mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/portability-lifecycle.xml" -m ""
           tests/test_platform.py
           tests/test_platform_signaling.py
           tests/test_platform_windows.py
@@ -290,6 +358,37 @@ jobs:
           tests/test_foreground.py
           tests/test_native_custody.py
           tests/test_portable_lifecycle.py
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}
+      - name: Summarize test result XML
+        if: always()
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
+          if not files:
+              print('JUnit: no XML files; no test result available')
+              raise SystemExit(1)
+          root = ET.parse(files[0]).getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
+          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
+          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
+          print(line)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(line + '\n')
+          PY
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-portability-lifecycle-all-${{ matrix.os }}
+          path: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}/*.xml
+          retention-days: 90
+          if-no-files-found: warn
       - name: Save pip cache on main or int branches (C-08)
         if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-ci-1.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
