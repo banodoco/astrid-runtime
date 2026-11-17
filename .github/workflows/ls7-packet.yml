@@ -33,7 +33,7 @@ jobs:
       - name: Prove waits, resolution, replay and final progress
         run: >-
           python -m pytest -q tests/test_ls7_committed_changes.py
-          tests/test_ls7_task_waits.py tests/test_ls7_thin_resolution.py tests/test_ls7_wait_client.py
+          tests/test_ls7_task_waits.py tests/test_ls7_thin_resolution.py tests/test_ls7_wait_client.py tests/test_ls7_rework.py
       - name: Preserve existing client projection, guarded reads and shutdown composition
         run: >-
           python -m pytest -q tests/test_client_parity.py tests/test_owner_identity_probes.py

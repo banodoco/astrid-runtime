@@ -8313,7 +8313,11 @@ class RuntimeService(TaskWaits, ThinRequests):
             ) if key in value} | ({"verified_facts": value["verified_facts"]} if "verified_facts" in value else {})
 
     def _next_claim_candidate(self, executor_id, capability_ids, requested_target, trusted_placement, identity):
+        from .resolution import ADMISSION_KEY
+        from .thin_requests import binding_is_stale, binding_matches
+
         caps = set(capability_ids)
+        executor = self.store.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
         rows = self.store.conn.execute(
             "SELECT id, capability, execution_request_json, spec_digest, waiting_reason "
             "FROM tasks WHERE status='queued' ORDER BY rowid"
@@ -8322,6 +8326,13 @@ class RuntimeService(TaskWaits, ThinRequests):
         selected_binding = None
         for item in rows:
             if caps and item["capability"] not in caps:
+                continue
+            metadata = self.store._spec(item).get(ADMISSION_KEY)
+            if (metadata is not None and not binding_matches(self.store, metadata, executor)
+                    and not binding_is_stale(self.store, metadata)):
+                # This frozen descriptor belongs to another matching host.
+                # It cannot block this host's later work or be refused merely
+                # because the current executor advertises different data.
                 continue
             activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
             if isinstance(activation, dict) and not self._activation_scope_matches(item["id"], activation, trusted_placement):
@@ -8474,7 +8485,12 @@ class RuntimeService(TaskWaits, ThinRequests):
         attempt_id, lease_id = new_id(), new_id()
         value = self.store._claim_task(row["id"], executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
         if value["task"]["status"] == "failed":
-            result = None
+            error = (value["task"].get("result") or {}).get("error") or {}
+            # Keep the existing no-attempt refusal envelope for thin clients;
+            # the task's terminal result, not a queued waiting state, is now
+            # authoritative and is retained in the same claim replay receipt.
+            result = ({"task": self._task_resource(value), "waiting_reason": error["code"]}
+                      if error.get("code") == "resolution_descriptor_stale" else None)
         elif value["task"]["status"] != "running":
             result = {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
         else:

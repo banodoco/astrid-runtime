@@ -24,14 +24,30 @@ def settings_match(store, descriptor):
 def binding_matches(store, metadata, executor):
     if not isinstance(metadata, dict) or executor is None:
         return False
-    if (metadata.get("executor_id") != executor["id"]
-            or metadata.get("runtime_epoch") != store._current_runtime_epoch()
-            or metadata.get("source_digest") != executor["source_digest"]
+    # Resolution is durable data, not a worker lease. A new Runtime boot or
+    # another host may execute the same frozen descriptor; claim authority
+    # still checks the current executor registration, epoch and ordinary fence.
+    # Ignore the executor/Runtime epoch fields in already-admitted LS-7 specs.
+    if (metadata.get("source_digest") != executor["source_digest"]
             or metadata.get("source_epoch") != executor["source_epoch"]):
         return False
     return settings_match(store, metadata) and any(descriptor_digest(d) == metadata.get("descriptor_digest")
                for cap in json.loads(executor["capabilities_json"]) if isinstance(cap, dict)
                for d in cap.get(DESCRIPTOR_KEY, []))
+
+
+def binding_is_stale(store, metadata):
+    """Distinguish superseded data from a temporarily unavailable host.
+
+    Retain last-known registrations across restarts and liveness expiry. An
+    offline matching host is not evidence that its descriptor changed. Only
+    a changed settings snapshot or replacement of every matching descriptor
+    invalidates the frozen admission; one unrelated host cannot refuse it.
+    """
+    if not isinstance(metadata, dict) or not settings_match(store, metadata):
+        return True
+    return not any(binding_matches(store, metadata, executor)
+                   for executor in store.conn.execute("SELECT * FROM executors"))
 
 
 class ThinRequests:
@@ -88,10 +104,10 @@ class ThinRequests:
         with self.store._transaction():
             executor, descriptor, digest = self._resolution_descriptor(thin, project_id, identity)
             resolved, values = resolve(descriptor, thin)
-            metadata = {"format": FORMAT, "descriptor_digest": digest, "executor_id": executor["id"],
+            metadata = {"format": FORMAT, "descriptor_digest": digest,
                         "source_digest": executor["source_digest"], "source_epoch": executor["source_epoch"],
                         "settings_digest": descriptor["settings_digest"], "settings_ref": descriptor.get("settings_ref"), "placement_generation": descriptor["placement_generation"],
-                        "runtime_epoch": self.store._current_runtime_epoch(), "original_hash": original_hash,
+                        "original_hash": original_hash,
                         "original": thin, "resolved_values": values}
             result = self.create_task({**resolved, "project": project_id, "idempotency_key": key},
                                       enforce_readiness=enforce_readiness, identity=identity, _thin_admission=metadata)

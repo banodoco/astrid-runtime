@@ -145,7 +145,11 @@ class TaskWaits:
                     capability = self.store.conn.execute("SELECT * FROM capabilities WHERE id=?", (task["capability"],)).fetchone()
                     dependencies = self.store._continuation_rows(task["id"])
                     admitted = not dependencies or self.store.conn.execute("SELECT 1 FROM continuation_admissions WHERE continuation_task_id=?", (task["id"],)).fetchone()
-                    available = bool(admitted and self.store._claim_waiting_reason(task, executor, capability, self.store._spec(task)) is None
+                    reason = self.store._claim_waiting_reason(task, executor, capability, self.store._spec(task))
+                    # Superseded resolution needs the ordinary atomic claim
+                    # refusal. This read still writes nothing and grants no
+                    # worker lease; the claim records its terminal error.
+                    available = bool(admitted and reason in {None, "resolution_descriptor_stale"}
                                      and self.store._task_lifetime_failure(task, datetime.now(timezone.utc)) is None)
                 if available:
                     return {"available": True, "capability_ids": [row["capability"]]}

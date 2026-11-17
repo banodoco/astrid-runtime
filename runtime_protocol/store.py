@@ -4159,7 +4159,7 @@ class RealmStore:
             raise ValidationError("resource keys must be non-empty strings")
         if int(estimated_scratch_bytes) < 0 or int(estimated_output_bytes) < 0:
             raise ValidationError("estimated resource bytes must be non-negative")
-        with self._mutex:
+        with self._mutex, self._transaction():
             timestamp = now()
             self.conn.execute("INSERT INTO capabilities(id, definition_digest, status, required_resource_keys_json, estimated_scratch_bytes, estimated_output_bytes, unavailable_reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET definition_digest=excluded.definition_digest, status=excluded.status, required_resource_keys_json=excluded.required_resource_keys_json, estimated_scratch_bytes=excluded.estimated_scratch_bytes, estimated_output_bytes=excluded.estimated_output_bytes, unavailable_reason=excluded.unavailable_reason, updated_at=excluded.updated_at", (capability_id, definition_digest, status, canonical_json(keys), int(estimated_scratch_bytes), int(estimated_output_bytes), unavailable_reason, timestamp, timestamp))
             row = self.conn.execute("SELECT * FROM capabilities WHERE id=?", (capability_id,)).fetchone()
@@ -4341,10 +4341,14 @@ class RealmStore:
 
     def _claim_waiting_reason(self, task, executor, capability, task_spec):
         from .resolution import ADMISSION_KEY
-        from .thin_requests import binding_matches
+        from .thin_requests import binding_is_stale, binding_matches
 
-        if ADMISSION_KEY in task_spec and not binding_matches(self, task_spec[ADMISSION_KEY], executor):
-            return "resolution_descriptor_stale"
+        if ADMISSION_KEY in task_spec:
+            metadata = task_spec[ADMISSION_KEY]
+            if executor is None or int(executor["runtime_epoch"]) != self._current_runtime_epoch():
+                return "waiting_for_worker"
+            if not binding_matches(self, metadata, executor):
+                return "resolution_descriptor_stale" if binding_is_stale(self, metadata) else "waiting_for_worker"
         executor_id = executor["id"] if executor is not None else None
         waiting_reason = None
         if not executor:
@@ -4445,6 +4449,16 @@ class RealmStore:
                 failure = self._task_lifetime_failure(task, datetime.now(timezone.utc))
                 if failure is not None:
                     return self._fail_task_in_transaction(task, failure, attempt_id=task["attempt_id"])
+                if waiting_reason == "resolution_descriptor_stale":
+                    # Refuse superseded resolution in the ordinary claim
+                    # transaction. No lease or attempt is issued, no inputs
+                    # are re-resolved, and result observers see a terminal
+                    # typed error instead of waiting until the task deadline.
+                    return self._fail_task_in_transaction(task, {
+                        "code": "resolution_descriptor_stale",
+                        "message": "the admitted resolution descriptor is no longer registered or its settings changed",
+                        "details": {"next_action": "submit a new request using the current entry and settings"},
+                    }, attempt_id=task["attempt_id"])
                 if waiting_reason:
                     self._set_waiting_reason(task_id, waiting_reason)
                     return self.get_task(task_id)
