@@ -84,3 +84,38 @@ jobs:
           name: ls7-cleanup-${{ matrix.source }}-repeat-${{ matrix.repetition }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: cleanup-proof
           retention-days: 14
+  watchdog-comparison:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        repetition: [1, 2, 3]
+        source: [base, candidate]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.source == 'base' && '2537fed24385ec1c24f48a812e09af4bb63fb794' || '0d0bdfe4bda0b94b79756e6ae0b7e7908a218c96' }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -e '.[test]'
+      - name: Record the exact watchdog checkout
+        run: |
+          mkdir -p watchdog-proof
+          git rev-parse HEAD > watchdog-proof/commit.txt
+          python --version > watchdog-proof/python.txt
+          python -m pip freeze > watchdog-proof/dependencies.txt
+          sw_vers > watchdog-proof/system.txt
+          uname -m >> watchdog-proof/system.txt
+      - name: Diagnose the unchanged watchdog sampling assertion
+        run: >-
+          python -m pytest -q --junitxml=watchdog-proof/results.xml
+          tests/test_p2_commit_phase_capture.py::test_live_watchdog_uses_real_handler_and_private_faulthandler_output
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ls7-watchdog-${{ matrix.source }}-repeat-${{ matrix.repetition }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: watchdog-proof
+          retention-days: 14
