@@ -93,6 +93,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["executor_id", "max_concurrency", "resource_keys", "capabilities", "protocol"],
       "properties": {
+        "resolution_descriptors": { "type": "array", "maxItems": 64, "items": { "$ref": "resolution.json#/definitions/Descriptor" } },
         "executor_id": { "type": "string", "minLength": 1 },
         "max_concurrency": { "type": "integer", "minimum": 1 },
         "resource_keys": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
@@ -457,7 +458,17 @@
           "not": { "required": ["outputs"] }
         },
         "outputs": { "type": "array", "items": { "$ref": "#/definitions/Output" } },
-        "effect": { "anyOf": [{ "$ref": "#/definitions/Effect" }, { "type": "null" }] }
+        "effect": { "anyOf": [{ "$ref": "#/definitions/Effect" }, { "type": "null" }] },
+        "progress": { "$ref": "#/definitions/Progress" }
+      }
+    },
+    "Progress": {
+      "type": "object", "additionalProperties": false, "minProperties": 1,
+      "properties": {
+        "phase": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "percent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "current": { "type": "number", "minimum": 0 },
+        "total": { "type": "number", "minimum": 1 }
       }
     },
     "Output": {

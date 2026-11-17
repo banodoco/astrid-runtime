@@ -710,8 +710,21 @@ paths:
     post:
       operationId: admitTask
       parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
-      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdmitTask' } } } }
+      requestBody: { required: true, content: { application/json: { schema: { oneOf: [ { $ref: '#/components/schemas/AdmitTask' }, { $ref: './schemas/resolution.json#/definitions/ThinAdmission' } ] } } } }
       responses: { '201': { description: Admitted task with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/wait-for-work:
+    post:
+      operationId: waitForWork
+      description: Read-only authenticated eligibility wait. A notification grants no claim; ordinary atomic claim remains required. Timeout is bounded to 25 seconds. No idempotency receipt or empty claim is written.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/resolution.json#/definitions/WorkWait' } } } }
+      responses: { '200': { description: Eligibility snapshot and scoped durable cursor, content: { application/json: { schema: { $ref: './schemas/resolution.json#/definitions/WaitObservation' } } } } }
+  /v1/tasks/{task_id}/wait:
+    post:
+      operationId: waitForTask
+      description: Read the committed task and managed outputs together. A scoped cursor waits for a change, lease deadline or shutdown; reconnect reads durable state and never executes again.
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/resolution.json#/definitions/WaitRequest' } } } }
+      responses: { '200': { description: Committed task and output snapshot, content: { application/json: { schema: { $ref: './schemas/resolution.json#/definitions/WaitObservation' } } } } }
   /v1/tasks/claim:
     post:
       operationId: claimTask

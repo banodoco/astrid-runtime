@@ -4336,6 +4336,58 @@ class RealmStore:
         ok = available - required >= floor
         return {"ok": ok, "required_bytes": required, "available_bytes": available, "floor_bytes": floor, "scratch_bytes": scratch_bytes, "output_bytes": output_bytes, "estimate_source": source, "reason": None if ok else "insufficient_storage"}
 
+    def _claim_waiting_reason(self, task, executor, capability, task_spec):
+        from .resolution import ADMISSION_KEY
+        from .thin_requests import binding_matches
+
+        if ADMISSION_KEY in task_spec and not binding_matches(self, task_spec[ADMISSION_KEY], executor):
+            return "resolution_descriptor_stale"
+        executor_id = executor["id"] if executor is not None else None
+        waiting_reason = None
+        if not executor:
+            waiting_reason = "waiting_for_worker"
+        elif executor["readiness"] != "ready":
+            waiting_reason = "waiting_for_worker"
+        elif not capability and task["capability_digest"] is not None:
+            # A task admitted before its executor advertises the
+            # capability remains queued, never claimable, until a
+            # matching registration arrives.
+            waiting_reason = "capability_unavailable"
+        elif capability and capability["status"] != "ready":
+            waiting_reason = "capability_unavailable"
+        elif not self.storage_preflight(task["capability"], storage_estimate=task_spec.get("storage_estimate"))["ok"]:
+            waiting_reason = "insufficient_storage"
+        elif task["capability"] not in self._executor_capability_ids(executor):
+            waiting_reason = "waiting_for_worker"
+        elif not self._executor_live(executor):
+            waiting_reason = "waiting_for_worker"
+        elif task["capability_digest"] is not None and (not capability or capability["definition_digest"] != task["capability_digest"]):
+            waiting_reason = "capability_unavailable"
+        elif (self._executor_capability(executor, task["capability"]) or {}).get("status", "ready") != "ready":
+            waiting_reason = "waiting_for_worker"
+        elif not execution_facts_match(
+            task_spec.get("required_facts", {"exact": {}, "minimum": {}}),
+            (self._executor_capability(executor, task["capability"]) or {}).get(
+                "verified_facts", {"exact": {}, "minimum": {}
+            }),
+        ):
+            waiting_reason = "waiting_for_executor_facts"
+        else:
+            active = self.conn.execute("SELECT COUNT(*) FROM tasks WHERE executor_id=? AND status='running'", (executor_id,)).fetchone()[0]
+            if active >= executor["max_concurrency"]:
+                waiting_reason = "waiting_for_worker"
+            else:
+                available = set(json.loads(executor["resource_keys_json"]))
+                for key in self._required_resource_keys(task["capability"]):
+                    if key not in available:
+                        waiting_reason = self._waiting_for_resource(key)
+                        break
+                    occupied = self.conn.execute("SELECT 1 FROM reservations WHERE executor_id=? AND resource_key=? AND released_at IS NULL LIMIT 1", (executor_id, key)).fetchone()
+                    if occupied:
+                        waiting_reason = self._waiting_for_resource(key)
+                        break
+        return waiting_reason
+
     def _claim_task(
         self, task_id, executor_id, lease_token, *, runtime_epoch=None,
         _transactional=True, allow_provider_recovery=False,
@@ -4383,49 +4435,7 @@ class RealmStore:
                     "SELECT project_id FROM runs WHERE id=?", (task["run_id"],)
                 ).fetchone()[0]
                 self._validate_spec_snapshot_refs(task_spec, task_project)
-                waiting_reason = None
-                if not executor:
-                    waiting_reason = "waiting_for_worker"
-                elif executor["readiness"] != "ready":
-                    waiting_reason = "waiting_for_worker"
-                elif not capability and task["capability_digest"] is not None:
-                    # A task admitted before its executor advertises the
-                    # capability remains queued, never claimable, until a
-                    # matching registration arrives.
-                    waiting_reason = "capability_unavailable"
-                elif capability and capability["status"] != "ready":
-                    waiting_reason = "capability_unavailable"
-                elif not self.storage_preflight(task["capability"], storage_estimate=task_spec.get("storage_estimate"))["ok"]:
-                    waiting_reason = "insufficient_storage"
-                elif task["capability"] not in self._executor_capability_ids(executor):
-                    waiting_reason = "waiting_for_worker"
-                elif not self._executor_live(executor):
-                    waiting_reason = "waiting_for_worker"
-                elif task["capability_digest"] is not None and (not capability or capability["definition_digest"] != task["capability_digest"]):
-                    waiting_reason = "capability_unavailable"
-                elif (self._executor_capability(executor, task["capability"]) or {}).get("status", "ready") != "ready":
-                    waiting_reason = "waiting_for_worker"
-                elif not execution_facts_match(
-                    task_spec.get("required_facts", {"exact": {}, "minimum": {}}),
-                    (self._executor_capability(executor, task["capability"]) or {}).get(
-                        "verified_facts", {"exact": {}, "minimum": {}
-                    }),
-                ):
-                    waiting_reason = "waiting_for_executor_facts"
-                else:
-                    active = self.conn.execute("SELECT COUNT(*) FROM tasks WHERE executor_id=? AND status='running'", (executor_id,)).fetchone()[0]
-                    if active >= executor["max_concurrency"]:
-                        waiting_reason = "waiting_for_worker"
-                    else:
-                        available = set(json.loads(executor["resource_keys_json"]))
-                        for key in self._required_resource_keys(task["capability"]):
-                            if key not in available:
-                                waiting_reason = self._waiting_for_resource(key)
-                                break
-                            occupied = self.conn.execute("SELECT 1 FROM reservations WHERE executor_id=? AND resource_key=? AND released_at IS NULL LIMIT 1", (executor_id, key)).fetchone()
-                            if occupied:
-                                waiting_reason = self._waiting_for_resource(key)
-                                break
+                waiting_reason = self._claim_waiting_reason(task, executor, capability, task_spec)
                 # Preflight may read snapshots or storage before authority is
                 # granted. Recheck the existing hard bounds after that work so
                 # a task cannot acquire a fresh attempt past its deadline.

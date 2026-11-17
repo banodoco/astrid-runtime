@@ -165,6 +165,9 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
 
     def server_close(self):
         self.accepting_authenticated_requests = False
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None:
+            runtime.close_task_waits()
         super().server_close()
         # RuntimeDaemon closes its store after the listener. Drain the one
         # admitted reaper before that connection can be closed or replaced.
@@ -1241,7 +1244,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             metadata, stream = self.runtime.open_object(path[2])
             return self._serve_verified_file(metadata, stream)
         if path == ["v1", "tasks"] and method == "POST":
-            self._identity("tasks:write")
+            identity = self._identity("tasks:write")
             body = self._project_mutation_body()
             body["idempotency_key"] = self.headers.get("Idempotency-Key")
             if not body["idempotency_key"]:
@@ -1249,7 +1252,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             # Admission authority lives here, inside the owner process.  The
             # readiness check and row creation share the store transaction;
             # a client precheck can never race an unavailable registration.
-            value = self.runtime.create_task(body, enforce_readiness=True)
+            value = self.runtime.create_task(body, enforce_readiness=True, identity=identity)
             resource = self.runtime._task_resource(value)
             project_id = value["run"].get("project_id") or "unscoped"
             return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("task.create", project_id, body.get("idempotency_key"), project_id=project_id)})
@@ -1265,6 +1268,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, self.runtime.claim_delegated_child(
                 path[2], self._body(), idempotency_key=self._idempotency_key(), identity=identity,
             ))
+        if path == ["v1", "tasks", "wait-for-work"] and method == "POST":
+            identity = self._identity("worker:execute")
+            return self._send(200, self.runtime.wait_for_work(
+                self._body(), identity=identity, auth_check=lambda: self._identity("worker:execute")))
+        if len(path) == 4 and path[:2] == ["v1", "tasks"] and path[3] == "wait" and method == "POST":
+            self._identity("tasks:read")
+            return self._send(200, self.runtime.wait_for_task(
+                path[2], self._body(), auth_check=lambda: self._identity("tasks:read")))
         if path == ["v1", "tasks", "claim"] and method == "POST":
             identity = self._identity("worker:execute")
             key = self.headers.get("Idempotency-Key")

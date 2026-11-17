@@ -1,0 +1,44 @@
+name: LS7 packet proof
+on:
+  pull_request:
+    branches: ["release/14/plan-55"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ls7-runtime-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  native-budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: banodoco/astrid-agent
+          ref: 19103ea6acbc030b3379e840ccc03491e47f1a0e
+          path: ls2-agent
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install packet test dependencies
+        run: |
+          python -m pip install -e '.[test]' -e ./packages/python
+          sudo apt-get update && sudo apt-get install -y strace
+      - name: Prove waits, resolution, replay and final progress
+        run: >-
+          python -m pytest -q tests/test_ls7_committed_changes.py
+          tests/test_ls7_task_waits.py tests/test_ls7_thin_resolution.py tests/test_ls7_wait_client.py
+      - name: Attribute native WAL and application syncs with the unchanged LS2 reader
+        run: python tests/ls7_native_budget.py --output ls7-native-proof --agent-checkout ls2-agent
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ls7-runtime-proof-${{ github.sha }}
+          path: ls7-native-proof
+          retention-days: 14
