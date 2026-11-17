@@ -40,6 +40,7 @@ jobs:
           tests/test_runtime_http_maintenance.py
           tests/test_p2_commit_phase_capture.py::test_live_watchdog_uses_real_handler_and_private_faulthandler_output
           tests/test_p2_commit_phase_capture.py::test_watchdog_stop_is_truthful_before_a_new_daemon_capture
+          tests/test_update_jobs.py::test_observed_job_leaves_the_contract_schema_digest_unchanged
       - name: Attribute native WAL and application syncs with the unchanged LS2 reader
         run: python tests/ls7_native_budget.py --output ls7-native-proof --agent-checkout ls2-agent
       - uses: actions/upload-artifact@v4
@@ -54,11 +55,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        repetition: [1, 2, 3]
         source: [base, candidate]
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.source == 'base' && '2537fed24385ec1c24f48a812e09af4bb63fb794' || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ matrix.source == 'base' && '2537fed24385ec1c24f48a812e09af4bb63fb794' || '2f78ead473a4b39fc1bb5d0012b93be66861808d' }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -68,13 +70,17 @@ jobs:
         run: |
           mkdir -p cleanup-proof
           git rev-parse HEAD > cleanup-proof/commit.txt
+          python --version > cleanup-proof/python.txt
+          python -m pip freeze > cleanup-proof/dependencies.txt
+          sw_vers > cleanup-proof/system.txt
+          uname -m >> cleanup-proof/system.txt
       - name: Diagnose the unchanged native custody assertion
         run: >-
           python -m pytest -q --junitxml=cleanup-proof/results.xml
-          tests/test_prepared_owner_authenticated_cleanup.py
+          tests/test_prepared_owner_authenticated_cleanup.py::test_authenticated_delayed_cleanup_ack_precedes_original_child_reap
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ls7-cleanup-${{ matrix.source }}-${{ github.event.pull_request.head.sha || github.sha }}
+          name: ls7-cleanup-${{ matrix.source }}-repeat-${{ matrix.repetition }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: cleanup-proof
           retention-days: 14
