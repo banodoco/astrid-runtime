@@ -239,7 +239,11 @@ DECLARED_XFAILS = {
     ),
 }
 
-MAX_DECLARED_XFAIL_TESTS = 10
+# The owner's ruling of 17 November 2026 (Release 14, Plan 39 K1b): the cap
+# counts test node IDs. The 19 quarantined on that day are a ceiling that may
+# only fall: lower this number as entries are fixed, never raise it. Plan 39's
+# wave 2 brings it to 10 or fewer before Release 14 ships.
+MAX_DECLARED_XFAIL_TESTS = 19
 MAX_XFAIL_DAYS = 14
 
 
