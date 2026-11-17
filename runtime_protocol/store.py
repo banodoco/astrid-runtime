@@ -1226,6 +1226,9 @@ class RealmStore:
             self.conn.rollback()
             raise
         else:
+            changes = getattr(self, "_committed_changes", None)
+            if changes is not None:
+                changes.committed()
             if self._idempotency_prune_pending:
                 self._idempotency_prune_clocks.update(self._idempotency_prune_pending)
                 self._last_idempotency_prune = max(self._idempotency_prune_pending.values())
@@ -1685,6 +1688,9 @@ class RealmStore:
     def close(self, *, orderly=True):
         try:
             with self._mutex:
+                changes = getattr(self, "_committed_changes", None)
+                if changes is not None:
+                    changes.close()
                 try:
                     if self.conn is not None:
                         clean_realm_id = None
