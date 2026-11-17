@@ -71,7 +71,7 @@ def test_xfail_validator_rejects_missing_metadata(field: str, message: str) -> N
     assert any(message in error for error in errors)
 
 
-@pytest.mark.parametrize("days", [-1, lanes.MAX_XFAIL_DAYS + 1])
+@pytest.mark.parametrize("days", [-1, 0, lanes.MAX_XFAIL_DAYS + 1])
 def test_xfail_validator_rejects_expiry_outside_the_allowed_window(days: int) -> None:
     from dataclasses import replace
 
@@ -91,12 +91,22 @@ def test_xfail_validator_rejects_non_strict_declarations() -> None:
 
 
 def test_xfail_limit_counts_exact_node_ids_even_when_grouped() -> None:
-    nodeids = tuple(f"tests/test_example.py::test_gap_{index}" for index in range(11))
+    count = lanes.MAX_DECLARED_XFAIL_TESTS + 1
+    nodeids = tuple(f"tests/test_example.py::test_gap_{index}" for index in range(count))
     declaration = _valid_xfail(nodeids=nodeids)
 
     errors = lanes.declared_xfail_errors({"grouped": declaration})
 
-    assert any("11 quarantined test node IDs exceed the limit of 10" in error for error in errors)
+    message = f"{count} quarantined test node IDs exceed the limit of {lanes.MAX_DECLARED_XFAIL_TESTS}"
+    assert any(message in error for error in errors)
+
+
+def test_xfail_limit_accepts_exactly_the_cap() -> None:
+    nodeids = tuple(
+        f"tests/test_example.py::test_gap_{index}" for index in range(lanes.MAX_DECLARED_XFAIL_TESTS)
+    )
+
+    assert lanes.declared_xfail_errors({"grouped": _valid_xfail(nodeids=nodeids)}) == []
 
 
 # --- workflows -----------------------------------------------------------------
