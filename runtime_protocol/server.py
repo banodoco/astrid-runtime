@@ -166,8 +166,9 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
     def server_close(self):
         self.accepting_authenticated_requests = False
         runtime = getattr(self, "runtime", None)
-        if runtime is not None:
-            runtime.close_task_waits()
+        close_waits = getattr(runtime, "close_task_waits", None)
+        if callable(close_waits):
+            close_waits()
         super().server_close()
         # RuntimeDaemon closes its store after the listener. Drain the one
         # admitted reaper before that connection can be closed or replaced.

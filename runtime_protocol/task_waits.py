@@ -8,7 +8,6 @@ import math
 import time
 from datetime import datetime, timezone
 
-from .committed_changes import CommittedChanges
 from .errors import InvalidRequestError, ValidationError
 from .store import _normalize_execution_target, execution_placement_matches
 from .util import canonical_json
@@ -16,13 +15,11 @@ from .util import canonical_json
 
 class TaskWaits:
     def _changes(self):
-        # Creation and every predicate read use the mutation lock. Condition
-        # releases *all* recursive acquisitions, including HTTP dispatch's.
+        # The store binds its condition when it creates the mutation lock.
+        # Condition releases *all* recursive acquisitions, including HTTP
+        # dispatch's; later instrumentation may wrap that same lock's guard.
         with self.store._mutex:
-            changes = getattr(self.store, "_committed_changes", None)
-            if changes is None:
-                changes = self.store._committed_changes = CommittedChanges(self.store._mutex)
-            return changes
+            return self.store._committed_changes
 
     def close_task_waits(self):
         self._changes().close()

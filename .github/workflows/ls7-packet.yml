@@ -34,6 +34,12 @@ jobs:
         run: >-
           python -m pytest -q tests/test_ls7_committed_changes.py
           tests/test_ls7_task_waits.py tests/test_ls7_thin_resolution.py tests/test_ls7_wait_client.py
+      - name: Preserve existing client projection, guarded reads and shutdown composition
+        run: >-
+          python -m pytest -q tests/test_client_parity.py tests/test_owner_identity_probes.py
+          tests/test_runtime_http_maintenance.py
+          tests/test_p2_commit_phase_capture.py::test_live_watchdog_uses_real_handler_and_private_faulthandler_output
+          tests/test_p2_commit_phase_capture.py::test_watchdog_stop_is_truthful_before_a_new_daemon_capture
       - name: Attribute native WAL and application syncs with the unchanged LS2 reader
         run: python tests/ls7_native_budget.py --output ls7-native-proof --agent-checkout ls2-agent
       - uses: actions/upload-artifact@v4
@@ -41,4 +47,34 @@ jobs:
         with:
           name: ls7-runtime-proof-${{ github.sha }}
           path: ls7-native-proof
+          retention-days: 14
+  native-cleanup-comparison:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [base, candidate]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.source == 'base' && '2537fed24385ec1c24f48a812e09af4bb63fb794' || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -e '.[test]'
+      - name: Record the exact checkout
+        run: |
+          mkdir -p cleanup-proof
+          git rev-parse HEAD > cleanup-proof/commit.txt
+      - name: Diagnose the unchanged native custody assertion
+        run: >-
+          python -m pytest -q --junitxml=cleanup-proof/results.xml
+          tests/test_prepared_owner_authenticated_cleanup.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ls7-cleanup-${{ matrix.source }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: cleanup-proof
           retention-days: 14

@@ -19,7 +19,7 @@ def test_generated_wait_can_close_without_mutating_task(tmp_path, monkeypatch):
     client = WorkspaceClient(daemon.endpoint, daemon.token)
     try:
         daemon.service.register_executor(registration(daemon.service), idempotency_key="register")
-        first = client.admit_thin_task(request()["thin_request"], idempotency_key="thin-create")
+        first = client.admit_task(thin_request=request()["thin_request"], idempotency_key="thin-create")
         task_id = first["task_id"]
         snapshot = client.wait_for_task(task_id, timeout_seconds=0)
         entered = threading.Event()
@@ -32,7 +32,7 @@ def test_generated_wait_can_close_without_mutating_task(tmp_path, monkeypatch):
         with ThreadPoolExecutor() as pool:
             pending = pool.submit(client.wait_for_task, task_id, cursor=snapshot["cursor"], timeout_seconds=25)
             assert entered.wait(1)
-            client.cancel_waits()
+            client._cancel_waits()
             with pytest.raises(ApiError) as error:
                 pending.result(1)
             assert error.value.code == "wait_cancelled"
@@ -40,7 +40,7 @@ def test_generated_wait_can_close_without_mutating_task(tmp_path, monkeypatch):
         # A reconnect resumes the durable task without admitting a second one.
         reader = WorkspaceClient(daemon.endpoint, daemon.token)
         assert reader.wait_for_task(task_id, cursor=snapshot["cursor"], timeout_seconds=0)["task"]["state"] == "queued"
-        assert reader.admit_thin_task(request()["thin_request"], idempotency_key="thin-create") == first
+        assert reader.admit_task(thin_request=request()["thin_request"], idempotency_key="thin-create") == first
         assert daemon.service.store.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
     finally:
         daemon.stop()
@@ -57,3 +57,14 @@ def test_generated_wait_transport_preserves_typed_scope_refusal(tmp_path):
         assert error.value.status == 401 and error.value.code == "unauthorized"
     finally:
         daemon.stop()
+
+
+def test_thin_admission_uses_the_existing_operation_without_ambiguous_fields():
+    def forbidden(*args, **kwargs):
+        pytest.fail("ambiguous admission reached the transport")
+    client = WorkspaceClient("http://127.0.0.1:1", "unused", transport=forbidden)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        client.admit_task(thin_request=request()["thin_request"], capability_id="another-capability",
+                          idempotency_key="ambiguous")
+    with pytest.raises(TypeError, match="requires capability_id"):
+        client.admit_task(idempotency_key="missing-resolved-fields")

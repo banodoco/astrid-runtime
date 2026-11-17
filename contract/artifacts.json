@@ -74,7 +74,7 @@
     "generators/release.json": "sha256:bc2e426715c604f06e1e286470eb4bbb58238b6518cecb4bb400f101f26986ce",
     "packages/python/astrid_runtime_client/__init__.py": "sha256:3892dbf37a38b4fb8222056a41bfed477c35345aa7f85e21c25ec65248247787",
     "packages/python/astrid_runtime_client/contract_metadata.py": "sha256:2496e8cd0bb1f9563e232107e53a811a3499399bf56981012b015a10dc8c639f",
-    "packages/python/astrid_runtime_client/generated.py": "sha256:c8723e25ed61dd2e421c0adc023ea49371d7a42e106b4c631c551c8be814a0c7",
+    "packages/python/astrid_runtime_client/generated.py": "sha256:0de489e7ab91f6744314948698ef33d1e2aa826dd86f83dd0f5d228732b32980",
     "packages/python/astrid_runtime_client/timeline_commit_types.py": "sha256:6c0d21d3eb87cff2977f9e33a5b4d0da13676c4ebad0df4c935f39106a45b417",
     "packages/python/pyproject.toml": "sha256:6c15723214b1d240f1e9fbea6692019da4893acc486dabcb74ab28e2efaf879f",
     "packages/typescript/package-lock.json": "sha256:bb5b79bd79ddd6c780a16e658763f7d534718a739703abcf809b75b664957d66",
@@ -88,5 +88,5 @@
     "runtime_protocol/schemas/timeline-commit-bundle.json": "sha256:393e9e91d4f20bf953d6f43530c0073d3d1ae2aff118516a2be39ce170df67e4"
   },
   "producer": "astrid-runtime",
-  "version": "sha256:4bd8a5ac859e618a90653ef936125e5556d205eb13df6835ed92866e7d6c7843"
+  "version": "sha256:c9ab3ff13549d535cacc89f541af7da6c23e7c6be55b69dd79c2eddbd1469192"
 }

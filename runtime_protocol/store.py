@@ -28,6 +28,7 @@ from . import cancellation
 from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
 from .cas import ContentAddressedStore
+from .committed_changes import CommittedChanges
 from .dirfd import remove_tree_at, open_directory_chain
 from .snapshot_refs import check_working_copy_base, parent_revision_row, prepare_snapshot, publish_snapshot, rewrite_spec_snapshots, source_kind_of, validate_capture_scope, working_copy_binding
 from .sqlite_uri import sqlite_file_uri
@@ -971,6 +972,7 @@ class RealmStore:
         store._lock_file = None
         store._admission_lock_file = None
         store._mutex = threading.RLock()
+        store._committed_changes = CommittedChanges(store._mutex)
         store.conn = None
         store._admission_active = False
         store._last_idempotency_prune = time.monotonic()
@@ -1085,6 +1087,7 @@ class RealmStore:
         self._lock_file = None
         self._admission_lock_file = None
         self._mutex = threading.RLock()
+        self._committed_changes = CommittedChanges(self._mutex)
         self.conn = None
         self._admission_active = False
         self._last_idempotency_prune = time.monotonic()
