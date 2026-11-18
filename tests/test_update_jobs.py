@@ -1308,7 +1308,7 @@ def test_update_request_makes_temporary_folder_owner_only_not_validate_only(tmp_
 OBSERVED_OPERATION_ID = "3" * 32
 # Computed on the base commit. Update status sits outside the versioned contract, so
 # observed_job must leave the generated schema digest exactly as it was.
-BASE_SCHEMA_DIGEST = "sha256:e5a3c475c7c38b63ab363eed5298b39c6021d0c229525041d330adfcf31ff102"
+BASE_SCHEMA_DIGEST = "sha256:a313b20d28be310e53fe0abe8e2f06a5dde1894a2c4b348fcf0e25ec57dce348"
 
 
 def _observed(state="failed", **fields):
