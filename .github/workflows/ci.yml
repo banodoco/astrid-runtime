@@ -342,7 +342,7 @@ jobs:
           echo "Agent: $agent_sha"
           printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Run sandbox process-control tests
-        run: mkdir -p "$TEST_RESULTS_DIR" && ASTRID_TEST_RESULTS_DIR="$TEST_RESULTS_DIR" sh tests/seccomp/run-suite.sh
+        run: mkdir -p "$TEST_RESULTS_DIR" && ASTRID_TEST_RESULTS_DIR="$TEST_RESULTS_DIR" sh tests/seccomp/run-suite.sh -rA --junitxml=/test-results/sandbox-process-control.xml
         shell: bash
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-sandbox-process-control
