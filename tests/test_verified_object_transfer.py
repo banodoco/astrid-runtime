@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
+from urllib.parse import urlsplit
 import pytest
 
 from astrid_runtime_client import ApiError, WorkspaceClient
@@ -145,3 +147,78 @@ def test_legacy_and_range_delivery_keep_independent_caller_hash(tmp_path, corrup
             assert receipt.digest == _identity(expected)
             assert receipt.stream_verified is False
     assert calls[-1]["Range"] == "bytes=1-3"
+
+
+def test_sender_does_not_mark_equal_length_corrupted_transmitted_chunks(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start()
+    try:
+        data = b"authorized" * (256 * 1024)
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        stored = client.ingest_object(data, media_type="application/octet-stream", idempotency_key="source")
+        original = daemon.service.open_object
+        class CorruptedStream:
+            def __init__(self, stream):
+                self.stream = stream
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+            def read(self, size):
+                chunk = self.stream.read(size)
+                return b"x" * len(chunk)
+        def corrupted(*args, **kwargs):
+            metadata, stream = original(*args, **kwargs)
+            return metadata, CorruptedStream(stream)
+        monkeypatch.setattr(daemon.service, "open_object", corrupted)
+        parsed = urlsplit(daemon.endpoint)
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        try:
+            connection.request("GET", "/v1/objects/" + stored["object_id"], headers={
+                "Authorization": "Bearer " + daemon.token, "Accept": MEDIA_TYPE})
+            response = connection.getresponse()
+            assert response.getheader("Content-Type") == MEDIA_TYPE
+            with pytest.raises(http.client.IncompleteRead) as incomplete:
+                response.read()
+            assert incomplete.value.partial == b"x" * len(data)
+            assert MARKER not in incomplete.value.partial
+        finally:
+            connection.close()
+    finally:
+        daemon.stop()
+
+
+def test_large_transfer_reads_bounded_chunks_on_server_and_caller(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start()
+    try:
+        data = b"large-stream" * (1024 * 1024)
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        stored = client.ingest_object(data, media_type="application/octet-stream", idempotency_key="large")
+        original_open = daemon.service.open_object
+        original_read = http.client.HTTPResponse.read
+        server_reads, client_reads = [], []
+        class BoundedStream:
+            def __init__(self, stream):
+                self.stream = stream
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+            def read(self, size):
+                assert 0 < size <= 1024 * 1024
+                server_reads.append(size)
+                return self.stream.read(size)
+        def opened(*args, **kwargs):
+            metadata, stream = original_open(*args, **kwargs)
+            return metadata, BoundedStream(stream)
+        def read(response, amount=None):
+            assert amount is not None and 0 < amount <= 1024 * 1024
+            client_reads.append(amount)
+            return original_read(response, amount)
+        monkeypatch.setattr(daemon.service, "open_object", opened)
+        monkeypatch.setattr(http.client.HTTPResponse, "read", read)
+        target = tmp_path / "large.bin"
+        result = client.get_object(stored["object_id"], destination=target, expected_size=len(data))
+        assert result.stream_verified and target.read_bytes() == data
+        assert len(server_reads) > 10 and len(client_reads) > 10
+    finally:
+        daemon.stop()

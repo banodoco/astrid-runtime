@@ -148,6 +148,16 @@ def render_python_client(manifest_path: Path = MANIFEST) -> str:
 def render_typescript_client() -> str:
     """Render contract response guards and resource operations into the TS client."""
     source = _regular(TYPESCRIPT_CLIENT_OUTPUT, "TypeScript client").decode("utf-8")
+    thumbnail_methods = {
+        "pendingThumbnailIntents": '  async pendingThumbnailIntents(executorId: string, runtimeEpoch: number, cursor?: string, limit = 50): Promise<Record<string, unknown>> { return this.json<Record<string, unknown>>((await this.request("POST", "/v1/thumbnail-intents/pending", new TextEncoder().encode(JSON.stringify({ executor_id: executorId, runtime_epoch: runtimeEpoch, cursor, limit })), { "Content-Type": "application/json" })).body) }',
+        "admitThumbnailIntent": '  async admitThumbnailIntent(taskId: string, intentId: string, executorId: string, runtimeEpoch: number): Promise<MutationResult<Task>> { return this.mutation<Task>((await this.request("POST", `/v1/tasks/${encodeURIComponent(taskId)}/thumbnail-intents/${encodeURIComponent(intentId)}/admit`, new TextEncoder().encode(JSON.stringify({ executor_id: executorId, runtime_epoch: runtimeEpoch })), { "Content-Type": "application/json", "Idempotency-Key": "thumbnail-intent-" + intentId }, [200, 201])).body) }',
+    }
+    for name, method in thumbnail_methods.items():
+        prefix = f"  async {name}("
+        if prefix in source:
+            source = '\n'.join(method if line.startswith(prefix) else line for line in source.split('\n'))
+        else:
+            source = source.replace('  async waitForWork(', method + '\n  async waitForWork(', 1)
     generation_query_method = '  async listGenerations(projectId: string, cursor?: string, limit = 50, filters: { kind?: string; model?: string; target?: string; tag?: string } = {}): Promise<Page<Generation>> { const query = new URLSearchParams({ limit: String(limit) }); if (cursor) query.set("cursor", cursor); for (const name of ["kind", "model", "target", "tag"] as const) { const value = filters[name]; if (value !== undefined) query.set(name, value); } return this.page((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/generations?${query}`)).body) }'
     source = '\n'.join(generation_query_method if line.startswith('  async listGenerations(') else line for line in source.split('\n'))
     task_query_method = '  async listProjectTasks(projectId: string, cursor?: string, limit = 50, kind?: "root_generation", order?: "admitted_desc"): Promise<Page<Task>> { return this.page((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/tasks?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}${kind !== undefined ? `&kind=${encodeURIComponent(kind)}` : ""}${order !== undefined ? `&order=${encodeURIComponent(order)}` : ""}`)).body) }'

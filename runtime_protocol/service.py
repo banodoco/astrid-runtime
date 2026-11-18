@@ -920,7 +920,7 @@ class RuntimeService(TaskWaits, ThinRequests):
         excess = sorted(set(requested) - negotiated)
         if excess:
             raise AuthorizationError("credential cannot negotiate requested scopes", details={"scopes": excess})
-        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY, "rendering.render.historical_revision.v1", "task_waits.v1", "task_resolution.v1"]}
+        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY, "rendering.render.historical_revision.v1", "task_waits.v1", "task_resolution.v1", "thumbnail_intents.v1"]}
 
     @staticmethod
     def _assert_executor_identity(identity, executor_id):
@@ -8711,6 +8711,15 @@ class RuntimeService(TaskWaits, ThinRequests):
             result["generation_intent"] = generation_intent
         return self._command_record("task.claim_delegated_child", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
+    def pending_thumbnail_intents(self, body, *, identity=None):
+        from .thumbnail_intents import pending
+        return pending(self, body, identity=identity)
+
+    @_verified_mutation
+    def admit_thumbnail_intent(self, task_id, intent_id, body, *, identity=None):
+        from .thumbnail_intents import admit
+        return admit(self, task_id, intent_id, body, identity=identity)
+
     @_durable_mutation(reap_task_lifetimes=True)
     def settle_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None, _verified_objects=None):
         idempotency_key = require_idempotency_key(idempotency_key)
@@ -8738,6 +8747,8 @@ class RuntimeService(TaskWaits, ThinRequests):
             raise ValidationError("result must be an object")
         if isinstance(body.get("result"), dict) and "outputs" in body["result"]:
             raise ValidationError("result.outputs is reserved; send outputs at the settlement top level")
+        if isinstance(body.get("result"), dict) and "thumbnail_intents" in body["result"]:
+            raise ValidationError("result.thumbnail_intents is reserved for durable Runtime settlement")
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)

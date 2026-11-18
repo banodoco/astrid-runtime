@@ -1287,6 +1287,19 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             resource = self.runtime._task_resource(value)
             project_id = value["run"].get("project_id") or "unscoped"
             return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("task.create", project_id, body.get("idempotency_key"), project_id=project_id)})
+        if path == ["v1", "thumbnail-intents", "pending"] and method == "POST":
+            identity = self._identity("worker:execute")
+            return self._send(200, self.runtime.pending_thumbnail_intents(self._body(), identity=identity))
+        if (len(path) == 6 and path[:2] == ["v1", "tasks"]
+                and path[3] == "thumbnail-intents" and path[5] == "admit" and method == "POST"):
+            identity = self._identity("worker:execute")
+            key = "thumbnail-intent-" + path[4]
+            if self._idempotency_key() != key:
+                raise ProtocolError("thumbnail intent admission requires its deterministic idempotency key")
+            value = self.runtime.admit_thumbnail_intent(path[2], path[4], self._body(), identity=identity)
+            project_id = value["run"]["project_id"]
+            return self._send(201, {"data": self.runtime._task_resource(value),
+                "receipt": self.runtime.committed_receipt("task.create", project_id, key, project_id=project_id)})
         if path == ["v1", "delegated-tasks"] and method == "POST":
             identity = self._identity("worker:execute")
             key = self._idempotency_key()

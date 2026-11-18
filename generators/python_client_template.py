@@ -1450,6 +1450,20 @@ class WorkspaceClient:
         if cursor is not None: payload["cursor"] = cursor
         return self._wait_request(f"/v1/tasks/{_path_part(task_id)}/wait", payload)
 
+    def pending_thumbnail_intents(self, *, executor_id: str, runtime_epoch: int, cursor: str | None = None, limit: int = 50) -> Mapping[str, Any]:
+        payload = {"executor_id": executor_id, "runtime_epoch": runtime_epoch, "limit": limit}
+        if cursor is not None:
+            payload["cursor"] = cursor
+        return self._json(self._request("POST", "/v1/thumbnail-intents/pending", body=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, expected=(200,))[2])
+
+    def admit_thumbnail_intent(self, task_id: str, intent_id: str, *, executor_id: str, runtime_epoch: int) -> MutationResult:
+        payload = {"executor_id": executor_id, "runtime_epoch": runtime_epoch}
+        return self._mutation_json(self._request("POST",
+            f"/v1/tasks/{_path_part(task_id)}/thumbnail-intents/{_path_part(intent_id)}/admit",
+            body=json.dumps(payload).encode(), headers={"Content-Type": "application/json",
+                "Idempotency-Key": "thumbnail-intent-" + intent_id}, expected=(200, 201))[2])
+
     def wait_for_work(self, *, executor_id: str, capability_ids: list[str], runtime_epoch: int, target: Mapping[str, Any] | None = None, cursor: str | None = None, timeout_seconds: float = 25.0) -> Mapping[str, Any]:
         """Read-only eligibility wait; a wake grants no claim or lease."""
         payload: dict[str, Any] = {"executor_id": executor_id, "capability_ids": capability_ids, "runtime_epoch": runtime_epoch,

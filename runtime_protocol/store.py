@@ -6258,6 +6258,13 @@ class RealmStore:
                     applied_effect=applied_effect,
                     created_at=timestamp,
                 )
+                if effect is not None and effect.get("effect_type") in {
+                        "generation.create_with_variant", "generation.variant.append", "generation.publish_v1"}:
+                    from .thumbnail_intents import settlement_intents
+                    intents = settlement_intents(self, task=task, attempt_id=attempt_id,
+                        project_id=task_project_id, managed_outputs=managed_outputs)
+                    if intents:
+                        result["thumbnail_intents"] = intents
                 if self._task_lifetime_failure(task, datetime.now(timezone.utc)):
                     raise LeaseError("task absolute deadline has expired")
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))

@@ -723,6 +723,19 @@ paths:
       parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { oneOf: [ { $ref: '#/components/schemas/AdmitTask' }, { $ref: './schemas/resolution.json#/definitions/ThinAdmission' } ] } } } }
       responses: { '201': { description: Admitted task with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/thumbnail-intents/pending:
+    post:
+      operationId: pendingThumbnailIntents
+      description: Authenticated worker reads pending enhancement intents durably committed with its completed generation attempts. Current executor identity, registration, epoch and local claim fence are required. Pagination covers parent tasks; no claim or mutation is performed.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false, required: [executor_id, runtime_epoch], properties: { executor_id: { type: string }, runtime_epoch: { type: integer, minimum: 1 }, cursor: { type: string }, limit: { type: integer, minimum: 1, maximum: 100 } } } } } }
+      responses: { '200': { description: Pending intents and next parent-task cursor, content: { application/json: { schema: { type: object, required: [items, next_cursor], properties: { items: { type: array, items: { type: object } }, next_cursor: { type: string, nullable: true } } } } } } }
+  /v1/tasks/{task_id}/thumbnail-intents/{intent_id}/admit:
+    post:
+      operationId: admitThumbnailIntent
+      description: A worker can admit only its Runtime-derived durable thumbnail proposal, using the current ready installed generation.thumbnail_backfill definition and ordinary task admission. The Idempotency-Key must be thumbnail-intent- followed by intent_id. Replays return the same task; failed tasks remain visible and use ordinary retry. Callers cannot supply a project, source, effect, task spec or capability.
+      parameters: [ { $ref: '#/components/parameters/TaskId' }, { name: intent_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false, required: [executor_id, runtime_epoch], properties: { executor_id: { type: string }, runtime_epoch: { type: integer, minimum: 1 } } } } } }
+      responses: { '201': { description: Ordinary thumbnail task with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/tasks/wait-for-work:
     post:
       operationId: waitForWork

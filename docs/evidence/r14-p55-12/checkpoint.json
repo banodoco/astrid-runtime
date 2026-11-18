@@ -1,0 +1,845 @@
+{
+  "archive": {
+    "bytes": 141111,
+    "file": "observations.zip",
+    "sha256": "81143ef1b9cdc0ee715c788d1b4f93e58a5be4d333643fbcb5e844200ce1e906"
+  },
+  "artifacts": [
+    {
+      "bytes": 455,
+      "file": "runtime-intent-wire.log",
+      "sha256": "35f5e867fecb0a87381c8ad5a2f75f8d3c81b8aed8a58056543570a9235fb80b"
+    },
+    {
+      "bytes": 509,
+      "file": "runtime-intent-wire.xml",
+      "nonpassing": [],
+      "outcomes": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 2,
+        "skipped": 0
+      },
+      "sha256": "fb6ae0addf44e8525c83e60d8016c30e66ce582fc5fc0b919e673efa092165eb"
+    },
+    {
+      "bytes": 17748,
+      "file": "runtime-intents-before.log",
+      "sha256": "cd24dc077f250e6f3b06a57ab32a5dcd4ee998c4cb6f4f0efcee5af8abe9ac07"
+    },
+    {
+      "bytes": 17741,
+      "file": "runtime-intents-before.xml",
+      "nonpassing": [
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_primary_reply_precedes_admission_and_restart_admits_once",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_existing_thumbnail_does_not_create_pending_intent",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_intent_admission_cannot_change_owner_epoch_or_source[actor]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_intent_admission_cannot_change_owner_epoch_or_source[epoch]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_intent_admission_cannot_change_owner_epoch_or_source[extra]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_intent_admission_cannot_change_owner_epoch_or_source[source-change]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_worker_cannot_supply_a_thumbnail_intent",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_effect_rollback_leaves_no_thumbnail_intent",
+          "outcome": "failed"
+        }
+      ],
+      "outcomes": {
+        "errors": 0,
+        "failed": 8,
+        "passed": 0,
+        "skipped": 0
+      },
+      "sha256": "3f96811b8d109f6986161fb8e34eb7dbaf5884d22630da8527fa70985411c5b3"
+    },
+    {
+      "bytes": 12697,
+      "file": "runtime-intents-head.log",
+      "sha256": "769ef6d7148a26be1e8949bd28ee6cda3cf3268ec47fe2708a68f34beeb3ed47"
+    },
+    {
+      "bytes": 13235,
+      "file": "runtime-intents-head.xml",
+      "nonpassing": [
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_primary_reply_precedes_admission_and_restart_admits_once",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_intent_admission_cannot_change_owner_epoch_or_source[actor]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_intent_admission_cannot_change_owner_epoch_or_source[epoch]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_intent_admission_cannot_change_owner_epoch_or_source[extra]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_intent_admission_cannot_change_owner_epoch_or_source[source-change]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_effect_rollback_leaves_no_thumbnail_intent",
+          "outcome": "failed"
+        }
+      ],
+      "outcomes": {
+        "errors": 0,
+        "failed": 6,
+        "passed": 9,
+        "skipped": 0
+      },
+      "sha256": "cbaa26459b6cb20844cf8127dbf56620077c72204483e02a5f8b4b10dad474ce"
+    },
+    {
+      "bytes": 2068,
+      "file": "runtime-intents-head2.log",
+      "sha256": "9b9636c66eada35a84c6a8268a1010fd42512a492f6712d1173a4b1ddd9a6c1b"
+    },
+    {
+      "bytes": 2551,
+      "file": "runtime-intents-head2.xml",
+      "nonpassing": [],
+      "outcomes": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 15,
+        "skipped": 0
+      },
+      "sha256": "4a777c7c91b323d3a5e00ae77061deb3e990748e0305f8becf56bfc4acb98840"
+    },
+    {
+      "bytes": 2089,
+      "file": "runtime-stream-base.log",
+      "sha256": "3e6c670c8f66b93a6d43060b42fc4fe01b79893aafaa8e1214772cded8f43632"
+    },
+    {
+      "bytes": 2638,
+      "file": "runtime-stream-base.xml",
+      "nonpassing": [],
+      "outcomes": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 17,
+        "skipped": 0
+      },
+      "sha256": "1fd29ffe9cacbeadb367752148f5226579996d1a7b46b6aa5a07db9710303f18"
+    },
+    {
+      "bytes": 21032,
+      "file": "runtime-stream-before-strict.log",
+      "sha256": "c69f2781d03541c1bcfc5f0d6243d3b367101f11deaf86f326f4a62b58925ab4"
+    },
+    {
+      "bytes": 21987,
+      "file": "runtime-stream-before-strict.xml",
+      "nonpassing": [
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_streamed_object_installs_independent_verified_file[0]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_streamed_object_installs_independent_verified_file[17]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_streamed_object_installs_independent_verified_file[9437197]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_claimed_success_cannot_install_bad_or_incomplete_bytes[equal-length]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_claimed_success_cannot_install_bad_or_incomplete_bytes[missing-marker]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_claimed_success_cannot_install_bad_or_incomplete_bytes[short]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_claimed_success_cannot_install_bad_or_incomplete_bytes[extra]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_claimed_success_cannot_install_bad_or_incomplete_bytes[wrong-length]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_claimed_success_cannot_install_bad_or_incomplete_bytes[wrong-identity]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_runtime_mutation_while_transmitting_withholds_completion",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_legacy_and_range_delivery_keep_independent_caller_hash[False]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_legacy_and_range_delivery_keep_independent_caller_hash[True]",
+          "outcome": "failed"
+        }
+      ],
+      "outcomes": {
+        "errors": 0,
+        "failed": 12,
+        "passed": 0,
+        "skipped": 0
+      },
+      "sha256": "1780d31eb3e8d15bdfa885aeba4298019a8bbf66da64ac9f20e2b7a4a565c444"
+    },
+    {
+      "bytes": 8702,
+      "file": "runtime-stream-before.log",
+      "sha256": "883bc91b8844d00c26127610a91a00d8edfd957d7f185a2c3041e6a2c862311e"
+    },
+    {
+      "bytes": 9178,
+      "file": "runtime-stream-before.xml",
+      "nonpassing": [
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_streamed_object_installs_independent_verified_file[0]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_streamed_object_installs_independent_verified_file[17]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_streamed_object_installs_independent_verified_file[9437197]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_legacy_and_range_delivery_keep_independent_caller_hash[False]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_legacy_and_range_delivery_keep_independent_caller_hash[True]",
+          "outcome": "failed"
+        }
+      ],
+      "outcomes": {
+        "errors": 0,
+        "failed": 5,
+        "passed": 7,
+        "skipped": 0
+      },
+      "sha256": "c2448be5e5652dc33ae9f6116a2399a333bb684b25eb3b2f23324935ef79fca7"
+    },
+    {
+      "bytes": 5727,
+      "file": "runtime-stream-final.log",
+      "sha256": "c4cc41bc64d9a9f3dd886a2325dea9eff17b85b925ead323a90992d3995af4c1"
+    },
+    {
+      "bytes": 6771,
+      "file": "runtime-stream-final.xml",
+      "nonpassing": [
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_sender_does_not_mark_equal_length_corrupted_transmitted_chunks",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_verified_object_transfer",
+          "name": "test_large_transfer_reads_bounded_chunks_on_server_and_caller",
+          "outcome": "failed"
+        }
+      ],
+      "outcomes": {
+        "errors": 0,
+        "failed": 2,
+        "passed": 29,
+        "skipped": 0
+      },
+      "sha256": "8f406e9437d07199f0106f776cd8cbda613286117584dafad119257c5543485a"
+    },
+    {
+      "bytes": 3467,
+      "file": "runtime-stream-head.log",
+      "sha256": "152430c396b91795621544a9b16beec97d74e3ff3645dccb325314a0b2282cf5"
+    },
+    {
+      "bytes": 4412,
+      "file": "runtime-stream-head.xml",
+      "nonpassing": [],
+      "outcomes": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 29,
+        "skipped": 0
+      },
+      "sha256": "3c1d332dfae1f181448a2d1585db2db4a54c01311afa63de10ae092ca6cbf778"
+    },
+    {
+      "bytes": 484,
+      "file": "runtime-stream-wire.log",
+      "sha256": "a5a19ef0e443b9fe307f89391ad834e5be61892a2858c94697b060d49fe90e2f"
+    },
+    {
+      "bytes": 538,
+      "file": "runtime-stream-wire.xml",
+      "nonpassing": [],
+      "outcomes": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 2,
+        "skipped": 0
+      },
+      "sha256": "635268aaac209b9e57e75641f097ecc648707ff76633e6036d7c6d32ea442160"
+    },
+    {
+      "bytes": 330,
+      "file": "runtime-thumbnail-base-after-space.log",
+      "sha256": "3b66a78f655374b45aa66417bf8cef5835e54f266c974c04084ed68fbd4018be"
+    },
+    {
+      "bytes": 10979,
+      "file": "runtime-thumbnail-base-workspace.log",
+      "sha256": "ffd382e50a425b409fbfa7c6189b9c8211ad46946f5a7032b6494d7ea3ab61e3"
+    },
+    {
+      "bytes": 13403,
+      "file": "runtime-thumbnail-base-workspace.xml",
+      "nonpassing": [],
+      "outcomes": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 83,
+        "skipped": 0
+      },
+      "sha256": "76cb9af16944cc43c2ba6de4c30f395f7ecc9ea62c2b669f0b9a9c70d2651a34"
+    },
+    {
+      "bytes": 2279586,
+      "file": "runtime-thumbnail-base.log",
+      "sha256": "4240d6677ca754506cb895ae6fadb6639f076241593ac94c952d489c42927e40"
+    },
+    {
+      "bytes": 2292239,
+      "file": "runtime-thumbnail-base.xml",
+      "nonpassing": [
+        {
+          "classname": "tests.test_generation_thumbnail_settlement",
+          "name": "test_create_with_variant_attaches_thumbnail_without_creative_variant_pollution",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_thumbnail_settlement",
+          "name": "test_publish_v1_attaches_each_group_thumbnail_by_primary_source",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_thumbnail_settlement",
+          "name": "test_variant_append_accepts_auxiliary_thumbnail_and_preserves_primary_descriptor",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_thumbnail_settlement",
+          "name": "test_thumbnail_attach_backfills_atomically_and_replays_without_changing_generation_identity",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_thumbnail_settlement",
+          "name": "test_thumbnail_attach_rejects_wrong_mime_stale_source_and_cross_project_without_partial_custody",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_thumbnail_settlement",
+          "name": "test_thumbnail_attach_honors_fence_and_rolls_back_published_bytes_on_receipt_failure",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_thumbnail_settlement",
+          "name": "test_publication_metadata_cannot_smuggle_runtime_thumbnail_descriptor",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_generation_tags_preserve_opaque_intent_and_publication_metadata[generated]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_generation_tags_preserve_opaque_intent_and_publication_metadata[imported]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_v1_matches_out_of_order_groups_and_derives_domain_identity",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_v1_reject_missing_selector_rolls_back_everything",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_v1_allow_records_missing_members_without_empty_generations",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_v1_allow_still_rejects_an_explicit_required_member",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_v1_settlement_uses_one_runtime_timestamp_for_publication_rows",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_v1_replay_conflict_and_stale_fence_are_atomic",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_with_existing_manifest_survives_restart_and_replay",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_rejects_unverified_manifest_reference_atomically[bytes]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_rejects_unverified_manifest_reference_atomically[missing]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_rejects_unverified_manifest_reference_atomically[conflicting-digest]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_rejects_unverified_manifest_reference_atomically[non-object]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_publish_rejects_unverified_manifest_reference_atomically[temporary]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_generic_output_generation_id_remains_managed_only",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_speech_settlement_derives_wav_duration_for_exact_media_selection[audio]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_speech_settlement_derives_wav_duration_for_exact_media_selection[speech]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_speech_settlement_exact_replay_returns_original_result",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_speech_settlement_invalid_wav_keeps_duration_unknown_and_selection_refused",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_speech_settlement_preserves_explicit_null_duration_and_refuses_selection",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_speech_settlement_zero_rate_wav_keeps_duration_unknown_and_selection_refused",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_speech_settlement_preserves_explicit_duration_metadata",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_publish_v1_settlement",
+          "name": "test_speech_settlement_verified_media_is_exact_over_authenticated_http",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_create_with_variant_is_atomic_and_replays_to_one_gallery_generation",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_create_with_variant_rejects_wrong_output_without_publishing",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_create_with_variant_stale_fence_publishes_nothing",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_create_with_variant_cancelled_task_publishes_nothing",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_create_with_variant_rejects_late_settlement_after_cancel",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_create_with_variant_rejects_foreign_project_target",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_create_with_variant_rejects_malformed_metadata_before_publication",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_is_atomic_and_replays_deterministically",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_promote_demotes_previous_primary_atomically",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_rejects_mismatched_or_unknown_media_family[video/mp4]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_rejects_mismatched_or_unknown_media_family[application/octet-stream]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_rejects_target_generation_from_another_project",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_rejects_source_variant_object_mismatch",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_requires_the_lineage_source_as_an_admitted_input[setup_kwargs0]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_requires_the_lineage_source_as_an_admitted_input[setup_kwargs1]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_rejects_non_integer_zero_ordinal_before_publication",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_rejects_stale_generation_version_without_mutation",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_rejects_wrong_output_cardinality_and_cleans_cas",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_rolls_back_after_publication_failure",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_generation_variant_append_settlement",
+          "name": "test_generation_variant_append_scopes_distinct_tasks_with_identical_output_bytes",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_worker_security_settlement",
+          "name": "test_two_worker_credentials_cannot_cross_claim_or_mutate_attempt",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_worker_security_settlement",
+          "name": "test_settlement_stages_all_outputs_before_fenced_publication",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_worker_security_settlement",
+          "name": "test_staged_bytes_are_reverified_before_cas_promotion",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_worker_security_settlement",
+          "name": "test_stale_fence_rejects_output_before_any_staging_or_publication",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_worker_security_settlement",
+          "name": "test_staged_cleanup_pins_directory_before_unlinking",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_worker_security_settlement",
+          "name": "test_promotion_uses_open_source_identity_after_path_replacement",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_worker_security_settlement",
+          "name": "test_retained_external_worker_token_is_fenced_after_abandon_restart_and_new_claim",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_failure_evidence_survives_restart_and_exact_replay",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart[success]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart[failure]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart[observed-cancel]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_managed_envelope_rejects_foreign_project_refs_and_wrong_attempt",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_managed_envelope_rejects_corrupt_same_project_input_bytes[source]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_managed_envelope_rejects_corrupt_same_project_input_bytes[effective_settings]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_observed_cancel_evidence_survives_restart_and_replay",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_corrupt_digest_and_stale_failure_fence_publish_nothing",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_managed_envelope_identity_mismatch_is_rejected",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_unknown_stop_retains_fenced_attempt_and_custody",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_cancel_requested_rejects_replacement_bytes_and_preserves_original_readback",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_expired_attempt_rejects_terminal_evidence_without_publication[failure]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_expired_attempt_rejects_terminal_evidence_without_publication[cancel]",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_legacy_expired_failure_without_evidence_still_cedes_owner",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_other_executor_cannot_publish_cancellation_evidence",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_failure_publication_error_rolls_back_terminal_and_associations",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_cancel_before_start_preserves_input_refs_without_inventing_attempt",
+          "outcome": "failed"
+        },
+        {
+          "classname": "tests.test_durable_terminal_results",
+          "name": "test_success_and_observed_cancel_race_has_one_terminal_and_no_failure_effect",
+          "outcome": "failed"
+        }
+      ],
+      "outcomes": {
+        "errors": 0,
+        "failed": 76,
+        "passed": 7,
+        "skipped": 0
+      },
+      "sha256": "59a8ee582cc3e201fef23e9b0210a47d2cbae7826e4fff53f798aa2e646a6f23"
+    },
+    {
+      "bytes": 15195,
+      "file": "runtime-thumbnail-head.log",
+      "sha256": "ee749c4e38fab3d30d3342abfcf4d9a66d81011ec5685e7c52f5637843980e1c"
+    },
+    {
+      "bytes": 18072,
+      "file": "runtime-thumbnail-head.xml",
+      "nonpassing": [
+        {
+          "classname": "tests.test_durable_thumbnail_intents",
+          "name": "test_scoped_http_worker_admits_only_its_stored_intent",
+          "outcome": "failed"
+        }
+      ],
+      "outcomes": {
+        "errors": 0,
+        "failed": 1,
+        "passed": 92,
+        "skipped": 0
+      },
+      "sha256": "808587fa241e74aa58b10916ee9d327935492e36aa810b17909b53f3a20df94e"
+    }
+  ],
+  "base": "f3dc970af71e7d413871b4a8e45e4ba0fbfabf5e",
+  "branch": "p55/ls-6-remainder",
+  "destination": "release/14/plan-55",
+  "evidence_kind": "Incremental local observations, not final pinned qualification",
+  "limits": [
+    "No test was skipped or deleted; the only existing test edit is the authorized delivery hash-count assertion3 to1.",
+    "Raw early failures, interrupted/no-result runs, collection errors and corrected new-test setup iterations remain in the archive.",
+    "Agent generated-client refresh and isolated proposed dependency re-pins are not complete.",
+    "New Agent full-path receipt/hash counter tests were written but not executed before the stop.",
+    "End-to-end generic-host restart-to-preview proof and hosted CI qualification are not complete.",
+    "No merge, tasks.md edit, Plan38 guard change, outside-packet fix or second packet."
+  ],
+  "other_blocker": {
+    "baseline": "17 passed in census selection",
+    "candidate": "16 passed/1 failed in same selection",
+    "cause": "New ordinary thumbnail action requires inventory52; preserved exact count assertion remains51.",
+    "mailbox": "https://github.com/banodoco/astrid-dev/issues/796#issuecomment-6986656021",
+    "test": "tests/test_capability_ledger.py::test_shipped_ledger_reconciles_historical_capability_sets"
+  },
+  "packet": "R14-P55-12",
+  "repository": "astrid-runtime",
+  "row": "Plan55 LS-6 remainder",
+  "session": "r14-P55-12-1",
+  "source_commit": "b59579a9ff7130d02356fe642b45b674bede3242",
+  "source_sha256": {
+    "contract/artifacts.json": "df6490b040774c5f18758b2fcda050283d28ae1957e7a86095b92886c705bdac",
+    "contract/openapi/workspace-v1.yaml": "6f52fc62d67a35f50dfc2f60652f8a255fc3725378db251f5ce7a80117bfce25",
+    "generators/generate.py": "48b5fa4921c09b0472d82eb4056267eb4b67253e03cf7357f4c989b01144c2b6",
+    "generators/python_client_init_template.py": "ab00ecc11b1c3ea098cdb457e7528c7ddac47d032b8cca0784ab004601dda15f",
+    "generators/python_client_template.py": "c1717a56e489855c1888e7cc375211f3193ec671525a928cb0b1d9f55b1b3cdd",
+    "packages/python/astrid_runtime_client/__init__.py": "c3df5924b1685d1a1b094c8617edc081e9073a0484e52fe40368b2fe8a63ff5f",
+    "packages/python/astrid_runtime_client/contract_metadata.py": "53992fe81d1d32ad6f4ab372b9c312adcc9627b39b87c4fb2034a2a300f96023",
+    "packages/python/astrid_runtime_client/generated.py": "9451b656bd8621da143a1698a21ce0f6370624027c592045d2675a8d96c01543",
+    "packages/typescript/src/contract-metadata.ts": "74b796673c054cff40c1c7b65839a70cc3e6f3beee60c7fe9d6957dd3c0b6fa5",
+    "packages/typescript/src/generated.ts": "ef2646d1c1902f54d33e9789eef45b3e11970c65acceac59149179a35a8fe870",
+    "runtime_protocol/contract_metadata.py": "c69b2c032f0753e50ce7fb2c269683f4ae7350bbdb1ac35661743446f2d88f7f",
+    "runtime_protocol/server.py": "9ca33b252fd4b0ca703aba5c112b8f0b34d5f5dc9b32ed98caca8568dc49b5f3",
+    "runtime_protocol/service.py": "98312414b432b9620bd3770e6d5da8a8658fc1b03a5fcbcc5c09f7488a88feac",
+    "runtime_protocol/store.py": "64b6037a286813926da03e9286ce3d3884eaf31f2b2274fea1111e3323357d9a",
+    "runtime_protocol/thumbnail_intents.py": "432b897853c445b7d7d81cf3378b2ada0115e1c0ce2cbbe997e2d1a4006abcd3",
+    "tests/test_durable_thumbnail_intents.py": "1ee8fc5f6df437cf6085ba03245e578a3bb8f2b57b0e2158a0244ddb7ce4fd6f",
+    "tests/test_verified_object_transfer.py": "0595661c6b92727df0f58059865ad0175d2a1935dba9e3f447cd9f166e591a76"
+  },
+  "source_tree": "202adc240d9d8e4aea569cd1d40ab709cd0da4c2",
+  "state": "BLOCKED; implementation stopped on existing-test product regression",
+  "stop_reason": {
+    "assertion": "assert again == payload",
+    "baseline": "passed; selection20 passed/4 known setup failures",
+    "candidate": "failed; selection19 passed/5 failed",
+    "cause": "A copied file identity including mtime_ns and ctime_ns is serialized into the managed result, so repeated assembly changes evidence.producer even when output bytes match.",
+    "test": "tests/test_runtime_run.py::test_managed_generation_result_is_deterministic_and_preserves_video_output",
+    "test_unchanged": true
+  }
+}
