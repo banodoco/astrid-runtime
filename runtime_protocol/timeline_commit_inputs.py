@@ -228,18 +228,59 @@ def _project_pack_source(connection: sqlite3.Connection, project_id: str,
     seen = set()
     for admission in admissions:
         if (not isinstance(admission, dict) or not {"id", "kind", "revision", "snapshot_digest"} <= set(admission)
-                or set(admission) - {"id", "kind", "revision", "snapshot_digest", "snapshot_object"}
+                or set(admission) - {"id", "kind", "revision", "snapshot_digest", "snapshot_object", "compiled", "descriptor", "authoring"}
                 or not isinstance(admission["id"], str) or not admission["id"]
                 or not isinstance(admission["kind"], str) or admission["kind"] not in {"effect", "animation", "transition"}
                 or not isinstance(admission["revision"], str) or not _DIGEST_RE.fullmatch(admission["revision"])
                 or not isinstance(admission["snapshot_digest"], str)
                 or not re.fullmatch(r"[0-9a-f]{64}", admission["snapshot_digest"])):
             raise ConflictError("project pack admission identity/digest is invalid")
+        if "compiled" in admission:
+            _compiled_descriptor(admission)
         identity = admission["id"], admission["kind"], admission["revision"]
         if identity in seen:
             raise ConflictError("project pack admission identity is ambiguous")
         seen.add(identity)
     validate_pack_snapshot_objects(connection, project_id, content)
+
+
+def _compiled_descriptor(admission: Mapping[str, Any]) -> dict[str, str]:
+    """The compiled element file an admission names inside its snapshot object.
+
+    The path is a file of that snapshot's `files` list; `sha256` is its digest
+    (the element's served digest). A listed element also carries the exact
+    `descriptor` (its ref plus catalog fields) and `authoring` paths the editor
+    selects by, so both are required whenever `compiled` is present.
+    """
+    from .store import pack_asset_path
+
+    value = admission["compiled"]
+    if (not isinstance(value, dict) or set(value) != {"path", "sha256"}
+            or "snapshot_object" not in admission
+            or not isinstance(value["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])):
+        raise ConflictError("project pack compiled element descriptor is invalid")
+    try:
+        pack_asset_path(value["path"])
+    except ValidationError as exc:
+        raise ConflictError("project pack compiled element path is invalid") from exc
+    descriptor = admission.get("descriptor")
+    authoring = admission.get("authoring")
+    if (not isinstance(descriptor, dict) or not isinstance(descriptor.get("packId"), str) or not descriptor["packId"]
+            or any(not isinstance(admission.get(key), str) or descriptor.get(key) != admission[key]
+                   for key in ("id", "kind", "revision"))):
+        raise ConflictError("project pack listed element descriptor does not name its admission")
+    if (not isinstance(authoring, dict) or set(authoring) != {"packRoot", "descriptorPath", "componentPath", "status"}
+            or not all(isinstance(item, str) and item for item in authoring.values())):
+        raise ConflictError("project pack listed element authoring is invalid")
+    return value
+
+
+def validate_pack_compiled_listing(content: Any) -> None:
+    """Refuse at document write any compiled admission the Runtime would later list and serve."""
+    admissions = content.get("admissions") if isinstance(content, dict) else None
+    for admission in admissions if isinstance(admissions, list) else []:
+        if isinstance(admission, dict) and "compiled" in admission:
+            _compiled_descriptor(admission)
 
 
 def pack_snapshot_objects(content: Any) -> list[dict[str, Any]]:
