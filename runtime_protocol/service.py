@@ -27,6 +27,7 @@ from .store import (
 from .util import atomic_json_write
 from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
 from .render_observer import admitted_run_id
+from .progress import normalize_progress
 from .idempotency import command_result, compact_result
 import hashlib
 import json
@@ -545,7 +546,12 @@ def _refuse_direct_shot_write(self, *args, **kwargs):
     raise RetiredRouteError("direct shot writes are retired; use timeline commands")
 
 
-class RuntimeService:
+from .task_waits import TaskWaits
+from .thin_requests import ThinRequests
+from .resolution import ADMISSION_KEY, registration_capabilities
+
+
+class RuntimeService(TaskWaits, ThinRequests):
     """Neutral application service composed by the daemon or an isolated test."""
 
     def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None, _admission_fd=None, pack_admissions=None, _local_worker_composition=None, _local_worker_composition_required=False):
@@ -914,7 +920,7 @@ class RuntimeService:
         excess = sorted(set(requested) - negotiated)
         if excess:
             raise AuthorizationError("credential cannot negotiate requested scopes", details={"scopes": excess})
-        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY, "rendering.render.historical_revision.v1"]}
+        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY, "rendering.render.historical_revision.v1", "task_waits.v1", "task_resolution.v1"]}
 
     @staticmethod
     def _assert_executor_identity(identity, executor_id):
@@ -6452,7 +6458,9 @@ class RuntimeService:
             raise AuthorizationError("discovery grant selected project/run/task/attempt association does not match")
 
     @_verified_mutation
-    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None, _recoverable_outputs=None):
+    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None, _recoverable_outputs=None, identity=None, _thin_admission=None):
+        if "thin_request" in body:
+            return self.create_thin_task(body, identity=identity, enforce_readiness=enforce_readiness)
         if "capability" in body or "expected_effect" in body:
             raise ValidationError("legacy task body aliases are not supported")
         capability = body.get("capability_id")
@@ -6463,7 +6471,7 @@ class RuntimeService:
         task_spec_value = body.get("spec", {})
         if not isinstance(task_spec_value, dict):
             raise ValidationError("task spec must be an object")
-        reserved = {"child_delegation", "delegated_parent", "delegated_stage", "delegated_inputs", "verified_publication_source", "input_refs", "derived_input_registry", "delegation_closed_attempt_id", "delegated_recoverable_outputs", "discovery_grant"}
+        reserved = {ADMISSION_KEY, "child_delegation", "delegated_parent", "delegated_stage", "delegated_inputs", "verified_publication_source", "input_refs", "derived_input_registry", "delegation_closed_attempt_id", "delegated_recoverable_outputs", "discovery_grant"}
         if set(task_spec_value) & reserved or set(body) & (reserved - {"child_delegation"}):
             raise ValidationError("delegation fields must use Runtime admission authority")
         if _delegated_lineage is not None and "child_delegation" in body:
@@ -6487,6 +6495,8 @@ class RuntimeService:
         if isinstance(execution_request, dict) and "execution_binding" in execution_request:
             raise ValidationError("caller-supplied execution_binding is not accepted")
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
+        if _thin_admission is not None:
+            task_spec[ADMISSION_KEY] = _thin_admission
         if "child_delegation" in body:
             task_spec["child_delegation"] = self._child_policy(body["child_delegation"])
             if any(object_id not in task_spec["input_object_ids"] for object_id in task_spec["child_delegation"]["input_object_ids"]):
@@ -8204,7 +8214,7 @@ class RuntimeService:
                 "executor_id", "max_concurrency", "resource_keys", "capabilities",
                 "protocol", "readiness", "readiness_reason", "runtime_epoch",
                 "source_digest", "dependency_digest", "source_epoch", "schema_digest",
-                "verified_facts",
+                "verified_facts", "resolution_descriptors",
             ),
         )
         executor_id = _wire_string(body, "executor_id")
@@ -8275,6 +8285,7 @@ class RuntimeService:
             body.get("runtime_epoch"), identity="executor",
             identity_id=body.get("executor_id"), required=existing is not None,
         )
+        capabilities = registration_capabilities(body)
         registered = self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"), verified_facts=verified_facts)
         result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": registered["capabilities"], "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch, "source_digest": body.get("source_digest"), "dependency_digest": body.get("dependency_digest"), "source_epoch": body.get("source_epoch")}
         if verified_facts is not None:
@@ -8300,6 +8311,65 @@ class RuntimeService:
                 "last_seen_at", "source_digest", "dependency_digest", "source_epoch",
                 "runtime_session_id",
             ) if key in value} | ({"verified_facts": value["verified_facts"]} if "verified_facts" in value else {})
+
+    def _next_claim_candidate(self, executor_id, capability_ids, requested_target, trusted_placement, identity):
+        from .resolution import ADMISSION_KEY
+        from .thin_requests import binding_is_stale, binding_matches
+
+        caps = set(capability_ids)
+        executor = self.store.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+        rows = self.store.conn.execute(
+            "SELECT id, capability, execution_request_json, spec_digest, waiting_reason "
+            "FROM tasks WHERE status='queued' ORDER BY rowid"
+        ).fetchall()
+        row = None
+        selected_binding = None
+        for item in rows:
+            if caps and item["capability"] not in caps:
+                continue
+            metadata = self.store._spec(item).get(ADMISSION_KEY)
+            if (metadata is not None and not binding_matches(self.store, metadata, executor)
+                    and not binding_is_stale(self.store, metadata)):
+                # This frozen descriptor belongs to another matching host.
+                # It cannot block this host's later work or be refused merely
+                # because the current executor advertises different data.
+                continue
+            activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
+            if isinstance(activation, dict) and not self._activation_scope_matches(item["id"], activation, trusted_placement):
+                # An exact prepared generation cannot block, mutate, or claim
+                # an earlier queued sibling merely sharing capability/target.
+                try:
+                    prepared_actor = self.prepared_child_executor(activation.get("task_id"))
+                except (AuthorizationError, ConflictError, LeaseError, ValidationError, NotFoundError):
+                    continue
+                if prepared_actor is not None:
+                    continue
+                # Ordinary remote generations retain the existing waiting
+                # response; remote activation authorization still runs below.
+            binding = self.store.execution_binding(item["id"])
+            targeted_request = self.store._execution_request_from_row(item)
+            targeted = targeted_request is not None
+            if targeted:
+                if binding is None:
+                    continue
+                if requested_target is None:
+                    # Ordinary local managed inputs retain a default request.
+                    # Only the credential-verified local machine may consume
+                    # that exact default binding without a selector.
+                    if (targeted_request["target"] != {"kind": "default"}
+                            or binding["resolved_target"] != targeted_request["target"]
+                            or executor_id != self._local_claim_actor
+                            or identity is None or identity.get("actor") != executor_id
+                            or identity.get("qualified_activation") is not None
+                            or trusted_placement is None
+                            or trusted_placement["actual"]["kind"] != "machine"):
+                        continue
+                elif canonical_json(binding["resolved_target"]) != canonical_json(requested_target):
+                    continue
+                selected_binding = binding
+            row = item
+            break
+        return row, selected_binding
 
     @_durable_mutation(reap_task_lifetimes=True)
     def claim_next(self, body, *, idempotency_key=None, identity=None):
@@ -8362,51 +8432,8 @@ class RuntimeService:
         # Enforce hard bounds and contain expired authority before selecting
         # work. Ordinary expiry alone does not make a running task claimable.
         self.store._reap_expired_leases()
-        caps = set(capability_ids)
-        rows = self.store.conn.execute(
-            "SELECT id, capability, execution_request_json, spec_digest, waiting_reason "
-            "FROM tasks WHERE status='queued' ORDER BY rowid"
-        ).fetchall()
-        row = None
-        selected_binding = None
-        for item in rows:
-            if caps and item["capability"] not in caps:
-                continue
-            activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
-            if isinstance(activation, dict) and not self._activation_scope_matches(item["id"], activation, trusted_placement):
-                # An exact prepared generation cannot block, mutate, or claim
-                # an earlier queued sibling merely sharing capability/target.
-                try:
-                    prepared_actor = self.prepared_child_executor(activation.get("task_id"))
-                except (AuthorizationError, ConflictError, LeaseError, ValidationError, NotFoundError):
-                    continue
-                if prepared_actor is not None:
-                    continue
-                # Ordinary remote generations retain the existing waiting
-                # response; remote activation authorization still runs below.
-            binding = self.store.execution_binding(item["id"])
-            targeted_request = self.store._execution_request_from_row(item)
-            targeted = targeted_request is not None
-            if targeted:
-                if binding is None:
-                    continue
-                if requested_target is None:
-                    # Ordinary local managed inputs retain a default request.
-                    # Only the credential-verified local machine may consume
-                    # that exact default binding without a selector.
-                    if (targeted_request["target"] != {"kind": "default"}
-                            or binding["resolved_target"] != targeted_request["target"]
-                            or executor_id != self._local_claim_actor
-                            or identity is None or identity.get("actor") != executor_id
-                            or identity.get("qualified_activation") is not None
-                            or trusted_placement is None
-                            or trusted_placement["actual"]["kind"] != "machine"):
-                        continue
-                elif canonical_json(binding["resolved_target"]) != canonical_json(requested_target):
-                    continue
-                selected_binding = binding
-            row = item
-            break
+        row, selected_binding = self._next_claim_candidate(
+            executor_id, capability_ids, requested_target, trusted_placement, identity)
         if row is None:
             # Persist the empty outcome too.  Otherwise a retry after another
             # task is admitted would silently claim new work.
@@ -8458,7 +8485,12 @@ class RuntimeService:
         attempt_id, lease_id = new_id(), new_id()
         value = self.store._claim_task(row["id"], executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
         if value["task"]["status"] == "failed":
-            result = None
+            error = (value["task"].get("result") or {}).get("error") or {}
+            # Keep the existing no-attempt refusal envelope for thin clients;
+            # the task's terminal result, not a queued waiting state, is now
+            # authoritative and is retained in the same claim replay receipt.
+            result = ({"task": self._task_resource(value), "waiting_reason": error["code"]}
+                      if error.get("code") == "resolution_descriptor_stale" else None)
         elif value["task"]["status"] != "running":
             result = {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
         else:
@@ -8684,8 +8716,11 @@ class RuntimeService:
         idempotency_key = require_idempotency_key(idempotency_key)
         body = dict(_wire_object(
             body,
-            allowed=("attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "effect", "result"),
+            allowed=("attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "effect", "result", "progress"),
         ))
+        progress = normalize_progress(body.get("progress"))
+        if progress is not None:
+            body["progress"] = progress
         supplied_attempt_id = body.get("attempt_id")
         if supplied_attempt_id is not None and str(supplied_attempt_id) != str(attempt_id):
             raise ConflictError("attempt_id does not match the attempt path")
@@ -8889,6 +8924,9 @@ class RuntimeService:
                 recorded = None
                 def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, created_at=None):
                     nonlocal recorded
+                    if progress is not None:
+                        progress_id = self.store._append_event(task["run_id"], row["task_id"], "task.progress", progress)
+                        event_ids = (*event_ids, progress_id)
                     recorded = self._command_record(
                         "attempt.settle", attempt_id, idempotency_key, request_hash,
                         self._task_resource(value), project_id=project_id or "unscoped",
@@ -10087,35 +10125,9 @@ class RuntimeService:
             or body["lease_seconds"] <= 0
         ):
             raise ValidationError("lease_seconds must be a positive integer")
-        progress = body.get("progress")
+        progress = normalize_progress(body.get("progress"))
         if progress is not None:
-            if not isinstance(progress, Mapping):
-                raise ValidationError("progress must be an object")
-            unexpected = set(progress) - {"phase", "percent", "current", "total"}
-            if unexpected:
-                raise ValidationError("progress contains unsupported fields", details={"fields": sorted(unexpected)})
-            normalized_progress = {}
-            if "phase" in progress:
-                phase = progress["phase"]
-                if not isinstance(phase, str) or not phase.strip() or len(phase) > 128:
-                    raise ValidationError("progress.phase must be a non-empty string of at most 128 characters")
-                normalized_progress["phase"] = phase.strip()
-            for key in ("percent", "current", "total"):
-                if key not in progress:
-                    continue
-                value = progress[key]
-                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                    raise ValidationError(f"progress.{key} must be a finite number")
-                if key == "percent" and not 0 <= float(value) <= 100:
-                    raise ValidationError("progress.percent must be between 0 and 100")
-                if key == "total" and float(value) < 1:
-                    raise ValidationError("progress.total must be at least 1")
-                if key == "current" and float(value) < 0:
-                    raise ValidationError("progress.current must be non-negative")
-                normalized_progress[key] = value
-            if not normalized_progress:
-                raise ValidationError("progress must contain phase, percent, current, or total")
-            body["progress"] = normalized_progress
+            body["progress"] = progress
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
