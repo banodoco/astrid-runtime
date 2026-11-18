@@ -4557,7 +4557,7 @@ class RealmStore:
             raise ValidationError("unsupported settlement effect_type")
         return kind
 
-    def _validate_settlement_effect(self, effect, *, project_id=None, result=None, input_object_ids=None):
+    def _validate_settlement_effect(self, effect, *, project_id=None, result=None, input_object_ids=None, attempt_id=None):
         kind = self._settlement_effect_kind(effect)
         if kind == "generation.publish_v1":
             return self._validate_generation_publish_v1_effect(
@@ -4593,6 +4593,7 @@ class RealmStore:
                 project_id=project_id,
                 result=result,
                 input_object_ids=input_object_ids,
+                attempt_id=attempt_id,
             )
         try:
             current = self._project(str(target))
@@ -5250,6 +5251,7 @@ class RealmStore:
         project_id=None,
         result=None,
         input_object_ids=None,
+        attempt_id=None,
     ):
         effect_type = "generation.thumbnail.attach"
         required_effect = {"effect_type", "target_id", "expected_version", "payload"}
@@ -5344,6 +5346,11 @@ class RealmStore:
         if len(thumbnail_outputs) != 1:
             raise ValidationError(f"{effect_type} requires exactly one thumbnail settlement output")
         selected = thumbnail_outputs[0]
+        allowed_log_groups = {"default"}
+        if isinstance(attempt_id, str) and attempt_id:
+            # The fenced settlement supplies this identity; an output cannot
+            # select another attempt's immutable log association.
+            allowed_log_groups.add(f"thumbnail-attempt:{attempt_id}")
         log_names = set()
         for output in outputs:
             if output is selected:
@@ -5362,7 +5369,7 @@ class RealmStore:
                 or output.get("filename") != name + ".log"
                 or output.get("media_type") != "text/plain"
                 or output.get("durability", "durable") != "durable"
-                or output.get("group_key", "default") != "default"
+                or output.get("group_key", "default") not in allowed_log_groups
                 or output.get("ordinal", 0) != 0
                 or output.get("is_primary", False) is not False
                 or any(field in output for field in (
@@ -5681,6 +5688,7 @@ class RealmStore:
                 project_id=project_id,
                 result=result,
                 input_object_ids=input_object_ids,
+                attempt_id=attempt_id,
             )
             generation = plan["generation"]
             descriptor = self._thumbnail_metadata_descriptor(
@@ -6239,6 +6247,7 @@ class RealmStore:
                         project_id=task_project_id,
                         result=result,
                         input_object_ids=input_object_ids,
+                        attempt_id=attempt_id,
                     )
                 self._validated_manifest_digest(result, project_id=task_project_id)
                 applied_effect = None
