@@ -503,7 +503,17 @@ class TimelineCommitStore:
         trusted = verified.get(object_id)
         if trusted is None or expected != (trusted[2], bytes.fromhex(object_id)):
             return False
-        return ContentAddressedStore(self.store.cas_root).current_identity(object_id) == trusted
+        return self._cas().current_identity(object_id) == trusted
+
+    def _cas(self):
+        """One ContentAddressedStore per CAS root (its constructor resolves and mkdirs)."""
+        from .cas import ContentAddressedStore
+
+        root = self.store.cas_root
+        cached = self.__dict__.get("_cas_instance")
+        if cached is None or cached[0] != root:
+            cached = self.__dict__["_cas_instance"] = (root, ContentAddressedStore(root))
+        return cached[1]
 
     @staticmethod
     def _object_value(object_id, data):
@@ -526,6 +536,13 @@ class TimelineCommitStore:
                     raise ProtocolError("accepted commit object changed during verification")
                 inputs.objects[object_id] = retained
             return retained
+        trusted = (self._verified_cas() or {}).get(object_id)
+        if trusted is not None and self._cas().current_identity(object_id) == trusted:
+            # Immutable and unchanged since it was hashed: the pin needs only
+            # (size, sha256), so the file is not opened or read.
+            value = (trusted[2], bytes.fromhex(object_id))
+            self._record_history_object(object_id, value)
+            return value
         data = self._read_history_object(object_id)
         return self._object_value(object_id, data)
 
@@ -673,11 +690,15 @@ class TimelineCommitStore:
             return reader(object_id)
         from .cas import ContentAddressedStore
 
-        return ContentAddressedStore(self.store.cas_root).read(object_id, verified=self._verified_cas())
+        return self._cas().read(object_id, verified=self._verified_cas())
 
     def _read_history_object(self, object_id):
         data = self._read_object(object_id)
         value = self._object_value(object_id, data)
+        self._record_history_object(object_id, value)
+        return data
+
+    def _record_history_object(self, object_id, value):
         previous = self._history_state["objects"].get(object_id)
         if previous is not None and previous != value:
             raise ProtocolError("accepted commit object changed during verification")
@@ -691,7 +712,6 @@ class TimelineCommitStore:
             if object_id in objects and objects[object_id] != value:
                 raise ProtocolError("accepted commit object changed during verification")
             objects[object_id] = value
-        return data
 
     def _membership(self, project_id, timeline_id):
         row = self.conn.execute("SELECT p.realm_id FROM timelines t JOIN projects p ON p.id=t.project_id "

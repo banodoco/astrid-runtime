@@ -121,6 +121,7 @@ def test_commit_and_history_read_cost_does_not_grow_with_history(film, monkeypat
     for (hashes_few, opens_few, stats_few), (hashes_many, opens_many, stats_many) in zip(few[:2], many[:2]):
         assert hashes_many == hashes_few
         assert opens_many == opens_few
+        assert stats_many == stats_few
     # A warm commit confirms the film's media by stat alone: no open, no hash.
     assert many[0][:2] == (0, 0) and many[0][2] > 0
     # A warm history read hashes and opens nothing; every confirm is a stat.
@@ -152,13 +153,16 @@ def test_trust_survives_a_refused_commit_and_an_unrelated_database_write(warm):
     before = Counter(counts.hashes)
     commits, _ = service._timeline_commits()
 
+    mark = counts.snapshot()
     with pytest.raises(RuntimeErrorBase):
         subject.edit(base="not-the-head")
     commits.clear_replay_memo()
     subject.edit()
     assert rehashed_since(counts, before) == []
+    assert counts.since(mark)[:2] == (0, 0), "no object is opened or read after a refusal"
 
     before = Counter(counts.hashes)
+    mark = counts.snapshot()
     service.store.conn.execute("UPDATE timelines SET name=COALESCE(name, '') || ' x'")
     service.store.conn.commit()
     with closing(sqlite3.connect(service.store.db_path, isolation_level=None)) as other:
@@ -166,6 +170,7 @@ def test_trust_survives_a_refused_commit_and_an_unrelated_database_write(warm):
     subject.edit()
     subject.read()
     assert rehashed_since(counts, before) == []
+    assert counts.since(mark)[:2] == (0, 0), "no object is opened or read after a database write"
 
 
 def an_old_object(service):
