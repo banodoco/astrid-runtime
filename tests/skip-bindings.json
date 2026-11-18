@@ -60,7 +60,21 @@
     "tests/test_platform_signaling.py::test_linux_pidfd_fallback_refuses_changed_or_unknown_identity",
     "tests/test_platform_signaling.py::test_linux_pidfd_fallback_rejects_invalid_signal_without_terminating_child",
     "tests/test_platform_signaling.py::test_public_pidfd_helpers_fallback_signals_real_child_and_retains_fd",
-    "tests/test_platform_signaling.py::test_public_pidfd_send_signal_fallback_errors_retain_real_fd"
+    "tests/test_platform_signaling.py::test_public_pidfd_send_signal_fallback_errors_retain_real_fd",
+    "tests/test_process_control.py::test_group_walk_refuses_our_own_group",
+    "tests/test_process_control.py::test_probe_child_creation_failure_is_actionable_and_not_a_sandbox_fallback",
+    "tests/test_process_control.py::test_probe_in_a_seccomp_like_environment",
+    "tests/test_process_control.py::test_probe_reaps_child_on_group_check_failure",
+    "tests/test_process_control.py::test_probe_uses_live_child_group_when_inherited_group_is_unreachable",
+    "tests/test_process_control.py::test_sandbox_mode_only_relaxes_enosys",
+    "tests/test_process_control.py::test_sandbox_mode_refuses_a_changed_incarnation",
+    "tests/test_process_control.py::test_sandbox_mode_signals_by_pid_after_a_start_time_check",
+    "tests/test_process_control.py::test_sandbox_mode_walks_the_group_leader_last",
+    "tests/test_process_control.py::test_sandbox_stop_tree_stops_the_whole_group",
+    "tests/test_process_control.py::test_strict_group_recovery_signals_members_without_a_sandbox_note",
+    "tests/test_process_control.py::test_strict_mode_keeps_killpg_failures",
+    "tests/test_process_control.py::test_strict_mode_never_signals_a_bare_pid",
+    "tests/test_process_control.py::test_symlinked_or_non_regular_setting_refuses_startup"
   ],
   "posix-file-modes-native-custody": [
     "tests/test_native_custody.py::test_native_custody_rejects_unsafe_owner_file",
@@ -126,6 +140,15 @@
     "tests/test_service_stop.py::test_windows_stop_tree_drains_descendants_after_leader_exits"
   ],
   "windows-process-and-lock-apis": [
+    "tests/test_platform_windows.py::test_windows_detached_child_inherits_job_handle",
+    "tests/test_platform_windows.py::test_windows_detached_owner_clears_job_handle_inheritance",
+    "tests/test_platform_windows.py::test_windows_directory_mutex_lock_contends_and_releases",
+    "tests/test_platform_windows.py::test_windows_directory_mutex_recovers_after_owner_process_exits",
+    "tests/test_platform_windows.py::test_windows_lockfileex_exclusive_and_unlock",
+    "tests/test_platform_windows.py::test_windows_overlapped_has_native_pointer_size_layout",
+    "tests/test_platform_windows.py::test_windows_process_identity_proves_exited_retained_child_absent",
+    "tests/test_platform_windows.py::test_windows_process_identity_uses_creation_time_and_bounded_sid",
+    "tests/test_platform_windows.py::test_windows_spawn_assigns_job_before_resuming_child",
     "tests/test_windows_worker_handoff.py::test_windows_launch_fresh_authenticated_exchange_and_socket_transfer",
     "tests/test_windows_worker_handoff.py::test_windows_launch_reconstructs_inherited_crt_file",
     "tests/test_windows_worker_handoff.py::test_windows_real_connection_refuses_unselected_process_identity",

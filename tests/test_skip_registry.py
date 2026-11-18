@@ -283,7 +283,7 @@ def _pytest_commands(run: str) -> list[PytestCommand]:
             elif token == "-n":
                 i += 1
             elif token.startswith("tests"):
-                paths.append(token.split("::")[0])
+                paths.append(token)
             i += 1
         commands.append(PytestCommand(_default_marker_expression() if expression is None else expression, paths, keyword))
     return commands
@@ -390,8 +390,17 @@ def _uses() -> dict[str, list[Use]]:
     for path in sorted(TESTS.glob("test_*.py")):
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source)
+        variables = dict(by_variable)
         module_marks: set[str] = set()
         for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "tests.lanes":
+                for alias in node.names:
+                    if alias.name in by_variable:
+                        variables[alias.asname or alias.name] = by_variable[alias.name]
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in variables:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        variables[target.id] = variables[node.value.id]
             if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets):
                 module_marks |= _mark_names(node.value)
 
@@ -401,7 +410,7 @@ def _uses() -> dict[str, list[Use]]:
                     visit(node.body, inherited | {n for d in node.decorator_list for n in _mark_names(d)}, classes | {node.name})
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
                     marks = inherited | {n for d in node.decorator_list for n in _mark_names(d)}
-                    entries = {by_variable[n].name for n in marks if n in by_variable}
+                    entries = {variables[n].name for n in marks if n in variables}
                     if "darwin_native" in marks:
                         entries.add("darwin-native")
                     # Embedded source strings in guard tests do not call the
@@ -439,11 +448,18 @@ def _k_keeps(expression: str, use: Use) -> bool:
     return not any(term in name.lower() for name in names)
 
 
+def _path_selects(selector: str, use: Use) -> bool:
+    filename, *node = selector.split("::")
+    path, test_file = (REPO / filename).resolve(), (TESTS / use.file).resolve()
+    if node:
+        selected = [part.split("[", 1)[0] for part in node]
+        actual = [*sorted(use.classes), use.test]
+        return path == test_file and actual[:len(selected)] == selected
+    return path == test_file or path in test_file.parents
+
+
 def _selects(command: PytestCommand, use: Use) -> bool:
-    if command.paths and not any(
-        (REPO / p).resolve() == (TESTS / use.file).resolve() or (REPO / p).resolve() in (TESTS / use.file).resolve().parents
-        for p in command.paths
-    ):
+    if command.paths and not any(_path_selects(path, use) for path in command.paths):
         return False
     if command.keyword_expression is not None and not _k_keeps(command.keyword_expression, use):
         return False
@@ -503,6 +519,25 @@ def test_skip_bindings_match_explicit_platform_lane_uses() -> None:
         for name, uses in _uses().items()
     }
     assert lanes.DECLARED_SKIP_NODES == expected
+
+
+@pytest.mark.parametrize("alias", ["import", "assignment"])
+def test_skip_inventory_follows_registered_marker_aliases(tmp_path, monkeypatch, alias) -> None:
+    declaration = (
+        "from tests.lanes import requires_windows_process_and_lock_apis as platform_only\n"
+        if alias == "import" else
+        "from tests.lanes import requires_windows_process_and_lock_apis\n"
+        "platform_only = requires_windows_process_and_lock_apis\n"
+    )
+    (tmp_path / "test_alias.py").write_text(
+        declaration + "@platform_only\ndef test_native(): pass\ndef test_unmarked(): pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "TESTS", tmp_path)
+    uses = _uses()["windows-process-and-lock-apis"]
+    assert [(use.file, use.test, use.hosts) for use in uses] == [
+        ("test_alias.py", "test_native", frozenset({"windows"})),
+    ]
 
 
 def test_every_declared_job_exists_and_runs_a_test_of_the_entry() -> None:
@@ -587,6 +622,18 @@ def _spec(text: str) -> dict:
 
 def _use(test: str = "test_a", file: str = "test_x.py", classes=(), marks=()) -> Use:
     return Use(file, test, frozenset(marks), frozenset(HOSTS), frozenset(classes))
+
+
+def test_node_selection_does_not_credit_other_tests_in_the_same_file() -> None:
+    command = _pytest_commands("python -m pytest -q tests/test_x.py::test_a")[0]
+    assert _selects(command, _use())
+    assert not _selects(command, _use("test_other"))
+    assert not _selects(command, _use(classes=["TestNative"]))
+    assert command.paths == ["tests/test_x.py::test_a"]
+    class_command = _pytest_commands("python -m pytest -q tests/test_x.py::TestNative::test_a[case]")[0]
+    assert _selects(class_command, _use(classes=["TestNative"]))
+    assert not _selects(class_command, _use(classes=["TestOther"]))
+    assert not _selects(class_command, _use())
 
 
 _ENTRY = DeclaredSkip("demo", "os_name == 'nt'", "demo", ("j",))
