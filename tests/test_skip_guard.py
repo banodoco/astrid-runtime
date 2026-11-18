@@ -28,9 +28,9 @@ def sandbox(pytester):
     return pytester
 
 
-def _run(sandbox, body: str):
+def _run(sandbox, body: str, *args: str):
     sandbox.makepyfile(check_it=textwrap.dedent(body))
-    return sandbox.runpytest_subprocess("-p", "no:cacheprovider", "-q")
+    return sandbox.runpytest_subprocess("-p", "no:cacheprovider", "-q", *args)
 
 
 def test_undeclared_pytest_skip_fails_the_run(sandbox):
@@ -62,7 +62,8 @@ def test_skip_mark_importorskip_and_xfail_fail_the_run(sandbox):
 
 
 @pytest.mark.parametrize("fixed", [False, True])
-def test_exact_declared_xfail_fails_when_the_gap_starts_passing(sandbox, fixed):
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "xdist"])
+def test_exact_declared_xfail_fails_when_the_gap_starts_passing(sandbox, fixed, workers):
     result = _run(sandbox, f"""
         from datetime import date, timedelta
         import pytest
@@ -86,7 +87,7 @@ def test_exact_declared_xfail_fails_when_the_gap_starts_passing(sandbox, fixed):
 
         def test_control():
             pass
-        """)
+        """, *(('-n', str(workers)) if workers else ()))
     if fixed:
         assert result.ret == pytest.ExitCode.TESTS_FAILED
         result.assert_outcomes(failed=1, passed=1)

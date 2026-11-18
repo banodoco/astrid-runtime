@@ -517,6 +517,15 @@ class _SkipGuard:
         if not report.skipped:
             return
         reason = getattr(report, "wasxfail", None)
+        # xdist serializes report attributes, but the controller never collects
+        # the worker's items. Carry the worker's exact marker validation with
+        # the report instead of consulting controller-local collection state.
+        if reason is not None and getattr(report, "astrid_declared_xfail", False):
+            key = (report.nodeid, str(reason))
+            self._approved_xfails.add(key)
+            if key not in self._reported_xfails:
+                self._reported_xfails.add(key)
+                self.declared_xfails.append(key)
         if reason is not None and (report.nodeid, str(reason)) in self._approved_xfails:
             return
         longrepr = report.longrepr
@@ -546,6 +555,7 @@ class _SkipGuard:
         mark = self._xfail_mark(item, str(reason))
         if mark is None or not self._check_xfail(item, mark):
             return
+        report.astrid_declared_xfail = True
         key = (item.nodeid, str(reason))
         if key not in self._reported_xfails:
             self._reported_xfails.add(key)
