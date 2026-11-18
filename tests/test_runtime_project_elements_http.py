@@ -10,19 +10,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import re
+import pathlib
 import uuid
 
 import pytest
 
 from runtime_protocol.errors import RuntimeErrorBase
+from runtime_protocol.util import canonical_json
 from runtime_protocol.server import pack_http_route
 from runtime_protocol.timeline_commit_inputs import PROJECT_PACK_KIND, PROJECT_PACK_SCHEMA
 from tests.door_helpers import HOSTED, start_door_world
 
 TSX = "elements/reveal/component.tsx"
 COMPILED = "elements/reveal/component.js"
-SHA_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def sha(data: bytes) -> str:
@@ -64,7 +64,9 @@ def admission(service, project: str, descriptor_object: dict, compiled: bytes, *
         "snapshot_object": descriptor_object,
         "compiled": {"path": COMPILED, "sha256": sha(compiled)},
         "descriptor": {"packId": owner_id(service, project), "id": ref_id, "kind": kind,
-                       "revision": revision_text, "label": "Reveal", "componentPath": TSX},
+                       "revision": revision_text, "label": "Reveal", "description": "", "componentPath": TSX,
+                       "defaults": {}, "parameters": [],
+                       "renderability": {"preview": "supported", "browserExport": "supported", "workerExport": "unknown"}},
         "authoring": {"packRoot": "/work/packs/reveal", "descriptorPath": "/work/packs/reveal/descriptor.yaml",
                       "componentPath": "/work/packs/reveal/component.tsx", "status": "admitted"},
     }
@@ -93,6 +95,10 @@ def replace_admissions(service, project: str, admissions: list[dict], key: str) 
     content["admissions"] = admissions
     service.update_document(project, row["id"], {"expected_version": row["version"], "content": content},
                             idempotency_key=key)
+
+
+FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "project-elements-list.json"
+FIXTURE_PROJECT, FIXTURE_REALM, FIXTURE_PACK = "fixture-project", "fixture-realm", "project_0123456789abcdef0123"
 
 
 def list_path(project: str) -> str:
@@ -128,30 +134,14 @@ def test_list_and_element_bytes_are_served_through_the_door(world, project):
     assert listed.status == 200
     assert listed.headers["content-type"] == "application/json"
     assert listed.headers["cache-control"] == "no-store"
-    body = listed.json()
-    assert set(body) == {"version", "projectId", "realmId", "selectionDigest", "projects", "elements"}
-    assert body["version"] == 1
-    assert body["projectId"] == project
-    assert body["realmId"] == service.realm["id"]
-    assert SHA_RE.fullmatch(body["selectionDigest"])
-
-    owner = owner_id(service, project)
-    revision = "sha256:" + "1" * 64
-    assert body["elements"] == [{
-        "ref": {"packId": owner, "kind": "effect", "id": "reveal", "revision": revision},
-        "digest": digest,
-        "descriptor": {"packId": owner, "id": "reveal", "kind": "effect", "revision": revision,
-                       "label": "Reveal", "componentPath": TSX},
-        "authoring": {"packRoot": "/work/packs/reveal", "descriptorPath": "/work/packs/reveal/descriptor.yaml",
-                      "componentPath": "/work/packs/reveal/component.tsx", "status": "admitted"},
-        "url": element_path(project, digest),
-    }]
-    assert body["projects"] == [{
-        "projectId": project, "packId": owner, "packRoot": "/work/packs/reveal", "status": "admitted",
-        "initCommand": f"python3 -m astrid.core.element.cli project-pack init --realm {service.realm['id']} --project {project}",
-        "admitCommand": f"python3 -m astrid.core.element.cli project-pack admit --realm {service.realm['id']} --project {project}",
-        "inspectCommand": f"python3 -m astrid.core.element.cli project-pack inspect --realm {service.realm['id']} --project {project}",
-    }]
+    # The committed fixture is the list response with the install's identities named by placeholders; the editor's
+    # parser test reads the same file.
+    expected = json.loads(FIXTURE.read_text().replace(FIXTURE_PROJECT, project)
+                          .replace(FIXTURE_REALM, service.realm["id"]).replace(FIXTURE_PACK, owner_id(service, project)))
+    assert expected["elements"][0]["digest"] == digest
+    refs = [[element["ref"], element["digest"]] for element in expected["elements"]]
+    expected["selectionDigest"] = sha(canonical_json({"projectId": project, "realmId": service.realm["id"], "refs": refs}).encode())
+    assert listed.json() == expected
 
     served = world.call(element_path(project, digest))
     assert served.status == 200
