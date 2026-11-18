@@ -3541,6 +3541,10 @@ class RuntimeService:
                     self._finite_number(source_offset.get(key), f"source_offset.{key}")
         else:
             self._finite_number(source_offset, "source_offset")
+        # The window origin into the shot's timeline: never negative (the Agent refuses it too).
+        origin = source_offset.get("start", 0) if isinstance(source_offset, dict) else source_offset
+        if origin is not None and origin < 0:
+            raise ValidationError("occurrence source_offset must not be negative")
         duration = occurrence.get("duration_ms", occurrence.get("duration"))
         if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(float(duration)) or duration <= 0 or int(duration) != duration:
             raise ValidationError("occurrence duration must be a finite positive integer")

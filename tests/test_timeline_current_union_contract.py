@@ -27,6 +27,7 @@ CASES = ORDINARY_CASES + [
     ("shot.pool", "occurrence:o", {"action": "add", "media": MEDIA}),
     ("occurrence.duplicate", "occurrence:o", {"occurrence_id": "new", "shot_id": "new-shot"}),
     ("occurrence.delete", "occurrence:o", {}),
+    ("occurrence.trim", "occurrence:o", {"occurrence_id": "o", "edge": "start", "to_ms": 1000}),
     ("producer.guard", None, {"pin": PIN}),
 ]
 NEW_OPERATIONS = {
@@ -47,10 +48,10 @@ def command(op, select, args):
 
 def test_exact_frozen_schema_and_operation_inventory_are_packaged():
     raw = (ROOT / "contract/schemas/edit-command.json").read_bytes()
-    assert hashlib.sha256(raw).hexdigest() == "1c20249fc9551da9b85c0b98f4e6ab758af50e026f3cfa918150291fa7e0f3e8"
+    assert hashlib.sha256(raw).hexdigest() == "307cbb095bf54d5aae7cd0166b30ca457983c222e5306ceb3234f7967098d890"
     schema = json.loads(raw)
-    assert len(schema["$defs"]) == 58
-    assert len(schema["$defs"]["EditCommand"]["allOf"]) == 30
+    assert len(schema["$defs"]) == 59
+    assert len(schema["$defs"]["EditCommand"]["allOf"]) == 31
     expected_operations = {c[0] for c in CASES} | NEW_OPERATIONS
     assert {c["if"]["properties"]["op"]["const"] for c in schema["$defs"]["EditCommand"]["allOf"]} == expected_operations
     bundle = json.loads((ROOT / "runtime_protocol/schemas/timeline-commit-bundle.json").read_bytes())

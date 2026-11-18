@@ -491,8 +491,13 @@ def _timing_record(raw, timing_id):
 def _attach_render_timing(projected, raw_clips, occurrence, registry):
     """Use the same shot clipping producer as managed rendering, before selection."""
     reason = None
-    if occurrence.get("speed", 1) != 1 or occurrence.get("source_offset", 0) != 0:
-        reason = "managed shot expansion does not apply occurrence speed/source_offset"
+    stored_offset = occurrence.get("source_offset", 0)
+    if isinstance(stored_offset, dict):
+        stored_offset = stored_offset.get("start", 0)
+    if occurrence.get("speed", 1) != 1:
+        reason = "managed shot expansion does not apply occurrence speed"
+    elif isinstance(stored_offset, bool) or not isinstance(stored_offset, (int, float)) or stored_offset < 0:
+        reason = "occurrence source_offset is not a non-negative window origin"
     try:
         if reason:
             raise ShotExpansionError(reason)
@@ -501,7 +506,8 @@ def _attach_render_timing(projected, raw_clips, occurrence, registry):
                             "at": float(Fraction(*occurrence["start"])),
                             "hold": float(Fraction(*occurrence["duration"])),
                             "track": occurrence.get("track_id"),
-                            "params": {"shot_id": occurrence["shot_id"], "timeline_document_id": "pinned"}}]}
+                            "params": {"shot_id": occurrence["shot_id"], "timeline_document_id": "pinned",
+                                       "source_offset": stored_offset / 1000}}]}
         expanded, _ = expand_shot_clips(parent, {"assets": {}},
                                        load_timeline=lambda _: (child, registry))
         by_source = {row["app"]["astrid_shot_composition"]["source_clip_id"]: row

@@ -1047,7 +1047,7 @@ def test_occurrence_speed_discrepancy_keeps_authored_values_and_marks_missing_pr
                   'speed': 2, 'source_offset': 0}
     _attach_render_timing(projected, [{'id': 'clip', 'at': 0, 'hold': 2}], occurrence, {'assets': {}})
     assert 'render_timing' not in projected[0]
-    assert 'does not apply occurrence speed/source_offset' in projected[0]['render_timing_unknown']
+    assert 'does not apply occurrence speed' in projected[0]['render_timing_unknown']
     assert projected[0]['authored_fields']['hold'] == 2
 
 

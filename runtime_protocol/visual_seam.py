@@ -279,7 +279,7 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
             clip["speed"] = effective_speed
         else:
             clip.pop("speed", None)
-        duration = clip_seconds(clip, (bound[1] - offset) * effective_speed if bound else 0, speed=effective_speed)
+        duration = clip_seconds(clip, (bound[1] - bound[0]) * effective_speed if bound else 0, speed=effective_speed)
         # Canonical child clips may carry the schema's asset_id spelling. Resolve
         # that reference before coverage classification so media aliases retain
         # the same full-frame semantics as clips already normalized to asset.
@@ -293,7 +293,7 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
         covered = render and covers_frame(clip, definition, config)
         if not authored_continuity and primary and covered:
             continuity.add(track)
-        if at < 0 or offset + at < 0:
+        if at < 0 or max(offset + at, bound[0] if bound else offset + at) < 0:
             structural.append({"code": "boundary/negative-start", "path": path, "frame": js_round((offset + at) * fps)})
         raw_start = js_round((offset + at) * fps)
         raw_end = raw_start + max(1, js_round(duration * fps))
@@ -311,12 +311,13 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
             clip["hold"] = duration * effective_speed
             clip.pop("duration_ms", None)
             clip.pop("duration", None)
-        applied_source_offset = 0 if is_audio else source_offset
-        if "from" in clip or "from_ms" in clip or applied_source_offset:
-            clip["from"] = seconds(raw, "from") + applied_source_offset
+        # source_offset is the window origin into the shot's timeline: `offset` here is already
+        # start - source_offset, so the child sits at start - source_offset + at and nothing is added to from/to.
+        if "from" in clip or "from_ms" in clip:
+            clip["from"] = seconds(raw, "from")
             clip.pop("from_ms", None)
         if "to" in clip or "to_ms" in clip:
-            clip["to"] = seconds(raw, "to") + applied_source_offset
+            clip["to"] = seconds(raw, "to")
             clip.pop("to_ms", None)
         asset = (registry.get("assets") or {}).get(asset_key, {})
         source = next((asset[k] for k in ("content_sha256", "object_id", "media_id", "digest", "file") if isinstance(asset.get(k), str)), None)
@@ -343,6 +344,9 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
             }
             visible_seconds = (end - start) / fps
             rendered["at"] = start / fps
+            cut = (start - raw_start) / fps  # shot time hidden before the window
+            if cut > 0 and rendered.get("clipType") != "image":
+                rendered["from"] = rendered.get("from", 0) + cut * effective_speed
             if "hold" in rendered or "to" not in rendered:
                 rendered["hold"] = visible_seconds * effective_speed
             else:
@@ -412,16 +416,20 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
                       if active(c) and child_tracks.get(c.get("track", o["track"]), {}).get("role") != "source"),
                      default=fallback_duration)
         extent = math.ceil(extent * 1000 - 1e-6) / 1000
+        source_offset = o.get("source_offset", o.get("source_offset_ms", 0))
+        if isinstance(source_offset, dict):
+            source_offset = source_offset.get("start", 0)
+        source_offset = finite(source_offset) / 1000
+        if source_offset < 0:
+            raise ValidationError("occurrence source_offset must not be negative")
+        if source_offset > 0:
+            extent = fallback_duration  # a trimmed window is exactly its duration, whatever the content holds
         end = min(offset + extent, next_start.get(o["occurrence_id"], offset + extent))
         path = ["parent", timeline_id, "occurrence", o["occurrence_id"]]
         occurrences.append({"path": path, "track": o["track"], "startFrame": js_round(offset * fps), "endFrame": js_round(end * fps),
                             "rawEndFrame": js_round((offset + extent) * fps), "clip": o, "source": o["shot_revision_id"], "primary": False})
         if offset < 0 or end <= offset:
             structural.append({"code": "boundary/invalid-occurrence", "path": path, "frame": js_round(offset * fps)})
-        source_offset = o.get("source_offset", o.get("source_offset_ms", 0))
-        if isinstance(source_offset, dict):
-            source_offset = source_offset.get("start", 0)
-        source_offset = finite(source_offset) / 1000
         span_begin = len(spans)
         render_begin = len(render_config["clips"]) if materialize else 0
         if materialize:
@@ -431,7 +439,7 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
                     render_config.setdefault("tracks", []).append(copy.deepcopy(t))
                     known_tracks.add(t.get("id"))
         for c in clips:
-            add(c, child_registry, path + ["clip", str(c.get("id", "?"))], offset=offset, bound=(offset, end), inherited_speed=inherited_speed,
+            add(c, child_registry, path + ["clip", str(c.get("id", "?"))], offset=offset - source_offset, bound=(offset, end), inherited_speed=inherited_speed,
                 inherited_track=o["track"], source_offset=source_offset, inherited_gain=o.get("gain", 1), muted=o.get("muted", o.get("mute", False)),
                 track_definitions=child_tracks)
         # An overlay-only occurrence cannot create a picture-lane seam either.

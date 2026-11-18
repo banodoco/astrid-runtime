@@ -2134,6 +2134,41 @@
               "if": {
                 "properties": {
                   "op": {
+                    "const": "occurrence.trim"
+                  }
+                },
+                "required": [
+                  "op"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "args": {
+                    "$ref": "#/$defs/OccurrenceTrimArgs"
+                  },
+                  "intent": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "ownership": {
+                        "const": "occurrence"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "select": {
+                    "pattern": "^occurrence:(?!.*::)[^/]+$",
+                    "type": "string"
+                  },
+                  "version": {
+                    "const": "1"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "op": {
                     "const": "clip.swap-media"
                   }
                 },
@@ -2595,6 +2630,33 @@
           "required": [
             "old_media",
             "media"
+          ],
+          "type": "object"
+        },
+        "OccurrenceTrimArgs": {
+          "additionalProperties": false,
+          "properties": {
+            "edge": {
+              "description": "Which edge of the occurrence window moves; the other edge and the content's timeline position stay fixed.",
+              "enum": [
+                "start",
+                "end"
+              ]
+            },
+            "occurrence_id": {
+              "pattern": "^(?!.*::)(?=.*\\S)[^/]+$",
+              "type": "string"
+            },
+            "to_ms": {
+              "description": "New absolute timeline position of that edge in milliseconds.",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "occurrence_id",
+            "edge",
+            "to_ms"
           ],
           "type": "object"
         },

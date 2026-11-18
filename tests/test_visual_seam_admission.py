@@ -98,7 +98,7 @@ def test_materialized_occurrence_timing_is_visual_only_and_matches_shared_vector
     rendered_standalone = projection["render_config"]["clips"][0]
     assert {key: rendered_standalone.get(key) for key in parent_clip} == parent_clip
     assert projection["render_registry"]["assets"]["occ-1:lane-audio-source"]["object_id"] == "object-lane-audio-source"
-    assert clips["audio-track-inherited"]["app"]["canonicalTiming"]["sourceOffsetMs"] == 350
+    assert clips["audio-track-inherited"]["app"]["canonicalTiming"]["sourceOffsetMs"] == 0
     assert clips["audio-track-inherited"]["app"]["canonicalTiming"]["occurrenceSpeed"] == 1.5
     assert projection["render_config"]["clips"][1]["id"] == "occ-1:visual-trim-inherited"
     assert child == original_child
@@ -971,12 +971,13 @@ def test_managed_materialization_preserves_child_effects_and_offset_without_trim
     parent["occurrences"][0]["source_offset"] = 1500
     child_effect = {"id": "child-fade", "type": "opacity", "params": {"opacity": 0.5}}
     local_effect = {"id": "local", "type": "crop", "params": {"left": 4}}
-    child = {"clips": [{"id": "picture", "clipType": "media", "asset": "picture", "at": 0, "hold": 1, "track": "v", "effects": [local_effect]}],
+    # source_offset is the window origin: the child at shot time 1.5 s is the first frame of the window
+    child = {"clips": [{"id": "picture", "clipType": "media", "asset": "picture", "at": 1.5, "hold": 1, "track": "v", "effects": [local_effect]}],
              "effects": [child_effect]}
     _, metadata = admit_closure(parent, {("s", "unsafe-shot"): {"internal_timeline_revision_id": "unsafe-child", "payload": {}}},
                                {"unsafe-child": {"payload": child}}, timeline_id="main", materialize=True)
     clip = metadata["render_config"]["clips"][0]
-    assert clip["from"] == 1.5
+    assert "from" not in clip
     assert clip["hold"] == 1
     assert clip["effects"] == [local_effect, child_effect]
     assert "from" not in child["clips"][0]
@@ -999,7 +1000,7 @@ def test_managed_render_freezes_child_effects_and_offset_from_pinned_closure(tmp
         child_effect = {"id": "child", "type": "opacity", "params": {"opacity": 0.5}}
         local_effect = {"id": "local", "type": "crop", "params": {"left": 4}}
         child = publication["internal_timeline_revisions"][0]["payload"]
-        child.update({"clips": [{"id": "picture", "clipType": "media", "at": 0, "hold": 1, "track": "v", "asset": "source", "effects": [local_effect]}],
+        child.update({"clips": [{"id": "picture", "clipType": "media", "at": 1.5, "hold": 3, "track": "v", "asset": "source", "effects": [local_effect]}],
                       "effects": [child_effect], "registry": {"assets": {"source": {"object_id": media, "type": "video/mp4"}}}})
         _accept_visual_publication(service, publication, idempotency_key="publish")
         task = service.create_task({"project": project["id"], "capability_id": "rendering.render", "capability_digest": capability,
@@ -1010,10 +1011,10 @@ def test_managed_render_freezes_child_effects_and_offset_from_pinned_closure(tmp
         assert ref["digest"] in task["task"]["spec"]["input_object_ids"]
         assert ref["revision_id"] == "unsafe-parent"
         clip = json.loads(service.object(ref["digest"])[1])["config"]["clips"][0]
-        assert clip["from"] == 1.5
+        assert "from" not in clip
         assert clip["effects"] == [local_effect, child_effect]
         assert frozen["inputs"]["timeline_authority"]["parent_revision_id"] == "unsafe-parent"
-        assert not frozen["inputs"]["timeline_authority"]["visual_seam_report"]["blocked"]
+        assert not frozen["inputs"]["timeline_authority"]["visual_seam_report"]["blocked"], frozen["inputs"]["timeline_authority"]["visual_seam_report"]
     finally:
         service.close()
 

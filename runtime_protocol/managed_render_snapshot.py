@@ -134,6 +134,11 @@ def expand_shot_clips(
         if parent_hold <= 0.0:
             raise ShotExpansionError(f"shot clip {clip.get('id', '?')} must have a positive hold")
         parent_end = parent_at + parent_hold
+        # params.source_offset (seconds) is the window origin into the shot's timeline: a child at
+        # internal time tau sits at parent_at - source_offset + tau and shows only inside the window.
+        window_origin = finite_float(params.get("source_offset", 0.0), f"shot clip {clip.get('id', '?')} source_offset")
+        if window_origin < 0.0:
+            raise ShotExpansionError(f"shot clip {clip.get('id', '?')} source_offset must not be negative")
         for child_clip in child_clips:
             if not isinstance(child_clip, Mapping):
                 raise ShotExpansionError(f"sub-clip inside sub-timeline {child_ref} must be an object")
@@ -174,7 +179,7 @@ def expand_shot_clips(
             if child_hold <= 0.0:
                 raise ShotExpansionError(f"Sub-clip {child_id} must have a positive duration")
 
-            raw_at = parent_at + child_at
+            raw_at = parent_at - window_origin + child_at
             raw_end = raw_at + child_hold / speed
             visible_at = max(raw_at, parent_at)
             visible_end = min(raw_end, parent_end)

@@ -56,6 +56,7 @@ TimelineInitArgs = TypedDict('TimelineInitArgs', {'name': str, 'slug': str, 'out
 WordAnchor = TypedDict('WordAnchor', {'source': str, 'document': 'WordAnchorDocument', 'word_ids': list[str], 'edge': NotRequired[Literal['start', 'end']], 'offset_s': NotRequired[float], 'offset_frames': NotRequired[int]})
 ClipAnchorArgs = TypedDict('ClipAnchorArgs', {'field': Literal['on', 'until'], 'declaration': Union[str, None], 'choice': Union[None, 'WordAnchor']})
 OccurrenceCreateArgs = TypedDict('OccurrenceCreateArgs', {'occurrence_id': str, 'shot_id': str, 'name': str, 'track': str, 'on': float, 'duration': float})
+OccurrenceTrimArgs = TypedDict('OccurrenceTrimArgs', {'occurrence_id': str, 'edge': Literal['start', 'end'], 'to_ms': int})
 TextBindingSetArgs = Union[Any, Any]
 DocPatchChange = Union['DocPatchChangeVariant1', 'DocPatchChangeVariant2', 'DocPatchChangeVariant3', 'DocPatchChangeVariant4', 'DocPatchChangeVariant5']
 DocPatchArgs = TypedDict('DocPatchArgs', {'changes': list['DocPatchChange']})
