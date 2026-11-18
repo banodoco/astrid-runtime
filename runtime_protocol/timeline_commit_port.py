@@ -964,7 +964,7 @@ class MediaReads:
             raise ConflictError("selected output historical attempt identity changed")
         return association, variant
 
-    def _selected_project_media(self, project_id, selection):
+    def _selected_project_media(self, project_id, selection, *, retained=False):
         """Reconstruct one record from managed authority; caller owns the mutex.
 
         This is also called within acceptance's BEGIN IMMEDIATE, never through
@@ -1068,17 +1068,19 @@ class MediaReads:
                 "variant_type": row["variant_type"], "entry": entry})
         except (ValueError, TypeError, OverflowError) as exc:
             raise ValidationError("invalid selected media metadata") from exc
-        # A pin taken before this change digested the whole record; it still vouches for the same bytes.
-        if "catalog_digest" in selection and selection["catalog_digest"] not in (record["catalog_digest"], legacy_digest):
+        # `retained` is only Service._verify_legacy_media_selections reading stored history: pins recorded before
+        # the digest covered identity alone hold the whole-record digest and must keep verifying there.
+        accepted = (record["catalog_digest"], legacy_digest) if retained else (record["catalog_digest"],)
+        if "catalog_digest" in selection and selection["catalog_digest"] not in accepted:
             raise ConflictError("selected media catalog digest changed")
         return record
 
-    def selected(self, project_id, selection):
+    def selected(self, project_id, selection, *, retained=False):
         from .timeline_commit_validation import validate_commit_value
         validate_commit_value(selection, "MediaSelection")
         if not isinstance(selection, dict) or set(selection) != {"asset", "generation_id", "variant_id", "object_id", "catalog_digest"}:
             raise ValidationError("selected media requires all five exact identity fields")
-        record = self._selected_project_media(project_id, selection)
+        record = self._selected_project_media(project_id, selection, retained=retained)
         return {"selection": {key: record[key] for key in selection},
                 **{key: record["entry"][key] for key in ("media_type", "size", "duration_seconds", "width", "height") if key in record["entry"]}}
 

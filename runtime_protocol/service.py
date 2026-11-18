@@ -3079,7 +3079,7 @@ class RuntimeService:
             if isinstance(value, dict):
                 if set(value) == {"asset", "generation_id", "variant_id", "object_id", "catalog_digest"}:
                     try:
-                        MediaReads(self).selected(document["project_id"], value)
+                        MediaReads(self).selected(document["project_id"], value, retained=True)
                     except (ConflictError, ValidationError, NotFoundError) as exc:
                         raise ConflictError("Timeline is read-only because a retained media selection changed. Inspect/export the original or restore the matching backup.",
                             details={"reason": "history_unavailable", "integrity_reason": "retained_media_selection_changed", "input": value}) from exc
