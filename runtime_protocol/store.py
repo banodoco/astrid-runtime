@@ -832,21 +832,6 @@ def realm_admission_fence(root, *, blocking=True):
             os.close(descriptor)
 
 
-def _write_recorder(writes):
-    """An authorizer that records which tables a write transaction changes."""
-    kinds = {sqlite3.SQLITE_INSERT: "insert", sqlite3.SQLITE_UPDATE: "update", sqlite3.SQLITE_DELETE: "delete"}
-    quiet = {sqlite3.SQLITE_READ, sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION,
-             sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT, sqlite3.SQLITE_RECURSIVE}
-
-    def record(action, first, second, database, source):
-        if action in kinds:
-            writes[kinds[action]].add(first)
-        elif action not in quiet and not (action == sqlite3.SQLITE_PRAGMA and second is None):
-            writes["other"] = True
-        return sqlite3.SQLITE_OK
-    return record
-
-
 class RealmStore:
     """The sole durable writer for one realm.
 
@@ -1238,11 +1223,6 @@ class RealmStore:
             return
         self.conn.execute("BEGIN IMMEDIATE")
         self._idempotency_prune_pending = {}
-        after_commit = getattr(self, "_after_commit", None)
-        writes = None
-        if after_commit is not None:
-            writes = {"insert": set(), "update": set(), "delete": set(), "other": False}
-            self.conn.set_authorizer(_write_recorder(writes))
         try:
             yield
             self.conn.commit()
@@ -1253,12 +1233,10 @@ class RealmStore:
             if self._idempotency_prune_pending:
                 self._idempotency_prune_clocks.update(self._idempotency_prune_pending)
                 self._last_idempotency_prune = max(self._idempotency_prune_pending.values())
+            after_commit = getattr(self, "_after_commit", None)
             if after_commit is not None:
-                self.conn.set_authorizer(None)
-                after_commit(writes)
+                after_commit()
         finally:
-            if writes is not None:
-                self.conn.set_authorizer(None)
             self._idempotency_prune_pending = None
 
     def _acquire_owner(self):

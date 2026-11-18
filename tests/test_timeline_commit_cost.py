@@ -68,7 +68,7 @@ class Film:
     def __init__(self, root, fixture):
         self.service = RuntimeService(root)
         self.project, self.timeline = fixture.project_id, fixture.timeline_id
-        self.next, self.before = 0, {"state": "absent"}
+        self.next, self.before, self.revisions = 0, {"state": "absent"}, []
 
         def execute(context, port):
             value = candidate(context, port)
@@ -87,6 +87,7 @@ class Film:
             publisher="commit-cost", invocation_path=route_path(self.project, self.timeline),
             authorize=lambda: None)
         self.next += 1
+        self.revisions.append(result["data"]["accepted_revision_id"])
         self.before = {"state": "present", "value": copy.deepcopy(change["value"])}
         return result
 

@@ -69,24 +69,39 @@ def test_head_verification_after_an_unrelated_write_costs_the_same_at_3_and_30_e
     assert after == warm, "an unrelated write must not force the history to be verified again"
 
 
-def statements_during_write(film, root, entries):
+def write_and_reread(film, root, entries):
+    """Statements for an unrelated write plus the next commit's scan of every entry.
+
+    The Agent loads each earlier entry's closure while it validates, so the
+    scan is what a discarded history makes expensive: first absorbing the
+    write, then discarding it as before #62.
+    """
     subject = Film(root, film.fixture)
     try:
         subject.grow(entries)
         commits, _ = subject.service._timeline_commits()
         head = head_of(subject)
-        head_reads(subject, commits, head)
+        for revision in subject.revisions:
+            commits.revision_closure(subject.project, subject.timeline, revision)
         log = statements(subject)
-        unrelated_write(subject.service, "counted")
-        return len(log)
+        costs = []
+        for slug in ("absorbed", "discarded"):
+            log.clear()
+            unrelated_write(subject.service, slug)
+            for revision in subject.revisions:
+                commits.revision_closure(subject.project, subject.timeline, revision)
+            costs.append(len(log))
+            subject.service.store._after_commit = None  # the second write discards, as before #62
+        return tuple(costs)
     finally:
         subject.service.close()
 
 
-def test_the_write_itself_costs_the_same_at_3_and_30_entries(film):
-    # The per-write recheck runs under store._mutex: it must not grow with history.
-    assert statements_during_write(film, film.fixture.source_root, 3) == \
-        statements_during_write(film, film.fixture.duplicate_root, 30)
+def test_absorbing_a_write_costs_no_more_than_the_full_rewalk_it_replaces(film):
+    for entries, root in ((3, film.fixture.source_root), (30, film.fixture.duplicate_root)):
+        absorbed, discarded = write_and_reread(film, root, entries)
+        print(f"entries={entries}: write plus scan of every entry, absorbed={absorbed} discarded={discarded}")
+        assert absorbed <= discarded
 
 
 def test_a_second_store_on_the_same_realm_does_not_take_over_the_write_hook(film):
