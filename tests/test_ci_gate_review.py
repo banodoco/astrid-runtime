@@ -153,6 +153,75 @@ def test_skip_binding_added_with_its_marker_cannot_approve_itself(tmp_path, monk
         registry_checks.test_skip_bindings_match_explicit_platform_lane_uses()
 
 
+def test_parameter_specific_skip_cannot_extend_to_a_second_case(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    filename = "tests/test_runtime_pack_admissions.py"
+    source = (REPO / filename).read_text(encoding="utf-8")
+    original_condition = (
+        'pytest.param(kind, marks=requires_case_sensitive_filesystem) '
+        'if kind == "folder_identities_collide" else kind'
+    )
+    assert source.count(original_condition) == 1
+    bindings = {
+        name: [node for node in nodes if node.startswith(filename + "::")]
+        for name, nodes in json.loads((REPO / "tests/skip-bindings.json").read_text()).items()
+    }
+    binding_file = repo / "tests/skip-bindings.json"
+    binding_file.write_text(json.dumps(bindings))
+    binding_bytes = binding_file.read_bytes()
+    (repo / filename).write_text(source)
+    git(repo, "init", "-q")
+    base = commit(repo, "reviewed initial parameter binding")
+    git(repo, "update-ref", "refs/remotes/origin/probe-base", base)
+    (repo / "candidate").write_text("candidate with unchanged tests and binding table\n")
+    commit(repo, "candidate")
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_BASE_REF", "probe-base")
+    monkeypatch.setattr(registry_checks, "REPO", repo)
+    monkeypatch.setattr(registry_checks, "TESTS", repo / "tests")
+    monkeypatch.setattr(registry_checks.lanes, "DECLARED_SKIP_NODES", {k: tuple(v) for k, v in bindings.items()})
+
+    # The real inventory/equality/history gate accepts the original source.
+    registry_checks.test_skip_bindings_match_explicit_platform_lane_uses()
+    (repo / filename).write_text(source.replace(
+        original_condition, original_condition.replace(
+            'kind == "folder_identities_collide"',
+            'kind in {"folder_identities_collide", "metadata_ambiguous_json"}',
+        ),
+    ))
+    assert binding_file.read_bytes() == binding_bytes
+    # Extending only the parameter mark must not inherit the sibling's grant.
+    with pytest.raises(AssertionError):
+        registry_checks.test_skip_bindings_match_explicit_platform_lane_uses()
+    assert {use.test for use in registry_checks._uses()["case-sensitive-filesystem"]} == {
+        "test_installed_reader_refusal_kind[folder_identities_collide]",
+        "test_installed_reader_refusal_kind[metadata_ambiguous_json]",
+    }
+
+
+def test_skip_lookup_preserves_parameter_and_whole_function_scopes():
+    lanes = registry_checks.lanes
+    function = "tests/test_runtime_pack_admissions.py::test_installed_reader_refusal_kind"
+    assert lanes.is_declared_skip(function + "[folder_identities_collide]", "case-sensitive-filesystem")
+    assert not lanes.is_declared_skip(function + "[metadata_ambiguous_json]", "case-sensitive-filesystem")
+    assert not lanes.is_declared_skip(function, "case-sensitive-filesystem")
+    file, test = function.split("::")
+    collision = registry_checks.Use(
+        Path(file).name, test + "[folder_identities_collide]", frozenset(), frozenset({"linux"}),
+    )
+    assert registry_checks._path_selects(function, collision)
+    assert registry_checks._path_selects(function + "[folder_identities_collide]", collision)
+    assert not registry_checks._path_selects(function + "[metadata_ambiguous_json]", collision)
+    whole_function = registry_checks.Use(Path(file).name, test, frozenset(), frozenset({"linux"}))
+    assert registry_checks._path_selects(function + "[metadata_ambiguous_json]", whole_function)
+    for name, nodes in lanes.DECLARED_SKIP_NODES.items():
+        for node in nodes:
+            if "[" not in node:
+                assert lanes.is_declared_skip(node, name)
+                assert lanes.is_declared_skip(node + "[parameter]", name)
+
+
 def test_push_reference_uses_the_pushed_branch_history(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

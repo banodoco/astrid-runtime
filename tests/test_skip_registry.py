@@ -363,6 +363,80 @@ class Use:
     classes: frozenset[str] = frozenset()  # enclosing class names
 
 
+@dataclass
+class _Parameter:
+    value: object
+    marks: frozenset[str] = frozenset()
+    id: str | None = None
+
+
+def _parameter_marks(decorator: ast.Call, assignments: dict[str, ast.AST]) -> list[tuple[str, frozenset[str]]]:
+    """Resolve parameter marks without importing or executing the test module.
+
+    The current parameter-specific declaration uses one string argument and a
+    conditional comprehension over dictionary keys. Unsupported expressions or
+    ambiguous IDs fail inventory, never become a whole-function allowance.
+    """
+    def value(node: ast.AST, scope: dict):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            return scope[node.id] if node.id in scope else value(assignments[node.id], scope)
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return [value(element, scope) for element in node.elts]
+        if isinstance(node, ast.Dict):
+            # Only keys participate in parameter iteration; values may name
+            # product exception classes and must not be imported or executed.
+            return {value(key, scope): None for key in node.keys}
+        if isinstance(node, ast.IfExp):
+            return value(node.body if value(node.test, scope) else node.orelse, scope)
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            left, right = value(node.left, scope), value(node.comparators[0], scope)
+            if isinstance(node.ops[0], ast.Eq):
+                return left == right
+            if isinstance(node.ops[0], ast.In):
+                return left in right
+        if isinstance(node, ast.ListComp) and len(node.generators) == 1:
+            generator = node.generators[0]
+            if isinstance(generator.target, ast.Name) and not generator.is_async:
+                result = []
+                for item in value(generator.iter, scope):
+                    nested = {**scope, generator.target.id: item}
+                    if all(value(condition, nested) for condition in generator.ifs):
+                        result.append(value(node.elt, nested))
+                return result
+        if isinstance(node, ast.Call) and len(node.args) == 1:
+            if isinstance(node.func, ast.Name) and node.func.id == "sorted" and not node.keywords:
+                return sorted(value(node.args[0], scope))
+            if (isinstance(node.func, ast.Attribute) and node.func.attr == "param"
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "pytest"):
+                fields = {field.arg: field.value for field in node.keywords}
+                if set(fields) <= {"marks", "id"}:
+                    return _Parameter(
+                        value(node.args[0], scope),
+                        frozenset(_mark_names(fields["marks"])) if "marks" in fields else frozenset(),
+                        value(fields["id"], scope) if "id" in fields else None,
+                    )
+        raise AssertionError(f"cannot statically resolve parameter-specific skip: {ast.unparse(node)}")
+
+    argument = ast.literal_eval(decorator.args[0])
+    assert isinstance(argument, str) and len(argument.split(",")) == 1, "parameter-specific skips require one statically identified argument"
+    parameters = value(decorator.args[1], {})
+    ids_node = next((field.value for field in decorator.keywords if field.arg == "ids"), None)
+    ids = value(ids_node, {}) if ids_node is not None else [None] * len(parameters)
+    assert len(ids) == len(parameters), "parameter-specific skip IDs must match the parameter table"
+    result = []
+    for parameter, explicit_id in zip(parameters, ids, strict=True):
+        parameter = parameter if isinstance(parameter, _Parameter) else _Parameter(parameter)
+        case_id = parameter.id if parameter.id is not None else explicit_id
+        if case_id is None:
+            case_id = parameter.value
+        assert isinstance(case_id, str) and case_id.isascii(), "parameter-specific skips require statically resolvable ASCII string IDs"
+        result.append((case_id, parameter.marks))
+    assert len({case_id for case_id, _ in result}) == len(result), "parameter-specific skip IDs must be unambiguous"
+    return result
+
+
 def _mark_names(node: ast.AST) -> set[str]:
     """Names of every ``pytest.mark.X`` and every bare name inside a decorator / pytestmark expression."""
     names = set()
@@ -384,12 +458,16 @@ def _entry_for_mark_variable() -> dict[str, DeclaredSkip]:
 
 
 def _uses() -> dict[str, list[Use]]:
-    """For each entry name, every test function that the entry guards."""
+    """For each entry, its function-wide or exact parameter-specific uses."""
     by_variable = _entry_for_mark_variable()
     uses: dict[str, list[Use]] = {name: [] for name in SKIP_REGISTRY}
     for path in sorted(TESTS.glob("test_*.py")):
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source)
+        assignments = {
+            target.id: node.value for node in tree.body if isinstance(node, ast.Assign)
+            for target in node.targets if isinstance(target, ast.Name)
+        }
         variables = dict(by_variable)
         module_marks: set[str] = set()
         for node in tree.body:
@@ -409,7 +487,9 @@ def _uses() -> dict[str, list[Use]]:
                 if isinstance(node, ast.ClassDef):
                     visit(node.body, inherited | {n for d in node.decorator_list for n in _mark_names(d)}, classes | {node.name})
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-                    marks = inherited | {n for d in node.decorator_list for n in _mark_names(d)}
+                    parameters = [d for d in node.decorator_list if isinstance(d, ast.Call)
+                                  and isinstance(d.func, ast.Attribute) and d.func.attr == "parametrize"]
+                    marks = inherited | {n for d in node.decorator_list if d not in parameters for n in _mark_names(d)}
                     entries = {variables[n].name for n in marks if n in variables}
                     if "darwin_native" in marks:
                         entries.add("darwin-native")
@@ -430,6 +510,20 @@ def _uses() -> dict[str, list[Use]]:
                         hosts &= SKIP_REGISTRY[name].runs_on()
                     for name in entries:
                         uses[name].append(Use(path.name, node.name, frozenset(marks & LANE_NAMES), hosts, classes))
+                    marked_parameters = [d for d in parameters if _mark_names(d) & variables.keys()]
+                    if marked_parameters:
+                        assert len(parameters) == 1, "parameter-specific skip inventory requires one resolved parameter dimension"
+                    for decorator in marked_parameters:
+                        for case_id, parameter_marks in _parameter_marks(decorator, assignments):
+                            parameter_entries = {variables[n].name for n in parameter_marks if n in variables}
+                            parameter_hosts = hosts
+                            for name in parameter_entries:
+                                parameter_hosts &= SKIP_REGISTRY[name].runs_on()
+                            for name in parameter_entries - entries:
+                                uses[name].append(Use(
+                                    path.name, f"{node.name}[{case_id}]",
+                                    frozenset((marks | parameter_marks) & LANE_NAMES), parameter_hosts, classes,
+                                ))
 
         visit(tree.body, module_marks)
     return uses
@@ -452,9 +546,12 @@ def _path_selects(selector: str, use: Use) -> bool:
     filename, *node = selector.split("::")
     path, test_file = (REPO / filename).resolve(), (TESTS / use.file).resolve()
     if node:
-        selected = [part.split("[", 1)[0] for part in node]
         actual = [*sorted(use.classes), use.test]
-        return path == test_file and actual[:len(selected)] == selected
+        return path == test_file and len(node) <= len(actual) and all(
+            selected == present if "[" in selected and "[" in present
+            else selected.split("[", 1)[0] == present.split("[", 1)[0]
+            for selected, present in zip(node, actual)
+        )
     return path == test_file or path in test_file.parents
 
 

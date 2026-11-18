@@ -108,8 +108,8 @@ class DeclaredSkip:
 SKIP_REGISTRY: dict[str, DeclaredSkip] = {}
 # The authorized users of each platform declaration are explicit. Reading the
 # decorators from today's tests would let a copied marker authorize itself.
-# Parameterized instances inherit their function's platform requirement;
-# quarantine xfails, by contrast, are bound to complete parameterized IDs.
+# Whole-function requirements cover their parameterized instances. A mark on
+# one parameter instead requires that complete node ID in the binding table.
 DECLARED_SKIP_NODES: dict[str, tuple[str, ...]] = {
     name: tuple(nodes)
     for name, nodes in json.loads(Path(__file__).with_name("skip-bindings.json").read_text()).items()
@@ -117,7 +117,8 @@ DECLARED_SKIP_NODES: dict[str, tuple[str, ...]] = {
 
 
 def is_declared_skip(nodeid: str, name: str) -> bool:
-    return nodeid.split("[", 1)[0] in DECLARED_SKIP_NODES.get(name, ())
+    allowed = DECLARED_SKIP_NODES.get(name, ())
+    return nodeid in allowed or nodeid.split("[", 1)[0] in allowed
 
 NO_WINDOWS_CI = (
     "The Windows unit/portability matrix and worker-handoff job were removed in aa6c5b0; "

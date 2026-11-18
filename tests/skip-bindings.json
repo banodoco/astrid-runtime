@@ -1,6 +1,6 @@
 {
   "case-sensitive-filesystem": [
-    "tests/test_runtime_pack_admissions.py::test_installed_reader_refusal_kind"
+    "tests/test_runtime_pack_admissions.py::test_installed_reader_refusal_kind[folder_identities_collide]"
   ],
   "darwin-native": [
     "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_accepts_system_temp_alias",
