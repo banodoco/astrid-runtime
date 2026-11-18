@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, is_dataclass
 import json
+import logging
 import os
+import sys
 import contextlib
 import threading
 import time
@@ -453,6 +455,9 @@ def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: 
         with RotatingLog(log_path) as log:
             platform.owner_only(log_path)
             with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                # Bound to the redirected stderr, so runtime.log lines carry a time.
+                logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True,
+                                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
                 try:
                     with cancellation.startup_scope(stopped):
                         result = bootstrap(paths, boundary, config)
