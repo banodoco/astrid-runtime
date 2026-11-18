@@ -85,6 +85,20 @@ class ProtocolError(RuntimeErrorBase):
     status = 400
 
 
+class HeadBusyError(ProtocolError):
+    """Inputs moved while a request verified them. Nothing was accepted; retry.
+
+    Answered as the contract's ``head_busy`` refusal (409, ``details.status``
+    ``refused``), which clients retry, not as a permanent 400.
+    """
+    code = "conflict"
+    status = 409
+
+    def __init__(self, message: str):
+        super().__init__(message, details={"status": "refused", "reason": "head_busy",
+                                           "base": None, "current": None, "conflicts": []})
+
+
 class BodyTooLargeError(ProtocolError):
     """A request body over its byte limit; the browser door answers it as 413."""
 

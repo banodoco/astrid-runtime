@@ -33,11 +33,14 @@ const deleted: ClipDeleteArgs = {};
 const params: ClipSetParamsArgs = { values: { "literal.key": null, seed: 2 }, clear: [], schema_source: source };
 const clearedParams: ClipSetParamsArgs = { values: {}, clear: ["seed"], schema_source: source };
 const scalar: ClipSetArgs = { values: { hold: 1.5 }, clear: ["asset", "transition"] };
+const appearance: ClipSetArgs = { values: { fit: "cover", x: -224, y: 0, width: 1280, height: 720, cropLeft: 0.1, opacity: 0.9 }, clear: [] };
 const cleared: ClipSetArgs = { values: {}, clear: ["hold"] };
+const clearedAppearance: ClipSetArgs = { values: {}, clear: ["fit", "cropLeft", "opacity"] };
 const trim: ClipTrimArgs = { in_s: null, out_s: 2.5 };
 const split: ClipSplitArgs = { on: 2.5, right_id: "right" };
 const track: TrackCreateArgs = { row: { id: "v", kind: "video", label: "Picture", future: null } };
 const label: TrackSetArgs = { values: { label: "" }, clear: [] };
+const trackAppearance: TrackSetArgs = { values: { fit: "manual", scale: 1.2, opacity: 0.5, blendMode: "screen" }, clear: [] };
 const inverse: InverseArgs = { publications: ["receipt"] };
 const restore: RestoreArgs = { revision_id: "r", content_digest: source.content_digest };
 const object: VerifiedDocumentObject = { object_id: media.object_id, digest: media.object_id, size: 2, media_type: "application/json", bytes_base64: "e30=" };
@@ -54,6 +57,12 @@ const wrongHold: ClipAddArgs = { row: { ...added.row, hold: true } };
 const extraDelete: ClipDeleteArgs = { ignored: true };
 // @ts-expect-error Scalar clear must name a supported field.
 const wrongClear: ClipSetArgs = { values: {}, clear: ["registry"] };
+// @ts-expect-error Clip fit is authored as contain or cover only.
+const wrongClipFit: ClipSetArgs = { values: { fit: "manual" }, clear: [] };
+// @ts-expect-error Track fit must use the canonical fit enum.
+const wrongTrackFit: TrackSetArgs = { values: { fit: "stretch" }, clear: [] };
+// @ts-expect-error Unknown crop keys remain closed.
+const wrongCrop: ClipSetArgs = { values: { crop: 0.2 }, clear: [] };
 // @ts-expect-error Unknown outer operation arguments are closed.
 const extraSplit: ClipSplitArgs = { on: 2, right_id: "right", extra: true };
 // @ts-expect-error Native type keeps the immutable old media pin.
