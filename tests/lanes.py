@@ -1,7 +1,7 @@
 """Test lanes (testing plan R-2).
 
-Lanes. The default run deselects tests marked ``integration``, ``darwin_native`` or
-``live`` (see ``addopts`` in pyproject.toml). ``integration`` runs in the nightly
+Lanes. CI's unit command explicitly deselects ``integration``, ``darwin_native`` or
+``live`` with its command-line -m; configuration cannot select tests. ``integration`` runs in the nightly
 job (and in the ``-m ""`` portability jobs), ``darwin_native`` in the ``darwin-native``
 job; no test is marked ``live`` yet. A ``darwin_native`` test is skipped off macOS.
 

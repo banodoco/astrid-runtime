@@ -43,6 +43,7 @@ if [ -n "$results_dir" ]; then
 fi
 
 python3 - "$root" "$agent_checkout" "$results_dir" "$@" <<'PY'
+import os
 import subprocess
 import sys
 
@@ -59,6 +60,14 @@ if agent_checkout:
     ))
 if results_dir:
     cmd.extend(("--mount", f"type=bind,source={results_dir},target=/test-results"))
+# Carry only comparison metadata, never the job token, into the sandbox.
+# The push event's immutable before SHA must not become the local plan fallback.
+for name in ("GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_REF"):
+    if name in os.environ:
+        cmd.extend(("-e", f"{name}={os.environ[name]}"))
+if event := os.environ.get("GITHUB_EVENT_PATH"):
+    cmd.extend(("--mount", f"type=bind,source={event},target=/runtime-github-event.json,readonly",
+                "-e", "GITHUB_EVENT_PATH=/runtime-github-event.json"))
 cmd.extend(("python:3.11", "python", "/src/tests/seccomp/container-entrypoint.py", *pytest_args))
 raise SystemExit(subprocess.run(cmd, check=False).returncode)
 PY

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
+import re
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
@@ -83,19 +85,86 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def reference_commit(repo: Path, base: str | None = None) -> str:
-    """Use the PR merge base; post-merge jobs compare their first parent.
+    """Use the PR target or the actual push's immutable previous tip.
 
-    CI supplies the target via GITHUB_BASE_REF. The plan branch is the local
-    fallback, not a candidate-maintained copy of the quarantine table.
+    A multi-commit push must compare with event.before, not its last commit's
+    parent or an unrelated plan branch. Missing push history fails closed.
     """
-    target = base or ("origin/" + os.environ["GITHUB_BASE_REF"] if os.environ.get("GITHUB_BASE_REF") else "origin/release/14/plan-39")
+    push = not base and os.environ.get("GITHUB_EVENT_NAME") == "push"
+    if base:
+        target = base
+    elif push:
+        try:
+            event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+            target = event["before"]
+            branch = event["ref"]
+        except (OSError, KeyError, ValueError) as exc:
+            raise ValueError("push merge base unavailable: immutable event.before and pushed ref are required") from exc
+        if not isinstance(target, str) or not re.fullmatch(r"[0-9a-f]{40}", target) or target == "0" * 40:
+            raise ValueError("push merge base unavailable: event.before must be a nonzero commit SHA")
+        if not isinstance(branch, str) or not branch.startswith("refs/heads/") or branch != os.environ.get("GITHUB_REF"):
+            raise ValueError("push merge base unavailable: event.ref does not match the pushed branch")
+    elif os.environ.get("GITHUB_BASE_REF"):
+        target = "origin/" + os.environ["GITHUB_BASE_REF"]
+    elif os.environ.get("GITHUB_REF", "").startswith("refs/heads/"):
+        target = "origin/" + os.environ["GITHUB_REF"].removeprefix("refs/heads/")
+    else:
+        target = "origin/release/14/plan-39"
     try:
         reference = _git(repo, "merge-base", "HEAD", target)
         if reference == _git(repo, "rev-parse", "HEAD"):
+            if push:
+                raise ValueError("push comparison does not precede the candidate")
             reference = _git(repo, "rev-parse", "HEAD^1")
         return reference
     except subprocess.CalledProcessError as exc:
         raise ValueError(f"quarantine merge base unavailable; fetch {target} and its history") from exc
+
+
+def _binding_pairs(value: dict) -> set[tuple[str, str]]:
+    if not isinstance(value, dict):
+        raise ValueError("skip bindings must be a dictionary")
+    pairs = set()
+    for name, nodes in value.items():
+        if not isinstance(name, str) or not isinstance(nodes, (list, tuple)) or any(not isinstance(node, str) for node in nodes):
+            raise ValueError("skip bindings must map declaration names to explicit node lists")
+        if len(nodes) != len(set(nodes)):
+            raise ValueError(f"duplicate skip binding in {name}")
+        pairs.update((name, node) for node in nodes)
+    return pairs
+
+
+def compare_skip_bindings(current: dict, reference: dict) -> list[str]:
+    additions = _binding_pairs(current) - _binding_pairs(reference)
+    errors = [f"new skip binding absent from merge base: {name}: {node}" for name, node in sorted(additions)]
+    errors.extend(f"new skip binding declaration absent from merge base: {name}" for name in sorted(current.keys() - reference.keys()))
+    return errors
+
+
+def _read_bindings(source: str) -> dict:
+    def unique(pairs):
+        result = {}
+        for name, value in pairs:
+            if name in result:
+                raise ValueError(f"duplicate skip binding declaration: {name}")
+            result[name] = value
+        return result
+    value = json.loads(source, object_pairs_hook=unique)
+    _binding_pairs(value)
+    return value
+
+
+def merge_base_skip_binding_errors(repo: Path, *, base: str | None = None, current: dict | None = None) -> list[str]:
+    try:
+        reference = reference_commit(repo, base)
+        before = _read_bindings(_git(repo, "show", f"{reference}:tests/skip-bindings.json"))
+        candidate = _read_bindings((repo / "tests/skip-bindings.json").read_text(encoding="utf-8"))
+        errors = compare_skip_bindings(candidate, before)
+        if current is not None:
+            errors.extend(compare_skip_bindings(current, before))
+        return errors
+    except (OSError, ValueError, TypeError, KeyError, subprocess.CalledProcessError) as exc:
+        return [f"skip binding reference check failed (a missing base registry requires Lead bootstrap): {exc}"]
 
 
 def merge_base_errors(repo: Path, *, base: str | None = None, current: dict | None = None) -> list[str]:

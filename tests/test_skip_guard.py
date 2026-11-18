@@ -33,7 +33,7 @@ def sandbox(pytester):
         }}}}
         """
     )
-    pytester.makeini("[pytest]\npython_files = check_*.py\n")
+    (pytester.path / "pyproject.toml").write_text('[tool.pytest.ini_options]\npython_files = ["check_*.py"]\n')
     return pytester
 
 

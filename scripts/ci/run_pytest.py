@@ -59,7 +59,8 @@ def main(argv=None) -> int:
     directory = options.directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     manifest = directory / "collection.json"
-    selection = [sys.executable, "-m", "pytest", f"--collection-manifest={manifest}"]
+    entrypoint = Path(__file__).with_name("pytest_entrypoint.py").resolve()
+    selection = [sys.executable, "-I", "-u", str(entrypoint), f"--collection-manifest={manifest}"]
     status = logged_run([*selection, "--collect-only", *collection_args(args)], directory / "collection.log")
     if status:
         return status

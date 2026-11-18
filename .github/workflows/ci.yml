@@ -60,7 +60,7 @@ jobs:
         run: python -m pytest -q -rP -m "" tests/test_windows_runtime_launch.py
       - name: Verify native realm creation, ownership, and rollback
         run: >-
-          python -m pytest -q
+          python -m pytest -q -m "not integration and not darwin_native and not live"
           tests/test_realm_creation_publication.py
           tests/test_realm_replacement_publication.py
           tests/test_platform_windows.py::test_windows_directory_mutex_uses_global_user_scoped_identity
@@ -73,7 +73,7 @@ jobs:
           tests/test_service_stop.py
       - name: Verify Runtime service cleanup receipt contract
         run: >-
-          python -m pytest -q
+          python -m pytest -q -m "not integration and not darwin_native and not live"
           tests/test_profile_services.py::test_supervisor_marks_runtime_owned_service_name_after_configured_env
           tests/test_profile_services.py::test_pack_host_cleanup_receipts_are_bounded_owner_only_and_preserved
           tests/test_profile_services.py::test_service_cleanup_receipt_history_keeps_latest_64_attempts
@@ -162,7 +162,7 @@ jobs:
       - run: python -m pip install -e "$ASTRID_CHECKOUT"
       - name: Run unit tests
         shell: bash
-        run: python scripts/ci/run_pytest.py "$TEST_RESULTS_DIR" unit -- -q -n 2
+        run: python scripts/ci/run_pytest.py "$TEST_RESULTS_DIR" unit -- -q -n 2 -m "not integration and not darwin_native and not live"
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
       - name: Verify stored per-test results

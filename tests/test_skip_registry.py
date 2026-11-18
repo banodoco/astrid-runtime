@@ -230,7 +230,7 @@ class Job:
 def _default_marker_expression() -> str:
     addopts = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["pytest"]["ini_options"]["addopts"]
     tokens = shlex.split(addopts)
-    return tokens[tokens.index("-m") + 1]
+    return tokens[tokens.index("-m") + 1] if "-m" in tokens else ""
 
 
 def _os_key(runner: str) -> str:
@@ -519,6 +519,9 @@ def test_skip_bindings_match_explicit_platform_lane_uses() -> None:
         for name, uses in _uses().items()
     }
     assert lanes.DECLARED_SKIP_NODES == expected
+    from tests.quarantine_policy import merge_base_skip_binding_errors
+
+    assert not (errors := merge_base_skip_binding_errors(REPO, current=lanes.DECLARED_SKIP_NODES)), "\n".join(errors)
 
 
 @pytest.mark.parametrize("alias", ["import", "assignment"])

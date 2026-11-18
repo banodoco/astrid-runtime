@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from pathlib import Path
 
 import pytest
 from _pytest.mark import KeywordMatcher, MarkMatcher
 from _pytest.mark.expression import Expression
+
+from tests.collection_policy import StaticCensus, configuration_errors, selection
 
 
 def pytest_addoption(parser):
@@ -27,7 +31,26 @@ class CollectionGuard:
     def __init__(self, config):
         self.config = config
         self.collected = {}
+        self.selectors = {}
         self.errors = set()
+        invocation = config.pluginmanager.get_plugin("runtime-declared-invocation")
+        worker = getattr(config, "workerinput", {}).get("runtime_declared_invocation")
+        if invocation is not None:
+            self.args, self.directory = invocation.args, invocation.directory
+        elif worker is not None:
+            self.args, self.directory = tuple(worker["args"]), Path(worker["directory"])
+        else:
+            # Direct CLI pytest remains supported. The recorded runner uses
+            # the frozen object above, never replaceable invocation_params.
+            self.args, self.directory = tuple(sys.argv[1:]), Path.cwd()
+        errors = configuration_errors(Path(config.rootpath), self.args)
+        if errors:
+            raise pytest.UsageError("UNDECLARED CONFIG: " + "; ".join(errors))
+        self.selection = selection(self.args)
+        if (config.option.keyword, config.option.markexpr) != self.selection:
+            raise pytest.UsageError("UNDECLARED DESELECTION: declared command-line -k/-m was rewritten")
+        namespace = config._parser.parse_known_args(list(self.args), namespace=argparse.Namespace())
+        self.static = StaticCensus(Path(config.rootpath), self.directory, namespace.file_or_dir)
         for option in ("deselect", "ignore", "ignore_glob"):
             if config.getoption(option, default=None):
                 raise pytest.UsageError(f"UNDECLARED DESELECTION: --{option.replace('_', '-')} is not a declared lane")
@@ -44,6 +67,12 @@ class CollectionGuard:
 
     def pytest_itemcollected(self, item):
         self.collected[item.nodeid] = item
+        self.static.record(item)
+        self.selectors[item.nodeid] = (KeywordMatcher.from_item(item), MarkMatcher.from_markers(item.iter_markers()))
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_configure_node(self, node):
+        node.workerinput["runtime_declared_invocation"] = {"args": list(self.args), "directory": str(self.directory)}
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_collection_modifyitems(self, session, config, items):
@@ -51,15 +80,18 @@ class CollectionGuard:
         # the permitted -m/-k selection from those items catches a conftest
         # that silently removes an item, including a tryfirst hook.
         expected = list(self.collected.values())
-        if config.option.markexpr:
-            expression = Expression.compile(config.option.markexpr)
-            expected = [item for item in expected if expression.evaluate(MarkMatcher.from_markers(item.iter_markers()))]
-        if config.option.keyword:
-            expression = Expression.compile(config.option.keyword.lstrip())
-            expected = [item for item in expected if expression.evaluate(KeywordMatcher.from_item(item))]
+        keyword, markexpr = self.selection
+        if markexpr:
+            expression = Expression.compile(markexpr)
+            expected = [item for item in expected if expression.evaluate(self.selectors[item.nodeid][1])]
+        if keyword:
+            expression = Expression.compile(keyword.lstrip())
+            expected = [item for item in expected if expression.evaluate(self.selectors[item.nodeid][0])]
         expected_ids = {item.nodeid for item in expected}
         result = yield
         actual_ids = {item.nodeid for item in items}
+        if (config.option.keyword, config.option.markexpr) != self.selection:
+            self._reject("UNDECLARED DESELECTION: declared command-line -k/-m was rewritten")
         if actual_ids != expected_ids:
             self._reject(
                 "UNDECLARED DESELECTION: collection hooks changed the declared selection; "
@@ -83,13 +115,19 @@ class CollectionGuard:
         actual = sorted(nodeids)
         if self.config.option.collectonly:
             manifest.parent.mkdir(parents=True, exist_ok=True)
-            manifest.write_text(json.dumps({"nodeids": actual}, indent=2) + "\n", encoding="utf-8")
+            manifest.write_text(json.dumps({
+                "nodeids": actual, "selection": list(self.selection),
+                "static_definitions": len(self.static.expected),
+            }, indent=2) + "\n", encoding="utf-8")
             return
         try:
-            expected = json.loads(manifest.read_text(encoding="utf-8"))["nodeids"]
+            reference = json.loads(manifest.read_text(encoding="utf-8"))
+            expected = reference["nodeids"]
         except (OSError, ValueError, KeyError) as exc:
             self._reject(f"collection manifest unavailable: {manifest}: {exc}")
             return
+        if reference.get("selection") != list(self.selection):
+            self._reject("UNDECLARED DESELECTION: command-line -k/-m differs from independent inventory")
         if not expected or actual != sorted(expected):
             self._reject(
                 "UNDECLARED DESELECTION: execution differs from independent --collect-only inventory; "
@@ -102,6 +140,8 @@ class CollectionGuard:
         # the same manifest; the controller independently checks its IDs too.
         controller = bool(getattr(session.config.option, "numprocesses", 0)) and not hasattr(session.config, "workerinput")
         if not controller:
+            if missing := self.static.missing():
+                self._reject(f"UNDECLARED DESELECTION: static test census has missing definitions: {missing}")
             self._check_manifest([item.nodeid for item in session.items])
 
     @pytest.hookimpl(optionalhook=True)
