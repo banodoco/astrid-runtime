@@ -1058,10 +1058,18 @@ class MediaReads:
             self.service._verify_child_object_bytes(
                 row["object_digest"], row["size"], label="selected media CAS object",
             )
-            record["catalog_digest"] = digest(record)
+            # The pin protects what a command depends on: the object's identity and bytes, its
+            # generation/variant and its media facts. Mutable lifecycle and authoring metadata
+            # (managed-output lifecycle/durability/provenance/task/attempt, generation and variant
+            # metadata) change after import without changing the selected bytes, so they stay out.
+            legacy_digest = digest(record)
+            record["catalog_digest"] = digest({
+                **{key: record[key] for key in ("realm_id", "project_id", "asset", "generation_id", "variant_id", "object_id")},
+                "variant_type": row["variant_type"], "entry": entry})
         except (ValueError, TypeError, OverflowError) as exc:
             raise ValidationError("invalid selected media metadata") from exc
-        if "catalog_digest" in selection and selection["catalog_digest"] != record["catalog_digest"]:
+        # A pin taken before this change digested the whole record; it still vouches for the same bytes.
+        if "catalog_digest" in selection and selection["catalog_digest"] not in (record["catalog_digest"], legacy_digest):
             raise ConflictError("selected media catalog digest changed")
         return record
 
