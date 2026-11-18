@@ -74,7 +74,7 @@ def test_threaded_http_dispatch_serializes_shared_runtime(daemon, monkeypatch):
     maximum = 0
     guard = threading.Lock()
 
-    def slow_health():
+    def slow_realm(**_):
         nonlocal active, maximum
         with guard:
             active += 1
@@ -82,16 +82,18 @@ def test_threaded_http_dispatch_serializes_shared_runtime(daemon, monkeypatch):
         time.sleep(0.03)
         with guard:
             active -= 1
-        return {"status": "ok"}
+        return {"id": "realm"}
 
-    monkeypatch.setattr(daemon.service, "health", slow_health)
+    # Health is deliberately served outside the store mutex; realm is not.
+    monkeypatch.setattr(daemon.service, "realm_resource", slow_realm)
 
-    def request_health():
-        with urllib.request.urlopen(f"{daemon.endpoint}/v1/health", timeout=2) as response:
+    def request_realm():
+        request = urllib.request.Request(f"{daemon.endpoint}/v1/realm", headers={"Authorization": f"Bearer {daemon.token}"})
+        with urllib.request.urlopen(request, timeout=2) as response:
             assert response.status == 200
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(lambda _: request_health(), range(4)))
+        list(pool.map(lambda _: request_realm(), range(4)))
 
     assert maximum == 1
 

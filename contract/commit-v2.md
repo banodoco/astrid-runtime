@@ -1420,6 +1420,12 @@ is invalid, an intervening change is conflict. Legacy refusal reasons such as
 `details.status: "refused"`, plus the structured code/path/hint/command. Auth and
 availability errors retain existing HTTP semantics and cannot claim acceptance.
 
+`head_busy` means stored inputs moved while the Runtime was verifying the
+request (another writer, or a change to the history it was checking). Nothing
+was accepted. It is the one refusal a client retries: send the same body with
+the same `Idempotency-Key` after a short backoff, and the retry either replays
+the accepted result or verifies against the new state. It is never a 400.
+
 Dry-run extends the existing `port.preview(prepared)` path in Agent
 `commit.py:1061`, not a client-only simulation. Send the same body with
 `dry_run: true` and a separate key. Run the same authorization, base/ancestry,

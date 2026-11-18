@@ -55,7 +55,7 @@ def test_success_and_replay_keep_receipt_and_emit_bounded_stage_timings(realm, c
     coordinator = CommitExecutionCoordinator(commits)
     provider = Provider(lambda _, port: port.accept())
 
-    with caplog.at_level(logging.DEBUG, logger="runtime_protocol.timeline_commit_execution"):
+    with caplog.at_level(logging.INFO, logger="runtime_protocol.timeline_commit_execution"):
         accepted = coordinator.execute(
             ctx, provider, lambda c: Port(commits, c, candidate), authorize=lambda: None,
         )
@@ -90,7 +90,7 @@ def test_timing_is_redacted_and_durable_winner_still_wins(realm, caplog):
         durable.append(port.accept())
         raise RuntimeError("payload-secret-must-not-be-logged")
 
-    with caplog.at_level(logging.DEBUG, logger="runtime_protocol.timeline_commit_execution"):
+    with caplog.at_level(logging.INFO, logger="runtime_protocol.timeline_commit_execution"):
         result = coordinator.execute(
             ctx, Provider(provider_call), lambda c: Port(commits, c, candidate),
             authorize=lambda: None,
@@ -117,7 +117,7 @@ def test_timing_covers_real_port_and_store_acceptance(realm, caplog):
     candidate = prepared(commits, ctx)
     coordinator = CommitExecutionCoordinator(commits)
 
-    with caplog.at_level(logging.DEBUG, logger="runtime_protocol.timeline_commit_execution"):
+    with caplog.at_level(logging.INFO, logger="runtime_protocol.timeline_commit_execution"):
         result = coordinator.execute(
             ctx,
             Provider(lambda _, port: (port.head(), port.accept(candidate))[1]),
