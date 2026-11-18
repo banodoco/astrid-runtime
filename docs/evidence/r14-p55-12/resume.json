@@ -1,0 +1,1046 @@
+{
+  "archive": {
+    "bytes": 5965,
+    "path": "observations-resume.zip",
+    "sha256": "5b313c3f9ad3891a655bbfaa48768722948a0c20f1972176a32eb46759fab222"
+  },
+  "artifacts": [
+    {
+      "bytes": 6208,
+      "name": "runtime-coherent-review.json",
+      "sha256": "33eca1953a2377bb20eb3a1b1204339f1672c547bca71b1f91c8b1df77625a38"
+    },
+    {
+      "bytes": 100,
+      "name": "runtime-stream-coherent.log",
+      "sha256": "df98381c6b529aabf4272091592ed3c05da6181c41aae28067986fab21551328"
+    },
+    {
+      "bytes": 4702,
+      "junit": {
+        "counts": {
+          "error": 0,
+          "failed": 0,
+          "passed": 31,
+          "skipped": 0
+        },
+        "test_ids": [
+          {
+            "id": "tests.test_runtime_object_ranges::test_suffix_oversized_and_explicit_ranges_preserve_get_head_identity",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=-0-GET]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=-0-HEAD]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=--GET]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=--HEAD]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=99--GET]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=99--HEAD]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=0-1,4-5-GET]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=0-1,4-5-HEAD]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[items=0-1-GET]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[items=0-1-HEAD]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=999999999999--GET]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_runtime_object_ranges::test_zero_and_malformed_ranges_are_unsatisfiable[bytes=999999999999--HEAD]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_http_response_lock::test_stalled_response_does_not_block_other_database_route",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_http_response_lock::test_abandoned_response_does_not_attempt_second_response",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_http_response_lock::test_slow_request_body_is_read_before_the_shared_database_lock",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generated_client::test_object_byte_range_etag_and_head_are_preserved",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_streamed_object_installs_independent_verified_file[0]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_streamed_object_installs_independent_verified_file[17]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_streamed_object_installs_independent_verified_file[9437197]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[equal-length]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[missing-marker]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[short]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[extra]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[wrong-length]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[wrong-identity]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_runtime_mutation_while_transmitting_withholds_completion",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_legacy_and_range_delivery_keep_independent_caller_hash[False]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_legacy_and_range_delivery_keep_independent_caller_hash[True]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_sender_does_not_mark_equal_length_corrupted_transmitted_chunks",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_verified_object_transfer::test_large_transfer_reads_bounded_chunks_on_server_and_caller",
+            "status": "passed"
+          }
+        ]
+      },
+      "name": "runtime-stream-coherent.xml",
+      "sha256": "33d60769d3e42a613b88863da29b959b40ef5a8103fa6ad06ade857893099824"
+    },
+    {
+      "bytes": 180,
+      "name": "runtime-thumbnail-coherent.log",
+      "sha256": "cc6f3e6f1886ea5b17bd25041387d1cbf9b753632f1048340d23233e8f6384f4"
+    },
+    {
+      "bytes": 14814,
+      "junit": {
+        "counts": {
+          "error": 0,
+          "failed": 0,
+          "passed": 93,
+          "skipped": 0
+        },
+        "test_ids": [
+          {
+            "id": "tests.test_generation_thumbnail_settlement::test_create_with_variant_attaches_thumbnail_without_creative_variant_pollution",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_thumbnail_settlement::test_publish_v1_attaches_each_group_thumbnail_by_primary_source",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_thumbnail_settlement::test_variant_append_accepts_auxiliary_thumbnail_and_preserves_primary_descriptor",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_thumbnail_settlement::test_thumbnail_attach_backfills_atomically_and_replays_without_changing_generation_identity",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_thumbnail_settlement::test_thumbnail_attach_rejects_wrong_mime_stale_source_and_cross_project_without_partial_custody",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_thumbnail_settlement::test_thumbnail_attach_honors_fence_and_rolls_back_published_bytes_on_receipt_failure",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_thumbnail_settlement::test_publication_metadata_cannot_smuggle_runtime_thumbnail_descriptor",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_generation_tags_preserve_opaque_intent_and_publication_metadata[generated]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_generation_tags_preserve_opaque_intent_and_publication_metadata[imported]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_v1_matches_out_of_order_groups_and_derives_domain_identity",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_v1_reject_missing_selector_rolls_back_everything",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_v1_reject_policy_disallows_explicit_optional_selector",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_v1_allow_records_missing_members_without_empty_generations",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_v1_allow_still_rejects_an_explicit_required_member",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_v1_settlement_uses_one_runtime_timestamp_for_publication_rows",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_v1_rejects_wrong_shape_duplicates_and_project_target_at_admission",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_v1_replay_conflict_and_stale_fence_are_atomic",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_with_existing_manifest_survives_restart_and_replay",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_rejects_unverified_manifest_reference_atomically[bytes]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_rejects_unverified_manifest_reference_atomically[missing]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_rejects_unverified_manifest_reference_atomically[conflicting-digest]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_rejects_unverified_manifest_reference_atomically[non-object]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_publish_rejects_unverified_manifest_reference_atomically[temporary]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_generic_output_generation_id_remains_managed_only",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_speech_settlement_derives_wav_duration_for_exact_media_selection[audio]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_speech_settlement_derives_wav_duration_for_exact_media_selection[speech]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_speech_settlement_exact_replay_returns_original_result",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_speech_settlement_invalid_wav_keeps_duration_unknown_and_selection_refused",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_speech_settlement_preserves_explicit_null_duration_and_refuses_selection",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_speech_settlement_zero_rate_wav_keeps_duration_unknown_and_selection_refused",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_speech_settlement_preserves_explicit_duration_metadata",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_publish_v1_settlement::test_speech_settlement_verified_media_is_exact_over_authenticated_http",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_create_with_variant_is_atomic_and_replays_to_one_gallery_generation",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_create_with_variant_rejects_wrong_output_without_publishing",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_create_with_variant_stale_fence_publishes_nothing",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_create_with_variant_cancelled_task_publishes_nothing",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_create_with_variant_rejects_late_settlement_after_cancel",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_create_with_variant_rejects_foreign_project_target",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_create_with_variant_rejects_malformed_metadata_before_publication",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_is_atomic_and_replays_deterministically",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_promote_demotes_previous_primary_atomically",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_rejects_unknown_primary_policy_before_admission",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_rejects_mismatched_or_unknown_media_family[video/mp4]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_rejects_mismatched_or_unknown_media_family[application/octet-stream]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_rejects_target_generation_from_another_project",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_rejects_source_variant_object_mismatch",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_requires_the_lineage_source_as_an_admitted_input[setup_kwargs0]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_requires_the_lineage_source_as_an_admitted_input[setup_kwargs1]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_rejects_non_integer_zero_ordinal_before_publication",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_rejects_stale_generation_version_without_mutation",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_rejects_wrong_output_cardinality_and_cleans_cas",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_rolls_back_after_publication_failure",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_generation_variant_append_settlement::test_generation_variant_append_scopes_distinct_tasks_with_identical_output_bytes",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_default_startup_uses_scoped_worker_credential",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_two_worker_credentials_cannot_cross_claim_or_mutate_attempt",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_settlement_stages_all_outputs_before_fenced_publication",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_staged_bytes_are_reverified_before_cas_promotion",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_stale_fence_rejects_output_before_any_staging_or_publication",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_attempt_staging_rejects_path_escape_ids",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_staged_cleanup_pins_directory_before_unlinking",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_promotion_uses_open_source_identity_after_path_replacement",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_journal_recovery_pins_cas_prefix_before_unlinking",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_worker_security_settlement::test_retained_external_worker_token_is_fenced_after_abandon_restart_and_new_claim",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_failure_evidence_survives_restart_and_exact_replay",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart[success]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart[failure]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_managed_envelope_terminal_artifacts_survive_cleanup_and_restart[observed-cancel]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_managed_envelope_rejects_foreign_project_refs_and_wrong_attempt",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_managed_envelope_rejects_corrupt_same_project_input_bytes[source]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_managed_envelope_rejects_corrupt_same_project_input_bytes[effective_settings]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_observed_cancel_evidence_survives_restart_and_replay",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_corrupt_digest_and_stale_failure_fence_publish_nothing",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_managed_envelope_identity_mismatch_is_rejected",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_unknown_stop_retains_fenced_attempt_and_custody",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_cancel_requested_rejects_replacement_bytes_and_preserves_original_readback",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_expired_attempt_rejects_terminal_evidence_without_publication[failure]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_expired_attempt_rejects_terminal_evidence_without_publication[cancel]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_legacy_expired_failure_without_evidence_still_cedes_owner",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_other_executor_cannot_publish_cancellation_evidence",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_public_python_client_sends_evidence_payloads_matching_worker_wire_schema",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_failure_publication_error_rolls_back_terminal_and_associations",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_cancel_before_start_preserves_input_refs_without_inventing_attempt",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_terminal_results::test_success_and_observed_cancel_race_has_one_terminal_and_no_failure_effect",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_primary_reply_precedes_admission_and_restart_admits_once",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_existing_thumbnail_does_not_create_pending_intent",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_intent_admission_cannot_change_owner_epoch_or_source[actor]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_intent_admission_cannot_change_owner_epoch_or_source[epoch]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_intent_admission_cannot_change_owner_epoch_or_source[extra]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_intent_admission_cannot_change_owner_epoch_or_source[source-change]",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_worker_cannot_supply_a_thumbnail_intent",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_effect_rollback_leaves_no_thumbnail_intent",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_failed_thumbnail_remains_retryable_without_repeating_generation",
+            "status": "passed"
+          },
+          {
+            "id": "tests.test_durable_thumbnail_intents::test_scoped_http_worker_admits_only_its_stored_intent",
+            "status": "passed"
+          }
+        ]
+      },
+      "name": "runtime-thumbnail-coherent.xml",
+      "sha256": "08bf3617d40597dad480575cca672a6f8e311af49a48aad471146fa9248d1d31"
+    }
+  ],
+  "base_commit": "f3dc970af71e7d413871b4a8e45e4ba0fbfabf5e",
+  "blocked_report": "https://github.com/banodoco/astrid-dev/issues/796#issuecomment-6987488171",
+  "blocker": "Actual installed thumbnail action returns one thumbnail plus ordinary durable job.stdout/job.stderr logs; existing Runtime attach validator requires len(all outputs)==1. Both real host recovery tests fail unchanged. Awaiting Lead routing; no fix applied.",
+  "comparisons": [
+    {
+      "base": "agent-caller-base-isolated.xml",
+      "base_ids": 22,
+      "changed": [],
+      "head": "agent-caller-frozen.xml",
+      "head_ids": 35,
+      "missing": [],
+      "new": [
+        "tests.core.generation.test_ls6_receipt_pipeline::test_caller_refuses_changed_in_process_verified_file",
+        "tests.core.generation.test_ls6_receipt_pipeline::test_changed_file_cannot_reuse_a_producer_receipt",
+        "tests.core.generation.test_ls6_receipt_pipeline::test_one_fetch_one_producer_hash_and_independent_runtime_and_caller[37]",
+        "tests.core.generation.test_ls6_receipt_pipeline::test_one_fetch_one_producer_hash_and_independent_runtime_and_caller[9437197]",
+        "tests.core.generation.test_ls6_receipt_pipeline::test_transforming_hook_mints_a_fresh_receipt",
+        "tests.test_output_receipt_observations::test_same_length_change_cannot_rebind_an_old_observation",
+        "tests.test_output_receipt_observations::test_stable_content_receipt_reuses_only_the_current_local_observation",
+        "tests.test_output_receipt_observations::test_unusable_sidecar_keeps_independent_output_hash[logical-path]",
+        "tests.test_output_receipt_observations::test_unusable_sidecar_keeps_independent_output_hash[malformed]",
+        "tests.test_output_receipt_observations::test_unusable_sidecar_keeps_independent_output_hash[missing]",
+        "tests.test_output_receipt_observations::test_unusable_sidecar_keeps_independent_output_hash[prompt]",
+        "tests.test_output_receipt_observations::test_unusable_sidecar_keeps_independent_output_hash[symlink]",
+        "tests.test_output_receipt_observations::test_unusable_sidecar_keeps_independent_output_hash[task]"
+      ]
+    },
+    {
+      "base": "agent-receipt-base-isolated.xml",
+      "base_ids": 149,
+      "changed": [],
+      "head": "agent-receipts-frozen.xml",
+      "head_ids": 149,
+      "missing": [],
+      "new": []
+    },
+    {
+      "base": "agent-census-base.xml",
+      "base_ids": 17,
+      "changed": [],
+      "head": "agent-census-approved-runtimepath.xml",
+      "head_ids": 17,
+      "missing": [],
+      "new": []
+    },
+    {
+      "base": "vibe-receipt-base-isolated.xml",
+      "base_ids": 24,
+      "changed": [],
+      "head": "vibe-receipt-resume-head-1.xml",
+      "head_ids": 24,
+      "missing": [],
+      "new": []
+    },
+    {
+      "base": "runtime-stream-base.xml",
+      "base_ids": 17,
+      "changed": [],
+      "head": "runtime-stream-coherent.xml",
+      "head_ids": 31,
+      "missing": [],
+      "new": [
+        "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[equal-length]",
+        "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[extra]",
+        "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[missing-marker]",
+        "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[short]",
+        "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[wrong-identity]",
+        "tests.test_verified_object_transfer::test_claimed_success_cannot_install_bad_or_incomplete_bytes[wrong-length]",
+        "tests.test_verified_object_transfer::test_large_transfer_reads_bounded_chunks_on_server_and_caller",
+        "tests.test_verified_object_transfer::test_legacy_and_range_delivery_keep_independent_caller_hash[False]",
+        "tests.test_verified_object_transfer::test_legacy_and_range_delivery_keep_independent_caller_hash[True]",
+        "tests.test_verified_object_transfer::test_runtime_mutation_while_transmitting_withholds_completion",
+        "tests.test_verified_object_transfer::test_sender_does_not_mark_equal_length_corrupted_transmitted_chunks",
+        "tests.test_verified_object_transfer::test_streamed_object_installs_independent_verified_file[0]",
+        "tests.test_verified_object_transfer::test_streamed_object_installs_independent_verified_file[17]",
+        "tests.test_verified_object_transfer::test_streamed_object_installs_independent_verified_file[9437197]"
+      ]
+    },
+    {
+      "base": "runtime-thumbnail-base-workspace.xml",
+      "base_ids": 83,
+      "changed": [],
+      "head": "runtime-thumbnail-coherent.xml",
+      "head_ids": 93,
+      "missing": [],
+      "new": [
+        "tests.test_durable_thumbnail_intents::test_effect_rollback_leaves_no_thumbnail_intent",
+        "tests.test_durable_thumbnail_intents::test_existing_thumbnail_does_not_create_pending_intent",
+        "tests.test_durable_thumbnail_intents::test_failed_thumbnail_remains_retryable_without_repeating_generation",
+        "tests.test_durable_thumbnail_intents::test_intent_admission_cannot_change_owner_epoch_or_source[actor]",
+        "tests.test_durable_thumbnail_intents::test_intent_admission_cannot_change_owner_epoch_or_source[epoch]",
+        "tests.test_durable_thumbnail_intents::test_intent_admission_cannot_change_owner_epoch_or_source[extra]",
+        "tests.test_durable_thumbnail_intents::test_intent_admission_cannot_change_owner_epoch_or_source[source-change]",
+        "tests.test_durable_thumbnail_intents::test_primary_reply_precedes_admission_and_restart_admits_once",
+        "tests.test_durable_thumbnail_intents::test_scoped_http_worker_admits_only_its_stored_intent",
+        "tests.test_durable_thumbnail_intents::test_worker_cannot_supply_a_thumbnail_intent"
+      ]
+    }
+  ],
+  "full_path_measurements": {
+    "base": [
+      {
+        "bytes": 37,
+        "caller": {
+          "bytes_hashed": 185,
+          "completed_streams": 5,
+          "coverage_gaps": []
+        },
+        "cas_unchanged_after_caller_mutation": true,
+        "features": {
+          "binder_receipt_kwargs": [],
+          "harvest_receipt_option": false
+        },
+        "fetch_count": 1,
+        "fetch_urls": [
+          "http://127.0.0.1:8188/view?filename=final.png&subfolder=&type=output"
+        ],
+        "independent_caller_file": true,
+        "producer": {
+          "bytes_hashed": 259,
+          "completed_streams": 7,
+          "coverage_gaps": []
+        },
+        "producer_checkpoints": {
+          "correlated_result": {
+            "bytes_hashed": 111,
+            "completed_streams": 3,
+            "coverage_gaps": []
+          },
+          "download": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "harvest": {
+            "bytes_hashed": 222,
+            "completed_streams": 6,
+            "coverage_gaps": []
+          },
+          "host_validation": {
+            "bytes_hashed": 259,
+            "completed_streams": 7,
+            "coverage_gaps": []
+          },
+          "materialized_result": {
+            "bytes_hashed": 185,
+            "completed_streams": 5,
+            "coverage_gaps": []
+          },
+          "settled": {
+            "bytes_hashed": 259,
+            "completed_streams": 7,
+            "coverage_gaps": []
+          },
+          "typed_outputs": {
+            "bytes_hashed": 259,
+            "completed_streams": 7,
+            "coverage_gaps": []
+          },
+          "uploaded_outputs": {
+            "bytes_hashed": 259,
+            "completed_streams": 7,
+            "coverage_gaps": []
+          },
+          "vibe_result": {
+            "bytes_hashed": 74,
+            "completed_streams": 2,
+            "coverage_gaps": []
+          }
+        },
+        "runtime_pre_delivery": {
+          "bytes_hashed": 222,
+          "completed_streams": 6,
+          "coverage_gaps": []
+        },
+        "runtime_primary_open_count": 1,
+        "runtime_transmit": {
+          "bytes_hashed": 74,
+          "completed_streams": 2,
+          "coverage_gaps": []
+        },
+        "settlement_state": "succeeded",
+        "sha256": "17f98bea63cd486d0c7186ded02888b4e5f0dcdf0174105f9f6fe1798a76a35c",
+        "task_status": "completed",
+        "thumbnail_intent_count": 0
+      },
+      {
+        "bytes": 9437197,
+        "caller": {
+          "bytes_hashed": 47185985,
+          "completed_streams": 5,
+          "coverage_gaps": []
+        },
+        "cas_unchanged_after_caller_mutation": true,
+        "features": {
+          "binder_receipt_kwargs": [],
+          "harvest_receipt_option": false
+        },
+        "fetch_count": 1,
+        "fetch_urls": [
+          "http://127.0.0.1:8188/view?filename=final.png&subfolder=&type=output"
+        ],
+        "independent_caller_file": true,
+        "producer": {
+          "bytes_hashed": 66060379,
+          "completed_streams": 7,
+          "coverage_gaps": []
+        },
+        "producer_checkpoints": {
+          "correlated_result": {
+            "bytes_hashed": 28311591,
+            "completed_streams": 3,
+            "coverage_gaps": []
+          },
+          "download": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "harvest": {
+            "bytes_hashed": 56623182,
+            "completed_streams": 6,
+            "coverage_gaps": []
+          },
+          "host_validation": {
+            "bytes_hashed": 66060379,
+            "completed_streams": 7,
+            "coverage_gaps": []
+          },
+          "materialized_result": {
+            "bytes_hashed": 47185985,
+            "completed_streams": 5,
+            "coverage_gaps": []
+          },
+          "settled": {
+            "bytes_hashed": 66060379,
+            "completed_streams": 7,
+            "coverage_gaps": []
+          },
+          "typed_outputs": {
+            "bytes_hashed": 66060379,
+            "completed_streams": 7,
+            "coverage_gaps": []
+          },
+          "uploaded_outputs": {
+            "bytes_hashed": 66060379,
+            "completed_streams": 7,
+            "coverage_gaps": []
+          },
+          "vibe_result": {
+            "bytes_hashed": 18874394,
+            "completed_streams": 2,
+            "coverage_gaps": []
+          }
+        },
+        "runtime_pre_delivery": {
+          "bytes_hashed": 28311591,
+          "completed_streams": 3,
+          "coverage_gaps": []
+        },
+        "runtime_primary_open_count": 1,
+        "runtime_transmit": {
+          "bytes_hashed": 9437197,
+          "completed_streams": 1,
+          "coverage_gaps": []
+        },
+        "settlement_state": "succeeded",
+        "sha256": "aba8b0a34943135e22abbd448299091a839913609e3711ef8a9a941b7d51555b",
+        "task_status": "completed",
+        "thumbnail_intent_count": 0
+      }
+    ],
+    "head": [
+      {
+        "bytes": 37,
+        "caller": {
+          "bytes_hashed": 37,
+          "completed_streams": 1,
+          "coverage_gaps": []
+        },
+        "cas_unchanged_after_caller_mutation": true,
+        "features": {
+          "binder_receipt_kwargs": [
+            "output_receipts",
+            "prompt_id"
+          ],
+          "harvest_receipt_option": true
+        },
+        "fetch_count": 1,
+        "fetch_urls": [
+          "http://127.0.0.1:8188/view?filename=final.png&subfolder=&type=output"
+        ],
+        "independent_caller_file": true,
+        "producer": {
+          "bytes_hashed": 37,
+          "completed_streams": 1,
+          "coverage_gaps": []
+        },
+        "producer_checkpoints": {
+          "correlated_result": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "download": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "harvest": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "host_validation": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "materialized_result": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "settled": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "typed_outputs": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "uploaded_outputs": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "vibe_result": {
+            "bytes_hashed": 37,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          }
+        },
+        "runtime_pre_delivery": {
+          "bytes_hashed": 222,
+          "completed_streams": 6,
+          "coverage_gaps": []
+        },
+        "runtime_primary_open_count": 1,
+        "runtime_transmit": {
+          "bytes_hashed": 37,
+          "completed_streams": 1,
+          "coverage_gaps": []
+        },
+        "settlement_state": "succeeded",
+        "sha256": "17f98bea63cd486d0c7186ded02888b4e5f0dcdf0174105f9f6fe1798a76a35c",
+        "task_status": "completed",
+        "thumbnail_intent_count": 1
+      },
+      {
+        "bytes": 9437197,
+        "caller": {
+          "bytes_hashed": 9437197,
+          "completed_streams": 1,
+          "coverage_gaps": []
+        },
+        "cas_unchanged_after_caller_mutation": true,
+        "features": {
+          "binder_receipt_kwargs": [
+            "output_receipts",
+            "prompt_id"
+          ],
+          "harvest_receipt_option": true
+        },
+        "fetch_count": 1,
+        "fetch_urls": [
+          "http://127.0.0.1:8188/view?filename=final.png&subfolder=&type=output"
+        ],
+        "independent_caller_file": true,
+        "producer": {
+          "bytes_hashed": 9437197,
+          "completed_streams": 1,
+          "coverage_gaps": []
+        },
+        "producer_checkpoints": {
+          "correlated_result": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "download": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "harvest": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "host_validation": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "materialized_result": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "settled": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "typed_outputs": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "uploaded_outputs": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          },
+          "vibe_result": {
+            "bytes_hashed": 9437197,
+            "completed_streams": 1,
+            "coverage_gaps": []
+          }
+        },
+        "runtime_pre_delivery": {
+          "bytes_hashed": 28311591,
+          "completed_streams": 3,
+          "coverage_gaps": []
+        },
+        "runtime_primary_open_count": 1,
+        "runtime_transmit": {
+          "bytes_hashed": 9437197,
+          "completed_streams": 1,
+          "coverage_gaps": []
+        },
+        "settlement_state": "succeeded",
+        "sha256": "aba8b0a34943135e22abbd448299091a839913609e3711ef8a9a941b7d51555b",
+        "task_status": "completed",
+        "thumbnail_intent_count": 1
+      }
+    ]
+  },
+  "lead_ruling": "https://github.com/banodoco/astrid-dev/issues/796#issuecomment-6987022689",
+  "limits": [
+    "Incremental local observations; not complete LS-6 qualification or Lead approval.",
+    "No existing tests skipped, deleted or relaxed. Existing test changes limited to authorized caller count3to1 and strict census51to52.",
+    "Base/head hash observations intentionally include proposed dependency changes; no dependency guard disabled and no latency gate claimed.",
+    "Python SHA instrumentation only; fixture Comfy response, real product custody/Runtime HTTP/SDK paths. No live model/GPU or cross-process hashing measurement.",
+    "Four identical Vibe SOCKS setup failures and one identical Agent /workspace ancestry refusal remain executed.",
+    "Early failed new-fixture setups and missing-Runtime collection attempt remain in raw artifacts.",
+    "Original checkpoint.json/observations.zip remain unchanged historical records."
+  ],
+  "observed_candidate_product_commits": {
+    "agent_local": "585cc048e90787d354358e22f90b9645116611f7",
+    "agent_published_equal_tree": "2fdf06a903b0fecaf9f70f1453e993119dccfd5e",
+    "runtime": "1a28101869bffcdb84cc2271307a7f55978def7b",
+    "vibecomfy": "08b770d9493a1d1c567b2c4d2166c2b1d794784b"
+  },
+  "packet": "R14-P55-12",
+  "pins_proposed_for_lead_review": {
+    "runtime": "1a28101869bffcdb84cc2271307a7f55978def7b",
+    "vibecomfy": "08b770d9493a1d1c567b2c4d2166c2b1d794784b"
+  },
+  "schema_version": 1,
+  "session": "r14-P55-12-1",
+  "source_commit_before_evidence": "f33a4f811e3df85f5c822ae85e6a78ea018f01f7",
+  "source_file_sha256": {
+    "contract/artifacts.json": "df6490b040774c5f18758b2fcda050283d28ae1957e7a86095b92886c705bdac",
+    "contract/openapi/workspace-v1.yaml": "6f52fc62d67a35f50dfc2f60652f8a255fc3725378db251f5ce7a80117bfce25",
+    "generators/generate.py": "48b5fa4921c09b0472d82eb4056267eb4b67253e03cf7357f4c989b01144c2b6",
+    "generators/python_client_init_template.py": "ab00ecc11b1c3ea098cdb457e7528c7ddac47d032b8cca0784ab004601dda15f",
+    "generators/python_client_template.py": "c1717a56e489855c1888e7cc375211f3193ec671525a928cb0b1d9f55b1b3cdd",
+    "packages/python/astrid_runtime_client/__init__.py": "c3df5924b1685d1a1b094c8617edc081e9073a0484e52fe40368b2fe8a63ff5f",
+    "packages/python/astrid_runtime_client/contract_metadata.py": "53992fe81d1d32ad6f4ab372b9c312adcc9627b39b87c4fb2034a2a300f96023",
+    "packages/python/astrid_runtime_client/generated.py": "9451b656bd8621da143a1698a21ce0f6370624027c592045d2675a8d96c01543",
+    "packages/typescript/src/contract-metadata.ts": "74b796673c054cff40c1c7b65839a70cc3e6f3beee60c7fe9d6957dd3c0b6fa5",
+    "packages/typescript/src/generated.ts": "ef2646d1c1902f54d33e9789eef45b3e11970c65acceac59149179a35a8fe870",
+    "runtime_protocol/contract_metadata.py": "c69b2c032f0753e50ce7fb2c269683f4ae7350bbdb1ac35661743446f2d88f7f",
+    "runtime_protocol/server.py": "9ca33b252fd4b0ca703aba5c112b8f0b34d5f5dc9b32ed98caca8568dc49b5f3",
+    "runtime_protocol/service.py": "98312414b432b9620bd3770e6d5da8a8658fc1b03a5fcbcc5c09f7488a88feac",
+    "runtime_protocol/store.py": "64b6037a286813926da03e9286ce3d3884eaf31f2b2274fea1111e3323357d9a",
+    "runtime_protocol/thumbnail_intents.py": "432b897853c445b7d7d81cf3378b2ada0115e1c0ce2cbbe997e2d1a4006abcd3",
+    "tests/test_durable_thumbnail_intents.py": "1ee8fc5f6df437cf6085ba03245e578a3bb8f2b57b0e2158a0244ddb7ce4fd6f",
+    "tests/test_verified_object_transfer.py": "0595661c6b92727df0f58059865ad0175d2a1935dba9e3f447cd9f166e591a76"
+  },
+  "source_tree_before_evidence": "37ccb4b8092de3dfb000cf94b3e9b53d7a608886",
+  "status": "blocked_on_thumbnail_log_settlement"
+}
