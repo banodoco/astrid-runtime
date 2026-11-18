@@ -69,9 +69,9 @@ def _cold_reads(service, monkeypatch, read):
     counts = Counter()
     original = cas_module.ContentAddressedStore.read
 
-    def counted(self, digest):
+    def counted(self, digest, **kwargs):
         counts[digest] += 1
-        return original(self, digest)
+        return original(self, digest, **kwargs)
 
     monkeypatch.setattr(cas_module.ContentAddressedStore, "read", counted)
     try:
@@ -91,13 +91,14 @@ def test_cold_history_and_head_reads_check_media_a_bounded_number_of_times(film,
             project, timeline, limit=50, authorize=lambda: None))
         recorded = [entry for entry in page["items"] if entry["intent"] == "recorded"]
         assert len(recorded) == revisions
-        assert counts, "history read must still check physical CAS bytes"
-        assert max(counts.values()) <= _READS_PER_OBJECT, counts
+        # Objects already verified at this file identity are confirmed by stat, not read;
+        # test_bounded_history_read_still_refuses_changed_media_bytes covers a changed file.
+        assert max(counts.values(), default=0) <= _READS_PER_OBJECT, counts
 
         # Opening the head (limit 1) is no dearer than listing everything.
         _, head_counts = _cold_reads(service, monkeypatch, lambda: service.list_timeline_commits(
             project, timeline, limit=1, authorize=lambda: None))
-        assert max(head_counts.values()) <= _READS_PER_OBJECT, head_counts
+        assert max(head_counts.values(), default=0) <= _READS_PER_OBJECT, head_counts
     finally:
         service.close()
 

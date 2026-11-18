@@ -20,6 +20,10 @@ def file_identity(value):
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
+def _digest_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
 @dataclass
 class StagedObject:
     path: Path
@@ -185,11 +189,34 @@ class ContentAddressedStore:
         finally:
             staged.discard()
 
-    def read(self, digest: str) -> bytes:
+    def current_identity(self, digest: str):
+        """One lstat: the identity of the ordinary file now at ``digest``, else None."""
+        try:
+            value = os.lstat(self.path_for(digest))
+        except OSError:
+            return None
+        return file_identity(value) if stat.S_ISREG(value.st_mode) else None
+
+    def read(self, digest: str, *, verified=None) -> bytes:
+        """Read and hash an object, or skip the hash while its file is unchanged.
+
+        ``verified`` maps digest -> the ``file_identity`` of the file whose bytes
+        were hashed.  Objects are immutable and published by a no-replace hard
+        link, so a file whose identity (including ``ctime``) is unchanged still
+        holds the bytes that were hashed.  A changed identity is hashed again.
+        """
         with self.open(digest) as stream:
+            initial = file_identity(os.fstat(stream.fileno()))
             data = stream.read()
-        if hashlib.sha256(data).hexdigest() != digest:
+            final = file_identity(os.fstat(stream.fileno()))
+        if verified is not None and initial == final and verified.get(digest) == initial:
+            return data
+        if _digest_bytes(data) != digest:
+            if verified is not None:
+                verified.pop(digest, None)
             raise ConflictError("CAS object failed hash verification")
+        if verified is not None and initial == final:
+            verified[digest] = initial
         return data
 
     def verify(self, digest: str) -> dict:
