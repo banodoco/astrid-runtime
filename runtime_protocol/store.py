@@ -5335,9 +5335,45 @@ class RealmStore:
         if result is None:
             return None
         outputs = result.get("outputs") if isinstance(result, dict) else None
-        if not isinstance(outputs, list) or len(outputs) != 1:
+        if not isinstance(outputs, list):
             raise ValidationError(f"{effect_type} requires exactly one thumbnail settlement output")
-        selected = outputs[0]
+        thumbnail_outputs = [
+            output for output in outputs
+            if isinstance(output, dict) and output.get("role") == "thumbnail"
+        ]
+        if len(thumbnail_outputs) != 1:
+            raise ValidationError(f"{effect_type} requires exactly one thumbnail settlement output")
+        selected = thumbnail_outputs[0]
+        log_names = set()
+        for output in outputs:
+            if output is selected:
+                continue
+            # GenericHost settles its durable stdout/stderr with every ordinary
+            # job. They retain the normal custody and association validation;
+            # this effect admits no additional creative or arbitrary outputs.
+            name = output.get("name") if isinstance(output, dict) else None
+            if (
+                name not in {"job.stdout", "job.stderr"}
+                or name in log_names
+                or output.get("kind") != "object"
+                or output.get("role") != "log"
+                or output.get("output_port") != "logs"
+                or output.get("variant_key") != name
+                or output.get("filename") != name + ".log"
+                or output.get("media_type") != "text/plain"
+                or output.get("durability", "durable") != "durable"
+                or output.get("group_key", "default") != "default"
+                or output.get("ordinal", 0) != 0
+                or output.get("is_primary", False) is not False
+                or any(field in output for field in (
+                    "generation_id", "duration_seconds", "producer", "provenance",
+                    "regeneration", "coverage",
+                ))
+            ):
+                raise ValidationError(
+                    f"{effect_type} permits only canonical durable job.stdout/job.stderr logs with the thumbnail"
+                )
+            log_names.add(name)
         if selected.get("name") != output_name or selected.get("ordinal", 0) != 0:
             raise ValidationError(
                 f"{effect_type} output selector did not resolve exactly one thumbnail",
