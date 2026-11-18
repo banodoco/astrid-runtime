@@ -638,7 +638,9 @@ class RuntimeService:
         if not configured_allowlist or not configured_allowlist.issubset(REBOOT_COMMAND_ALLOWLIST):
             raise ValidationError("reboot allowlist contains an unsupported command", details={"allowlist": sorted(configured_allowlist), "supported": sorted(REBOOT_COMMAND_ALLOWLIST)})
         self.reboot_allowlist = configured_allowlist
-        self._verified_cas_objects = {}
+        self._verified_cas_objects = getattr(self.store, "verified_cas", None)
+        if self._verified_cas_objects is None:
+            self._verified_cas_objects = {}
         self._recover_cas_publication_journals()
         # Only startup may remove abandoned transfers: live handlers own their files.
         upload_dir = self.store.staging_root / "uploads"

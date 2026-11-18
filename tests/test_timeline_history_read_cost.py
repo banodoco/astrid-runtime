@@ -69,9 +69,9 @@ def _cold_reads(service, monkeypatch, read):
     counts = Counter()
     original = cas_module.ContentAddressedStore.read
 
-    def counted(self, digest):
+    def counted(self, digest, **kwargs):
         counts[digest] += 1
-        return original(self, digest)
+        return original(self, digest, **kwargs)
 
     monkeypatch.setattr(cas_module.ContentAddressedStore, "read", counted)
     try:
