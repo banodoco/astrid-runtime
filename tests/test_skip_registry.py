@@ -109,6 +109,105 @@ def test_xfail_limit_accepts_exactly_the_cap() -> None:
     assert lanes.declared_xfail_errors({"grouped": _valid_xfail(nodeids=nodeids)}) == []
 
 
+def test_quarantine_cannot_grow_or_extend_against_the_git_merge_base() -> None:
+    from tests.quarantine_policy import merge_base_errors, policy_from_registry
+
+    assert not (errors := merge_base_errors(REPO, current=policy_from_registry(lanes))), "\n".join(errors)
+
+
+@pytest.mark.parametrize("change", ["ceiling", "new-node", "swapped-node", "expiry", "exception", "age-window"])
+def test_merge_base_policy_rejects_same_pr_quarantine_edits(change: str) -> None:
+    from copy import deepcopy
+    import subprocess
+    import types
+    from tests.quarantine_policy import compare_policies, policy_from_source, reference_commit
+
+    reference = policy_from_source((TESTS / "lanes.py").read_text(encoding="utf-8"))
+    current = deepcopy(reference)
+    first = next(iter(current["nodes"]))
+    if change == "ceiling":
+        current["ceiling"] += 1
+    elif change in ("new-node", "swapped-node"):
+        current["nodes"]["tests/test_new.py::test_hidden_bug"] = deepcopy(current["nodes"][first])
+        if change == "swapped-node":
+            del current["nodes"][first]
+        else:
+            current["ceiling"] += 1
+    elif change == "expiry":
+        current["nodes"][first]["expires"] = (date.fromisoformat(current["nodes"][first]["expires"]) + timedelta(days=1)).isoformat()
+    elif change == "exception":
+        current["nodes"][first]["raises"] = "builtins.Exception"
+    else:
+        current["max_days"] += 1
+    # Exercise the actual former gate and its same-PR pin, not a reimplementation
+    # of their loopholes. Only these isolated modules are forged.
+    base = reference_commit(REPO)
+    modules = {}
+    for filename, module_name in (("lanes.py", "_packet_base_lanes"), ("test_skip_guard.py", "_packet_base_guard")):
+        source = subprocess.check_output(["git", "show", f"{base}:tests/{filename}"], cwd=REPO, text=True)
+        module = types.ModuleType(module_name)
+        module.__file__ = str(TESTS / filename)
+        sys.modules[module_name] = module
+        try:
+            exec(compile(source, f"{base}:tests/{filename}", "exec"), module.__dict__)
+        finally:
+            del sys.modules[module_name]
+        modules[filename] = module
+    legacy = modules["lanes.py"]
+    legacy.MAX_DECLARED_XFAIL_TESTS = current["ceiling"]
+    legacy.MAX_XFAIL_DAYS = current["max_days"]
+    grouped = {}
+    for nodeid, contract in current["nodes"].items():
+        group = grouped.setdefault(contract["name"], {**contract, "nodeids": []})
+        group["nodeids"].append(nodeid)
+    legacy.DECLARED_XFAILS = {
+        name: legacy.DeclaredXfail(**{**contract, "nodeids": tuple(contract["nodeids"])})
+        for name, contract in grouped.items()
+    }
+    reference_day = min(date.fromisoformat(entry["expires"]) for entry in reference["nodes"].values()) - timedelta(days=13)
+    assert legacy.declared_xfail_errors(today=reference_day) == []
+    old_pin = modules["test_skip_guard.py"]
+    old_pin.lanes = legacy
+    old_pin._PINNED_XFAILS = old_pin._declared_xfail_contract(legacy.DECLARED_XFAILS)
+    old_pin.test_xfail_declarations_are_immutable_and_semantic()
+    assert compare_policies(current, reference)
+
+
+def test_merge_base_policy_allows_removing_fixed_quarantines_and_shortening_expiry() -> None:
+    from copy import deepcopy
+    from tests.quarantine_policy import compare_policies, policy_from_source
+
+    reference = policy_from_source((TESTS / "lanes.py").read_text(encoding="utf-8"))
+    current = deepcopy(reference)
+    del current["nodes"][next(iter(current["nodes"]))]
+    current["ceiling"] -= 1
+    first = next(iter(current["nodes"]))
+    current["nodes"][first]["expires"] = (date.fromisoformat(current["nodes"][first]["expires"]) - timedelta(days=1)).isoformat()
+    assert compare_policies(current, reference) == []
+
+
+def test_quarantine_reference_is_read_from_git_not_the_candidate_pin_table(tmp_path) -> None:
+    import subprocess
+    from tests.quarantine_policy import merge_base_errors
+
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    original = (TESTS / "lanes.py").read_text(encoding="utf-8")
+    (repo / "tests/lanes.py").write_text(original, encoding="utf-8")
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+    git("init", "-q")
+    git("add", "tests/lanes.py")
+    git("-c", "user.name=Guard probe", "-c", "user.email=probe@example.invalid", "commit", "-qm", "reference")
+    reference = git("rev-parse", "HEAD")
+    (repo / "tests/lanes.py").write_text(original.replace("MAX_DECLARED_XFAIL_TESTS = 19", "MAX_DECLARED_XFAIL_TESTS = 20"), encoding="utf-8")
+    # Updating a second, candidate-controlled copy cannot change Git history.
+    (repo / "tests/test_skip_guard.py").write_text("_PINNED_XFAILS = {'edited-in-same-pr': True}\n", encoding="utf-8")
+    git("add", "tests")
+    git("-c", "user.name=Guard probe", "-c", "user.email=probe@example.invalid", "commit", "-qm", "raised both copies")
+    assert any("ceiling increased" in error for error in merge_base_errors(repo, base=reference))
+
+
 # --- workflows -----------------------------------------------------------------
 
 @dataclass
@@ -159,7 +258,15 @@ def _pytest_commands(run: str) -> list[PytestCommand]:
         if "pytest" not in line:
             continue
         tokens = shlex.split(line)
-        rest = tokens[tokens.index("pytest") + 1:]
+        if "scripts/ci/run_pytest.py" in tokens:
+            start = tokens.index("scripts/ci/run_pytest.py") + 3
+            rest = tokens[start:]
+            if rest[:1] == ["--"]:
+                rest = rest[1:]
+        elif "pytest" in tokens:
+            rest = tokens[tokens.index("pytest") + 1:]
+        else:
+            continue
         expression, keyword, paths, i = None, None, [], 0
         while i < len(rest):
             token = rest[i]
@@ -294,11 +401,21 @@ def _uses() -> dict[str, list[Use]]:
                     visit(node.body, inherited | {n for d in node.decorator_list for n in _mark_names(d)}, classes | {node.name})
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
                     marks = inherited | {n for d in node.decorator_list for n in _mark_names(d)}
-                    text = ast.get_source_segment(source, node) or ""
                     entries = {by_variable[n].name for n in marks if n in by_variable}
                     if "darwin_native" in marks:
                         entries.add("darwin-native")
-                    entries |= {name for name, d in SKIP_REGISTRY.items() if d.only_error and f'"{name}"' in text}
+                    # Embedded source strings in guard tests do not call the
+                    # runtime helper in this item. Credit actual AST calls.
+                    entries |= {
+                        call.args[0].value
+                        for call in ast.walk(node)
+                        if isinstance(call, ast.Call) and call.args
+                        and ((isinstance(call.func, ast.Name) and call.func.id == "skip_for_declared_error")
+                             or (isinstance(call.func, ast.Attribute) and call.func.attr == "skip_for_declared_error"))
+                        and isinstance(call.args[0], ast.Constant)
+                        and call.args[0].value in SKIP_REGISTRY
+                        and SKIP_REGISTRY[call.args[0].value].only_error
+                    }
                     hosts = frozenset(HOSTS)
                     for name in entries:
                         hosts &= SKIP_REGISTRY[name].runs_on()
@@ -380,6 +497,14 @@ def test_every_entry_has_tests_and_a_condition_that_lets_some_host_run_them() ->
         assert entry.runs_on(), f"{entry.name}: the condition skips on every host"
 
 
+def test_skip_bindings_match_explicit_platform_lane_uses() -> None:
+    expected = {
+        name: tuple(sorted({f"tests/{use.file}::" + "::".join([*sorted(use.classes), use.test]) for use in uses}))
+        for name, uses in _uses().items()
+    }
+    assert lanes.DECLARED_SKIP_NODES == expected
+
+
 def test_every_declared_job_exists_and_runs_a_test_of_the_entry() -> None:
     jobs, uses, problems = _jobs(), _uses(), []
     for entry in SKIP_REGISTRY.values():
@@ -446,6 +571,12 @@ def test_continue_on_error_expressions_are_supported_forms() -> None:
 
 def test_k_filters_are_plain_exclusions() -> None:
     assert not _bad_k_filters(_jobs())
+
+
+def test_recorded_pytest_runner_keeps_the_same_lane_and_path_selection() -> None:
+    plain = _pytest_commands('python -m pytest -q -n 2 -m "integration" tests/test_platform.py')
+    recorded = _pytest_commands('python scripts/ci/run_pytest.py "$TEST_RESULTS_DIR" unit -- -q -n 2 -m "integration" tests/test_platform.py')
+    assert recorded == plain
 
 
 # --- the parser itself: one focused test per simplification it used to make ---------------

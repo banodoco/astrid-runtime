@@ -22,6 +22,15 @@ def sandbox(pytester):
         import sys
         sys.path.insert(0, {str(REPO)!r})
         from tests.lanes import pytest_configure  # noqa: F401
+        from tests.ci_evidence import pytest_addoption  # noqa: F401
+        from tests import lanes
+        # These are declarations for this isolated synthetic suite, not a
+        # wildcard exemption for arbitrary uses of the real platform marks.
+        lanes.DECLARED_SKIP_NODES = {{**getattr(lanes, "DECLARED_SKIP_NODES", {{}}), **{{
+            "windows-security": ("check_it.py::test_platform_only",),
+            "posix-process-groups": ("check_it.py::test_platform_only",),
+            "windows-symlink-creation": ("check_it.py::test_symlink", "check_it.py::test_a"),
+        }}}}
         """
     )
     pytester.makeini("[pytest]\npython_files = check_*.py\n")
@@ -302,15 +311,20 @@ def test_a_skip_raised_in_a_fixture_teardown_fails_the_run(sandbox):
 def test_a_declared_skip_raised_in_a_fixture_teardown_is_listed(sandbox):
     result = _run(sandbox, """
         import pytest
+        from tests import lanes
+        from tests.lanes import skip_for_declared_error
+        lanes.CURRENT = lanes.HOSTS["windows"]
         @pytest.fixture
         def late():
             yield
-            pytest.skip("[declared:windows-security] native Windows socket exclusivity and file DACL APIs")
+            error = OSError(1314, "no privilege")
+            error.winerror = 1314
+            skip_for_declared_error("windows-symlink-creation", error)
         def test_a(late): pass
         def test_b(): pass
         """)
     assert result.ret == 0, result.stdout.str()
-    result.stdout.fnmatch_lines(["declared skips (1):", "  SKIP *::test_a: [[]declared:windows-security]*"])
+    result.stdout.fnmatch_lines(["declared skips (1):", "  SKIP *::test_a: [[]declared:windows-symlink-creation]*"])
 
 
 def test_skips_of_non_blocking_entries_are_listed_under_their_own_header(sandbox):
@@ -371,3 +385,45 @@ def test_a_declared_skip_where_its_condition_is_false_here_fails_the_run(sandbox
         """)
     assert result.ret != 0
     result.stdout.fnmatch_lines(["UNDECLARED SKIP *::test_misused: *[[]declared:" + name + "] used where its condition*is false*"])
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "xdist"])
+@pytest.mark.parametrize("forgery", ["raw-outcome", "borrowed-marker", "runtime-helper", "borrowed-runtime-error"])
+def test_registered_tag_cannot_authorize_an_unrelated_test(sandbox, workers, forgery):
+    helper = _foreign_helper()
+    name = "windows-security" if sys.platform != "win32" else "posix-process-groups"
+    reason = f"{lanes.SKIP_REGISTRY[name].tag} {lanes.SKIP_REGISTRY[name].reason}"
+    if forgery == "raw-outcome":
+        body = f"from _pytest.outcomes import Skipped\ndef test_unrelated(): raise Skipped({reason!r})"
+    elif forgery == "borrowed-marker":
+        body = f"from tests.lanes import {helper}\n@{helper}\ndef test_unrelated(): assert False"
+    elif forgery == "runtime-helper":
+        body = f"from tests.lanes import skip_for_declared_error\ndef test_unrelated(): skip_for_declared_error({name!r}, OSError('unrelated'))"
+    else:
+        body = '''
+from tests import lanes
+lanes.CURRENT = lanes.HOSTS["windows"]
+def test_unrelated():
+    error = OSError(1314, "no privilege")
+    error.winerror = 1314
+    lanes.skip_for_declared_error("windows-symlink-creation", error)
+'''
+    result = _run(sandbox, body + "\ndef test_control(): pass\n", *(('-n', str(workers)) if workers else ()))
+    assert result.ret == pytest.ExitCode.TESTS_FAILED, result.stdout.str()
+    if forgery == "runtime-helper":
+        result.assert_outcomes(failed=1, passed=1)
+    else:
+        result.stdout.fnmatch_lines(["UNDECLARED SKIP *::test_unrelated: *not declared for this item*"])
+
+
+def test_a_forged_tag_in_an_authorized_item_still_needs_skip_provenance(sandbox):
+    reason = f"{lanes.SKIP_REGISTRY['windows-security'].tag} {lanes.SKIP_REGISTRY['windows-security'].reason}"
+    result = _run(sandbox, f"""
+        from _pytest.outcomes import Skipped
+        from tests import lanes
+        lanes.CURRENT = lanes.HOSTS["linux"]
+        def test_platform_only(): raise Skipped({reason!r})
+        def test_control(): pass
+        """)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.stdout.fnmatch_lines(["UNDECLARED SKIP *::test_platform_only: forged declared skip*"])

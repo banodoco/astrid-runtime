@@ -46,6 +46,16 @@ def _xfail_call(node: ast.AST, imported: dict[str, str]) -> ast.Call | None:
 def _xfail_kwargs(call: ast.Call, imported: dict[str, str], module: str) -> tuple[str | None, bool, str | None]:
     values = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
     reason = _literal_string(values.get("reason"))
+    reason_call = values.get("reason")
+    if (
+        isinstance(reason_call, ast.Call)
+        and _dotted(reason_call.func, imported) == "tests.lanes.declared_xfail_reason"
+        and len(reason_call.args) == 1
+        and not reason_call.keywords
+    ):
+        declaration = lanes.DECLARED_XFAILS.get(_literal_string(reason_call.args[0]))
+        if declaration is not None:
+            reason = declaration.reason
     strict = isinstance(values.get("strict"), ast.Constant) and values["strict"].value is True
     raises = values.get("raises")
     if raises is None:
@@ -235,6 +245,15 @@ def test_static_policy_rejects_copied_xfail_reason_without_exact_node_binding() 
     ]
     for source in cases:
         assert any(name == "pytest.mark.xfail" for _, name in hidden_gates(source, path="tests/test_runtime_domains.py"))
+
+
+def test_static_policy_understands_the_declared_reason_helper_without_widening_it() -> None:
+    source = (REPO / "tests/test_installed_pack_custody_spawn.py").read_text(encoding="utf-8")
+    path = "tests/test_installed_pack_custody_spawn.py"
+    assert hidden_gates(source, path=path) == []
+    forged = source.replace("def test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungranted(", "def test_unrelated(")
+    assert any(name == "pytest.mark.xfail" for _, name in hidden_gates(forged, path=path))
+    assert any(name == "pytest.mark.xfail" for _, name in hidden_gates(source, path="tests/test_unrelated.py"))
 
 
 def _test_python_files():
