@@ -16,6 +16,8 @@ import math
 from pathlib import Path
 
 from .asset_identity import same_asset_identity
+from .errors import ValidationError
+from .occurrence_window import source_offset, visible_span
 
 _LOGGER = logging.getLogger(__name__)
 _LoadTimelineFn = Callable[[str], tuple[Mapping[str, object], Mapping[str, object]]]
@@ -136,9 +138,10 @@ def expand_shot_clips(
         parent_end = parent_at + parent_hold
         # params.source_offset (seconds) is the window origin into the shot's timeline: a child at
         # internal time tau sits at parent_at - source_offset + tau and shows only inside the window.
-        window_origin = finite_float(params.get("source_offset", 0.0), f"shot clip {clip.get('id', '?')} source_offset")
-        if window_origin < 0.0:
-            raise ShotExpansionError(f"shot clip {clip.get('id', '?')} source_offset must not be negative")
+        try:
+            window_origin = source_offset(params.get("source_offset", 0.0))
+        except ValidationError as exc:
+            raise ShotExpansionError(f"shot clip {clip.get('id', '?')} {exc}") from exc
         for child_clip in child_clips:
             if not isinstance(child_clip, Mapping):
                 raise ShotExpansionError(f"sub-clip inside sub-timeline {child_ref} must be an object")
@@ -181,11 +184,11 @@ def expand_shot_clips(
 
             raw_at = parent_at - window_origin + child_at
             raw_end = raw_at + child_hold / speed
-            visible_at = max(raw_at, parent_at)
-            visible_end = min(raw_end, parent_end)
-            if visible_end <= visible_at:
+            span = visible_span(raw_at, raw_end, parent_at, parent_hold)
+            if span is None:
                 _LOGGER.debug("Dropping child clip %s outside parent shot window", child_id)
                 continue
+            visible_at, visible_end = span
             left_trim = visible_at - raw_at
             visible_duration = visible_end - visible_at
             expanded = dict(child_clip)

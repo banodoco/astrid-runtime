@@ -14,6 +14,7 @@ from collections import ChainMap, defaultdict
 from itertools import pairwise
 
 from .errors import ConflictError, NotFoundError, ValidationError
+from .occurrence_window import source_offset as read_source_offset, visible_span
 from .seam_intent import (
     boundary_intent_owners,
     intent_context,
@@ -302,7 +303,10 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
             lower, upper = js_round(bound[0] * fps), js_round(bound[1] * fps)
             if primary and covered and (raw_start < lower or raw_end > upper):
                 structural.append({"code": "boundary/owner-overhang", "path": path, "startFrame": raw_start, "endFrame": raw_end, "ownerEndFrame": upper})
-            start, end = max(start, lower), min(end, upper)
+            span = visible_span(start, end, lower, upper - lower)
+            if span is None:
+                return
+            start, end = span
         if end <= start:
             return
         clip["at"] = (offset + at)
@@ -416,12 +420,7 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
                       if active(c) and child_tracks.get(c.get("track", o["track"]), {}).get("role") != "source"),
                      default=fallback_duration)
         extent = math.ceil(extent * 1000 - 1e-6) / 1000
-        source_offset = o.get("source_offset", o.get("source_offset_ms", 0))
-        if isinstance(source_offset, dict):
-            source_offset = source_offset.get("start", 0)
-        source_offset = finite(source_offset) / 1000
-        if source_offset < 0:
-            raise ValidationError("occurrence source_offset must not be negative")
+        source_offset = read_source_offset(o.get("source_offset", o.get("source_offset_ms", 0))) / 1000
         if source_offset > 0:
             extent = fallback_duration  # a trimmed window is exactly its duration, whatever the content holds
         end = min(offset + extent, next_start.get(o["occurrence_id"], offset + extent))

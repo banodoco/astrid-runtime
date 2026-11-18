@@ -13,6 +13,7 @@ from fractions import Fraction
 
 from .errors import ConflictError, NotFoundError, ValidationError
 from .util import canonical_json
+from .occurrence_window import source_offset
 from .managed_render_snapshot import ShotExpansionError, expand_shot_clips
 from .visual_seam import agreed_clips
 
@@ -491,13 +492,12 @@ def _timing_record(raw, timing_id):
 def _attach_render_timing(projected, raw_clips, occurrence, registry):
     """Use the same shot clipping producer as managed rendering, before selection."""
     reason = None
-    stored_offset = occurrence.get("source_offset", 0)
-    if isinstance(stored_offset, dict):
-        stored_offset = stored_offset.get("start", 0)
-    if occurrence.get("speed", 1) != 1:
+    try:
+        stored_offset = source_offset(occurrence.get("source_offset", 0))
+    except ValidationError:
+        stored_offset, reason = 0.0, "occurrence source_offset is not a non-negative window origin"
+    if reason is None and occurrence.get("speed", 1) != 1:
         reason = "managed shot expansion does not apply occurrence speed"
-    elif isinstance(stored_offset, bool) or not isinstance(stored_offset, (int, float)) or stored_offset < 0:
-        reason = "occurrence source_offset is not a non-negative window origin"
     try:
         if reason:
             raise ShotExpansionError(reason)
