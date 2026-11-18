@@ -6022,7 +6022,7 @@ class RuntimeService(TaskWaits, ThinRequests):
             if retained_fd is not None:
                 os.close(retained_fd)
 
-    def open_object(self, digest):
+    def open_object(self, digest, *, verify_content=True):
         normalized = str(digest).removeprefix("sha256:")
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (normalized,)).fetchone()
@@ -6037,7 +6037,7 @@ class RuntimeService(TaskWaits, ThinRequests):
             token = file_identity(value)
             # Verify once per immutable file identity, including after restart.
             # Repeated byte-range seeks do not scan the entire large object.
-            if self._verified_cas_objects.get(normalized) != token:
+            if verify_content and self._verified_cas_objects.get(normalized) != token:
                 verified = self._verify_open_file(stream.fileno(), normalized, int(metadata["size"]), label="CAS object")
                 self._verified_cas_objects[normalized] = file_identity(verified)
             stream.seek(0)

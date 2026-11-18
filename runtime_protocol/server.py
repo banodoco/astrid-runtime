@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -16,6 +17,9 @@ from .errors import RuntimeErrorBase, AuthorizationError, BodyTooLargeError, Con
 from .service import reject_retired_timeline_writer, validate_idempotency_key
 from .cas import IO_CHUNK_BYTES
 from .store import PACK_ID_RE, PACK_DIGEST_RE, pack_asset_path
+
+VERIFIED_OBJECT_MEDIA_TYPE = "application/vnd.astrid.verified-object.v1"
+VERIFIED_OBJECT_MARKER = b"\nASTRID-OBJECT-COMPLETE-v1\n"
 
 
 def pack_http_route(target):
@@ -467,9 +471,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(encoded)
 
-    def _send_file(self, status, stream, start, length, headers):
+    def _send_file(self, status, stream, start, length, headers, verified_digest=None):
         if getattr(self, "_defer_response", False):
-            self._pending_file_response = (status, stream, start, length, headers)
+            self._pending_file_response = (status, stream, start, length, headers, verified_digest)
             return
         try:
             self.send_response(status)
@@ -477,19 +481,30 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self.send_header("X-Request-ID", self._request_id())
             for key, value in headers.items():
                 self.send_header(key, str(value))
-            self.send_header("Content-Length", str(length))
+            self.send_header("Content-Length", str(length + (len(VERIFIED_OBJECT_MARKER) if verified_digest else 0)))
             self.end_headers()
             self._response_started = True
             if self.command != "HEAD":
                 stream.seek(start)
                 remaining = length
+                digest = hashlib.sha256() if verified_digest else None
                 while remaining:
                     chunk = stream.read(min(remaining, IO_CHUNK_BYTES))
                     if not chunk:
                         self.close_connection = True
                         return
+                    if digest is not None:
+                        digest.update(chunk)
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
+                if digest is not None:
+                    # Verify the exact transmitted chunks, including absence of
+                    # extra source bytes. Never turn a truncated/mutated file
+                    # into a successful receipt merely because headers matched.
+                    if stream.read(1) or digest.hexdigest() != verified_digest:
+                        self.close_connection = True
+                        return
+                    self.wfile.write(VERIFIED_OBJECT_MARKER)
         finally:
             stream.close()
 
@@ -534,6 +549,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         finally:
             if stream is not None:
                 stream.close()
+
+    def _serve_verified_object_stream(self, metadata, stream):
+        digest = str(metadata["digest"]).removeprefix("sha256:")
+        length = int(metadata["size"])
+        self._send_file(200, stream, 0, length, {
+            "Content-Type": VERIFIED_OBJECT_MEDIA_TYPE,
+            "X-Object-Media-Type": metadata["media_type"],
+            "X-Object-Length": str(length),
+            "X-Content-Digest": "sha256:" + digest,
+            "ETag": '"sha256:' + digest + '"',
+        }, digest)
 
     def _is_binary_io(self):
         if not hasattr(self, "path"):
@@ -1242,6 +1268,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(201, value)
         if len(path) == 3 and path[:2] == ["v1", "objects"] and method in ("GET", "HEAD"):
             self._identity("objects:read")
+            if (method == "GET" and not self.headers.get("Range")
+                    and self.headers.get("Accept") == VERIFIED_OBJECT_MEDIA_TYPE):
+                metadata, stream = self.runtime.open_object(path[2], verify_content=False)
+                return self._serve_verified_object_stream(metadata, stream)
             metadata, stream = self.runtime.open_object(path[2])
             return self._serve_verified_file(metadata, stream)
         if path == ["v1", "tasks"] and method == "POST":

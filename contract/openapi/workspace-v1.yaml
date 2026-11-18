@@ -695,9 +695,20 @@ paths:
   /v1/objects/{object_id}:
     get:
       operationId: getObject
+      description: >-
+        A full GET may negotiate application/vnd.astrid.verified-object.v1 with
+        Accept. Its body is exactly X-Object-Length payload bytes followed by
+        the ASCII marker LF ASTRID-OBJECT-COMPLETE-v1 LF. Runtime hashes the
+        chunks it transmits and emits the marker only after digest and length
+        match the stored object. X-Content-Digest is its sha256 identity and
+        X-Object-Media-Type is the original type. The caller independently
+        verifies received bytes against the authorized result digest and size
+        and requires the marker before atomically installing a file. Headers
+        and payload length alone are not a successful transfer. HEAD and range
+        requests retain their existing byte contract and caller verification.
       parameters: [ { $ref: '#/components/parameters/ObjectId' }, { $ref: '#/components/parameters/Range' } ]
       responses:
-        '200': { description: Full bytes, headers: { ETag: { $ref: '#/components/headers/ETag' }, Accept-Ranges: { $ref: '#/components/headers/AcceptRanges' } }, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '200': { description: Full bytes or negotiated verified stream, headers: { ETag: { $ref: '#/components/headers/ETag' }, Accept-Ranges: { $ref: '#/components/headers/AcceptRanges' }, X-Object-Length: { schema: { type: integer, minimum: 0 } }, X-Content-Digest: { schema: { type: string } }, X-Object-Media-Type: { schema: { type: string } } }, content: { application/octet-stream: { schema: { type: string, format: binary } }, application/vnd.astrid.verified-object.v1: { schema: { type: string, format: binary } } } }
         '206': { description: Byte range, headers: { Content-Range: { $ref: '#/components/headers/ContentRange' }, ETag: { $ref: '#/components/headers/ETag' } }, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
         '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
     head:
