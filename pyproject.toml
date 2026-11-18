@@ -19,7 +19,7 @@ astrid-runtime = "astrid_runtime.cli:main"
 [tool.pytest.ini_options]
 pythonpath = ["tests", "packages/python"]
 testpaths = ["tests"]
-addopts = "-ra -m 'not integration and not darwin_native and not live'"
+addopts = "-ra"
 # Keep passed test trees from accumulating across the full suite; failed trees
 # remain available for diagnosis and all test-time storage guards still run.
 tmp_path_retention_policy = "failed"

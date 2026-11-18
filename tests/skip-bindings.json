@@ -1,0 +1,185 @@
+{
+  "case-sensitive-filesystem": [
+    "tests/test_runtime_pack_admissions.py::test_installed_reader_refusal_kind[folder_identities_collide]"
+  ],
+  "darwin-native": [
+    "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_accepts_system_temp_alias",
+    "tests/test_door_lifecycle.py::test_real_up_opens_a_ready_door_and_names_a_taken_port",
+    "tests/test_installed_pack_custody_spawn.py::test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungranted",
+    "tests/test_local_worker_handoff.py::test_fresh_successor_peer_binds_exact_incarnation_and_operation",
+    "tests/test_local_worker_handoff.py::test_inherited_creator_descriptor_cannot_authenticate_successor",
+    "tests/test_local_worker_handoff.py::test_transfer_rejects_duplicate_keys_and_mismatched_seal",
+    "tests/test_operator_upgrade.py::test_operator_upgrade_restarts_a_real_current_runtime",
+    "tests/test_real_bootstrap.py::test_concurrent_reconnect_survives_restricted_pid_identity_probe",
+    "tests/test_real_bootstrap.py::test_real_subprocess_fresh_launch_reconnect_and_scoped_generated_client",
+    "tests/test_real_bootstrap.py::test_real_subprocess_restart_preserves_realm_and_credential",
+    "tests/test_real_bootstrap.py::test_real_subprocess_stale_discovery_recovers_without_new_realm",
+    "tests/test_release_identity.py::test_runtime_b11_local_submodule_is_pinned",
+    "tests/test_relocation_real_e2e.py::test_real_runtime_cutover_failure_rolls_back_tree_and_metadata",
+    "tests/test_relocation_real_e2e.py::test_real_runtime_daemon_cutover_starts_from_new_support_root",
+    "tests/test_role_custody_authority.py::test_actual_darwin_self_identity_and_boundary_use_native_shared_marker"
+  ],
+  "dirfd-o-path": [
+    "tests/test_dirfd_ancestor_walk.py::test_chain_does_not_need_read_access_to_ancestors",
+    "tests/test_dirfd_ancestor_walk.py::test_chain_still_rejects_a_symlinked_ancestor",
+    "tests/test_dirfd_ancestor_walk.py::test_chain_still_rejects_a_symlinked_leaf"
+  ],
+  "linux-tree-custody": [
+    "tests/test_custody_linux_deadlines.py::test_complete_frame_received_after_deadline_is_refused",
+    "tests/test_custody_linux_deadlines.py::test_frame_read_uses_one_deadline_for_trickled_bytes",
+    "tests/test_custody_linux_deadlines.py::test_native_publish_refuses_missing_boot_scope",
+    "tests/test_custody_linux_deadlines.py::test_native_publish_refuses_unproven_pidfd",
+    "tests/test_custody_linux_deadlines.py::test_native_signal_uses_pidfd_and_refuses_enosys_without_fallback",
+    "tests/test_custody_linux_deadlines.py::test_registration_expiring_during_identity_check_never_binds",
+    "tests/test_linux_construction_sites.py::test_real_site_refuses_child_exiting_before_seal",
+    "tests/test_linux_construction_sites.py::test_real_site_seals_binds_and_signals",
+    "tests/test_linux_construction_sites.py::test_relay_broker_creates_owner_only_scope_under_restrictive_umask",
+    "tests/test_linux_construction_sites.py::test_relay_broker_does_not_change_existing_scope_parent",
+    "tests/test_linux_construction_sites.py::test_retained_wait_reaps_a_signalled_child_promptly",
+    "tests/test_linux_process_binding.py::test_exited_child_is_refused_without_signal",
+    "tests/test_linux_process_binding.py::test_exited_peer_is_rejected_per_connection_and_the_real_child_still_seals",
+    "tests/test_linux_process_binding.py::test_exited_unreaped_child_is_refused_before_binding_and_never_signalled",
+    "tests/test_linux_process_binding.py::test_hidepid_without_pid_namespace_fails_closed",
+    "tests/test_linux_process_binding.py::test_missing_or_denied_boot_id_fails_closed_for_token_and_signal",
+    "tests/test_linux_process_binding.py::test_namespace_zero_or_missing_is_refused",
+    "tests/test_linux_process_binding.py::test_non_child_same_user_connection_does_not_starve_the_real_child",
+    "tests/test_linux_process_binding.py::test_pidfd_probe_failure_refuses_admission_and_never_uses_bare_pid_fallback",
+    "tests/test_linux_process_binding.py::test_pidfd_probe_succeeds_on_this_kernel",
+    "tests/test_linux_process_binding.py::test_real_broker_term_is_reaped_by_retained_process",
+    "tests/test_linux_process_binding.py::test_real_host_broker_constructs_on_linux_and_custody_branches_stay_in_one_module",
+    "tests/test_linux_process_binding.py::test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child",
+    "tests/test_linux_process_binding.py::test_registration_frame_pid_must_match_the_kernel_peer_pid",
+    "tests/test_linux_process_binding.py::test_signal_reaches_the_same_process_and_refusal_signals_nothing",
+    "tests/test_linux_process_binding.py::test_token_round_trips_for_a_live_child_and_refuses_forged_fields",
+    "tests/test_linux_runtime_boundary_native.py::test_forged_record_and_stale_incarnation_are_refused",
+    "tests/test_linux_runtime_boundary_native.py::test_reaped_owner_is_refused_without_signal",
+    "tests/test_linux_runtime_boundary_native.py::test_start_publishes_native_custody_and_term_signals_exact_owner",
+    "tests/test_m1_review.py::test_linux_cleanup_retains_exited_child_until_group_teardown",
+    "tests/test_native_custody.py::test_native_custody_real_reparented_controller_signals_and_releases",
+    "tests/test_platform_signaling.py::test_linux_pidfd_fallback_checks_and_terminates_real_child",
+    "tests/test_platform_signaling.py::test_linux_pidfd_fallback_refuses_changed_or_unknown_identity",
+    "tests/test_platform_signaling.py::test_linux_pidfd_fallback_rejects_invalid_signal_without_terminating_child",
+    "tests/test_platform_signaling.py::test_public_pidfd_helpers_fallback_signals_real_child_and_retains_fd",
+    "tests/test_platform_signaling.py::test_public_pidfd_send_signal_fallback_errors_retain_real_fd",
+    "tests/test_process_control.py::test_group_walk_refuses_our_own_group",
+    "tests/test_process_control.py::test_probe_child_creation_failure_is_actionable_and_not_a_sandbox_fallback",
+    "tests/test_process_control.py::test_probe_in_a_seccomp_like_environment",
+    "tests/test_process_control.py::test_probe_reaps_child_on_group_check_failure",
+    "tests/test_process_control.py::test_probe_uses_live_child_group_when_inherited_group_is_unreachable",
+    "tests/test_process_control.py::test_sandbox_mode_only_relaxes_enosys",
+    "tests/test_process_control.py::test_sandbox_mode_refuses_a_changed_incarnation",
+    "tests/test_process_control.py::test_sandbox_mode_signals_by_pid_after_a_start_time_check",
+    "tests/test_process_control.py::test_sandbox_mode_walks_the_group_leader_last",
+    "tests/test_process_control.py::test_sandbox_stop_tree_stops_the_whole_group",
+    "tests/test_process_control.py::test_strict_group_recovery_signals_members_without_a_sandbox_note",
+    "tests/test_process_control.py::test_strict_mode_keeps_killpg_failures",
+    "tests/test_process_control.py::test_strict_mode_never_signals_a_bare_pid",
+    "tests/test_process_control.py::test_symlinked_or_non_regular_setting_refuses_startup"
+  ],
+  "posix-file-modes-native-custody": [
+    "tests/test_native_custody.py::test_native_custody_rejects_unsafe_owner_file",
+    "tests/test_native_parent_privacy.py::test_public_native_scope_is_refused_without_publishing_custody"
+  ],
+  "posix-fork": [
+    "tests/test_realm_admission_hardening.py::test_concurrent_admission_serializes_owner_and_never_reports_sqlite_race",
+    "tests/test_t4_replacement_foundation.py::test_catalog_full_read_modify_write_preserves_parallel_registrations"
+  ],
+  "posix-inherited-descriptors": [
+    "tests/test_astrid_activation_join.py::test_runtime_relay_to_committed_generic_host_activation_receiver_cpu",
+    "tests/test_astrid_activation_join.py::test_runtime_relay_to_generic_host_successor_finalization_cpu"
+  ],
+  "posix-owner-only-permissions": [
+    "tests/test_platform_windows.py::test_owner_only_rejects_symlink_before_chmod"
+  ],
+  "posix-private-modes": [
+    "tests/test_local_worker_handoff.py::test_successor_listener_default_parent_binds_private_socket_and_cleans_up",
+    "tests/test_platform.py::test_owner_only_applies_and_checks_private_file_and_directory_modes",
+    "tests/test_source_startup_identity.py::test_filemode_disabled_does_not_hide_tracked_executable_change",
+    "tests/test_source_startup_identity.py::test_raw_hash_batches_preserve_unusual_paths_and_do_not_write_objects",
+    "tests/test_source_startup_identity.py::test_tracked_delete_rename_and_executable_mode_are_captured",
+    "tests/test_source_startup_identity.py::test_tracked_symlink_target_is_captured",
+    "tests/test_source_startup_identity.py::test_untracked_symlink_and_executable_mode_are_captured"
+  ],
+  "posix-process-group-id-reuse": [
+    "tests/test_process_group_cleanup.py::test_a_group_is_signalled_only_while_it_is_still_ours"
+  ],
+  "posix-process-groups": [
+    "tests/test_m1_review.py::test_run_native_startup_signal_cancels_promptly_and_cleans_up",
+    "tests/test_operator_upgrade_recovery.py::test_sigkill_keeps_upgrade_transaction_identity_at_every_journal_step",
+    "tests/test_platform.py::test_eperm_from_group_holding_only_a_zombie_leader_means_group_gone",
+    "tests/test_platform.py::test_eperm_from_group_with_a_live_member_is_a_real_failure",
+    "tests/test_platform.py::test_eperm_from_group_with_all_zombie_rows_means_group_gone",
+    "tests/test_platform.py::test_eperm_from_group_with_empty_ps_listing_is_a_real_failure",
+    "tests/test_platform.py::test_eperm_from_group_with_zombie_and_live_rows_is_a_real_failure",
+    "tests/test_platform.py::test_stop_tree_cleans_up_grandchild",
+    "tests/test_service_stop.py::test_service_stdin_eof_runs_handlers_and_cleans_process_group",
+    "tests/test_timeline_commit_crash.py::test_host_boundary_first_capture_process_death",
+    "tests/test_timeline_commit_crash.py::test_real_process_death_at_acceptance_boundary",
+    "tests/test_timeline_commit_crash.py::test_retained_inputs_process_death"
+  ],
+  "posix-uid-metadata": [
+    "tests/test_local_worker_composition.py::test_host_only_custody_scope_wrong_owner_never_grants_authority"
+  ],
+  "windows-dirfd-adapter": [
+    "tests/test_dirfd_windows.py::test_windows_real_containment_and_parent_creation",
+    "tests/test_dirfd_windows.py::test_windows_real_external_writer_path_cannot_be_replaced",
+    "tests/test_dirfd_windows.py::test_windows_real_inflight_parent_rename_is_detected",
+    "tests/test_dirfd_windows.py::test_windows_real_junction_escape_refused",
+    "tests/test_dirfd_windows.py::test_windows_real_long_paths_and_native_identity",
+    "tests/test_dirfd_windows.py::test_windows_real_rename_race_detected_and_no_write_to_replacement",
+    "tests/test_dirfd_windows.py::test_windows_real_symlink_refused",
+    "tests/test_platform_filesystem.py::test_windows_directory_descriptor_operations",
+    "tests/test_windows_filesystem_native.py::test_native_case_and_short_aliases_retain_the_same_file_identity",
+    "tests/test_windows_filesystem_native.py::test_native_extended_dos_path_round_trip",
+    "tests/test_windows_filesystem_native.py::test_native_replacement_preserves_open_reader_and_pinned_parent",
+    "tests/test_windows_filesystem_native.py::test_native_unc_containment_and_publication"
+  ],
+  "windows-job-object": [
+    "tests/test_platform.py::test_windows_job_close_kills_grandchild",
+    "tests/test_service_stop.py::test_windows_service_stdin_eof_runs_handler_before_job_cleanup",
+    "tests/test_service_stop.py::test_windows_stop_tree_drains_descendants_after_leader_exits"
+  ],
+  "windows-process-and-lock-apis": [
+    "tests/test_platform_windows.py::test_windows_detached_child_inherits_job_handle",
+    "tests/test_platform_windows.py::test_windows_detached_owner_clears_job_handle_inheritance",
+    "tests/test_platform_windows.py::test_windows_directory_mutex_lock_contends_and_releases",
+    "tests/test_platform_windows.py::test_windows_directory_mutex_recovers_after_owner_process_exits",
+    "tests/test_platform_windows.py::test_windows_lockfileex_exclusive_and_unlock",
+    "tests/test_platform_windows.py::test_windows_overlapped_has_native_pointer_size_layout",
+    "tests/test_platform_windows.py::test_windows_process_identity_proves_exited_retained_child_absent",
+    "tests/test_platform_windows.py::test_windows_process_identity_uses_creation_time_and_bounded_sid",
+    "tests/test_platform_windows.py::test_windows_spawn_assigns_job_before_resuming_child",
+    "tests/test_windows_worker_handoff.py::test_windows_launch_fresh_authenticated_exchange_and_socket_transfer",
+    "tests/test_windows_worker_handoff.py::test_windows_launch_reconstructs_inherited_crt_file",
+    "tests/test_windows_worker_handoff.py::test_windows_real_connection_refuses_unselected_process_identity",
+    "tests/test_windows_worker_handoff.py::test_windows_retained_worker_survives_original_owner_job_close",
+    "tests/test_windows_worker_handoff.py::test_windows_role_broker_seals_the_same_child_creation_identity",
+    "tests/test_windows_worker_handoff.py::test_windows_strict_network_startup_with_inherited_channel",
+    "tests/test_windows_worker_handoff.py::test_windows_venv_launch_retains_actual_pid_and_selected_environment",
+    "tests/test_windows_worker_handoff.py::test_windows_worker_launch_ignores_a_rogue_first_connection"
+  ],
+  "windows-reparse-point-rejection": [
+    "tests/test_platform_filesystem.py::test_windows_directory_descriptor_rejects_symlink_component"
+  ],
+  "windows-runtime-venv": [
+    "tests/test_windows_runtime_launch.py::test_windows_update_backup_up_uses_the_actual_venv_interpreter"
+  ],
+  "windows-security": [
+    "tests/test_m1_review.py::test_windows_credential_rejects_public_file_before_read",
+    "tests/test_m1_review.py::test_windows_discovery_and_credentials_are_private_from_creation",
+    "tests/test_m1_review.py::test_windows_listener_cannot_be_rebound",
+    "tests/test_m1_review.py::test_windows_owner_only_rejects_public_dacl_and_stat_only_check",
+    "tests/test_m1_review.py::test_windows_rejects_owner_mismatch_with_private_dacl",
+    "tests/test_m1_review.py::test_windows_rejects_shared_credential_directory"
+  ],
+  "windows-sqlite-backup": [
+    "tests/test_platform_filesystem.py::test_windows_backup_restore_verify_uses_pinned_filesystem_paths"
+  ],
+  "windows-symlink-creation": [
+    "tests/test_dirfd_windows.py::test_windows_real_symlink_refused",
+    "tests/test_platform_filesystem.py::test_windows_directory_descriptor_rejects_symlink_component"
+  ],
+  "windows-token-process-times": [
+    "tests/test_platform.py::test_windows_current_user_and_get_process_times_identity"
+  ]
+}

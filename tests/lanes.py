@@ -1,7 +1,7 @@
 """Test lanes (testing plan R-2).
 
-Lanes. The default run deselects tests marked ``integration``, ``darwin_native`` or
-``live`` (see ``addopts`` in pyproject.toml). ``integration`` runs in the nightly
+Lanes. CI's unit command explicitly deselects ``integration``, ``darwin_native`` or
+``live`` with its command-line -m; configuration cannot select tests. ``integration`` runs in the nightly
 job (and in the ``-m ""`` portability jobs), ``darwin_native`` in the ``darwin-native``
 job; no test is marked ``live`` yet. A ``darwin_native`` test is skipped off macOS.
 
@@ -13,11 +13,13 @@ ends holding more than FD_LEAK_ALLOWANCE descriptors beyond what it held at star
 from __future__ import annotations
 
 import os
+import json
 import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlparse
 
@@ -104,6 +106,20 @@ class DeclaredSkip:
 
 
 SKIP_REGISTRY: dict[str, DeclaredSkip] = {}
+# The authorized users of each platform declaration are explicit. Reading the
+# decorators from today's tests would let a copied marker authorize itself.
+# Whole-function requirements cover their parameterized instances. A mark on
+# one parameter instead requires that complete node ID in the binding table.
+DECLARED_SKIP_NODES: dict[str, tuple[str, ...]] = {
+    name: tuple(nodes)
+    for name, nodes in json.loads(Path(__file__).with_name("skip-bindings.json").read_text()).items()
+}
+
+
+def is_declared_skip(nodeid: str, name: str) -> bool:
+    allowed = DECLARED_SKIP_NODES.get(name, ())
+    return nodeid in allowed or nodeid.split("[", 1)[0] in allowed
+
 NO_WINDOWS_CI = (
     "The Windows unit/portability matrix and worker-handoff job were removed in aa6c5b0; "
     "windows-realm-publication does not select these tests"
@@ -413,7 +429,7 @@ requires_linux_o_path = _declare(
 # only fire on Windows, and only for WinError 1314 (no symlink privilege).
 _WINDOWS_SYMLINKS = _declare(
     "windows-symlink-creation", "os_name == 'nt'",
-    "symlink creation is unavailable for this Windows account", ("unit",),
+    "symlink creation is unavailable for this Windows account", (), no_ci=NO_WINDOWS_CI,
     only_error=lambda error: getattr(error, "winerror", None) == 1314,
 )
 # Applied to every ``darwin_native`` test below; the lane is deselected by default
@@ -424,11 +440,16 @@ _DARWIN_NATIVE = _declare(
 )
 
 
+_RUNTIME_SKIP_PROVENANCE = object()
+
+
 def skip_for_declared_error(name: str, error: BaseException) -> None:
     """Skip for a declared runtime condition, or raise ``error`` when it is not that condition."""
     declared = SKIP_REGISTRY[name]
-    if declared.applies(CURRENT) and (declared.only_error is None or declared.only_error(error)):
-        pytest.skip(f"{declared.tag} {declared.reason}")
+    if declared.only_error is not None and declared.applies(CURRENT) and declared.only_error(error):
+        outcome = pytest.skip.Exception(f"{declared.tag} {declared.reason}")
+        outcome._astrid_provenance = _RUNTIME_SKIP_PROVENANCE
+        raise outcome
     raise error
 
 
@@ -468,8 +489,8 @@ def _declared_entry(reason: str) -> DeclaredSkip:
 class _SkipGuard:
     """No invisible skips: list every skip by name and fail on any undeclared one.
 
-    A skip is declared when its reason carries ``[declared:NAME]`` for a NAME in
-    SKIP_REGISTRY (the ``requires_*`` marks and ``darwin_native`` do this). Any
+    A skip is declared when the item, host and marker or matched runtime error
+    agree with its declaration. A reason string is never authority. Any
     other skip (a raw ``pytest.skip``, ``importorskip``, ``skip`` mark) fails the
     run. Xfails additionally need an exact node, reason, strictness and
     exception declaration in ``DECLARED_XFAILS``. Works under xdist: reports
@@ -507,6 +528,20 @@ class _SkipGuard:
             self._approved_xfails.add((item.nodeid, reason))
         return valid
 
+    def _skip_error(self, item, reason: str) -> str | None:
+        match = _DECLARED_TAG.search(reason)
+        if not match or match.group(1) not in SKIP_REGISTRY:
+            return reason
+        name = match.group(1)
+        declared = SKIP_REGISTRY[name]
+        if not declared.applies(CURRENT):
+            return f"{declared.tag} used where its condition is false on this host: {reason}"
+        if not is_declared_skip(item.nodeid, name):
+            return f"{declared.tag} is not declared for this item: {reason}"
+        if reason != f"{declared.tag} {declared.reason}":
+            return f"{declared.tag} does not match its declared reason: {reason}"
+        return None
+
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, config, items) -> None:
         for item in items:
@@ -514,23 +549,32 @@ class _SkipGuard:
                 self._check_xfail(item, mark)
 
     def _record(self, report) -> None:
+        for problem in getattr(report, "astrid_invalid_marks", ()):
+            entry = (report.nodeid, problem)
+            if entry not in self.undeclared:
+                self.undeclared.append(entry)
         if not report.skipped:
             return
         reason = getattr(report, "wasxfail", None)
+        # xdist serializes report attributes, but the controller never collects
+        # the worker's items. Carry the worker's exact marker validation with
+        # the report instead of consulting controller-local collection state.
+        if reason is not None and getattr(report, "astrid_declared_xfail", False):
+            key = (report.nodeid, str(reason))
+            self._approved_xfails.add(key)
+            if key not in self._reported_xfails:
+                self._reported_xfails.add(key)
+                self.declared_xfails.append(key)
         if reason is not None and (report.nodeid, str(reason)) in self._approved_xfails:
             return
         longrepr = report.longrepr
         reason = longrepr[2] if isinstance(longrepr, tuple) else str(longrepr)
         reason = reason.removeprefix("Skipped: ")
         match = _DECLARED_TAG.search(reason)
-        if match and match.group(1) in SKIP_REGISTRY:
-            declared = SKIP_REGISTRY[match.group(1)]
-            if declared.applies(CURRENT):
-                self.declared.append((report.nodeid, reason))
-            else:
-                self.undeclared.append((report.nodeid, f"{declared.tag} used where its condition is false on this host: {reason}"))
+        if match and getattr(report, "astrid_declared_skip", None) == match.group(1):
+            self.declared.append((report.nodeid, reason))
         else:
-            self.undeclared.append((report.nodeid, reason))
+            self.undeclared.append((report.nodeid, getattr(report, "astrid_skip_error", reason)))
 
     def pytest_runtest_logreport(self, report) -> None:
         # A skipif mark skips in setup, a runtime pytest.skip() in call, a fixture's in teardown.
@@ -540,12 +584,40 @@ class _SkipGuard:
     def pytest_runtest_makereport(self, item, call):
         outcome = yield
         report = outcome.get_result()
+        invalid = []
+        for marker in item.iter_markers("xfail"):
+            if not self._check_xfail(item, marker):
+                invalid.append("xfail is not allowed: " + str(marker.kwargs.get("reason")))
+        for marker in (*item.iter_markers("skip"), *item.iter_markers("skipif")):
+            marker_reason = str(marker.kwargs.get("reason", ""))
+            match = _DECLARED_TAG.search(marker_reason)
+            # A borrowed platform marker is invalid even on the host where
+            # its condition is false and it would silently become dormant.
+            if match and not is_declared_skip(item.nodeid, match.group(1)):
+                invalid.append(f"{match.group(0)} is not declared for this item")
+        report.astrid_invalid_marks = invalid
         reason = getattr(report, "wasxfail", None)
         if reason is None:
+            if report.skipped:
+                longrepr = report.longrepr
+                skip_reason = longrepr[2] if isinstance(longrepr, tuple) else str(longrepr)
+                skip_reason = skip_reason.removeprefix("Skipped: ")
+                problem = self._skip_error(item, skip_reason)
+                marked = report.when == "setup" and any(
+                    mark.kwargs.get("reason") == skip_reason
+                    and (mark.name == "skip" or bool(mark.args and mark.args[0] is True))
+                    for mark in (*item.iter_markers("skip"), *item.iter_markers("skipif"))
+                )
+                runtime_error = call.excinfo is not None and getattr(call.excinfo.value, "_astrid_provenance", None) is _RUNTIME_SKIP_PROVENANCE
+                if problem is None and (marked or runtime_error):
+                    report.astrid_declared_skip = _DECLARED_TAG.search(skip_reason).group(1)
+                else:
+                    report.astrid_skip_error = problem or "forged declared skip without its marker or matched error: " + skip_reason
             return
         mark = self._xfail_mark(item, str(reason))
         if mark is None or not self._check_xfail(item, mark):
             return
+        report.astrid_declared_xfail = True
         key = (item.nodeid, str(reason))
         if key not in self._reported_xfails:
             self._reported_xfails.add(key)
@@ -599,6 +671,8 @@ class _SkipGuard:
 
 
 def pytest_configure(config):
+    from tests import ci_evidence
+    ci_evidence.configure(config)
     for name, meaning in LANE_MARKERS.items():
         config.addinivalue_line("markers", f"{name}: {meaning}")
     config.pluginmanager.register(_FdGuard(), "fd-leak-guard")

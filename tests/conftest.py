@@ -13,8 +13,10 @@ import pytest
 from tests.astrid_checkout import astrid_importable, selected_agent_stub  # noqa: F401  (fixtures)
 from tests.lanes import pytest_collection_modifyitems, pytest_configure  # noqa: F401  (lanes)
 from tests.process_groups import ProcessGroups
+from tests import ci_evidence
 
 def pytest_addoption(parser):
+    ci_evidence.pytest_addoption(parser)
     parser.addoption(
         "--process-control", choices=("strict", "sandbox"), default="strict",
         help="run the suite as an install with this Runtime process-control setting "

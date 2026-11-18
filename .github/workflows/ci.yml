@@ -60,7 +60,7 @@ jobs:
         run: python -m pytest -q -rP -m "" tests/test_windows_runtime_launch.py
       - name: Verify native realm creation, ownership, and rollback
         run: >-
-          python -m pytest -q
+          python -m pytest -q -m "not integration and not darwin_native and not live"
           tests/test_realm_creation_publication.py
           tests/test_realm_replacement_publication.py
           tests/test_platform_windows.py::test_windows_directory_mutex_uses_global_user_scoped_identity
@@ -73,7 +73,7 @@ jobs:
           tests/test_service_stop.py
       - name: Verify Runtime service cleanup receipt contract
         run: >-
-          python -m pytest -q
+          python -m pytest -q -m "not integration and not darwin_native and not live"
           tests/test_profile_services.py::test_supervisor_marks_runtime_owned_service_name_after_configured_env
           tests/test_profile_services.py::test_pack_host_cleanup_receipts_are_bounded_owner_only_and_preserved
           tests/test_profile_services.py::test_service_cleanup_receipt_history_keeps_latest_64_attempts
@@ -162,36 +162,20 @@ jobs:
       - run: python -m pip install -e "$ASTRID_CHECKOUT"
       - name: Run unit tests
         shell: bash
-        run: mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/unit.xml" -n 2
+        run: python scripts/ci/run_pytest.py "$TEST_RESULTS_DIR" unit -- -q -n 2 -m "not integration and not darwin_native and not live"
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
-      - name: Summarize test result XML
+      - name: Verify stored per-test results
         if: always()
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          from xml.etree import ElementTree as ET
-          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
-          if not files:
-              print('JUnit: no XML files; no test result available')
-              raise SystemExit(1)
-          root = ET.parse(files[0]).getroot()
-          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
-          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
-          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
-          print(line)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
-              summary.write(line + '\n')
-          PY
+        run: python scripts/ci/check_test_results.py "$TEST_RESULTS_DIR"
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-unit-all-${{ matrix.os }}
-          path: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}/*.xml
+          path: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}/*
           retention-days: 90
           if-no-files-found: warn
 
@@ -358,37 +342,21 @@ jobs:
           echo "Agent: $agent_sha"
           printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Run sandbox process-control tests
-        run: mkdir -p "$TEST_RESULTS_DIR" && ASTRID_TEST_RESULTS_DIR="$TEST_RESULTS_DIR" sh tests/seccomp/run-suite.sh -rA --junitxml=/test-results/sandbox-process-control.xml
+        run: mkdir -p "$TEST_RESULTS_DIR" && ASTRID_TEST_RESULTS_DIR="$TEST_RESULTS_DIR" sh tests/seccomp/run-suite.sh
         shell: bash
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-sandbox-process-control
-      - name: Summarize test result XML
+      - name: Verify stored per-test results
         if: always()
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-sandbox-process-control
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          from xml.etree import ElementTree as ET
-          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
-          if not files:
-              print('JUnit: no XML files; no test result available')
-              raise SystemExit(1)
-          root = ET.parse(files[0]).getroot()
-          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
-          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
-          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
-          print(line)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
-              summary.write(line + '\n')
-          PY
+        run: python scripts/ci/check_test_results.py "$TEST_RESULTS_DIR"
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-sandbox-process-control-all-${{ runner.os }}
-          path: ${{ runner.temp }}/test-results-sandbox-process-control/*.xml
+          path: ${{ runner.temp }}/test-results-sandbox-process-control/*
           retention-days: 90
           if-no-files-found: warn
 
@@ -448,7 +416,7 @@ jobs:
       - name: Run portability lifecycle tests
         shell: bash
         run: >-
-          mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/portability-lifecycle.xml" -m ""
+          python scripts/ci/run_pytest.py "$TEST_RESULTS_DIR" portability-lifecycle -- -q -m ""
           tests/test_platform.py
           tests/test_platform_signaling.py
           tests/test_platform_windows.py
@@ -469,33 +437,17 @@ jobs:
           tests/test_portable_lifecycle.py
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}
-      - name: Summarize test result XML
+      - name: Verify stored per-test results
         if: always()
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          from xml.etree import ElementTree as ET
-          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
-          if not files:
-              print('JUnit: no XML files; no test result available')
-              raise SystemExit(1)
-          root = ET.parse(files[0]).getroot()
-          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
-          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
-          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
-          print(line)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
-              summary.write(line + '\n')
-          PY
+        run: python scripts/ci/check_test_results.py "$TEST_RESULTS_DIR"
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-portability-lifecycle-all-${{ matrix.os }}
-          path: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}/*.xml
+          path: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}/*
           retention-days: 90
           if-no-files-found: warn
       - name: Save pip cache on main or int branches (C-08)

@@ -109,6 +109,105 @@ def test_xfail_limit_accepts_exactly_the_cap() -> None:
     assert lanes.declared_xfail_errors({"grouped": _valid_xfail(nodeids=nodeids)}) == []
 
 
+def test_quarantine_cannot_grow_or_extend_against_the_git_merge_base() -> None:
+    from tests.quarantine_policy import merge_base_errors, policy_from_registry
+
+    assert not (errors := merge_base_errors(REPO, current=policy_from_registry(lanes))), "\n".join(errors)
+
+
+@pytest.mark.parametrize("change", ["ceiling", "new-node", "swapped-node", "expiry", "exception", "age-window"])
+def test_merge_base_policy_rejects_same_pr_quarantine_edits(change: str) -> None:
+    from copy import deepcopy
+    import subprocess
+    import types
+    from tests.quarantine_policy import compare_policies, policy_from_source, reference_commit
+
+    reference = policy_from_source((TESTS / "lanes.py").read_text(encoding="utf-8"))
+    current = deepcopy(reference)
+    first = next(iter(current["nodes"]))
+    if change == "ceiling":
+        current["ceiling"] += 1
+    elif change in ("new-node", "swapped-node"):
+        current["nodes"]["tests/test_new.py::test_hidden_bug"] = deepcopy(current["nodes"][first])
+        if change == "swapped-node":
+            del current["nodes"][first]
+        else:
+            current["ceiling"] += 1
+    elif change == "expiry":
+        current["nodes"][first]["expires"] = (date.fromisoformat(current["nodes"][first]["expires"]) + timedelta(days=1)).isoformat()
+    elif change == "exception":
+        current["nodes"][first]["raises"] = "builtins.Exception"
+    else:
+        current["max_days"] += 1
+    # Exercise the actual former gate and its same-PR pin, not a reimplementation
+    # of their loopholes. Only these isolated modules are forged.
+    base = reference_commit(REPO)
+    modules = {}
+    for filename, module_name in (("lanes.py", "_packet_base_lanes"), ("test_skip_guard.py", "_packet_base_guard")):
+        source = subprocess.check_output(["git", "show", f"{base}:tests/{filename}"], cwd=REPO, text=True)
+        module = types.ModuleType(module_name)
+        module.__file__ = str(TESTS / filename)
+        sys.modules[module_name] = module
+        try:
+            exec(compile(source, f"{base}:tests/{filename}", "exec"), module.__dict__)
+        finally:
+            del sys.modules[module_name]
+        modules[filename] = module
+    legacy = modules["lanes.py"]
+    legacy.MAX_DECLARED_XFAIL_TESTS = current["ceiling"]
+    legacy.MAX_XFAIL_DAYS = current["max_days"]
+    grouped = {}
+    for nodeid, contract in current["nodes"].items():
+        group = grouped.setdefault(contract["name"], {**contract, "nodeids": []})
+        group["nodeids"].append(nodeid)
+    legacy.DECLARED_XFAILS = {
+        name: legacy.DeclaredXfail(**{**contract, "nodeids": tuple(contract["nodeids"])})
+        for name, contract in grouped.items()
+    }
+    reference_day = min(date.fromisoformat(entry["expires"]) for entry in reference["nodes"].values()) - timedelta(days=13)
+    assert legacy.declared_xfail_errors(today=reference_day) == []
+    old_pin = modules["test_skip_guard.py"]
+    old_pin.lanes = legacy
+    old_pin._PINNED_XFAILS = old_pin._declared_xfail_contract(legacy.DECLARED_XFAILS)
+    old_pin.test_xfail_declarations_are_immutable_and_semantic()
+    assert compare_policies(current, reference)
+
+
+def test_merge_base_policy_allows_removing_fixed_quarantines_and_shortening_expiry() -> None:
+    from copy import deepcopy
+    from tests.quarantine_policy import compare_policies, policy_from_source
+
+    reference = policy_from_source((TESTS / "lanes.py").read_text(encoding="utf-8"))
+    current = deepcopy(reference)
+    del current["nodes"][next(iter(current["nodes"]))]
+    current["ceiling"] -= 1
+    first = next(iter(current["nodes"]))
+    current["nodes"][first]["expires"] = (date.fromisoformat(current["nodes"][first]["expires"]) - timedelta(days=1)).isoformat()
+    assert compare_policies(current, reference) == []
+
+
+def test_quarantine_reference_is_read_from_git_not_the_candidate_pin_table(tmp_path) -> None:
+    import subprocess
+    from tests.quarantine_policy import merge_base_errors
+
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    original = (TESTS / "lanes.py").read_text(encoding="utf-8")
+    (repo / "tests/lanes.py").write_text(original, encoding="utf-8")
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+    git("init", "-q")
+    git("add", "tests/lanes.py")
+    git("-c", "user.name=Guard probe", "-c", "user.email=probe@example.invalid", "commit", "-qm", "reference")
+    reference = git("rev-parse", "HEAD")
+    (repo / "tests/lanes.py").write_text(original.replace("MAX_DECLARED_XFAIL_TESTS = 19", "MAX_DECLARED_XFAIL_TESTS = 20"), encoding="utf-8")
+    # Updating a second, candidate-controlled copy cannot change Git history.
+    (repo / "tests/test_skip_guard.py").write_text("_PINNED_XFAILS = {'edited-in-same-pr': True}\n", encoding="utf-8")
+    git("add", "tests")
+    git("-c", "user.name=Guard probe", "-c", "user.email=probe@example.invalid", "commit", "-qm", "raised both copies")
+    assert any("ceiling increased" in error for error in merge_base_errors(repo, base=reference))
+
+
 # --- workflows -----------------------------------------------------------------
 
 @dataclass
@@ -131,7 +230,7 @@ class Job:
 def _default_marker_expression() -> str:
     addopts = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["pytest"]["ini_options"]["addopts"]
     tokens = shlex.split(addopts)
-    return tokens[tokens.index("-m") + 1]
+    return tokens[tokens.index("-m") + 1] if "-m" in tokens else ""
 
 
 def _os_key(runner: str) -> str:
@@ -159,7 +258,15 @@ def _pytest_commands(run: str) -> list[PytestCommand]:
         if "pytest" not in line:
             continue
         tokens = shlex.split(line)
-        rest = tokens[tokens.index("pytest") + 1:]
+        if "scripts/ci/run_pytest.py" in tokens:
+            start = tokens.index("scripts/ci/run_pytest.py") + 3
+            rest = tokens[start:]
+            if rest[:1] == ["--"]:
+                rest = rest[1:]
+        elif "pytest" in tokens:
+            rest = tokens[tokens.index("pytest") + 1:]
+        else:
+            continue
         expression, keyword, paths, i = None, None, [], 0
         while i < len(rest):
             token = rest[i]
@@ -176,7 +283,7 @@ def _pytest_commands(run: str) -> list[PytestCommand]:
             elif token == "-n":
                 i += 1
             elif token.startswith("tests"):
-                paths.append(token.split("::")[0])
+                paths.append(token)
             i += 1
         commands.append(PytestCommand(_default_marker_expression() if expression is None else expression, paths, keyword))
     return commands
@@ -256,6 +363,80 @@ class Use:
     classes: frozenset[str] = frozenset()  # enclosing class names
 
 
+@dataclass
+class _Parameter:
+    value: object
+    marks: frozenset[str] = frozenset()
+    id: str | None = None
+
+
+def _parameter_marks(decorator: ast.Call, assignments: dict[str, ast.AST]) -> list[tuple[str, frozenset[str]]]:
+    """Resolve parameter marks without importing or executing the test module.
+
+    The current parameter-specific declaration uses one string argument and a
+    conditional comprehension over dictionary keys. Unsupported expressions or
+    ambiguous IDs fail inventory, never become a whole-function allowance.
+    """
+    def value(node: ast.AST, scope: dict):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            return scope[node.id] if node.id in scope else value(assignments[node.id], scope)
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return [value(element, scope) for element in node.elts]
+        if isinstance(node, ast.Dict):
+            # Only keys participate in parameter iteration; values may name
+            # product exception classes and must not be imported or executed.
+            return {value(key, scope): None for key in node.keys}
+        if isinstance(node, ast.IfExp):
+            return value(node.body if value(node.test, scope) else node.orelse, scope)
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            left, right = value(node.left, scope), value(node.comparators[0], scope)
+            if isinstance(node.ops[0], ast.Eq):
+                return left == right
+            if isinstance(node.ops[0], ast.In):
+                return left in right
+        if isinstance(node, ast.ListComp) and len(node.generators) == 1:
+            generator = node.generators[0]
+            if isinstance(generator.target, ast.Name) and not generator.is_async:
+                result = []
+                for item in value(generator.iter, scope):
+                    nested = {**scope, generator.target.id: item}
+                    if all(value(condition, nested) for condition in generator.ifs):
+                        result.append(value(node.elt, nested))
+                return result
+        if isinstance(node, ast.Call) and len(node.args) == 1:
+            if isinstance(node.func, ast.Name) and node.func.id == "sorted" and not node.keywords:
+                return sorted(value(node.args[0], scope))
+            if (isinstance(node.func, ast.Attribute) and node.func.attr == "param"
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "pytest"):
+                fields = {field.arg: field.value for field in node.keywords}
+                if set(fields) <= {"marks", "id"}:
+                    return _Parameter(
+                        value(node.args[0], scope),
+                        frozenset(_mark_names(fields["marks"])) if "marks" in fields else frozenset(),
+                        value(fields["id"], scope) if "id" in fields else None,
+                    )
+        raise AssertionError(f"cannot statically resolve parameter-specific skip: {ast.unparse(node)}")
+
+    argument = ast.literal_eval(decorator.args[0])
+    assert isinstance(argument, str) and len(argument.split(",")) == 1, "parameter-specific skips require one statically identified argument"
+    parameters = value(decorator.args[1], {})
+    ids_node = next((field.value for field in decorator.keywords if field.arg == "ids"), None)
+    ids = value(ids_node, {}) if ids_node is not None else [None] * len(parameters)
+    assert len(ids) == len(parameters), "parameter-specific skip IDs must match the parameter table"
+    result = []
+    for parameter, explicit_id in zip(parameters, ids, strict=True):
+        parameter = parameter if isinstance(parameter, _Parameter) else _Parameter(parameter)
+        case_id = parameter.id if parameter.id is not None else explicit_id
+        if case_id is None:
+            case_id = parameter.value
+        assert isinstance(case_id, str) and case_id.isascii(), "parameter-specific skips require statically resolvable ASCII string IDs"
+        result.append((case_id, parameter.marks))
+    assert len({case_id for case_id, _ in result}) == len(result), "parameter-specific skip IDs must be unambiguous"
+    return result
+
+
 def _mark_names(node: ast.AST) -> set[str]:
     """Names of every ``pytest.mark.X`` and every bare name inside a decorator / pytestmark expression."""
     names = set()
@@ -277,14 +458,27 @@ def _entry_for_mark_variable() -> dict[str, DeclaredSkip]:
 
 
 def _uses() -> dict[str, list[Use]]:
-    """For each entry name, every test function that the entry guards."""
+    """For each entry, its function-wide or exact parameter-specific uses."""
     by_variable = _entry_for_mark_variable()
     uses: dict[str, list[Use]] = {name: [] for name in SKIP_REGISTRY}
     for path in sorted(TESTS.glob("test_*.py")):
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source)
+        assignments = {
+            target.id: node.value for node in tree.body if isinstance(node, ast.Assign)
+            for target in node.targets if isinstance(target, ast.Name)
+        }
+        variables = dict(by_variable)
         module_marks: set[str] = set()
         for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "tests.lanes":
+                for alias in node.names:
+                    if alias.name in by_variable:
+                        variables[alias.asname or alias.name] = by_variable[alias.name]
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in variables:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        variables[target.id] = variables[node.value.id]
             if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets):
                 module_marks |= _mark_names(node.value)
 
@@ -293,17 +487,43 @@ def _uses() -> dict[str, list[Use]]:
                 if isinstance(node, ast.ClassDef):
                     visit(node.body, inherited | {n for d in node.decorator_list for n in _mark_names(d)}, classes | {node.name})
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-                    marks = inherited | {n for d in node.decorator_list for n in _mark_names(d)}
-                    text = ast.get_source_segment(source, node) or ""
-                    entries = {by_variable[n].name for n in marks if n in by_variable}
+                    parameters = [d for d in node.decorator_list if isinstance(d, ast.Call)
+                                  and isinstance(d.func, ast.Attribute) and d.func.attr == "parametrize"]
+                    marks = inherited | {n for d in node.decorator_list if d not in parameters for n in _mark_names(d)}
+                    entries = {variables[n].name for n in marks if n in variables}
                     if "darwin_native" in marks:
                         entries.add("darwin-native")
-                    entries |= {name for name, d in SKIP_REGISTRY.items() if d.only_error and f'"{name}"' in text}
+                    # Embedded source strings in guard tests do not call the
+                    # runtime helper in this item. Credit actual AST calls.
+                    entries |= {
+                        call.args[0].value
+                        for call in ast.walk(node)
+                        if isinstance(call, ast.Call) and call.args
+                        and ((isinstance(call.func, ast.Name) and call.func.id == "skip_for_declared_error")
+                             or (isinstance(call.func, ast.Attribute) and call.func.attr == "skip_for_declared_error"))
+                        and isinstance(call.args[0], ast.Constant)
+                        and call.args[0].value in SKIP_REGISTRY
+                        and SKIP_REGISTRY[call.args[0].value].only_error
+                    }
                     hosts = frozenset(HOSTS)
                     for name in entries:
                         hosts &= SKIP_REGISTRY[name].runs_on()
                     for name in entries:
                         uses[name].append(Use(path.name, node.name, frozenset(marks & LANE_NAMES), hosts, classes))
+                    marked_parameters = [d for d in parameters if _mark_names(d) & variables.keys()]
+                    if marked_parameters:
+                        assert len(parameters) == 1, "parameter-specific skip inventory requires one resolved parameter dimension"
+                    for decorator in marked_parameters:
+                        for case_id, parameter_marks in _parameter_marks(decorator, assignments):
+                            parameter_entries = {variables[n].name for n in parameter_marks if n in variables}
+                            parameter_hosts = hosts
+                            for name in parameter_entries:
+                                parameter_hosts &= SKIP_REGISTRY[name].runs_on()
+                            for name in parameter_entries - entries:
+                                uses[name].append(Use(
+                                    path.name, f"{node.name}[{case_id}]",
+                                    frozenset((marks | parameter_marks) & LANE_NAMES), parameter_hosts, classes,
+                                ))
 
         visit(tree.body, module_marks)
     return uses
@@ -322,11 +542,21 @@ def _k_keeps(expression: str, use: Use) -> bool:
     return not any(term in name.lower() for name in names)
 
 
+def _path_selects(selector: str, use: Use) -> bool:
+    filename, *node = selector.split("::")
+    path, test_file = (REPO / filename).resolve(), (TESTS / use.file).resolve()
+    if node:
+        actual = [*sorted(use.classes), use.test]
+        return path == test_file and len(node) <= len(actual) and all(
+            selected == present if "[" in selected and "[" in present
+            else selected.split("[", 1)[0] == present.split("[", 1)[0]
+            for selected, present in zip(node, actual)
+        )
+    return path == test_file or path in test_file.parents
+
+
 def _selects(command: PytestCommand, use: Use) -> bool:
-    if command.paths and not any(
-        (REPO / p).resolve() == (TESTS / use.file).resolve() or (REPO / p).resolve() in (TESTS / use.file).resolve().parents
-        for p in command.paths
-    ):
+    if command.paths and not any(_path_selects(path, use) for path in command.paths):
         return False
     if command.keyword_expression is not None and not _k_keeps(command.keyword_expression, use):
         return False
@@ -378,6 +608,36 @@ def test_every_entry_has_tests_and_a_condition_that_lets_some_host_run_them() ->
     for entry in SKIP_REGISTRY.values():
         assert uses[entry.name], f"{entry.name}: no test uses this entry"
         assert entry.runs_on(), f"{entry.name}: the condition skips on every host"
+
+
+def test_skip_bindings_match_explicit_platform_lane_uses() -> None:
+    expected = {
+        name: tuple(sorted({f"tests/{use.file}::" + "::".join([*sorted(use.classes), use.test]) for use in uses}))
+        for name, uses in _uses().items()
+    }
+    assert lanes.DECLARED_SKIP_NODES == expected
+    from tests.quarantine_policy import merge_base_skip_binding_errors
+
+    assert not (errors := merge_base_skip_binding_errors(REPO, current=lanes.DECLARED_SKIP_NODES)), "\n".join(errors)
+
+
+@pytest.mark.parametrize("alias", ["import", "assignment"])
+def test_skip_inventory_follows_registered_marker_aliases(tmp_path, monkeypatch, alias) -> None:
+    declaration = (
+        "from tests.lanes import requires_windows_process_and_lock_apis as platform_only\n"
+        if alias == "import" else
+        "from tests.lanes import requires_windows_process_and_lock_apis\n"
+        "platform_only = requires_windows_process_and_lock_apis\n"
+    )
+    (tmp_path / "test_alias.py").write_text(
+        declaration + "@platform_only\ndef test_native(): pass\ndef test_unmarked(): pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "TESTS", tmp_path)
+    uses = _uses()["windows-process-and-lock-apis"]
+    assert [(use.file, use.test, use.hosts) for use in uses] == [
+        ("test_alias.py", "test_native", frozenset({"windows"})),
+    ]
 
 
 def test_every_declared_job_exists_and_runs_a_test_of_the_entry() -> None:
@@ -448,6 +708,12 @@ def test_k_filters_are_plain_exclusions() -> None:
     assert not _bad_k_filters(_jobs())
 
 
+def test_recorded_pytest_runner_keeps_the_same_lane_and_path_selection() -> None:
+    plain = _pytest_commands('python -m pytest -q -n 2 -m "integration" tests/test_platform.py')
+    recorded = _pytest_commands('python scripts/ci/run_pytest.py "$TEST_RESULTS_DIR" unit -- -q -n 2 -m "integration" tests/test_platform.py')
+    assert recorded == plain
+
+
 # --- the parser itself: one focused test per simplification it used to make ---------------
 
 def _spec(text: str) -> dict:
@@ -456,6 +722,18 @@ def _spec(text: str) -> dict:
 
 def _use(test: str = "test_a", file: str = "test_x.py", classes=(), marks=()) -> Use:
     return Use(file, test, frozenset(marks), frozenset(HOSTS), frozenset(classes))
+
+
+def test_node_selection_does_not_credit_other_tests_in_the_same_file() -> None:
+    command = _pytest_commands("python -m pytest -q tests/test_x.py::test_a")[0]
+    assert _selects(command, _use())
+    assert not _selects(command, _use("test_other"))
+    assert not _selects(command, _use(classes=["TestNative"]))
+    assert command.paths == ["tests/test_x.py::test_a"]
+    class_command = _pytest_commands("python -m pytest -q tests/test_x.py::TestNative::test_a[case]")[0]
+    assert _selects(class_command, _use(classes=["TestNative"]))
+    assert not _selects(class_command, _use(classes=["TestOther"]))
+    assert not _selects(class_command, _use())
 
 
 _ENTRY = DeclaredSkip("demo", "os_name == 'nt'", "demo", ("j",))
