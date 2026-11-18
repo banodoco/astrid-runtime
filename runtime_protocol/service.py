@@ -3114,6 +3114,9 @@ class RuntimeService:
                     self.store, validate_prepared=lambda value: validate_commit_value(value, "PreparedCommit"),
                 )
                 self._timeline_commit_coordinator = CommitExecutionCoordinator(self._timeline_commit_store)
+                # Only the service's own store absorbs unrelated writes. Throwaway stores
+                # (integrity reports, render admission) must never take this over.
+                self.store._after_commit = self._timeline_commit_store._absorb_own_write
             return self._timeline_commit_store, self._timeline_commit_coordinator
 
     def _timeline_authorize(self, project_id, timeline_id, authorize, *, mutation=True,

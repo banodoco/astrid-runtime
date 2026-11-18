@@ -69,6 +69,49 @@ def test_head_verification_after_an_unrelated_write_costs_the_same_at_3_and_30_e
     assert after == warm, "an unrelated write must not force the history to be verified again"
 
 
+def statements_during_write(film, root, entries):
+    subject = Film(root, film.fixture)
+    try:
+        subject.grow(entries)
+        commits, _ = subject.service._timeline_commits()
+        head = head_of(subject)
+        head_reads(subject, commits, head)
+        log = statements(subject)
+        unrelated_write(subject.service, "counted")
+        return len(log)
+    finally:
+        subject.service.close()
+
+
+def test_the_write_itself_costs_the_same_at_3_and_30_entries(film):
+    # The per-write recheck runs under store._mutex: it must not grow with history.
+    assert statements_during_write(film, film.fixture.source_root, 3) == \
+        statements_during_write(film, film.fixture.duplicate_root, 30)
+
+
+def test_a_second_store_on_the_same_realm_does_not_take_over_the_write_hook(film):
+    from runtime_protocol.timeline_commit_store import TimelineCommitStore
+
+    subject = Film(film.fixture.duplicate_root, film.fixture)
+    try:
+        subject.grow(3)
+        commits, _ = subject.service._timeline_commits()
+        head = head_of(subject)
+        log = statements(subject)
+        head_reads(subject, commits, head)
+        log.clear()
+        head_reads(subject, commits, head)
+        warm = len(log)
+        # integrity_report and render admission build stores like this one.
+        TimelineCommitStore(subject.service.store, validate_prepared=None)
+        unrelated_write(subject.service, "after-throwaway")
+        log.clear()
+        head_reads(subject, commits, head)
+        assert len(log) == warm
+    finally:
+        subject.service.close()
+
+
 def test_a_write_in_the_same_project_keeps_the_retained_history(film):
     subject = Film(film.fixture.duplicate_root, film.fixture)
     try:

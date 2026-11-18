@@ -52,6 +52,11 @@ def reject(reason, message=None, *, status=409, diagnostic_reason=None, safe_det
     raise error
 
 
+_QUERY_TABLE = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+_QUERY_RANGE = re.compile(r"\b(?:COUNT|MAX|MIN|SUM|AVG|GROUP|ORDER|LIMIT)\b", re.IGNORECASE)
+# Marks a query whose rows are exactly those of a bounded span of accepted history:
+# only a write to the history table itself (or a change to existing rows) can alter it.
+_HISTORY_RANGE = "/* history-range */ "
 _SEQUENCE_QUERY = "SELECT next_seq FROM project_sequences WHERE project_id=?"
 _VERSION_PARTS = ("connection", "total_changes", "data_version", "files", "package_owner")
 
@@ -289,6 +294,7 @@ class TimelineCommitStore:
         self._history_state = {}
         # Every SQL result a retained proof consumed: (query, parameters, method) -> rows.
         self._retained_rows = {}
+        self._query_tables = {}
         self._connection = self.store.conn
         self._reading = False
         self._acceptance_transaction = False
@@ -296,8 +302,6 @@ class TimelineCommitStore:
         self._database_identity = (value.st_dev, value.st_ino)
         self._wal_identity = None
         self.clear_replay_memo()
-        # The store calls this after any other committed write (see _absorb_own_write).
-        self.store._after_commit = self._absorb_own_write
 
     def clear_replay_memo(self):
         with self.store._mutex:
@@ -307,7 +311,7 @@ class TimelineCommitStore:
             self._retained_rows = {}
             self._replay_generation += 1
 
-    def _absorb_own_write(self):
+    def _absorb_own_write(self, writes=None):
         """Keep verified history across an unrelated write by this Runtime.
 
         Accepted history is immutable and each proof is valid for exactly the
@@ -317,6 +321,11 @@ class TimelineCommitStore:
         and every retained SQL result still reads back identically; otherwise
         everything is discarded, as before. A new head then costs only its own
         verification, not a replay of each entry the caller loads next.
+
+        ``writes`` names the tables the write inserted into, updated or deleted
+        from (``None`` or ``other`` means unknown). Only retained results the
+        write can have changed are read back: an insert cannot alter a row a
+        proof looked up by key, so the cost is the write's, not the history's.
         """
         with self.store._mutex:
             if self._acceptance_transaction or getattr(self._verification, "current", None) is not None:
@@ -329,7 +338,7 @@ class TimelineCommitStore:
                         and version[2] == previous[2] and version[4] == previous[4]
                         and all(old is None or (new is not None and old[:2] == new[:2] and old[-2:] == new[-2:])
                                 for old, new in zip(previous[3], version[3]))
-                        and self._retained_rows_unchanged()):
+                        and self._retained_rows_unchanged(writes)):
                     self._history_state["heads"].clear()
                     self._replay_store_version = version
                 else:
@@ -337,8 +346,24 @@ class TimelineCommitStore:
             except Exception:
                 self.clear_replay_memo()
 
-    def _retained_rows_unchanged(self):
+    def _write_can_change(self, query, method, writes):
+        if writes is None or writes["other"]:
+            return True
+        tables = self._query_tables.get(query)
+        if tables is None:
+            tables = self._query_tables[query] = frozenset(_QUERY_TABLE.findall(query))
+        if not tables or tables & (writes["update"] | writes["delete"]):
+            return True
+        if query.startswith(_HISTORY_RANGE):
+            return "timeline_commit_history" in writes["insert"]
+        if tables & writes["insert"]:
+            return method != "fetchone" or _QUERY_RANGE.search(query) is not None
+        return False
+
+    def _retained_rows_unchanged(self, writes=None):
         for (query, parameters, method), expected in list(self._retained_rows.items()):
+            if not self._write_can_change(query, method, writes):
+                continue
             value = getattr(self.store.conn.execute(query, parameters), method)()
             rows = [value] if method == "fetchone" else value
             live = tuple(None if row is None else tuple(row) for row in rows)
@@ -1058,7 +1083,7 @@ class TimelineCommitStore:
                 "SELECT * FROM timeline_commit_history WHERE project_id=? AND timeline_id=? "
                 "AND project_seq>? AND project_seq<=? ORDER BY project_seq", (*scope, low, ordinal)).fetchall()
             ledgers = {row["txn_id"]: dict(row) for row in self.conn.execute(
-                "SELECT * FROM command_idempotency WHERE txn_id IN (SELECT publication_id "
+                f"{_HISTORY_RANGE}SELECT * FROM command_idempotency WHERE txn_id IN (SELECT publication_id "
                 "FROM timeline_commit_history WHERE project_id=? AND timeline_id=? AND project_seq>? AND project_seq<=?)",
                 (*scope, low, ordinal)).fetchall()}
             for row in rows:
