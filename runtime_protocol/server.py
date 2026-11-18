@@ -226,11 +226,13 @@ class _ReplyWriter:
             raise TimeoutError("reply write timed out") from cause
         select.select([], [self._sock], [], left)
 
+    closed = False
+
     def flush(self):
         pass
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class RuntimeHandler(BaseHTTPRequestHandler):
