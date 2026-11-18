@@ -1233,6 +1233,9 @@ class RealmStore:
             if self._idempotency_prune_pending:
                 self._idempotency_prune_clocks.update(self._idempotency_prune_pending)
                 self._last_idempotency_prune = max(self._idempotency_prune_pending.values())
+            after_commit = getattr(self, "_after_commit", None)
+            if after_commit is not None:
+                after_commit()
         finally:
             self._idempotency_prune_pending = None
 
