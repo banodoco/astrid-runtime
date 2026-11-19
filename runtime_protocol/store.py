@@ -594,6 +594,7 @@ def public_task_spec(spec):
     public.pop("execution_request", None)
     public.pop("_runtime_reuse_toolchain", None)
     public.pop("_runtime_render_admission", None)
+    public.pop("_runtime_thumbnail_intent", None)
     intent = public.pop(GENERATION_INTENT_STORAGE_KEY, None)
     if intent is None and LEGACY_GENERATION_INTENT_STORAGE_KEY in public:
         intent = public.pop(LEGACY_GENERATION_INTENT_STORAGE_KEY)
@@ -2829,13 +2830,17 @@ class RealmStore:
                 return False
         return True
 
-    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False, execution_request=None, capture_validator=None):
+    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False, execution_request=None, capture_validator=None, _thumbnail_intent=None):
         if not capability:
             raise ValidationError("capability is required")
         if not isinstance(spec, dict):
             raise ValidationError("task spec must be an object")
         if "_runtime_render_admission" in spec:
             raise ValidationError("render admission identity is Runtime-owned")
+        if "_runtime_thumbnail_intent" in spec or (
+            isinstance(spec.get("spec"), dict) and "_runtime_thumbnail_intent" in spec["spec"]
+        ):
+            raise ValidationError("thumbnail intent binding is Runtime-owned")
         if "execution_binding" in spec or (
             isinstance(spec.get("spec"), dict)
             and "execution_binding" in spec["spec"]
@@ -2862,6 +2867,14 @@ class RealmStore:
             spec["required_facts"] = normalize_execution_facts(spec["required_facts"], field="required_facts")
         with self._mutex, (self._transaction() if capability == "rendering.render" else nullcontext()):
             project_id = self._project(project)["id"] if project else None
+            thumbnail_intent = None
+            if _thumbnail_intent is not None:
+                from .thumbnail_intents import BINDING_KEY, CAPABILITY_ID, binding_intent
+                if (capability != CAPABILITY_ID or not isinstance(expected_effect, dict)
+                        or expected_effect.get("effect_type") != "generation.thumbnail.attach"):
+                    raise ValidationError("thumbnail intent requires the native thumbnail task")
+                thumbnail_intent = binding_intent(self, _thumbnail_intent)
+                spec = {**spec, BINDING_KEY: dict(_thumbnail_intent)}
             from .timeline_commit_producer_checkpoint import complete_pending_render, validate_pending_render
             checkpoint = validate_pending_render(self, project_id, capability, spec, idempotency_key,
                                                  expected_effect, capability_digest, execution_request)
@@ -3056,6 +3069,7 @@ class RealmStore:
                         expected_effect,
                         project_id=project_id,
                         input_object_ids=spec.get("input_object_ids", []) if isinstance(spec, dict) else [],
+                        thumbnail_intent=thumbnail_intent,
                     )
                 if historical_admission:
                     # The Runtime-built snapshot is not published until every
@@ -4557,7 +4571,7 @@ class RealmStore:
             raise ValidationError("unsupported settlement effect_type")
         return kind
 
-    def _validate_settlement_effect(self, effect, *, project_id=None, result=None, input_object_ids=None, attempt_id=None):
+    def _validate_settlement_effect(self, effect, *, project_id=None, result=None, input_object_ids=None, attempt_id=None, thumbnail_intent=None):
         kind = self._settlement_effect_kind(effect)
         if kind == "generation.publish_v1":
             return self._validate_generation_publish_v1_effect(
@@ -4594,6 +4608,7 @@ class RealmStore:
                 result=result,
                 input_object_ids=input_object_ids,
                 attempt_id=attempt_id,
+                thumbnail_intent=thumbnail_intent,
             )
         try:
             current = self._project(str(target))
@@ -5252,6 +5267,7 @@ class RealmStore:
         result=None,
         input_object_ids=None,
         attempt_id=None,
+        thumbnail_intent=None,
     ):
         effect_type = "generation.thumbnail.attach"
         required_effect = {"effect_type", "target_id", "expected_version", "payload"}
@@ -5312,18 +5328,33 @@ class RealmStore:
                 "thumbnail attachment generation is outside the task project",
                 details={"target_id": target_id, "project_id": project_id},
             )
-        if int(generation["version"]) != expected_version:
-            raise ConflictError(
-                "stale thumbnail attachment target generation version",
-                details={"target": target_id, "expected": expected_version, "actual": int(generation["version"])},
-            )
-        primary_variant = self._generation_primary_variant(target_id)
-        primary_source_object_id = "sha256:" + primary_variant["object_id"]
-        if primary_source_object_id != source_object_id:
-            raise ConflictError(
-                "thumbnail source is not the generation primary object",
-                details={"expected": primary_source_object_id, "actual": source_object_id},
-            )
+        variant = None
+        if thumbnail_intent is None:
+            if int(generation["version"]) != expected_version:
+                raise ConflictError(
+                    "stale thumbnail attachment target generation version",
+                    details={"target": target_id, "expected": expected_version, "actual": int(generation["version"])},
+                )
+            primary_variant = self._generation_primary_variant(target_id)
+            primary_source_object_id = "sha256:" + primary_variant["object_id"]
+            if primary_source_object_id != source_object_id:
+                raise ConflictError(
+                    "thumbnail source is not the generation primary object",
+                    details={"expected": primary_source_object_id, "actual": source_object_id},
+                )
+        else:
+            if (thumbnail_intent["project_id"] != str(project_id)
+                    or thumbnail_intent["generation_id"] != target_id
+                    or thumbnail_intent["source_object_id"] != source_object_id
+                    or thumbnail_intent["recipe_version"] != payload["recipe_version"]):
+                raise ConflictError("thumbnail attachment differs from its Runtime-owned intent")
+            variant = self.conn.execute(
+                "SELECT * FROM generation_variants WHERE id=?", (thumbnail_intent["variant_id"],),
+            ).fetchone()
+            if (variant is None or variant["generation_id"] != target_id
+                    or "sha256:" + variant["object_id"] != source_object_id):
+                raise ConflictError("thumbnail intent variant source changed")
+            primary_source_object_id = source_object_id
         source_digest = source_object_id.removeprefix("sha256:")
         if not self.conn.execute("SELECT 1 FROM objects WHERE digest=?", (source_digest,)).fetchone():
             raise ConflictError("thumbnail source object is not present in Runtime CAS")
@@ -5400,6 +5431,7 @@ class RealmStore:
             "generation": generation,
             "primary_source_object_id": primary_source_object_id,
             "thumbnail": descriptor,
+            "variant": variant,
         }
 
     def _apply_settlement_effect(
@@ -5413,6 +5445,7 @@ class RealmStore:
         settled_at=None,
         attempt_id=None,
         duration_seconds_presence=None,
+        thumbnail_intent=None,
     ):
         kind = self._settlement_effect_kind(effect)
         if kind == "generation.publish_v1":
@@ -5689,7 +5722,11 @@ class RealmStore:
                 result=result,
                 input_object_ids=input_object_ids,
                 attempt_id=attempt_id,
+                thumbnail_intent=thumbnail_intent,
             )
+            if thumbnail_intent is not None:
+                from .thumbnail_intents import apply_thumbnail
+                return apply_thumbnail(self, plan, project_id=project_id, settled_at=settled_at or now())
             generation = plan["generation"]
             descriptor = self._thumbnail_metadata_descriptor(
                 plan["thumbnail"], plan["primary_source_object_id"]
@@ -6241,6 +6278,8 @@ class RealmStore:
                 # transaction.  Publication and object/project metadata are
                 # performed only after all lease/effect checks succeeded.
                 self.assert_delegated_children_completed(task_id, attempt_id)
+                from .thumbnail_intents import task_intent
+                thumbnail_intent = task_intent(self, task)
                 if effect is not None:
                     self._validate_settlement_effect(
                         effect,
@@ -6248,6 +6287,7 @@ class RealmStore:
                         result=result,
                         input_object_ids=input_object_ids,
                         attempt_id=attempt_id,
+                        thumbnail_intent=thumbnail_intent,
                     )
                 self._validated_manifest_digest(result, project_id=task_project_id)
                 applied_effect = None
@@ -6275,6 +6315,7 @@ class RealmStore:
                         settled_at=timestamp,
                         attempt_id=attempt_id,
                         duration_seconds_presence=duration_seconds_presence,
+                        thumbnail_intent=thumbnail_intent,
                     )
                 if publish is not None and not append_effect:
                     publish()
@@ -6307,7 +6348,7 @@ class RealmStore:
                         "generation.create_with_variant", "generation.variant.append", "generation.publish_v1"}:
                     from .thumbnail_intents import settlement_intents
                     intents = settlement_intents(self, task=task, attempt_id=attempt_id,
-                        project_id=task_project_id, managed_outputs=managed_outputs)
+                        project_id=task_project_id, managed_outputs=managed_outputs, result=result)
                     if intents:
                         result["thumbnail_intents"] = intents
                 if self._task_lifetime_failure(task, datetime.now(timezone.utc)):

@@ -6458,7 +6458,7 @@ class RuntimeService(TaskWaits, ThinRequests):
             raise AuthorizationError("discovery grant selected project/run/task/attempt association does not match")
 
     @_verified_mutation
-    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None, _recoverable_outputs=None, identity=None, _thin_admission=None):
+    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None, _recoverable_outputs=None, identity=None, _thin_admission=None, _thumbnail_intent=None):
         if "thin_request" in body:
             return self.create_thin_task(body, identity=identity, enforce_readiness=enforce_readiness)
         if "capability" in body or "expected_effect" in body:
@@ -6472,6 +6472,7 @@ class RuntimeService(TaskWaits, ThinRequests):
         if not isinstance(task_spec_value, dict):
             raise ValidationError("task spec must be an object")
         reserved = {ADMISSION_KEY, "child_delegation", "delegated_parent", "delegated_stage", "delegated_inputs", "verified_publication_source", "input_refs", "derived_input_registry", "delegation_closed_attempt_id", "delegated_recoverable_outputs", "discovery_grant"}
+        reserved.add("_runtime_thumbnail_intent")
         if set(task_spec_value) & reserved or set(body) & (reserved - {"child_delegation"}):
             raise ValidationError("delegation fields must use Runtime admission authority")
         if _delegated_lineage is not None and "child_delegation" in body:
@@ -6538,7 +6539,8 @@ class RuntimeService(TaskWaits, ThinRequests):
         from .capture_validation import validate_capture
         inputs = task_spec_value.get("inputs") if isinstance(task_spec_value.get("inputs"), dict) else {}
         value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness, execution_request=execution_request,
-                                       capture_validator=lambda snapshot, ref: validate_capture(self, snapshot, ref, inputs))
+                                       capture_validator=lambda snapshot, ref: validate_capture(self, snapshot, ref, inputs),
+                                       _thumbnail_intent=_thumbnail_intent)
         return value
 
     def _live_delegating_parent(self, attempt_id, lease, *, identity):
