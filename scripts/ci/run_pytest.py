@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -58,9 +59,14 @@ def main(argv=None) -> int:
         parser.error("the runner owns collection and result output options")
     directory = options.directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
+    # A sandbox may not inherit the host step's environment. Retain its native
+    # observer beside the existing raw evidence; the host copies those bytes.
+    observer = Path(os.environ.get("CEILING_STEP_DIR", str(directory / "ceiling")))
+    observer.mkdir(parents=True, exist_ok=True)
+    os.environ["CEILING_STEP_DIR"] = str(observer)
     manifest = directory / "collection.json"
     entrypoint = Path(__file__).with_name("pytest_entrypoint.py").resolve()
-    selection = [sys.executable, "-I", "-u", str(entrypoint), f"--collection-manifest={manifest}"]
+    selection = [sys.executable, "-I", "-u", str(entrypoint), "-p", "scripts.ci.ceiling_pytest", f"--collection-manifest={manifest}"]
     status = logged_run([*selection, "--collect-only", *collection_args(args)], directory / "collection.log")
     if status:
         return status

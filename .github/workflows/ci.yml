@@ -2,6 +2,8 @@
 name: CI
 
 on:
+  schedule:
+    - cron: "17 1 * * *"
   # Pushes start CI only on main, release mains and int/ integration branches. Pull requests run for every base branch.
   push:
     branches: [main, "release/*/main", "int/**", "release/14/plan-39"]
@@ -33,7 +35,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Checkout published Agent alongside Runtime
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-03 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         env:
           AGENT_SHA: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9
         run: |
@@ -44,36 +46,48 @@ jobs:
           git -C "$agent_dir" checkout --detach --quiet FETCH_HEAD
           test "$(git -C "$agent_dir" rev-parse HEAD)" = "$AGENT_SHA"
       - name: Record effective Runtime and Agent checkouts
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-04 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           runtime_sha=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
           agent_sha=$(git -C "$GITHUB_WORKSPACE/../astrid-agent" rev-parse HEAD)
           echo "Runtime: $runtime_sha"
           echo "Agent: $agent_sha"
           printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
-      - run: python -m pip install -e '.[test]'
-      - run: python -m pip install -e packages/python
+      - name: Plan39 recorded command 05
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-05 --matrix ${{ strategy.job-index || 0 }} --shell pwsh {0}
+        run: python -m pip install -e '.[test]'
+      - name: Plan39 recorded command 06
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-06 --matrix ${{ strategy.job-index || 0 }} --shell pwsh {0}
+        run: python -m pip install -e packages/python
       - name: Install published Agent from sibling checkout
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-07 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: python -m pip install -e "$GITHUB_WORKSPACE/../astrid-agent"
       - name: Verify Windows update backup daemon from a selected venv
-        run: python -m pytest -q -rP -m "" tests/test_windows_runtime_launch.py
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-08 --matrix ${{ strategy.job-index || 0 }} --shell pwsh {0}
+        run: python -m pytest -p ceiling_pytest -q -rP -m "" tests/test_windows_runtime_launch.py
       - name: Verify native realm creation, ownership, and rollback
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-09 --matrix ${{ strategy.job-index || 0 }} --shell pwsh {0}
         run: >-
-          python -m pytest -q -m "not integration and not darwin_native and not live"
+          python -m pytest -p ceiling_pytest -q -m "not integration and not darwin_native and not live"
           tests/test_realm_creation_publication.py
           tests/test_realm_replacement_publication.py
           tests/test_platform_windows.py::test_windows_directory_mutex_uses_global_user_scoped_identity
           tests/test_m1_review.py
       - name: Verify native Windows signal and foreground cleanup paths
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-10 --matrix ${{ strategy.job-index || 0 }} --shell pwsh {0}
         run: >-
-          python -m pytest -q -m ""
+          python -m pytest -p ceiling_pytest -q -m ""
           tests/test_platform_signaling.py
           tests/test_runtime_cli_serve_cleanup.py
           tests/test_service_stop.py
       - name: Verify Runtime service cleanup receipt contract
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-11 --matrix ${{ strategy.job-index || 0 }} --shell pwsh {0}
         run: >-
-          python -m pytest -q -m "not integration and not darwin_native and not live"
+          python -m pytest -p ceiling_pytest -q -m "not integration and not darwin_native and not live"
           tests/test_profile_services.py::test_supervisor_marks_runtime_owned_service_name_after_configured_env
           tests/test_profile_services.py::test_pack_host_cleanup_receipts_are_bounded_owner_only_and_preserved
           tests/test_profile_services.py::test_service_cleanup_receipt_history_keeps_latest_64_attempts
@@ -92,6 +106,14 @@ jobs:
         with:
           path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
           key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
+      - name: Retain actual Plan39 command and native result evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-ceiling-${{ github.job }}-${{ strategy.job-index || '0' }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failure-ceiling/${{ github.job }}/
+          retention-days: 90
+          if-no-files-found: error
 
   unit:
     runs-on: ${{ matrix.os }}
@@ -118,7 +140,7 @@ jobs:
         id: astrid-pin
         env:
           AGENT_OVERRIDE: ${{ inputs.agent_sha }}
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-03 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
           if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -127,7 +149,7 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Checkout pinned Agent
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-04 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         env:
           AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
         run: |
@@ -137,7 +159,7 @@ jobs:
           git -C "$ASTRID_CHECKOUT" checkout --detach --quiet "$AGENT_SHA"
           test "$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)" = "$AGENT_SHA"
       - name: Record effective Runtime and Agent checkouts
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-05 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           runtime_sha=$(git rev-parse HEAD)
           agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
@@ -147,21 +169,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: npm ci
+      - name: Plan39 recorded command 07
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-07 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: npm ci
         working-directory: packages/typescript
       - name: Add locked TypeScript compiler to PATH
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-08 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: echo "$GITHUB_WORKSPACE/packages/typescript/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Install system media tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-09 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
       - name: Install system media tools (macOS)
         if: runner.os == 'macOS'
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-10 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: brew install ffmpeg
-      - run: python -m pip install -e '.[test]'
-      - run: python -m pip install -e "$ASTRID_CHECKOUT"
+      - name: Plan39 recorded command 11
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-11 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pip install -e '.[test]'
+      - name: Plan39 recorded command 12
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-12 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pip install -e "$ASTRID_CHECKOUT"
       - name: Run unit tests
-        shell: bash
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-13 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: python scripts/ci/run_pytest.py "$TEST_RESULTS_DIR" unit -- -q -n 2 -m "not integration and not darwin_native and not live"
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
@@ -169,6 +200,7 @@ jobs:
         if: always()
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-14 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: python scripts/ci/check_test_results.py "$TEST_RESULTS_DIR"
       - name: Upload test results
         if: always()
@@ -185,6 +217,14 @@ jobs:
         with:
           path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
           key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
+      - name: Retain actual Plan39 command and native result evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-ceiling-${{ github.job }}-${{ strategy.job-index || '0' }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failure-ceiling/${{ github.job }}/
+          retention-days: 90
+          if-no-files-found: error
 
   darwin-native:
     # The darwin_native lane is deselected by default and skipped off macOS; this
@@ -201,12 +241,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: brew install ffmpeg
+      - name: Plan39 recorded command 03
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-03 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: brew install ffmpeg
       # Non-editable: the host-only spawn test needs the installed pair (runtime_protocol and astrid in the
       # same site-packages), the layout the verified launcher's import mapping covers.
-      - run: python -m pip install '.[test]'
+      - name: Plan39 recorded command 04
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-04 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pip install '.[test]'
       - name: Checkout published Agent alongside Runtime (darwin spawn test needs the Agent)
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-05 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         env:
           AGENT_SHA: 4866090edcce7df31d1f0e03cf2354b878e94105
         run: |
@@ -217,11 +261,14 @@ jobs:
           git -C "$agent_dir" checkout --detach --quiet FETCH_HEAD
           test "$(git -C "$agent_dir" rev-parse HEAD)" = "$AGENT_SHA"
       - name: Install the Agent's locked dependencies, then the Agent non-editably
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-06 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           python -m pip install --disable-pip-version-check --no-input --require-hashes -r "$GITHUB_WORKSPACE/../astrid-agent/requirements/runtime.lock"
           python -m pip install --disable-pip-version-check --no-input --no-deps "$GITHUB_WORKSPACE/../astrid-agent"
-      - run: python -m pytest -q -m darwin_native
+      - name: Plan39 recorded command 07
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-07 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pytest -p ceiling_pytest -q -m darwin_native
 
       - name: Save pip cache on main or int branches (C-08)
         if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-ci-3.outputs.cache-hit != 'true' }}
@@ -229,18 +276,43 @@ jobs:
         with:
           path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
           key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
+      - name: Retain actual Plan39 command and native result evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-ceiling-${{ github.job }}-${{ strategy.job-index || '0' }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failure-ceiling/${{ github.job }}/
+          retention-days: 90
+          if-no-files-found: error
 
   typescript-client:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Plan39 evidence collector
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: npm ci
+      - name: Plan39 recorded command 02
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-02 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: npm ci
         working-directory: packages/typescript
-      - run: npm test
+      - name: Plan39 recorded command 03
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-03 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: npm test
         working-directory: packages/typescript
+      - name: Retain actual Plan39 command and native result evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-ceiling-${{ github.job }}-${{ strategy.job-index || '0' }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failure-ceiling/${{ github.job }}/
+          retention-days: 90
+          if-no-files-found: error
 
   boundary:
     runs-on: ubuntu-latest
@@ -261,7 +333,7 @@ jobs:
         id: astrid-pin
         env:
           AGENT_OVERRIDE: ${{ inputs.agent_sha }}
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-03 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
           if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -270,7 +342,7 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Checkout pinned Agent
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-04 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         env:
           AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
         run: |
@@ -280,7 +352,7 @@ jobs:
           git -C "$ASTRID_CHECKOUT" checkout --detach --quiet FETCH_HEAD
           test "$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)" = "$AGENT_SHA"
       - name: Record effective Runtime and Agent checkouts
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-05 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           runtime_sha=$(git rev-parse HEAD)
           agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
@@ -290,9 +362,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: python -m pip install -e '.[test]'
-      - run: python -m pip install -e "$ASTRID_CHECKOUT"
-      - run: python -m pytest -q tests/test_second_client_e2e.py -m ""
+      - name: Plan39 recorded command 07
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-07 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pip install -e '.[test]'
+      - name: Plan39 recorded command 08
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-08 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pip install -e "$ASTRID_CHECKOUT"
+      - name: Plan39 recorded command 09
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-09 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pytest -p ceiling_pytest -q tests/test_second_client_e2e.py -m ""
 
       - name: Save pip cache on main or int branches (C-08)
         if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-ci-2.outputs.cache-hit != 'true' }}
@@ -300,6 +379,14 @@ jobs:
         with:
           path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
           key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
+      - name: Retain actual Plan39 command and native result evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-ceiling-${{ github.job }}-${{ strategy.job-index || '0' }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failure-ceiling/${{ github.job }}/
+          retention-days: 90
+          if-no-files-found: error
 
   sandbox-process-control:
     # Sandbox mode under a seccomp profile that denies what NVIDIA OpenShell's
@@ -311,11 +398,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Set up Plan39 evidence collector
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Select pinned Agent revision
         id: astrid-pin
         env:
           AGENT_OVERRIDE: ${{ inputs.agent_sha }}
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-01 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
           if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -324,7 +415,7 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Checkout pinned Agent
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-02 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         env:
           AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
         run: |
@@ -334,7 +425,7 @@ jobs:
           git -C "$ASTRID_CHECKOUT" checkout --detach --quiet "$AGENT_SHA"
           test "$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)" = "$AGENT_SHA"
       - name: Record effective Runtime and Agent checkouts
-        shell: bash
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-03 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           runtime_sha=$(git rev-parse HEAD)
           agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
@@ -343,13 +434,15 @@ jobs:
           printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Run sandbox process-control tests
         run: mkdir -p "$TEST_RESULTS_DIR" && ASTRID_TEST_RESULTS_DIR="$TEST_RESULTS_DIR" sh tests/seccomp/run-suite.sh
-        shell: bash
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-04 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-sandbox-process-control
       - name: Verify stored per-test results
         if: always()
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-sandbox-process-control
+        shell: python -I "${{ github.workspace }}/scripts/ci/ceiling_capture.py" --step step-05 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: python scripts/ci/check_test_results.py "$TEST_RESULTS_DIR"
       - name: Upload test results
         if: always()
@@ -359,6 +452,14 @@ jobs:
           path: ${{ runner.temp }}/test-results-sandbox-process-control/*
           retention-days: 90
           if-no-files-found: warn
+      - name: Retain actual Plan39 command and native result evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-ceiling-${{ github.job }}-${{ strategy.job-index || '0' }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failure-ceiling/${{ github.job }}/
+          retention-days: 90
+          if-no-files-found: error
 
   portability-lifecycle:
     env:
@@ -389,7 +490,7 @@ jobs:
         id: astrid-pin
         env:
           AGENT_OVERRIDE: ${{ inputs.agent_sha }}
-        shell: bash
+        shell: python -I "${{ github.workspace }}/astrid-runtime/scripts/ci/ceiling_capture.py" --step step-03 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
           if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -403,18 +504,25 @@ jobs:
           ref: ${{ steps.astrid-pin.outputs.sha }}
           path: astrid-agent
       - name: Record effective checkouts
-        shell: bash
+        shell: python -I "${{ github.workspace }}/astrid-runtime/scripts/ci/ceiling_capture.py" --step step-05 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: |
           runtime_sha=$(git rev-parse HEAD)
           agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
           echo "Runtime: $runtime_sha"
           echo "Agent: $agent_sha"
           printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
-      - run: python -m pip install -e '.[test]'
-      - run: python -m pip install -e packages/python
-      - run: python -m pip install -e "$ASTRID_CHECKOUT"
+      - name: Plan39 recorded command 06
+        shell: python -I "${{ github.workspace }}/astrid-runtime/scripts/ci/ceiling_capture.py" --step step-06 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pip install -e '.[test]'
+      - name: Plan39 recorded command 07
+        shell: python -I "${{ github.workspace }}/astrid-runtime/scripts/ci/ceiling_capture.py" --step step-07 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pip install -e packages/python
+      - name: Plan39 recorded command 08
+        shell: python -I "${{ github.workspace }}/astrid-runtime/scripts/ci/ceiling_capture.py" --step step-08 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
+        run: python -m pip install -e "$ASTRID_CHECKOUT"
       - name: Run portability lifecycle tests
-        shell: bash
+        if: ${{ !cancelled() }}
+        shell: python -I "${{ github.workspace }}/astrid-runtime/scripts/ci/ceiling_capture.py" --step step-09 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: >-
           python scripts/ci/run_pytest.py "$TEST_RESULTS_DIR" portability-lifecycle -- -q -m ""
           tests/test_platform.py
@@ -441,6 +549,7 @@ jobs:
         if: always()
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}
+        shell: python -I "${{ github.workspace }}/astrid-runtime/scripts/ci/ceiling_capture.py" --step step-10 --matrix ${{ strategy.job-index || 0 }} --shell bash {0}
         run: python scripts/ci/check_test_results.py "$TEST_RESULTS_DIR"
       - name: Upload test results
         if: always()
@@ -460,6 +569,15 @@ jobs:
   # A pull request into a release branch comes from a branch of that release and names what it belongs
   # to: the plan (a plan branch does so by its name) or the astrid-dev issue. See the Release skill,
   # "How a release runs".
+      - name: Retain actual Plan39 command and native result evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-ceiling-${{ github.job }}-${{ strategy.job-index || '0' }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failure-ceiling/${{ github.job }}/
+          retention-days: 90
+          if-no-files-found: error
+
   landing-reference:
     name: landing reference
     if: ${{ github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/') && endsWith(github.base_ref, '/main') }}
