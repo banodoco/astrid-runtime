@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "repository": "banodoco/astrid-runtime",
+  "authority": {
+    "dev_sha": "4223b30a2b56c7eb59da3a47b200516372bdca5a",
+    "decision": "6995664680",
+    "amendment": "6996255390",
+    "seed_and_reconciliation_decision": "6998651356",
+    "g1_report_sha256": "d4a4b2d5bce5324c47d0018db9ce651e979550c9361f74354caf65b939a99879",
+    "g2_report_sha256": "50760681220707845c9bd50e6795a0914fce9f705177359f6300ebc9324be522"
+  },
+  "entries": [],
+  "retired": []
+}

@@ -1,0 +1,164 @@
+{
+  "schema": 1,
+  "packet": "R14-P39-14",
+  "session": "r14-P39-14-1",
+  "repository": "banodoco/astrid-runtime",
+  "authority": "https://github.com/banodoco/astrid-dev/issues/796#issuecomment-6998651356",
+  "verification_utc": "2026-11-19T03:25:29.605670+00:00",
+  "destination_merged": "19cd1e35cd247fd394204940b6e7a02929fa3fc6",
+  "comparator_tests": {
+    "command": "python3 -I scripts/ci/test_failure_ceiling.py -v",
+    "passed": 27,
+    "exit": 0,
+    "log": "comparator-tests.txt"
+  },
+  "native_executed_proof": {
+    "fixture_only": true,
+    "product_qualification": false,
+    "executed_local_fixture_commit": "c49c7e0925f1e25c6a9702554bdf5440e6621ea8",
+    "implementation_sha256": {
+      "failure_ceiling.py": "a5e977a0e8744973f35f10ac682b1ef4b80c6250a71c3a9bca93584b5c4145ed",
+      "ceiling_adapters.py": "fadd505b101bf3d9c77d54c66b32a485943f54eef66303bf1f519518c19e0a92",
+      "ceiling_capture.py": "a19174a70946c5ca7d4b7e16385da17a13b868eed4019c5a5e734623fce840a1",
+      "ceiling_node.mjs": "7a93667f5c53eac83676b95ef12d9eff7b81c653d23595ab3c4143ddd1abe411"
+    },
+    "results": {
+      "complete-covered-merge": "PASS",
+      "complete-covered-release": "PASS",
+      "actual-fixture-retirement": "PASS",
+      "retired-recurrence": "FAIL",
+      "sensitive-different-cause": "FAIL",
+      "missing-nightly": "FAIL"
+    },
+    "actual_native_invocations": 10,
+    "expected_raw_exits": {
+      "g1": 1,
+      "g2": 1,
+      "passing": 0,
+      "recurrence": 1,
+      "different-cause": 1
+    },
+    "qualification_limit": "Executed fixture retirement is not retirement of any G1/G2 product entry."
+  },
+  "reporter_typescript": {
+    "compiler": "TypeScript 5.9.3",
+    "strict": true,
+    "exit": 0
+  },
+  "seed_entries": 0,
+  "reconciliation": {
+    "missing_nine": "accepted by Lead 6998651356",
+    "failed_subtests_33": "retained and matched individually",
+    "missing_native_jobs_and_censuses": "unknown; blocks qualification"
+  },
+  "product_qualification": false,
+  "product_retirements": 0,
+  "limits": [
+    "No complete covered product run is claimed.",
+    "No real product entry is retired by the executable fixture.",
+    "Missing job/native census evidence and installed Windows journey tuple remain unknown.",
+    "App ten G2-pass failures remain uncovered; Lead owns bisection and routing.",
+    "Hosted trusted comparator bootstrap is expected to fail until the accepted base contains it."
+  ],
+  "implementation_sha256": {
+    "scripts/ci/ceiling_adapters.py": "fadd505b101bf3d9c77d54c66b32a485943f54eef66303bf1f519518c19e0a92",
+    "scripts/ci/ceiling_capture.py": "a19174a70946c5ca7d4b7e16385da17a13b868eed4019c5a5e734623fce840a1",
+    "scripts/ci/ceiling_hosted.py": "1ca0aa5685ffd5faea197ccb56acba086b6502a6f44217f328df190eafb3448a",
+    "scripts/ci/ceiling_node.mjs": "7a93667f5c53eac83676b95ef12d9eff7b81c653d23595ab3c4143ddd1abe411",
+    "scripts/ci/ceiling_pytest.py": "3166c8770e290ede0237987b73c16832aa2e428595a4777dfec0ac8b9ef79796",
+    "scripts/ci/failure_ceiling.py": "a5e977a0e8744973f35f10ac682b1ef4b80c6250a71c3a9bca93584b5c4145ed",
+    "scripts/ci/test_failure_ceiling.py": "57bf1d041fb7cc9a7429f8a9017487264b769d3391b7a46e867182749a317587",
+    "scripts/ci/prove_failure_ceiling.py": "a5efb0631dc0a8edab8c4266a1f87f05c4e4f9f92f9c637b47b0c930e92b9921"
+  },
+  "evidence_sha256": {
+    "app-source-tuple-stage-facts.json.gz": "6547961025c91c0118f3fae2dfa6194d5868441888b7ebdaea58ee851a22240b",
+    "build_seed.py": "d16fbbc6a925f727f175c2e981662f2a39aeb552b639fb456903504a8b053c59",
+    "comparator-tests.txt": "a9a0f3cec225ad615ba4817072ff06f97c7c0a9ae8ef1369b829318a8ad7ffda",
+    "coverage-gap-native-records.json.gz": "d7199d3c5133c47e2263229b06c3624830325ae38095ef446356be48aefcbdbb",
+    "id9-coverage-source-facts.json.gz": "1fb6aa894655d36b660779bbf6d631ee45bb7b6270c9310b0b0096bc57307326",
+    "lead-6998123631.json.gz": "cee018d66072be20cb3b8bda4ea4e113262ee04fbe1716e52e41957df5007a89",
+    "lead-6998138942.json.gz": "38a0f6cd5ffabd7e56776e677043fcf7e73f792dd1f7b7c407900e80351cc71a",
+    "lead-6998651356.json.gz": "1bdd3d76d7e720d79fb409bf93c3713751d15020ff172186f515488f87f62162",
+    "native-adapter-probes.tar.gz": "adc6869ba123b2e1507d1e3d0ef6fe206381bd8a77ca4616e9aa07f9f7c37c0e",
+    "native-executed-proof.json": "670ca7e525d047d67d99916bff47f57821af1b4e51d3daa3568c891353e0be05",
+    "native-executed-proof.tar.gz": "08695bb011fe8ec7526371e7e9da73094a5206d7e05655b4cae072438c04bf6d",
+    "native-omission-source-facts.json.gz": "6959a0ff483acd8a95d9d99fa501b1a776c66caa8851a787ef7ee4bbedd17b05",
+    "nine-id-reconciliation.json.gz": "a1b0ac17063ba83afca547bf3bc824db4366cb7a4b7c044faa574d603bd61cd4",
+    "required-job-dependency-facts.json.gz": "8a768452abf3eacc74561cdc141b5e7091ef53db9fa68e1525d2d6ef64293db8",
+    "seed-summary.json": "b144cb3b25c98107879c90f8548d18fd64b8f70f3572ecefb6d8d4b3cf3e3fad",
+    "subtest-reconciliation-33.json.gz": "d2ed8dcba9bca122227c87ef582588e7b04b9630f24369afaa66bf0ff065008b",
+    "workflow-bootstrap-proof.json": "4cbacca2c0eddca96a4c082274cb8cd61874af392267da6fe0313a97fe493173",
+    "workflow-command-comparison.json": "e07bd168424322a8e1dcea343d458ec6cd541b3d8658921ca10919f2ff1de71a",
+    "workflow-validation.json": "57b0d4db009ab6f2e987311fe704b99336c0017ead7ae2f67f63eb769d73442c"
+  },
+  "workflow_validation": {
+    "validator": "actionlint v1.7.7",
+    "command": [
+      "actionlint",
+      "-shellcheck=",
+      "-pyflakes=",
+      "-oneline",
+      ".github/workflows/ci.yml",
+      ".github/workflows/nightly.yml",
+      ".github/workflows/failure-ceiling.yml"
+    ],
+    "exit": 0,
+    "output": "",
+    "scope": "All packet workflow files; external shellcheck/pyflakes are disabled because this check validates Actions schema and expression contexts.",
+    "prior_failure": "GitHub rejected expressions in steps.shell before creating native jobs; prior implementation checkpoint is unqualified.",
+    "core_implementation_unchanged": true,
+    "matrix_environment_explicit_for_every_captured_job": true,
+    "captured_jobs": [
+      {
+        "workflow": ".github/workflows/nightly.yml",
+        "job": "integration",
+        "matrix": null
+      },
+      {
+        "workflow": ".github/workflows/ci.yml",
+        "job": "windows-realm-publication",
+        "matrix": null
+      },
+      {
+        "workflow": ".github/workflows/ci.yml",
+        "job": "unit",
+        "matrix": {
+          "os": [
+            "ubuntu-latest",
+            "macos-latest"
+          ]
+        }
+      },
+      {
+        "workflow": ".github/workflows/ci.yml",
+        "job": "darwin-native",
+        "matrix": null
+      },
+      {
+        "workflow": ".github/workflows/ci.yml",
+        "job": "typescript-client",
+        "matrix": null
+      },
+      {
+        "workflow": ".github/workflows/ci.yml",
+        "job": "boundary",
+        "matrix": null
+      },
+      {
+        "workflow": ".github/workflows/ci.yml",
+        "job": "sandbox-process-control",
+        "matrix": null
+      },
+      {
+        "workflow": ".github/workflows/ci.yml",
+        "job": "portability-lifecycle",
+        "matrix": {
+          "os": [
+            "ubuntu-latest",
+            "macos-latest"
+          ]
+        }
+      }
+    ]
+  }
+}

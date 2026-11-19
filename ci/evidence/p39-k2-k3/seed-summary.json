@@ -1,0 +1,2161 @@
+{
+  "schema": 1,
+  "repository": "astrid-runtime",
+  "authority": {
+    "dev_sha": "4223b30a2b56c7eb59da3a47b200516372bdca5a",
+    "decision": "6995664680",
+    "amendment": "6996255390",
+    "seed_and_reconciliation_decision": "6998651356",
+    "g1_report_sha256": "d4a4b2d5bce5324c47d0018db9ce651e979550c9361f74354caf65b939a99879",
+    "g2_report_sha256": "50760681220707845c9bd50e6795a0914fce9f705177359f6300ebc9324be522"
+  },
+  "admitted": 0,
+  "explicit_candidates_not_admitted": 349,
+  "native_inventory": 30871,
+  "owners": {},
+  "source_artifacts": [
+    {
+      "artifact_id": 14433570144,
+      "sha256": "251504f9bafa12608c3cfba3b40b0b73660b61238c6b991256a577ba9478947a",
+      "lane": "CI/unit (ubuntu-latest)",
+      "selected": 9652,
+      "subtest_context": "unavailable in original reporter"
+    },
+    {
+      "artifact_id": 14441948450,
+      "sha256": "4e69a97c8c31ebeb74b0697b3eec81e9cd6ab3ca91344dbf38b83e3cbb6f27ee",
+      "lane": "CI/unit (macos-latest)",
+      "selected": 9652,
+      "subtest_context": "unavailable in original reporter"
+    },
+    {
+      "artifact_id": 14432965131,
+      "sha256": "7b1df79462732caca66698db134a715bd5dede8951923fe72d9d45af65c8b120",
+      "lane": "CI/sandbox-process-control",
+      "selected": 9576,
+      "subtest_context": "unavailable in original reporter"
+    },
+    {
+      "artifact_id": 14431410903,
+      "sha256": "1795cd499e47be787d39a66c69373ca9064980d2954beb30013626b214005ccb",
+      "lane": "CI/portability-lifecycle (ubuntu-latest)",
+      "selected": 662,
+      "subtest_context": "unavailable in original reporter"
+    },
+    {
+      "artifact_id": 14430684562,
+      "sha256": "d3f07c853a004bbcee7a6ae71cefe3758a53f1432332d9163716931172828fa7",
+      "lane": "CI/portability-lifecycle (macos-latest)",
+      "selected": 662,
+      "subtest_context": "unavailable in original reporter"
+    },
+    {
+      "artifact_id": 14429154793,
+      "sha256": "38d8856cc8ff7fd461075f96119b65ca91948e694d22d1db42615edc2983bba6",
+      "lane": "Nightly/integration",
+      "selected": 667,
+      "subtest_context": "unavailable in original reporter"
+    }
+  ],
+  "not_admitted": [
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_imported_media_catalog.py::test_project_media_permission_and_size_rejections_have_no_catalog_side_effects",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_diagnostics.py::test_diagnostics_uses_shared_update_job_result_and_program_root_log",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_diagnostics.py::test_direct_journal_wins_over_old_job_and_rejects_public_log",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_direct_render_admission.py::test_direct_managed_render_rejects_legacy_shot_before_claim",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_direct_render_admission.py::test_direct_managed_render_rejects_nested_shot_before_queueing",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_operator_lifecycle_sol_closures.py::test_upgrade_lifecycle_refusal_after_owner_stop_never_restarts_for_recovery",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_p2_commit_phase_capture.py::test_supported_app_bootstrap_loads_this_pinned_helper_offline",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_precut_realm_fixture.py::test_two_restored_copies_have_independent_owner_locks_and_readonly_stable_bytes",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_precut_variants.py::test_variants_restore_exact_historical_images_and_publication_identity[music-documents-film-move-baseline-film-two-clip-publication]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_precut_variants.py::test_variants_restore_exact_historical_images_and_publication_identity[anchor-input-anchor-baseline-input-anchor-baseline]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_precut_variants.py::test_variants_restore_exact_historical_images_and_publication_identity[raw-raw-parent-raw-publication]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_restore_history_fixture.py::test_authenticated_capture_has_only_two_parent_images_and_original_counters",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_root_generation_query.py::test_malformed_unvalidated_effect_type_cannot_certify_ordinary[kind0]",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_root_generation_query.py::test_malformed_unvalidated_effect_type_cannot_certify_ordinary[kind1]",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_rename_semantics.py::test_raw_os_rename_call_sites_remain_reviewed_fail_if_present_moves",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_original_retry_ignores_corrupt_later_acceptance[event_hash-0000000000000000000000000000000000000000000000000000000000000000]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_original_retry_ignores_corrupt_later_acceptance[payload_json-{\"corrupt\":true}]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_upstream_v31_schema_migration_installs_empty_history_without_invented_baselines",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_legacy_timeline_v31_fixture_remains_a_distinct_migration_source",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_shot_composition_runtime.py::test_parent_composition_history_lists_broken_rows_but_restore_rejects_tampered_dependencies",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_shot_layering_fixture.py::test_shared_shot_layering_fixture_is_valid_and_complete",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_skip_policy.py::test_no_test_file_skips_by_hand",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_spec_dedup.py::test_offline_migration_and_compaction_of_duplicate_render_specs",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_seed_preserves_full_raw_assertions_and_history",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[missing_batch]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[missing_step]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[wrong_ordinal]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[foreign]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[outside]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[duplicate]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[ambiguous]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[tampered_source]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[wrong_phase]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[media-False]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[media-True]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[missing_media-False]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[missing_media-True]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-False-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-False-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-True-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-True-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-False-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-False-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-True-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-True-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_declared_allocation_and_retired_reservation_remain_exact",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_legacy_authority.py::test_service_actual_bootstrap_command_restore_and_exact_retries",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_legacy_authority.py::test_http_actual_create_command_restore_rename_and_ordinary_artifact_metadata",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[legacy-native-delete]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[legacy-whole-restore]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[v2-native-delete]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[v2-whole-restore]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[before-revision]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[before-digest]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[before-state]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[after-revision]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[after-digest]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[after-state]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[path]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[extra-write]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-before]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-after]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-ref]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-path]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-extra]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[missing-history]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[publication]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[step]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[command-range]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[native-range]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[effect-range]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[effect-value]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[missing-effect-pin]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-effect-value]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-effect-op]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[transient-root]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-None]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-timeline]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-step-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-atomic]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-fallback]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-None]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-timeline]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-step-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-atomic]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-fallback]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_producer_checkpoint.py::test_a_new_settled_attempt_cannot_consume_the_accepted_task_again",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_recorder_abi_authority.py::test_genuine_fork_recorder_authority_history_and_exact_retry[1]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_recorder_abi_authority.py::test_supported_genuine_legacy_acceptance_remains_replayable_after_restart",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_recorder_abi_authority.py::test_legacy_history_cannot_acquire_injected_mode_two",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication.py::test_publication_is_fenced_atomic_and_exactly_replayable",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication.py::test_prepared_checkpoint_cannot_publish_after_cancel_or_stale_fence",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication.py::test_prepared_checkpoint_resumes_on_retried_attempt_after_runtime_restart",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_tracked_target_refuses_without_invalidating_canonical_history",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_existing_same_project_unadmitted_target_refuses_before_checkpoint",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication0]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[False]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication2]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[main]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication4]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication5]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication6]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_text_legacy_custody.py::test_legacy_reuse_refuses_without_any_writes[corrupt_bytes]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication7]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication8]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_inconsistent_native_target_cannot_override_legacy_admission",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_corrupt_immutable_spec_cannot_supply_target_authority",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_canonical_tracking_after_prepare_refuses_before_publication_writes",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_exact_published_checkpoint_replays_before_live_target_changes",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_verified_media.py::test_verified_image_and_both_swap_inputs_preserve_exact_selection_without_writes",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_tracking_is_scoped_to_the_publication_target",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_legacy_head_without_canonical_publication_remains_publishable",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_v33_protected_acceptance.py::test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH[automatic]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_v33_protected_acceptance.py::test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH[explicit_interruption]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (macos-latest)",
+      "native_id": "tests/test_v33_protected_acceptance.py::test_V33_ACTUAL_R0_ROLLBACK_FULL_SET_BEFORE_EXECUTABLE_LAUNCH[interrupted_restore]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_imported_media_catalog.py::test_project_media_permission_and_size_rejections_have_no_catalog_side_effects",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_diagnostics.py::test_diagnostics_uses_shared_update_job_result_and_program_root_log",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_diagnostics.py::test_direct_journal_wins_over_old_job_and_rejects_public_log",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_direct_render_admission.py::test_direct_managed_render_rejects_legacy_shot_before_claim",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_direct_render_admission.py::test_direct_managed_render_rejects_nested_shot_before_queueing",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_restore_history_fixture.py::test_authenticated_capture_has_only_two_parent_images_and_original_counters",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_root_generation_query.py::test_malformed_unvalidated_effect_type_cannot_certify_ordinary[kind0]",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_root_generation_query.py::test_malformed_unvalidated_effect_type_cannot_certify_ordinary[kind1]",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_operator_lifecycle_sol_closures.py::test_upgrade_lifecycle_refusal_after_owner_stop_never_restarts_for_recovery",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_p2_commit_phase_capture.py::test_supported_app_bootstrap_loads_this_pinned_helper_offline",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_precut_realm_fixture.py::test_two_restored_copies_have_independent_owner_locks_and_readonly_stable_bytes",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_precut_variants.py::test_variants_restore_exact_historical_images_and_publication_identity[music-documents-film-move-baseline-film-two-clip-publication]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_precut_variants.py::test_variants_restore_exact_historical_images_and_publication_identity[anchor-input-anchor-baseline-input-anchor-baseline]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_precut_variants.py::test_variants_restore_exact_historical_images_and_publication_identity[raw-raw-parent-raw-publication]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_shot_composition_runtime.py::test_parent_composition_history_lists_broken_rows_but_restore_rejects_tampered_dependencies",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_shot_layering_fixture.py::test_shared_shot_layering_fixture_is_valid_and_complete",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_skip_policy.py::test_no_test_file_skips_by_hand",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_spec_dedup.py::test_offline_migration_and_compaction_of_duplicate_render_specs",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_rename_semantics.py::test_raw_os_rename_call_sites_remain_reviewed_fail_if_present_moves",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[media-False]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[media-True]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[missing_media-False]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[missing_media-True]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_original_retry_ignores_corrupt_later_acceptance[event_hash-0000000000000000000000000000000000000000000000000000000000000000]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_original_retry_ignores_corrupt_later_acceptance[payload_json-{\"corrupt\":true}]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_upstream_v31_schema_migration_installs_empty_history_without_invented_baselines",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_legacy_timeline_v31_fixture_remains_a_distinct_migration_source",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_seed_preserves_full_raw_assertions_and_history",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[missing_batch]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[missing_step]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[wrong_ordinal]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[foreign]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[outside]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[duplicate]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[ambiguous]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[tampered_source]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[wrong_phase]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-False-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-False-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-True-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-True-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-False-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-False-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-True-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-True-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_declared_allocation_and_retired_reservation_remain_exact",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-None]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-timeline]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-step-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-atomic]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-fallback]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-None]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-timeline]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-step-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-atomic]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-fallback]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[legacy-native-delete]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[legacy-whole-restore]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[v2-native-delete]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[v2-whole-restore]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[before-revision]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[before-digest]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[before-state]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[after-revision]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[after-digest]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[after-state]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[path]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[extra-write]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-before]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-after]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-ref]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-path]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-extra]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[missing-history]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[publication]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[step]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[command-range]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[native-range]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[effect-range]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[effect-value]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[missing-effect-pin]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-effect-value]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-effect-op]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[transient-root]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_legacy_authority.py::test_service_actual_bootstrap_command_restore_and_exact_retries",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_legacy_authority.py::test_http_actual_create_command_restore_rename_and_ordinary_artifact_metadata",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_producer_checkpoint.py::test_a_new_settled_attempt_cannot_consume_the_accepted_task_again",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_recorder_abi_authority.py::test_genuine_fork_recorder_authority_history_and_exact_retry[1]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_recorder_abi_authority.py::test_supported_genuine_legacy_acceptance_remains_replayable_after_restart",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_recorder_abi_authority.py::test_legacy_history_cannot_acquire_injected_mode_two",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication.py::test_publication_is_fenced_atomic_and_exactly_replayable",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication.py::test_prepared_checkpoint_cannot_publish_after_cancel_or_stale_fence",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication.py::test_prepared_checkpoint_resumes_on_retried_attempt_after_runtime_restart",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_tracked_target_refuses_without_invalidating_canonical_history",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_existing_same_project_unadmitted_target_refuses_before_checkpoint",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication0]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[False]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication2]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[main]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication4]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication5]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication6]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication7]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication8]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_inconsistent_native_target_cannot_override_legacy_admission",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_corrupt_immutable_spec_cannot_supply_target_authority",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_canonical_tracking_after_prepare_refuses_before_publication_writes",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_exact_published_checkpoint_replays_before_live_target_changes",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_tracking_is_scoped_to_the_publication_target",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_legacy_head_without_canonical_publication_remains_publishable",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_text_legacy_custody.py::test_legacy_reuse_refuses_without_any_writes[corrupt_bytes]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/unit (ubuntu-latest)",
+      "native_id": "tests/test_timeline_verified_media.py::test_verified_image_and_both_swap_inputs_preserve_exact_selection_without_writes",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_imported_media_catalog.py::test_project_media_permission_and_size_rejections_have_no_catalog_side_effects",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_diagnostics.py::test_diagnostics_uses_shared_update_job_result_and_program_root_log",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_diagnostics.py::test_direct_journal_wins_over_old_job_and_rejects_public_log",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_direct_render_admission.py::test_direct_managed_render_rejects_legacy_shot_before_claim",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_direct_render_admission.py::test_direct_managed_render_rejects_nested_shot_before_queueing",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_linux_listener.py::test_child_exit_during_actual_http_invalidates_buffered_success",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_linux_listener.py::test_actual_custodian_crash_keeps_engine_but_refuses_replacement",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_root_generation_query.py::test_malformed_unvalidated_effect_type_cannot_certify_ordinary[kind0]",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_root_generation_query.py::test_malformed_unvalidated_effect_type_cannot_certify_ordinary[kind1]",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_operator_lifecycle_sol_closures.py::test_upgrade_lifecycle_refusal_after_owner_stop_never_restarts_for_recovery",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_p2_commit_phase_capture.py::test_supported_app_bootstrap_loads_this_pinned_helper_offline",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_precut_realm_fixture.py::test_two_restored_copies_have_independent_owner_locks_and_readonly_stable_bytes",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_precut_variants.py::test_variants_restore_exact_historical_images_and_publication_identity[music-documents-film-move-baseline-film-two-clip-publication]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_precut_variants.py::test_variants_restore_exact_historical_images_and_publication_identity[anchor-input-anchor-baseline-input-anchor-baseline]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_precut_variants.py::test_variants_restore_exact_historical_images_and_publication_identity[raw-raw-parent-raw-publication]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_process_control.py::test_probe_uses_live_child_group_when_inherited_group_is_unreachable",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_process_control.py::test_probe_reaps_child_on_group_check_failure[3]",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_shot_composition_runtime.py::test_parent_composition_history_lists_broken_rows_but_restore_rejects_tampered_dependencies",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_shot_layering_fixture.py::test_shared_shot_layering_fixture_is_valid_and_complete",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_skip_policy.py::test_no_test_file_skips_by_hand",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_spec_dedup.py::test_offline_migration_and_compaction_of_duplicate_render_specs",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_rename_semantics.py::test_raw_os_rename_call_sites_remain_reviewed_fail_if_present_moves",
+      "owner": "R15-3 (RT6)",
+      "reason": "G1 diagnostic is missing, too weak or truncated"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_restore_history_fixture.py::test_authenticated_capture_has_only_two_parent_images_and_original_counters",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[media-False]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[media-True]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[missing_media-False]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_restore_port.py::test_restore_rejects_damaged_exact_source_before_provider_or_writes[missing_media-True]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_seed_preserves_full_raw_assertions_and_history",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[missing_batch]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[missing_step]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[wrong_ordinal]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[foreign]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[outside]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[duplicate]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[ambiguous]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[tampered_source]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_sequential_verifier.py::test_public_three_products_scope_forgery_refuses_without_write[wrong_phase]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_original_retry_ignores_corrupt_later_acceptance[event_hash-0000000000000000000000000000000000000000000000000000000000000000]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_original_retry_ignores_corrupt_later_acceptance[payload_json-{\"corrupt\":true}]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_upstream_v31_schema_migration_installs_empty_history_without_invented_baselines",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_commit_acceptance.py::test_legacy_timeline_v31_fixture_remains_a_distinct_migration_source",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[legacy-native-delete]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[legacy-whole-restore]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[v2-native-delete]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_inverse_sequential_scope_round_trip[v2-whole-restore]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[before-revision]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[before-digest]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[before-state]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[after-revision]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[after-digest]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[after-state]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[path]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[extra-write]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-before]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-after]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-ref]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-path]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-extra]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[missing-history]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[publication]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[step]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[command-range]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[native-range]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[effect-range]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[effect-value]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[missing-effect-pin]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-effect-value]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[source-effect-op]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_inverse_sequential_authority.py::test_restore_inverse_refuses_inexact_sequential_authority[transient-root]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_legacy_authority.py::test_service_actual_bootstrap_command_restore_and_exact_retries",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_legacy_authority.py::test_http_actual_create_command_restore_rename_and_ordinary_artifact_metadata",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-None]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-timeline]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-step-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-atomic]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[raw-fallback]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-None]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-timeline]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-step-parent]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-atomic]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_native_asset_union.py::test_disjoint_clip_merge_and_guarded_undo_preserve_explicit_scopes[both-fallback]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-False-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-False-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-True-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[False-True-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-False-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-False-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-True-stable-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_real_forward_omission_keeps_exact_allocations[True-True-historical-track]",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_forward_created_authority.py::test_declared_allocation_and_retired_reservation_remain_exact",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_recorder_abi_authority.py::test_genuine_fork_recorder_authority_history_and_exact_retry[1]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_recorder_abi_authority.py::test_supported_genuine_legacy_acceptance_remains_replayable_after_restart",
+      "owner": "R15-3 (RT6)",
+      "reason": "failure stage is not bound to the call phase on both measurements"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_recorder_abi_authority.py::test_legacy_history_cannot_acquire_injected_mode_two",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_producer_checkpoint.py::test_a_new_settled_attempt_cannot_consume_the_accepted_task_again",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_text_legacy_custody.py::test_legacy_reuse_refuses_without_any_writes[corrupt_bytes]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_verified_media.py::test_verified_image_and_both_swap_inputs_preserve_exact_selection_without_writes",
+      "owner": "R15-3 (RT6)",
+      "reason": "matching error alone does not resolve custody/persistence/settlement/refusal cause; outside-cut admission not established"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication.py::test_publication_is_fenced_atomic_and_exactly_replayable",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication.py::test_prepared_checkpoint_cannot_publish_after_cancel_or_stale_fence",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication.py::test_prepared_checkpoint_resumes_on_retried_attempt_after_runtime_restart",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_tracked_target_refuses_without_invalidating_canonical_history",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_existing_same_project_unadmitted_target_refuses_before_checkpoint",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication0]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[False]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication2]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[main]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication4]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication5]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication6]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication7]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_missing_or_malformed_admitted_target_fails_closed[publication8]",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_inconsistent_native_target_cannot_override_legacy_admission",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_corrupt_immutable_spec_cannot_supply_target_authority",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_canonical_tracking_after_prepare_refuses_before_publication_writes",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_exact_published_checkpoint_replays_before_live_target_changes",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_tracking_is_scoped_to_the_publication_target",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    },
+    {
+      "lane": "CI/sandbox-process-control",
+      "native_id": "tests/test_timeline_render_publication_authority.py::test_legacy_head_without_canonical_publication_remains_publishable",
+      "owner": "R15-3 (RT6)",
+      "reason": "sensitive case retained outside ceiling pending explicit cause/installed-witness review"
+    }
+  ],
+  "limits": [
+    "residual R15-1/R15-2 groups require supported cause evidence; no blanket admission",
+    "App identities use uniquely reconciled full source tuples; internal IDs remain unavailable in historical logs",
+    "no later exact-head product retirement receipt was found; executable fixture proof is separate"
+  ]
+}

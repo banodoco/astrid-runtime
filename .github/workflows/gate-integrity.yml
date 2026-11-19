@@ -38,4 +38,3 @@ jobs:
           ASTRID_GATE_OWNERS: ${{ vars.ASTRID_GATE_OWNERS }}
           PULL_REQUEST: ${{ github.event.pull_request.number }}
         run: python -I scripts/ci/protect_gate_paths.py --pull-request "$PULL_REQUEST"
-

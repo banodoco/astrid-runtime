@@ -16,8 +16,9 @@ import subprocess
 import sys
 import urllib.request
 
-PREFIXES = ("scripts/ci/", "scripts/worker-env/", ".github/workflows/", ".github/actions/", "requirements/")
+PREFIXES = ("ci/", "scripts/ci/", "scripts/worker-env/", ".github/workflows/", ".github/actions/", "requirements/")
 FILES = {
+    "packages/typescript/package.json", "packages/typescript/package-lock.json",
     "scripts/__init__.py", "tests/__init__.py", "tests/lanes.py",
     "tests/ci_evidence.py", "tests/collection_policy.py", "tests/quarantine_policy.py",
     "tests/skip-bindings.json", "tests/test_skip_guard.py", "tests/test_skip_policy.py",

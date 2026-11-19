@@ -1,0 +1,1148 @@
+{
+  "version": 1,
+  "repository": "banodoco/astrid-runtime",
+  "authority": {
+    "plan": "Plan 39 K2/K3",
+    "source": "banodoco/astrid-dev@4223b30a2b56c7eb59da3a47b200516372bdca5a",
+    "decision": "6995664680",
+    "amendment": "6996255390"
+  },
+  "merge": [
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "unit (ubuntu-latest)",
+      "kind": "tests",
+      "job_id": "unit",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select pinned Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Checkout pinned Agent",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Add locked TypeScript compiler to PATH",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Install system media tools",
+          "kind": "check",
+          "optional": true
+        },
+        {
+          "id": "step-10",
+          "name": "Install system media tools (macOS)",
+          "kind": "check",
+          "optional": true
+        },
+        {
+          "id": "step-11",
+          "name": "Plan39 recorded command 11",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-12",
+          "name": "Plan39 recorded command 12",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-13",
+          "name": "Run unit tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/unit (ubuntu-latest)"
+        },
+        {
+          "id": "step-14",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "unit (macos-latest)",
+      "kind": "tests",
+      "job_id": "unit",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select pinned Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Checkout pinned Agent",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Add locked TypeScript compiler to PATH",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Install system media tools",
+          "kind": "check",
+          "optional": true
+        },
+        {
+          "id": "step-10",
+          "name": "Install system media tools (macOS)",
+          "kind": "check",
+          "optional": true
+        },
+        {
+          "id": "step-11",
+          "name": "Plan39 recorded command 11",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-12",
+          "name": "Plan39 recorded command 12",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-13",
+          "name": "Run unit tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/unit (macos-latest)"
+        },
+        {
+          "id": "step-14",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "1",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "windows-realm-publication",
+      "kind": "tests",
+      "job_id": "windows-realm-publication",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Checkout published Agent alongside Runtime",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Plan39 recorded command 05",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-06",
+          "name": "Plan39 recorded command 06",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Install published Agent from sibling checkout",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Verify Windows update backup daemon from a selected venv",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/windows-realm-publication/step-08"
+        },
+        {
+          "id": "step-09",
+          "name": "Verify native realm creation, ownership, and rollback",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/windows-realm-publication/step-09"
+        },
+        {
+          "id": "step-10",
+          "name": "Verify native Windows signal and foreground cleanup paths",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/windows-realm-publication/step-10"
+        },
+        {
+          "id": "step-11",
+          "name": "Verify Runtime service cleanup receipt contract",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/windows-realm-publication/step-11"
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "darwin-native",
+      "kind": "tests",
+      "job_id": "darwin-native",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Plan39 recorded command 03",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Plan39 recorded command 04",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Checkout published Agent alongside Runtime (darwin spawn test needs the Agent)",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-06",
+          "name": "Install the Agent's locked dependencies, then the Agent non-editably",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/darwin-native"
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "4866090edcce7df31d1f0e03cf2354b878e94105"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "typescript-client",
+      "kind": "tests",
+      "job_id": "typescript-client",
+      "commands": [
+        {
+          "id": "step-02",
+          "name": "Plan39 recorded command 02",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-03",
+          "name": "Plan39 recorded command 03",
+          "kind": "tests",
+          "optional": false,
+          "runner": "node",
+          "invocations": 1,
+          "lane": "CI/typescript-client"
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {}
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "boundary",
+      "kind": "tests",
+      "job_id": "boundary",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select pinned Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Checkout pinned Agent",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Plan39 recorded command 08",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Plan39 recorded command 09",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/boundary"
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "sandbox-process-control",
+      "kind": "tests",
+      "job_id": "sandbox-process-control",
+      "commands": [
+        {
+          "id": "step-01",
+          "name": "Select pinned Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-02",
+          "name": "Checkout pinned Agent",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-03",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Run sandbox process-control tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/sandbox-process-control"
+        },
+        {
+          "id": "step-05",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "portability-lifecycle (ubuntu-latest)",
+      "kind": "tests",
+      "job_id": "portability-lifecycle",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-06",
+          "name": "Plan39 recorded command 06",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Plan39 recorded command 08",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Run portability lifecycle tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/portability-lifecycle (ubuntu-latest)"
+        },
+        {
+          "id": "step-10",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "portability-lifecycle (macos-latest)",
+      "kind": "tests",
+      "job_id": "portability-lifecycle",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-06",
+          "name": "Plan39 recorded command 06",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Plan39 recorded command 08",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Run portability lifecycle tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/portability-lifecycle (macos-latest)"
+        },
+        {
+          "id": "step-10",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "1",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    }
+  ],
+  "release": [
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "unit (ubuntu-latest)",
+      "kind": "tests",
+      "job_id": "unit",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select pinned Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Checkout pinned Agent",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Add locked TypeScript compiler to PATH",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Install system media tools",
+          "kind": "check",
+          "optional": true
+        },
+        {
+          "id": "step-10",
+          "name": "Install system media tools (macOS)",
+          "kind": "check",
+          "optional": true
+        },
+        {
+          "id": "step-11",
+          "name": "Plan39 recorded command 11",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-12",
+          "name": "Plan39 recorded command 12",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-13",
+          "name": "Run unit tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/unit (ubuntu-latest)"
+        },
+        {
+          "id": "step-14",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "unit (macos-latest)",
+      "kind": "tests",
+      "job_id": "unit",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select pinned Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Checkout pinned Agent",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Add locked TypeScript compiler to PATH",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Install system media tools",
+          "kind": "check",
+          "optional": true
+        },
+        {
+          "id": "step-10",
+          "name": "Install system media tools (macOS)",
+          "kind": "check",
+          "optional": true
+        },
+        {
+          "id": "step-11",
+          "name": "Plan39 recorded command 11",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-12",
+          "name": "Plan39 recorded command 12",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-13",
+          "name": "Run unit tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/unit (macos-latest)"
+        },
+        {
+          "id": "step-14",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "1",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "windows-realm-publication",
+      "kind": "tests",
+      "job_id": "windows-realm-publication",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Checkout published Agent alongside Runtime",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Plan39 recorded command 05",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-06",
+          "name": "Plan39 recorded command 06",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Install published Agent from sibling checkout",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Verify Windows update backup daemon from a selected venv",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/windows-realm-publication/step-08"
+        },
+        {
+          "id": "step-09",
+          "name": "Verify native realm creation, ownership, and rollback",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/windows-realm-publication/step-09"
+        },
+        {
+          "id": "step-10",
+          "name": "Verify native Windows signal and foreground cleanup paths",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/windows-realm-publication/step-10"
+        },
+        {
+          "id": "step-11",
+          "name": "Verify Runtime service cleanup receipt contract",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/windows-realm-publication/step-11"
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "darwin-native",
+      "kind": "tests",
+      "job_id": "darwin-native",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Plan39 recorded command 03",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Plan39 recorded command 04",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Checkout published Agent alongside Runtime (darwin spawn test needs the Agent)",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-06",
+          "name": "Install the Agent's locked dependencies, then the Agent non-editably",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/darwin-native"
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "4866090edcce7df31d1f0e03cf2354b878e94105"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "typescript-client",
+      "kind": "tests",
+      "job_id": "typescript-client",
+      "commands": [
+        {
+          "id": "step-02",
+          "name": "Plan39 recorded command 02",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-03",
+          "name": "Plan39 recorded command 03",
+          "kind": "tests",
+          "optional": false,
+          "runner": "node",
+          "invocations": 1,
+          "lane": "CI/typescript-client"
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {}
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "boundary",
+      "kind": "tests",
+      "job_id": "boundary",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select pinned Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Checkout pinned Agent",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Plan39 recorded command 08",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Plan39 recorded command 09",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/boundary"
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "sandbox-process-control",
+      "kind": "tests",
+      "job_id": "sandbox-process-control",
+      "commands": [
+        {
+          "id": "step-01",
+          "name": "Select pinned Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-02",
+          "name": "Checkout pinned Agent",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-03",
+          "name": "Record effective Runtime and Agent checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-04",
+          "name": "Run sandbox process-control tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/sandbox-process-control"
+        },
+        {
+          "id": "step-05",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "portability-lifecycle (ubuntu-latest)",
+      "kind": "tests",
+      "job_id": "portability-lifecycle",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-06",
+          "name": "Plan39 recorded command 06",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Plan39 recorded command 08",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Run portability lifecycle tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/portability-lifecycle (ubuntu-latest)"
+        },
+        {
+          "id": "step-10",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "portability-lifecycle (macos-latest)",
+      "kind": "tests",
+      "job_id": "portability-lifecycle",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Record effective checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-06",
+          "name": "Plan39 recorded command 06",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-07",
+          "name": "Plan39 recorded command 07",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Plan39 recorded command 08",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Run portability lifecycle tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "CI/portability-lifecycle (macos-latest)"
+        },
+        {
+          "id": "step-10",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "1",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    },
+    {
+      "workflow": "Nightly",
+      "workflow_file": "nightly.yml",
+      "job": "integration",
+      "kind": "tests",
+      "job_id": "integration",
+      "commands": [
+        {
+          "id": "step-03",
+          "name": "Select Agent revision",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-05",
+          "name": "Check historical Agent archive input",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-06",
+          "name": "Record effective checkouts",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-08",
+          "name": "Plan39 recorded command 08",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-09",
+          "name": "Add locked TypeScript compiler to PATH",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-10",
+          "name": "Install system media tools",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-11",
+          "name": "Plan39 recorded command 11",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-12",
+          "name": "Plan39 recorded command 12",
+          "kind": "check",
+          "optional": false
+        },
+        {
+          "id": "step-13",
+          "name": "Run nightly integration tests",
+          "kind": "tests",
+          "optional": false,
+          "runner": "pytest",
+          "invocations": 1,
+          "lane": "Nightly/integration"
+        },
+        {
+          "id": "step-14",
+          "name": "Verify stored per-test results",
+          "kind": "check",
+          "optional": false
+        }
+      ],
+      "matrix_index": "0",
+      "dependency_tuple": {
+        "banodoco/astrid-agent": "0e1543e0da2215db9cb3320cfd1083174c3c62a9"
+      }
+    }
+  ]
+}

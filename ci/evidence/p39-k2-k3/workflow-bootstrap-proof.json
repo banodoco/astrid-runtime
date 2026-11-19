@@ -1,0 +1,38 @@
+{
+  "fixture_only": true,
+  "product_qualification": false,
+  "shell": "python -I -c \"import os,runpy,sys; sys.argv.extend(['--matrix',os.environ['ASTRID_CI_MATRIX']]); runpy.run_path(os.path.join(os.environ['GITHUB_WORKSPACE'],'scripts/ci/ceiling_capture.py'),run_name='__main__')\" --step step-03 --shell bash \"{0}\"",
+  "working_directory": "/workspace/scratch/984232aa1788/astrid-runtime/scripts",
+  "script_with_spaces": true,
+  "matrix_index": "7",
+  "actual_exit": 7,
+  "actual_output": "bootstrap real output\n",
+  "command_receipt": {
+    "schema": 1,
+    "repository": "banodoco/astrid-runtime",
+    "head": "d5f796723eb9be7ee3aca32a6dfab121ebf4fd46",
+    "tuple": {
+      "banodoco/astrid-runtime": "d5f796723eb9be7ee3aca32a6dfab121ebf4fd46",
+      "banodoco/astrid-agent": "d5ad6ff756bbc7556b190e97a724aaab5c3ed1d2",
+      "banodoco/astrid-app": "4845945814b20b1c1a9c19dc9a034e0a5c1ebd6f"
+    },
+    "step": "step-03",
+    "job": "bootstrap",
+    "matrix_index": "7",
+    "run_id": "local-workflow-bootstrap",
+    "attempt": "1",
+    "shell": "bash",
+    "command_sha256": "427bf32d78188594662566a937bc2fac7c76991b3b77bbeee946f142c1a17e4b",
+    "installed_sources": {},
+    "tuple_conflicts": [],
+    "started_at": 1795059234.7736528,
+    "complete": true,
+    "raw_exit": 7,
+    "finished_at": 1795059234.7770264
+  },
+  "fixed_workflows": [
+    ".github/workflows/nightly.yml",
+    ".github/workflows/ci.yml"
+  ],
+  "cause": "GitHub Actions forbids expressions in steps.shell; use a static Python bootstrap with runtime environment values."
+}
