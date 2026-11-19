@@ -1,0 +1,26 @@
+{
+  "runtime_base": "2537fed24385ec1c24f48a812e09af4bb63fb794",
+  "agent_base": "aa988878b383fb965b5fc05601baa15a93849d42",
+  "vibecomfy_pin": "c27fe76b79d917fd9c08246660bc77211be64146",
+  "files": {
+    "run_focused.py": "fb7c57d814d33106d15c9440b23625146d4297f60c42a421c05084286764edb3",
+    "test_general_log_retry_probe.py": "671648e5b9287ead292f2ded239d0af64fd64e6aeaa0e4a541bfcb59192a1e22",
+    "test_legacy_creative_log_settlement.py": "3411653634742ccc440bc7c6ead0bdd36b0876bf05265dca6807cc67d6960b53",
+    "release-base-retry.json": "066f6a4f4284e31604084f744c2653901a4b7f539b1bd774fb18309510cbfd94",
+    "release-base-retry.log": "5e8adb8464cce287b689c3a476bfc08350860e04edb6c5cfef3ba99040df514c",
+    "release-base-retry.xml": "0b6e73c093605bce68f0fc765723c84653f3f62214adeb5e2f5f60293fddb6f1",
+    "release-base-retry-observations.json": "344386be2babcd77563d26a770245db1bfaa107ea6e7fb1c4b688f8232dc1cd7",
+    "release-before-creative.json": "3e4f070797950c3cccfc1d2aab27560c87e8d03c1b0476e2d70955598e5176bf",
+    "release-before-creative.log": "3f55e289e1a53daab6488f1f0bee91c2c0598db8f716ed2b36392ec421eff6c6",
+    "release-before-creative.xml": "71001ae2e368f24fea0ba8ba7e673146f08680de39efd5543319437ecf0f20d5",
+    "release-before-retry.json": "5604a8017992a2b9a5be143606b7b97d201017c2dd57ff915c8b3a4c74dfbe1c",
+    "release-before-retry.log": "b2ac83d610a9ad86fa97071c194b5d4ad073631193ff730b9b1a74cf93c0c171",
+    "release-before-retry.xml": "3ba0b8940fdc64d3ab1bf509b14f51023cb7aa4ddb61a525cc2bd313efec9133"
+  },
+  "results": {
+    "release-base-retry": "FAIL: same task executes fail then success; terminal publication HTTP 409 conflicts on attempt_id and provenance_json",
+    "release-before-creative": "FAIL: both create_with_variant and variant.append count canonical stdout/stderr as creative outputs",
+    "release-before-retry": "NO-RESULT setup: VibeComfy revision guard refused the P55-12 checkout; corrected to release pin without modifying guard"
+  },
+  "archive_sha256": "acd924a152719d820e88aaf4e6c4bc8828ff82de20a285e6729e092390e9ca00"
+}
