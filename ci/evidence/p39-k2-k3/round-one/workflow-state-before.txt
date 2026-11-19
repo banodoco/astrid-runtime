@@ -1,0 +1,80 @@
+test_cancelled_workflow_rejects_the_same_complete_receipts (__main__.HostedWorkflowTests.test_cancelled_workflow_rejects_the_same_complete_receipts) ... 
+  test_cancelled_workflow_rejects_the_same_complete_receipts (__main__.HostedWorkflowTests.test_cancelled_workflow_rejects_the_same_complete_receipts) (workflow='CI', tier='merge') ... FAIL
+  test_cancelled_workflow_rejects_the_same_complete_receipts (__main__.HostedWorkflowTests.test_cancelled_workflow_rejects_the_same_complete_receipts) (workflow='CI', tier='release') ... FAIL
+  test_cancelled_workflow_rejects_the_same_complete_receipts (__main__.HostedWorkflowTests.test_cancelled_workflow_rejects_the_same_complete_receipts) (workflow='Nightly', tier='release') ... FAIL
+test_completed_failure_workflows_keep_complete_receipts_eligible (__main__.HostedWorkflowTests.test_completed_failure_workflows_keep_complete_receipts_eligible) ... ok
+test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) ... 
+  test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='queued') ... FAIL
+  test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='in_progress') ... FAIL
+  test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='pending') ... FAIL
+  test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='waiting') ... FAIL
+  test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='requested') ... FAIL
+
+======================================================================
+FAIL: test_cancelled_workflow_rejects_the_same_complete_receipts (__main__.HostedWorkflowTests.test_cancelled_workflow_rejects_the_same_complete_receipts) (workflow='CI', tier='merge')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/984232aa1788/astrid-runtime/scripts/ci/test_ceiling_hosted.py", line 117, in test_cancelled_workflow_rejects_the_same_complete_receipts
+    self.assertNotEqual(verdict["verdict"], "PASS", verdict)
+AssertionError: 'PASS' == 'PASS' : {'schema': 1, 'repository': 'fixture/astrid-runtime', 'head': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8', 'tier': 'merge', 'tuple': {'fixture/astrid-runtime': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8'}, 'verdict': 'PASS', 'errors': [], 'unknown': [], 'covered': ['["CI/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]'], 'retired': [], 'retirement_receipts': [], 'warnings': [], 'raw_outcomes_preserved': True}
+
+======================================================================
+FAIL: test_cancelled_workflow_rejects_the_same_complete_receipts (__main__.HostedWorkflowTests.test_cancelled_workflow_rejects_the_same_complete_receipts) (workflow='CI', tier='release')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/984232aa1788/astrid-runtime/scripts/ci/test_ceiling_hosted.py", line 117, in test_cancelled_workflow_rejects_the_same_complete_receipts
+    self.assertNotEqual(verdict["verdict"], "PASS", verdict)
+AssertionError: 'PASS' == 'PASS' : {'schema': 1, 'repository': 'fixture/astrid-runtime', 'head': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8', 'tier': 'release', 'tuple': {'fixture/astrid-runtime': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8'}, 'verdict': 'PASS', 'errors': [], 'unknown': [], 'covered': ['["CI/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]', '["Nightly/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]'], 'retired': [], 'retirement_receipts': [], 'warnings': [], 'raw_outcomes_preserved': True}
+
+======================================================================
+FAIL: test_cancelled_workflow_rejects_the_same_complete_receipts (__main__.HostedWorkflowTests.test_cancelled_workflow_rejects_the_same_complete_receipts) (workflow='Nightly', tier='release')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/984232aa1788/astrid-runtime/scripts/ci/test_ceiling_hosted.py", line 117, in test_cancelled_workflow_rejects_the_same_complete_receipts
+    self.assertNotEqual(verdict["verdict"], "PASS", verdict)
+AssertionError: 'PASS' == 'PASS' : {'schema': 1, 'repository': 'fixture/astrid-runtime', 'head': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8', 'tier': 'release', 'tuple': {'fixture/astrid-runtime': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8'}, 'verdict': 'PASS', 'errors': [], 'unknown': [], 'covered': ['["CI/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]', '["Nightly/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]'], 'retired': [], 'retirement_receipts': [], 'warnings': [], 'raw_outcomes_preserved': True}
+
+======================================================================
+FAIL: test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='queued')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/984232aa1788/astrid-runtime/scripts/ci/test_ceiling_hosted.py", line 130, in test_deadline_rejects_nonterminal_workflows_despite_complete_receipts
+    self.assertNotEqual(verdict["verdict"], "PASS", verdict)
+AssertionError: 'PASS' == 'PASS' : {'schema': 1, 'repository': 'fixture/astrid-runtime', 'head': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8', 'tier': 'release', 'tuple': {'fixture/astrid-runtime': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8'}, 'verdict': 'PASS', 'errors': [], 'unknown': [], 'covered': ['["CI/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]', '["Nightly/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]'], 'retired': [], 'retirement_receipts': [], 'warnings': [], 'raw_outcomes_preserved': True}
+
+======================================================================
+FAIL: test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='in_progress')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/984232aa1788/astrid-runtime/scripts/ci/test_ceiling_hosted.py", line 130, in test_deadline_rejects_nonterminal_workflows_despite_complete_receipts
+    self.assertNotEqual(verdict["verdict"], "PASS", verdict)
+AssertionError: 'PASS' == 'PASS' : {'schema': 1, 'repository': 'fixture/astrid-runtime', 'head': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8', 'tier': 'release', 'tuple': {'fixture/astrid-runtime': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8'}, 'verdict': 'PASS', 'errors': [], 'unknown': [], 'covered': ['["CI/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]', '["Nightly/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]'], 'retired': [], 'retirement_receipts': [], 'warnings': [], 'raw_outcomes_preserved': True}
+
+======================================================================
+FAIL: test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='pending')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/984232aa1788/astrid-runtime/scripts/ci/test_ceiling_hosted.py", line 130, in test_deadline_rejects_nonterminal_workflows_despite_complete_receipts
+    self.assertNotEqual(verdict["verdict"], "PASS", verdict)
+AssertionError: 'PASS' == 'PASS' : {'schema': 1, 'repository': 'fixture/astrid-runtime', 'head': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8', 'tier': 'release', 'tuple': {'fixture/astrid-runtime': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8'}, 'verdict': 'PASS', 'errors': [], 'unknown': [], 'covered': ['["CI/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]', '["Nightly/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]'], 'retired': [], 'retirement_receipts': [], 'warnings': [], 'raw_outcomes_preserved': True}
+
+======================================================================
+FAIL: test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='waiting')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/984232aa1788/astrid-runtime/scripts/ci/test_ceiling_hosted.py", line 130, in test_deadline_rejects_nonterminal_workflows_despite_complete_receipts
+    self.assertNotEqual(verdict["verdict"], "PASS", verdict)
+AssertionError: 'PASS' == 'PASS' : {'schema': 1, 'repository': 'fixture/astrid-runtime', 'head': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8', 'tier': 'release', 'tuple': {'fixture/astrid-runtime': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8'}, 'verdict': 'PASS', 'errors': [], 'unknown': [], 'covered': ['["CI/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]', '["Nightly/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]'], 'retired': [], 'retirement_receipts': [], 'warnings': [], 'raw_outcomes_preserved': True}
+
+======================================================================
+FAIL: test_deadline_rejects_nonterminal_workflows_despite_complete_receipts (__main__.HostedWorkflowTests.test_deadline_rejects_nonterminal_workflows_despite_complete_receipts) (state='requested')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/984232aa1788/astrid-runtime/scripts/ci/test_ceiling_hosted.py", line 130, in test_deadline_rejects_nonterminal_workflows_despite_complete_receipts
+    self.assertNotEqual(verdict["verdict"], "PASS", verdict)
+AssertionError: 'PASS' == 'PASS' : {'schema': 1, 'repository': 'fixture/astrid-runtime', 'head': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8', 'tier': 'release', 'tuple': {'fixture/astrid-runtime': 'c49c7e0925f1e25c6a9702554bdf5440e6621ea8'}, 'verdict': 'PASS', 'errors': [], 'unknown': [], 'covered': ['["CI/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]', '["Nightly/native","[\\"custody.test.mjs\\",4,1,0,\\"sensitive custody identity\\"]","null","null"]'], 'retired': [], 'retirement_receipts': [], 'warnings': [], 'raw_outcomes_preserved': True}
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.061s
+
+FAILED (failures=8)

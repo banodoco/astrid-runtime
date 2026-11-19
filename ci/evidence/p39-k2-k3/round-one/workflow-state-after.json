@@ -1,0 +1,64 @@
+{
+  "review": "6999421639",
+  "collector_sha256": "392a0265587f3431d1b8286629006be274a0cff83633b0250b91bc5b57dd11b1",
+  "receipt_source": "../native-executed-proof.tar.gz",
+  "cases": [
+    {
+      "status": "completed",
+      "conclusion": "failure",
+      "verdict": "PASS",
+      "complete": true,
+      "collection_errors": [],
+      "artifact_sha256": [
+        "f80c375c02319eb8493730bbc3e8a22e77d5150dee59e2853c1750942e1a6011",
+        "dc615db4540ec170266a1fbf9b7651656c56666dd4edfc744b99fad14083efac"
+      ]
+    },
+    {
+      "status": "completed",
+      "conclusion": "cancelled",
+      "verdict": "FAIL",
+      "complete": false,
+      "collection_errors": [
+        "unqualified workflow CI / run local-fixture-g2-ci: status=completed, conclusion=cancelled"
+      ],
+      "artifact_sha256": [
+        "f80c375c02319eb8493730bbc3e8a22e77d5150dee59e2853c1750942e1a6011",
+        "dc615db4540ec170266a1fbf9b7651656c56666dd4edfc744b99fad14083efac"
+      ]
+    },
+    {
+      "status": "in_progress",
+      "conclusion": null,
+      "verdict": "FAIL",
+      "complete": false,
+      "collection_errors": [
+        "unqualified workflow CI / run local-fixture-g2-ci: status=in_progress, conclusion=None"
+      ],
+      "artifact_sha256": [
+        "f80c375c02319eb8493730bbc3e8a22e77d5150dee59e2853c1750942e1a6011",
+        "dc615db4540ec170266a1fbf9b7651656c56666dd4edfc744b99fad14083efac"
+      ]
+    },
+    {
+      "status": "queued",
+      "conclusion": null,
+      "verdict": "FAIL",
+      "complete": false,
+      "collection_errors": [
+        "unqualified workflow CI / run local-fixture-g2-ci: status=queued, conclusion=None"
+      ],
+      "artifact_sha256": [
+        "f80c375c02319eb8493730bbc3e8a22e77d5150dee59e2853c1750942e1a6011",
+        "dc615db4540ec170266a1fbf9b7651656c56666dd4edfc744b99fad14083efac"
+      ]
+    }
+  ],
+  "test_exits": {
+    "test_failure_ceiling.py": 0,
+    "test_ceiling_hosted.py": 0
+  },
+  "same_receipt_archives_as_before": true,
+  "fixture_only": true,
+  "deadline_test": "1-second deadline with monotonic values 0 then 2, no sleep; queued/in_progress/pending/waiting/requested all rejected"
+}
