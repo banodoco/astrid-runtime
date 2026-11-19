@@ -1,0 +1,2624 @@
+[
+  {
+    "lane": "CI/boundary",
+    "native_id": "tests/test_second_client_e2e.py::test_second_client_core_journey_is_executable",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_accepts_system_temp_alias",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_door_lifecycle.py::test_real_up_opens_a_ready_door_and_names_a_taken_port",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_local_worker_handoff.py::test_fresh_successor_peer_binds_exact_incarnation_and_operation[incarnation]",
+    "parameter": "[incarnation]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_local_worker_handoff.py::test_fresh_successor_peer_binds_exact_incarnation_and_operation[none]",
+    "parameter": "[none]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_local_worker_handoff.py::test_fresh_successor_peer_binds_exact_incarnation_and_operation[operation]",
+    "parameter": "[operation]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_local_worker_handoff.py::test_inherited_creator_descriptor_cannot_authenticate_successor",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_local_worker_handoff.py::test_transfer_rejects_duplicate_keys_and_mismatched_seal[altered_seal]",
+    "parameter": "[altered_seal]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_local_worker_handoff.py::test_transfer_rejects_duplicate_keys_and_mismatched_seal[duplicate_nested]",
+    "parameter": "[duplicate_nested]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_local_worker_handoff.py::test_transfer_rejects_duplicate_keys_and_mismatched_seal[duplicate_root]",
+    "parameter": "[duplicate_root]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_local_worker_handoff.py::test_transfer_rejects_duplicate_keys_and_mismatched_seal[nonfinite]",
+    "parameter": "[nonfinite]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_local_worker_handoff.py::test_transfer_rejects_duplicate_keys_and_mismatched_seal[valid]",
+    "parameter": "[valid]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_operator_upgrade.py::test_operator_upgrade_restarts_a_real_current_runtime",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_real_bootstrap.py::test_concurrent_reconnect_survives_restricted_pid_identity_probe",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_real_bootstrap.py::test_real_subprocess_fresh_launch_reconnect_and_scoped_generated_client",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_real_bootstrap.py::test_real_subprocess_restart_preserves_realm_and_credential",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_real_bootstrap.py::test_real_subprocess_stale_discovery_recovers_without_new_realm",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_release_identity.py::test_runtime_b11_local_submodule_is_pinned",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_relocation_real_e2e.py::test_real_runtime_cutover_failure_rolls_back_tree_and_metadata",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_relocation_real_e2e.py::test_real_runtime_daemon_cutover_starts_from_new_support_root",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/darwin-native",
+    "native_id": "tests/test_role_custody_authority.py::test_actual_darwin_self_identity_and_boundary_use_native_shared_marker",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'active_realm_without_realm_id\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'bad_pid\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'empty\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'missing\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'missing_birth\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'wrong_instance\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'wrong_realm_root\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_busy_preflight_does_not_create_bootstrap_lock_or_mutate_state",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'force_collection': \"'False'\"})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_busy_preflight_does_not_create_bootstrap_lock_or_mutate_state",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'force_collection': \"'True'\"})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'extra-field\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'malformed\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'managed_by\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'missing\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'owner-binding\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'release\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'extra-field\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'malformed\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'managed_by\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'missing\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'owner-binding\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'release\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'data_empty\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'data_wrong\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'legacy_marker\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'marker_missing\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'marker_wrong\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'realm_id\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'realm_missing\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'realm_wrong\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'backup_catalog_link\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'bad_backup_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'bad_live_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'foreign_realm\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'journal\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'journal_link\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'live_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'live_catalog_link\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'missing_realm\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'realm_root_link\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'retained_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'selection\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'selection_link\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'wrong_data_root\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'wrong_realm_root\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_refuses_any_publication_and_fence_race",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'publication': '\"\\'discovery\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_refuses_any_publication_and_fence_race",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'publication': '\"\\'instance_lock\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'agent_head\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'dirty\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'dirty_hash\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'runtime_head\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'agent_head\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'dirty\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'dirty_hash\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'runtime_head\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_start_and_reconnect_validate_identity_once_after_successful_health",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'bootstrap\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_start_and_reconnect_validate_identity_once_after_successful_health",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'connect\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_unhealthy_owner_refuses_before_identity_read_or_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'bootstrap\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_unhealthy_owner_refuses_before_identity_read_or_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'connect\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::StaleOwnerTests::test_unknown_or_matching_owner_is_preserved",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'observation': '\"\\'same\\'\"'})"
+  },
+  {
+    "lane": "CI/sandbox-process-control",
+    "native_id": "tests/test_bootstrap.py::StaleOwnerTests::test_unknown_or_matching_owner_is_preserved",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'observation': '\"\\'unknown\\'\"'})"
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",103,1,0,\"verified media read preserves the complete pin and encoded alias without mutation authority\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",124,1,0,\"verified document read sends the exact pin without mutation authority\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",140,1,0,\"verified document object read sends the exact pin and object without mutation authority\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",157,1,0,\"generated TypeScript client performs scoped handshake and idempotent project admission\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",177,1,0,\"public package exports the client and preserves response extensions without echoing envelope fields\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",195,1,0,\"generated TypeScript client preserves inclusive range and strong ETag\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",204,1,0,\"generated TypeScript client preserves the EventPage boundary\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",215,1,0,\"generated TypeScript client exposes structured conflict errors\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",22,1,0,\"public commit client preserves v2 requests, receipts, previews and historical rebased replies\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",220,1,0,\"generated TypeScript client registers capabilities and fences failure\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",242,1,0,\"generated TypeScript recovery routes preserve path identity and 201 checkpoint responses\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",262,1,0,\"preference clients preserve user null receipts and committed project receipts\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",284,1,0,\"preference clients reject caller ownership and malformed null receipt results\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",304,1,0,\"null preference receipts do not weaken ordinary or project mutation decoding\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",311,1,0,\"ordinary mutation extensions do not bypass known data and receipt types\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",327,1,0,\"document kind filter preserves existing pagination arguments and escapes query values\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",335,1,0,\"binary client imports forward Blob without materializing its bytes\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",351,1,0,\"default fetch receives Blob directly\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",367,1,0,\"persisted timeline view sends explicit key and preserves the plain view response\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",382,1,0,\"app-state client reads absent state, writes with a null receipt and rejects mismatched resources\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/client.test.mjs\",8,1,0,\"generated TypeScript task query preserves default URL and forwards scoped generation query\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",104,3,0,\"base retires original callbacks even with equal identity\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",104,3,0,\"credential retires original callbacks even with equal identity\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",104,3,0,\"dispose retires original callbacks even with equal identity\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",104,3,0,\"reconnect retires original callbacks even with equal identity\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",104,3,0,\"transport retires original callbacks even with equal identity\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",135,1,0,\"old negotiation completion cannot revive a retired binding\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",153,1,0,\"retirement during response-body await refuses a stale ACK\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",170,1,0,\"equal-identity renewal retries exact original bytes/key after uncertain ACK\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",195,3,0,\"received 401 retires the binding\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",195,3,0,\"received 403 retires the binding\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",195,3,0,\"received 503 retires the binding\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",195,3,0,\"received disconnect retires the binding\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",211,1,0,\"mismatched negotiation and missing owned credentials fail closed\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",225,1,0,\"semantic conflict preserves the live binding and generated error\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",235,1,0,\"public handshake snapshot cannot forge actor/scopes during realm await\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",256,1,0,\"scope string containing requested scope must fail closed\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",268,1,0,\"non-string schema digest must fail closed\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",280,1,0,\"handshake authority is captured before public assignment and promise propagation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed handshake.actor_id 42 retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed handshake.actor_id \\\"  \\\" retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed handshake.realm_id 42 retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed handshake.realm_id \\\"\\\" retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed handshake.schema_digest \\\"  \\\" retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed handshake.schema_digest null retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed handshake.scopes [\\\"not-projects:write-granted\\\"] retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed handshake.scopes [\\\"projects:write\\\",42] retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed handshake.scopes null retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed health.schema_digest \\\"  \\\" retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed health.schema_digest \\\"\\\" retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed realm.realm_id 42 retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",309,3,0,\"malformed realm.realm_id \\\"  \\\" retires negotiation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",328,3,0,\"retirement during getRealm promise propagation blocks negotiation continuation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",328,3,0,\"retirement during handshake promise propagation blocks negotiation continuation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",328,3,0,\"retirement during health promise propagation blocks negotiation continuation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",345,5,0,\"retirement during handshake body await blocks negotiation continuation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",345,5,0,\"retirement during handshake response await blocks negotiation continuation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",345,5,0,\"retirement during health body await blocks negotiation continuation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",345,5,0,\"retirement during health response await blocks negotiation continuation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",345,5,0,\"retirement during realm body await blocks negotiation continuation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",345,5,0,\"retirement during realm response await blocks negotiation continuation\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",371,1,0,\"unsupported fetch wrapper that awaits forwarding can dispatch after retirement\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",50,1,0,\"one client, base, credential and fetch serve negotiation, task, read and transmit\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/typescript-client",
+    "native_id": "[\"test/operation-handle.test.mjs\",85,1,0,\"retire blocks a continuation after an await at actual generated-client dispatch\"]",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'active_realm_without_realm_id\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'bad_pid\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'empty\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'missing_birth\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'wrong_instance\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'wrong_realm_root\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_busy_preflight_does_not_create_bootstrap_lock_or_mutate_state",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'force_collection': \"'False'\"})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_busy_preflight_does_not_create_bootstrap_lock_or_mutate_state",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'force_collection': \"'True'\"})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'extra-field\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'malformed\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'managed_by\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'owner-binding\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'release\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'extra-field\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'malformed\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'managed_by\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'owner-binding\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'release\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'data_empty\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'data_wrong\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'legacy_marker\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'marker_missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'marker_wrong\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'realm_id\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'realm_missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'realm_wrong\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'backup_catalog_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'bad_backup_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'bad_live_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'foreign_realm\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'journal\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'journal_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'live_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'live_catalog_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'missing_realm\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'realm_root_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'retained_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'selection\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'selection_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'wrong_data_root\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'wrong_realm_root\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_refuses_any_publication_and_fence_race",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'publication': '\"\\'discovery\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_refuses_any_publication_and_fence_race",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'publication': '\"\\'instance_lock\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'agent_head\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'dirty\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'dirty_hash\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'runtime_head\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'agent_head\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'dirty\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'dirty_hash\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'runtime_head\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_start_and_reconnect_validate_identity_once_after_successful_health",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'bootstrap\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_start_and_reconnect_validate_identity_once_after_successful_health",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'connect\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_unhealthy_owner_refuses_before_identity_read_or_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'bootstrap\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_unhealthy_owner_refuses_before_identity_read_or_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'connect\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::StaleOwnerTests::test_unknown_or_matching_owner_is_preserved",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'observation': '\"\\'same\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (macos-latest)",
+    "native_id": "tests/test_bootstrap.py::StaleOwnerTests::test_unknown_or_matching_owner_is_preserved",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'observation': '\"\\'unknown\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'active_realm_without_realm_id\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'bad_pid\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'empty\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'missing_birth\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'wrong_instance\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_and_restart_refuse_missing_or_invalid_owner_lock",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'case': '\"\\'wrong_realm_root\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_busy_preflight_does_not_create_bootstrap_lock_or_mutate_state",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'force_collection': \"'False'\"})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_down_busy_preflight_does_not_create_bootstrap_lock_or_mutate_state",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'force_collection': \"'True'\"})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'extra-field\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'malformed\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'managed_by\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'owner-binding\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'release\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'extra-field\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'malformed\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'managed_by\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'owner-binding\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_identity_mismatch_and_invalid_live_identity_refuse_up_and_connect_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'release\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'data_empty\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'data_wrong\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'legacy_marker\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'marker_missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'marker_wrong\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'realm_id\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'realm_missing\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_pinokio_r1_stop_refuses_marker_or_realm_mismatch",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'field': '\"\\'realm_wrong\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'backup_catalog_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'bad_backup_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'bad_live_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'foreign_realm\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'journal\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'journal_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'live_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'live_catalog_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'missing_realm\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'realm_root_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'retained_catalog\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'selection\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'selection_link\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'wrong_data_root\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_malformed_and_conflicting_metadata_refuses_without_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'mutation': '\"\\'wrong_realm_root\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_refuses_any_publication_and_fence_race",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'publication': '\"\\'discovery\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_restore_selection_refuses_any_publication_and_fence_race",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'publication': '\"\\'instance_lock\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'agent_head\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'dirty\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'dirty_hash\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'connect\\'\"', 'field': '\"\\'runtime_head\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'agent_head\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'dirty\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'dirty_hash\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_source_identity_fields_are_compared_for_up_and_connect",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'path': '\"\\'up\\'\"', 'field': '\"\\'runtime_head\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_start_and_reconnect_validate_identity_once_after_successful_health",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'bootstrap\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_start_and_reconnect_validate_identity_once_after_successful_health",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'connect\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_unhealthy_owner_refuses_before_identity_read_or_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'bootstrap\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::BootstrapTests::test_unhealthy_owner_refuses_before_identity_read_or_writes",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'caller': '\"\\'connect\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::StaleOwnerTests::test_unknown_or_matching_owner_is_preserved",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'observation': '\"\\'same\\'\"'})"
+  },
+  {
+    "lane": "CI/unit (ubuntu-latest)",
+    "native_id": "tests/test_bootstrap.py::StaleOwnerTests::test_unknown_or_matching_owner_is_preserved",
+    "parameter": null,
+    "subtest": "SubtestContext(msg=None, kwargs={'observation': '\"\\'unknown\\'\"'})"
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-08",
+    "native_id": "tests/test_windows_runtime_launch.py::test_runtime_checkout_is_not_a_selectable_shutdown_owner",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-08",
+    "native_id": "tests/test_windows_runtime_launch.py::test_windows_daemon_launch_preserves_selected_python[False]",
+    "parameter": "[False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-08",
+    "native_id": "tests/test_windows_runtime_launch.py::test_windows_daemon_launch_preserves_selected_python[True]",
+    "parameter": "[True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-08",
+    "native_id": "tests/test_windows_runtime_launch.py::test_windows_realm_creation_keeps_stderr_out_of_its_json_metadata",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-08",
+    "native_id": "tests/test_windows_runtime_launch.py::test_windows_realm_creation_preserves_non_json_child_diagnostic",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-08",
+    "native_id": "tests/test_windows_runtime_launch.py::test_windows_realm_creation_preserves_selected_python[False]",
+    "parameter": "[False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-08",
+    "native_id": "tests/test_windows_runtime_launch.py::test_windows_realm_creation_preserves_selected_python[True]",
+    "parameter": "[True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-08",
+    "native_id": "tests/test_windows_runtime_launch.py::test_windows_update_backup_up_uses_the_actual_venv_interpreter",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_admission_copy_cancels_before_copying_bytes",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_admission_sqlite_progress_cancels_and_removes_callback",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_door_wait_cancels_between_health_and_realm_reads",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_endpoint_readiness_cancels_before_poll_or_network",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_cleanup_kills_group_before_reaping_leader[False]",
+    "parameter": "[False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_cleanup_kills_group_before_reaping_leader[True]",
+    "parameter": "[True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_cleanup_refuses_externally_reaped_child[False]",
+    "parameter": "[False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_cleanup_refuses_externally_reaped_child[True]",
+    "parameter": "[True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_cleanup_refuses_group_after_leader_reaped[False]",
+    "parameter": "[False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_cleanup_refuses_group_after_leader_reaped[True]",
+    "parameter": "[True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_group_signalling_refuses_missing_custody[False-4321]",
+    "parameter": "[False-4321]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_group_signalling_refuses_missing_custody[False-target1]",
+    "parameter": "[False-target1]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_group_signalling_refuses_missing_custody[True-4321]",
+    "parameter": "[True-4321]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_linux_group_signalling_refuses_missing_custody[True-target1]",
+    "parameter": "[True-target1]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_listener_sets_exclusive_windows_option_before_bind[darwin]",
+    "parameter": "[darwin]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_listener_sets_exclusive_windows_option_before_bind[linux]",
+    "parameter": "[linux]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_listener_sets_exclusive_windows_option_before_bind[win32]",
+    "parameter": "[win32]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_run_cancellation_during_bootstrap_cleans_up_and_exits_nonzero",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_startup_lock_wait_cancels_without_acquiring_or_unlocking",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_startup_transport_checks_cancel_after_socket_timeout",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_startup_transport_retains_original_timeout_budget",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_windows_credential_rejects_public_file_before_read",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_windows_discovery_and_credentials_are_private_from_creation",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_windows_owner_only_rejects_public_dacl_and_stat_only_check",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_windows_rejects_owner_mismatch_with_private_dacl",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_windows_rejects_shared_credential_directory",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_m1_review.py::test_windows_stat_metadata_cannot_authorize_a_credential",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_platform_windows.py::test_windows_directory_mutex_uses_global_user_scoped_identity",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_creation_publication.py::test_competing_opener_cannot_take_ownership_during_publication[native]",
+    "parameter": "[native]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_creation_publication.py::test_competing_opener_cannot_take_ownership_during_publication[windows-publication]",
+    "parameter": "[windows-publication]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_creation_publication.py::test_creation_closes_descendants_before_rename_and_reopens_owned_realm[native]",
+    "parameter": "[native]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_creation_publication.py::test_creation_closes_descendants_before_rename_and_reopens_owned_realm[windows-publication]",
+    "parameter": "[windows-publication]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_creation_publication.py::test_creation_failure_closes_children_but_keeps_admission_until_rollback[native-after-reopen]",
+    "parameter": "[native-after-reopen]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_creation_publication.py::test_creation_failure_closes_children_but_keeps_admission_until_rollback[native-before-rename]",
+    "parameter": "[native-before-rename]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_creation_publication.py::test_creation_failure_closes_children_but_keeps_admission_until_rollback[windows-publication-after-reopen]",
+    "parameter": "[windows-publication-after-reopen]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_creation_publication.py::test_creation_failure_closes_children_but_keeps_admission_until_rollback[windows-publication-before-rename]",
+    "parameter": "[windows-publication-before-rename]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_admission_fence_rejects_root_swapped_between_open_and_lock",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_borrowed_admission_rejects_other_directory_and_remains_caller_owned",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_maintenance_cannot_cross_directory_admission_fence",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_replacement_fences_candidate_through_startup_and_rollback[rollback-offline-native]",
+    "parameter": "[rollback-offline-native]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_replacement_fences_candidate_through_startup_and_rollback[rollback-offline-windows-publication]",
+    "parameter": "[rollback-offline-windows-publication]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_replacement_fences_candidate_through_startup_and_rollback[rollback-online-native]",
+    "parameter": "[rollback-online-native]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_replacement_fences_candidate_through_startup_and_rollback[rollback-online-windows-publication]",
+    "parameter": "[rollback-online-windows-publication]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_replacement_fences_candidate_through_startup_and_rollback[success-offline-native]",
+    "parameter": "[success-offline-native]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_replacement_fences_candidate_through_startup_and_rollback[success-offline-windows-publication]",
+    "parameter": "[success-offline-windows-publication]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_replacement_fences_candidate_through_startup_and_rollback[success-online-native]",
+    "parameter": "[success-online-native]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-09",
+    "native_id": "tests/test_realm_replacement_publication.py::test_replacement_fences_candidate_through_startup_and_rollback[success-online-windows-publication]",
+    "parameter": "[success-online-windows-publication]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_foreign_close_during_signaling_is_neither_recorded_nor_swallowed",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_preserves_errno[1-pidfd_open-arguments0]",
+    "parameter": "[1-pidfd_open-arguments0]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_preserves_errno[1-pidfd_send_signal-arguments1]",
+    "parameter": "[1-pidfd_send_signal-arguments1]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_preserves_errno[22-pidfd_open-arguments0]",
+    "parameter": "[22-pidfd_open-arguments0]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_preserves_errno[22-pidfd_send_signal-arguments1]",
+    "parameter": "[22-pidfd_send_signal-arguments1]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_preserves_errno[3-pidfd_open-arguments0]",
+    "parameter": "[3-pidfd_open-arguments0]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_preserves_errno[3-pidfd_send_signal-arguments1]",
+    "parameter": "[3-pidfd_send_signal-arguments1]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_preserves_errno[40-pidfd_open-arguments0]",
+    "parameter": "[40-pidfd_open-arguments0]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_preserves_errno[40-pidfd_send_signal-arguments1]",
+    "parameter": "[40-pidfd_send_signal-arguments1]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_integer_wraparound[pidfd_open-arguments0]",
+    "parameter": "[pidfd_open-arguments0]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_integer_wraparound[pidfd_open-arguments1]",
+    "parameter": "[pidfd_open-arguments1]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_integer_wraparound[pidfd_send_signal-arguments2]",
+    "parameter": "[pidfd_send_signal-arguments2]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_missing_libc_entry_point",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[aarch64-widths9-]",
+    "parameter": "[aarch64-widths9-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[armv6l-widths12-]",
+    "parameter": "[armv6l-widths12-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[armv7l-widths11-arm-linux-gnu]",
+    "parameter": "[armv7l-widths11-arm-linux-gnu]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[i686-widths5-x86_64-linux-gnux32]",
+    "parameter": "[i686-widths5-x86_64-linux-gnux32]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[i686-widths6-x86_64-linux-muslx32]",
+    "parameter": "[i686-widths6-x86_64-linux-muslx32]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[i686-widths8-]",
+    "parameter": "[i686-widths8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[mips-widths1-mips-linux-gnu]",
+    "parameter": "[mips-widths1-mips-linux-gnu]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[mips64-widths2-mips64-linux-gnuabi64]",
+    "parameter": "[mips64-widths2-mips64-linux-gnuabi64]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[mips64-widths3-mips64-linux-gnuabin32]",
+    "parameter": "[mips64-widths3-mips64-linux-gnuabin32]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[ppc64-widths10-]",
+    "parameter": "[ppc64-widths10-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[unknown-widths0-]",
+    "parameter": "[unknown-widths0-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[x86_64-widths4-x86_64-linux-gnux32]",
+    "parameter": "[x86_64-widths4-x86_64-linux-gnux32]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_refuses_unverified_abi_before_loading_libc[x86_64-widths7-]",
+    "parameter": "[x86_64-widths7-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-aarch64-8-]",
+    "parameter": "[pidfd_open-arguments0-434-aarch64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-armv6l-4-arm-linux-gnueabi]",
+    "parameter": "[pidfd_open-arguments0-434-armv6l-4-arm-linux-gnueabi]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-armv7l-4-arm-linux-gnueabihf]",
+    "parameter": "[pidfd_open-arguments0-434-armv7l-4-arm-linux-gnueabihf]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-armv7l-4-arm-linux-musleabi]",
+    "parameter": "[pidfd_open-arguments0-434-armv7l-4-arm-linux-musleabi]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-armv7l-4-arm-linux-musleabihf]",
+    "parameter": "[pidfd_open-arguments0-434-armv7l-4-arm-linux-musleabihf]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-i386-4-]",
+    "parameter": "[pidfd_open-arguments0-434-i386-4-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-i486-4-]",
+    "parameter": "[pidfd_open-arguments0-434-i486-4-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-i586-4-]",
+    "parameter": "[pidfd_open-arguments0-434-i586-4-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-i686-4-]",
+    "parameter": "[pidfd_open-arguments0-434-i686-4-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-loongarch64-8-]",
+    "parameter": "[pidfd_open-arguments0-434-loongarch64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-ppc64-8-]",
+    "parameter": "[pidfd_open-arguments0-434-ppc64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-ppc64le-8-]",
+    "parameter": "[pidfd_open-arguments0-434-ppc64le-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-riscv64-8-]",
+    "parameter": "[pidfd_open-arguments0-434-riscv64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-s390x-8-]",
+    "parameter": "[pidfd_open-arguments0-434-s390x-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_open-arguments0-434-x86_64-8-]",
+    "parameter": "[pidfd_open-arguments0-434-x86_64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-aarch64-8-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-aarch64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-armv6l-4-arm-linux-gnueabi]",
+    "parameter": "[pidfd_send_signal-arguments1-424-armv6l-4-arm-linux-gnueabi]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-armv7l-4-arm-linux-gnueabihf]",
+    "parameter": "[pidfd_send_signal-arguments1-424-armv7l-4-arm-linux-gnueabihf]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-armv7l-4-arm-linux-musleabi]",
+    "parameter": "[pidfd_send_signal-arguments1-424-armv7l-4-arm-linux-musleabi]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-armv7l-4-arm-linux-musleabihf]",
+    "parameter": "[pidfd_send_signal-arguments1-424-armv7l-4-arm-linux-musleabihf]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-i386-4-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-i386-4-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-i486-4-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-i486-4-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-i586-4-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-i586-4-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-i686-4-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-i686-4-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-loongarch64-8-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-loongarch64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-ppc64-8-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-ppc64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-ppc64le-8-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-ppc64le-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-riscv64-8-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-riscv64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-s390x-8-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-s390x-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_pidfd_syscall_uses_verified_abi_and_typed_arguments[pidfd_send_signal-arguments1-424-x86_64-8-]",
+    "parameter": "[pidfd_send_signal-arguments1-424-x86_64-8-]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_signaling_closes_pidfd_when_send_syscall_fails",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_signaling_does_not_observe_identity_when_pidfd_open_fails",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_signaling_refuses_unknown_abi_and_closes_any_open_pidfd[False]",
+    "parameter": "[False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_signaling_refuses_unknown_abi_and_closes_any_open_pidfd[True]",
+    "parameter": "[True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_signaling_uses_each_available_stdlib_wrapper[None]",
+    "parameter": "[None]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_signaling_uses_each_available_stdlib_wrapper[both]",
+    "parameter": "[both]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_signaling_uses_each_available_stdlib_wrapper[pidfd_open]",
+    "parameter": "[pidfd_open]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_linux_signaling_uses_each_available_stdlib_wrapper[pidfd_send_signal]",
+    "parameter": "[pidfd_send_signal]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_pidfd_syscall_fallback_is_linux_only",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_propagate_errors_without_closing_fd[1-pidfd_open-arguments0-False]",
+    "parameter": "[1-pidfd_open-arguments0-False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_propagate_errors_without_closing_fd[1-pidfd_open-arguments0-True]",
+    "parameter": "[1-pidfd_open-arguments0-True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_propagate_errors_without_closing_fd[1-pidfd_send_signal-arguments1-False]",
+    "parameter": "[1-pidfd_send_signal-arguments1-False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_propagate_errors_without_closing_fd[1-pidfd_send_signal-arguments1-True]",
+    "parameter": "[1-pidfd_send_signal-arguments1-True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_propagate_errors_without_closing_fd[40-pidfd_open-arguments0-False]",
+    "parameter": "[40-pidfd_open-arguments0-False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_propagate_errors_without_closing_fd[40-pidfd_open-arguments0-True]",
+    "parameter": "[40-pidfd_open-arguments0-True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_propagate_errors_without_closing_fd[40-pidfd_send_signal-arguments1-False]",
+    "parameter": "[40-pidfd_send_signal-arguments1-False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_propagate_errors_without_closing_fd[40-pidfd_send_signal-arguments1-True]",
+    "parameter": "[40-pidfd_send_signal-arguments1-True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_require_linux_even_with_stdlib_wrapper[pidfd_open-arguments0-darwin]",
+    "parameter": "[pidfd_open-arguments0-darwin]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_require_linux_even_with_stdlib_wrapper[pidfd_open-arguments0-freebsd]",
+    "parameter": "[pidfd_open-arguments0-freebsd]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_require_linux_even_with_stdlib_wrapper[pidfd_open-arguments0-win32]",
+    "parameter": "[pidfd_open-arguments0-win32]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_require_linux_even_with_stdlib_wrapper[pidfd_send_signal-arguments1-darwin]",
+    "parameter": "[pidfd_send_signal-arguments1-darwin]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_require_linux_even_with_stdlib_wrapper[pidfd_send_signal-arguments1-freebsd]",
+    "parameter": "[pidfd_send_signal-arguments1-freebsd]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_require_linux_even_with_stdlib_wrapper[pidfd_send_signal-arguments1-win32]",
+    "parameter": "[pidfd_send_signal-arguments1-win32]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_select_wrappers_independently_and_preserve_arguments[pidfd_open-arguments0-stdlib_arguments0-syscall_arguments0-18-False]",
+    "parameter": "[pidfd_open-arguments0-stdlib_arguments0-syscall_arguments0-18-False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_select_wrappers_independently_and_preserve_arguments[pidfd_open-arguments0-stdlib_arguments0-syscall_arguments0-18-True]",
+    "parameter": "[pidfd_open-arguments0-stdlib_arguments0-syscall_arguments0-18-True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_select_wrappers_independently_and_preserve_arguments[pidfd_open-arguments1-stdlib_arguments1-syscall_arguments1-18-False]",
+    "parameter": "[pidfd_open-arguments1-stdlib_arguments1-syscall_arguments1-18-False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_select_wrappers_independently_and_preserve_arguments[pidfd_open-arguments1-stdlib_arguments1-syscall_arguments1-18-True]",
+    "parameter": "[pidfd_open-arguments1-stdlib_arguments1-syscall_arguments1-18-True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_select_wrappers_independently_and_preserve_arguments[pidfd_send_signal-arguments2-stdlib_arguments2-syscall_arguments2-None-False]",
+    "parameter": "[pidfd_send_signal-arguments2-stdlib_arguments2-syscall_arguments2-None-False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_select_wrappers_independently_and_preserve_arguments[pidfd_send_signal-arguments2-stdlib_arguments2-syscall_arguments2-None-True]",
+    "parameter": "[pidfd_send_signal-arguments2-stdlib_arguments2-syscall_arguments2-None-True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_select_wrappers_independently_and_preserve_arguments[pidfd_send_signal-arguments3-stdlib_arguments3-syscall_arguments3-None-False]",
+    "parameter": "[pidfd_send_signal-arguments3-stdlib_arguments3-syscall_arguments3-None-False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_helpers_select_wrappers_independently_and_preserve_arguments[pidfd_send_signal-arguments3-stdlib_arguments3-syscall_arguments3-None-True]",
+    "parameter": "[pidfd_send_signal-arguments3-stdlib_arguments3-syscall_arguments3-None-True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_send_signal_fallback_refuses_non_null_siginfo[0]",
+    "parameter": "[0]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_send_signal_fallback_refuses_non_null_siginfo[False]",
+    "parameter": "[False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_send_signal_fallback_refuses_non_null_siginfo[siginfo0]",
+    "parameter": "[siginfo0]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_public_pidfd_send_signal_preserves_siginfo_for_stdlib",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_signal_process_uses_public_pidfd_helpers",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_console_close_waits_for_runtime_cleanup_before_return[2]",
+    "parameter": "[2]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_console_close_waits_for_runtime_cleanup_before_return[5]",
+    "parameter": "[5]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_console_close_waits_for_runtime_cleanup_before_return[6]",
+    "parameter": "[6]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_console_handler_failure_restores_python_signals[api]",
+    "parameter": "[api]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_console_handler_failure_restores_python_signals[registration]",
+    "parameter": "[registration]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_hidden_service_without_console_keeps_signal_handlers",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_signal_process_keeps_successful_ctrl_break_cooperative",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_signal_process_refuses_identity_mismatch_before_ctrl_break",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_signal_process_reports_checked_termination_failure",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_platform_signaling.py::test_windows_signal_process_uses_checked_fallback_when_ctrl_break_fails",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_runtime_cli_serve_cleanup.py::test_start_stops_daemon_before_restoring_control_handlers[False]",
+    "parameter": "[False]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_runtime_cli_serve_cleanup.py::test_start_stops_daemon_before_restoring_control_handlers[True]",
+    "parameter": "[True]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_service_stop.py::test_windows_service_stdin_eof_runs_handler_before_job_cleanup",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-10",
+    "native_id": "tests/test_service_stop.py::test_windows_stop_tree_drains_descendants_after_leader_exits",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_cleanup_receipt_write_failure_retains_identity_and_stop_retries",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_cleanup_retry_preserves_on_failure_clean_exit_policy",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_cleanup_retry_preserves_readiness_failure_outcome",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_invalid_declaration_is_refused[document18]",
+    "parameter": "[document18]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_invalid_declaration_is_refused[document19]",
+    "parameter": "[document19]",
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_pack_host_cleanup_receipt_refuses_corrupt_history_without_overwriting",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_pack_host_cleanup_receipts_are_bounded_owner_only_and_preserved",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_pending_cleanup_blocks_replacement_attempt",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_service_cleanup_receipt_history_keeps_latest_64_attempts",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_shutdown_retry_publishes_pack_host_cleanup_receipt",
+    "parameter": null,
+    "subtest": null
+  },
+  {
+    "lane": "CI/windows-realm-publication/step-11",
+    "native_id": "tests/test_profile_services.py::test_supervisor_marks_runtime_owned_service_name_after_configured_env",
+    "parameter": null,
+    "subtest": null
+  }
+]
