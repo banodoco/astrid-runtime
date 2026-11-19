@@ -16,6 +16,7 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     env:
+      ASTRID_CI_MATRIX: ${{ strategy.job-index || 0 }}
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     steps:
       - uses: actions/checkout@v4

@@ -23,6 +23,8 @@ concurrency:
 jobs:
   windows-realm-publication:
     runs-on: windows-latest
+    env:
+      ASTRID_CI_MATRIX: ${{ strategy.job-index || 0 }}
     steps:
       - uses: actions/checkout@v4
       - name: Restore pip cache (C-08)
@@ -118,6 +120,7 @@ jobs:
   unit:
     runs-on: ${{ matrix.os }}
     env:
+      ASTRID_CI_MATRIX: ${{ strategy.job-index || 0 }}
       ASTRID_CHECKOUT: ${{ github.workspace }}/../astrid-agent
     strategy:
       fail-fast: false
@@ -230,6 +233,8 @@ jobs:
     # The darwin_native lane is deselected by default and skipped off macOS; this
     # is the job where it runs (tests/lanes.py SKIP_REGISTRY).
     runs-on: macos-latest
+    env:
+      ASTRID_CI_MATRIX: ${{ strategy.job-index || 0 }}
     steps:
       - uses: actions/checkout@v4
       - name: Restore pip cache (C-08)
@@ -287,6 +292,8 @@ jobs:
 
   typescript-client:
     runs-on: ubuntu-latest
+    env:
+      ASTRID_CI_MATRIX: ${{ strategy.job-index || 0 }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up Plan39 evidence collector
@@ -317,6 +324,7 @@ jobs:
   boundary:
     runs-on: ubuntu-latest
     env:
+      ASTRID_CI_MATRIX: ${{ strategy.job-index || 0 }}
       ASTRID_CHECKOUT: ${{ github.workspace }}/../astrid-agent
     steps:
       - uses: actions/checkout@v4
@@ -393,6 +401,7 @@ jobs:
     # does: pidfd_open (ENOSYS), pidfd_send_signal and process-group kill (EPERM).
     runs-on: ubuntu-latest
     env:
+      ASTRID_CI_MATRIX: ${{ strategy.job-index || 0 }}
       ASTRID_CHECKOUT: ${{ github.workspace }}/../astrid-agent
     steps:
       - uses: actions/checkout@v4
@@ -463,6 +472,7 @@ jobs:
 
   portability-lifecycle:
     env:
+      ASTRID_CI_MATRIX: ${{ strategy.job-index || 0 }}
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     defaults:
       run:

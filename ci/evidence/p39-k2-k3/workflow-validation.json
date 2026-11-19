@@ -13,5 +13,58 @@
   "output": "",
   "scope": "All packet workflow files; external shellcheck/pyflakes are disabled because this check validates Actions schema and expression contexts.",
   "prior_failure": "GitHub rejected expressions in steps.shell before creating native jobs; prior implementation checkpoint is unqualified.",
-  "core_implementation_unchanged": true
+  "core_implementation_unchanged": true,
+  "matrix_environment_explicit_for_every_captured_job": true,
+  "captured_jobs": [
+    {
+      "workflow": ".github/workflows/nightly.yml",
+      "job": "integration",
+      "matrix": null
+    },
+    {
+      "workflow": ".github/workflows/ci.yml",
+      "job": "windows-realm-publication",
+      "matrix": null
+    },
+    {
+      "workflow": ".github/workflows/ci.yml",
+      "job": "unit",
+      "matrix": {
+        "os": [
+          "ubuntu-latest",
+          "macos-latest"
+        ]
+      }
+    },
+    {
+      "workflow": ".github/workflows/ci.yml",
+      "job": "darwin-native",
+      "matrix": null
+    },
+    {
+      "workflow": ".github/workflows/ci.yml",
+      "job": "typescript-client",
+      "matrix": null
+    },
+    {
+      "workflow": ".github/workflows/ci.yml",
+      "job": "boundary",
+      "matrix": null
+    },
+    {
+      "workflow": ".github/workflows/ci.yml",
+      "job": "sandbox-process-control",
+      "matrix": null
+    },
+    {
+      "workflow": ".github/workflows/ci.yml",
+      "job": "portability-lifecycle",
+      "matrix": {
+        "os": [
+          "ubuntu-latest",
+          "macos-latest"
+        ]
+      }
+    }
+  ]
 }
