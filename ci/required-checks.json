@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "repository": "banodoco/astrid-runtime",
+  "authority": {
+    "plan": "Plan 39 K2/K3",
+    "source": "banodoco/astrid-dev@4223b30a2b56c7eb59da3a47b200516372bdca5a",
+    "decision": "6995664680",
+    "amendment": "6996255390"
+  },
+  "merge": [
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "unit (ubuntu-latest)",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "unit (macos-latest)",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "windows-realm-publication",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "darwin-native",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "typescript-client",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "boundary",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "sandbox-process-control",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "portability-lifecycle (ubuntu-latest)",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "portability-lifecycle (macos-latest)",
+      "kind": "tests"
+    }
+  ],
+  "release": [
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "unit (ubuntu-latest)",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "unit (macos-latest)",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "windows-realm-publication",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "darwin-native",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "typescript-client",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "boundary",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "sandbox-process-control",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "portability-lifecycle (ubuntu-latest)",
+      "kind": "tests"
+    },
+    {
+      "workflow": "CI",
+      "workflow_file": "ci.yml",
+      "job": "portability-lifecycle (macos-latest)",
+      "kind": "tests"
+    },
+    {
+      "workflow": "Nightly",
+      "workflow_file": "nightly.yml",
+      "job": "integration",
+      "kind": "tests"
+    }
+  ]
+}
