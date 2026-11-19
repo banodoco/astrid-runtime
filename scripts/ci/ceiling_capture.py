@@ -91,10 +91,18 @@ def main(argv=None):
                 "sh": ["sh", "-e"], "pwsh": ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"],
                 "powershell": ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"],
                 "cmd": ["cmd", "/D", "/E:ON", "/V:OFF", "/S", "/C"], "python": [sys.executable]}
+    command = commands[args.shell]
+    if sys.platform == "win32" and args.shell == "bash":
+        # Actions resolves Bash on PATH before launching it. Passing a bare
+        # name to Windows CreateProcess instead can select System32's WSL shim.
+        executable = shutil.which("bash")
+        if executable is None:
+            raise FileNotFoundError("Bash was not found on the runner PATH")
+        command[0] = executable
     metadata = {"schema": 1, "repository": repository, "head": inputs[repository],
                 "tuple": inputs, "step": args.step, "job": os.environ["GITHUB_JOB"], "matrix_index": args.matrix,
                 "run_id": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-                "shell": args.shell, "command_sha256": hashlib.sha256(script).hexdigest(),
+                "shell": args.shell, "shell_argv": command, "command_sha256": hashlib.sha256(script).hexdigest(),
                 "installed_sources": installed_sources, "tuple_conflicts": conflicts,
                 "started_at": time.time(), "complete": False}
     receipt = directory / "command.json"
@@ -102,7 +110,7 @@ def main(argv=None):
     env = dict(os.environ, CEILING_STEP_DIR=str(directory))
     env["PYTHONPATH"] = str(Path(__file__).resolve().parent) + os.pathsep + env.get("PYTHONPATH", "")
     with (directory / "command.log").open("wb", buffering=0) as log:
-        process = subprocess.Popen([*commands[args.shell], str(executed_script)], env=env,
+        process = subprocess.Popen([*command, str(executed_script)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         assert process.stdout is not None
         try:
