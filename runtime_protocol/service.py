@@ -920,7 +920,7 @@ class RuntimeService(TaskWaits, ThinRequests):
         excess = sorted(set(requested) - negotiated)
         if excess:
             raise AuthorizationError("credential cannot negotiate requested scopes", details={"scopes": excess})
-        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY, "rendering.render.historical_revision.v1", "task_waits.v1", "task_resolution.v1"]}
+        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY, "rendering.render.historical_revision.v1", "task_waits.v1", "task_resolution.v1", "thumbnail_intents.v1"]}
 
     @staticmethod
     def _assert_executor_identity(identity, executor_id):
@@ -6022,7 +6022,7 @@ class RuntimeService(TaskWaits, ThinRequests):
             if retained_fd is not None:
                 os.close(retained_fd)
 
-    def open_object(self, digest):
+    def open_object(self, digest, *, verify_content=True):
         normalized = str(digest).removeprefix("sha256:")
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (normalized,)).fetchone()
@@ -6037,7 +6037,7 @@ class RuntimeService(TaskWaits, ThinRequests):
             token = file_identity(value)
             # Verify once per immutable file identity, including after restart.
             # Repeated byte-range seeks do not scan the entire large object.
-            if self._verified_cas_objects.get(normalized) != token:
+            if verify_content and self._verified_cas_objects.get(normalized) != token:
                 verified = self._verify_open_file(stream.fileno(), normalized, int(metadata["size"]), label="CAS object")
                 self._verified_cas_objects[normalized] = file_identity(verified)
             stream.seek(0)
@@ -6458,7 +6458,7 @@ class RuntimeService(TaskWaits, ThinRequests):
             raise AuthorizationError("discovery grant selected project/run/task/attempt association does not match")
 
     @_verified_mutation
-    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None, _recoverable_outputs=None, identity=None, _thin_admission=None):
+    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None, _recoverable_outputs=None, identity=None, _thin_admission=None, _thumbnail_intent=None):
         if "thin_request" in body:
             return self.create_thin_task(body, identity=identity, enforce_readiness=enforce_readiness)
         if "capability" in body or "expected_effect" in body:
@@ -6472,6 +6472,7 @@ class RuntimeService(TaskWaits, ThinRequests):
         if not isinstance(task_spec_value, dict):
             raise ValidationError("task spec must be an object")
         reserved = {ADMISSION_KEY, "child_delegation", "delegated_parent", "delegated_stage", "delegated_inputs", "verified_publication_source", "input_refs", "derived_input_registry", "delegation_closed_attempt_id", "delegated_recoverable_outputs", "discovery_grant"}
+        reserved.add("_runtime_thumbnail_intent")
         if set(task_spec_value) & reserved or set(body) & (reserved - {"child_delegation"}):
             raise ValidationError("delegation fields must use Runtime admission authority")
         if _delegated_lineage is not None and "child_delegation" in body:
@@ -6538,7 +6539,8 @@ class RuntimeService(TaskWaits, ThinRequests):
         from .capture_validation import validate_capture
         inputs = task_spec_value.get("inputs") if isinstance(task_spec_value.get("inputs"), dict) else {}
         value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness, execution_request=execution_request,
-                                       capture_validator=lambda snapshot, ref: validate_capture(self, snapshot, ref, inputs))
+                                       capture_validator=lambda snapshot, ref: validate_capture(self, snapshot, ref, inputs),
+                                       _thumbnail_intent=_thumbnail_intent)
         return value
 
     def _live_delegating_parent(self, attempt_id, lease, *, identity):
@@ -8711,6 +8713,15 @@ class RuntimeService(TaskWaits, ThinRequests):
             result["generation_intent"] = generation_intent
         return self._command_record("task.claim_delegated_child", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
+    def pending_thumbnail_intents(self, body, *, identity=None):
+        from .thumbnail_intents import pending
+        return pending(self, body, identity=identity)
+
+    @_verified_mutation
+    def admit_thumbnail_intent(self, task_id, intent_id, body, *, identity=None):
+        from .thumbnail_intents import admit
+        return admit(self, task_id, intent_id, body, identity=identity)
+
     @_durable_mutation(reap_task_lifetimes=True)
     def settle_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None, _verified_objects=None):
         idempotency_key = require_idempotency_key(idempotency_key)
@@ -8738,6 +8749,8 @@ class RuntimeService(TaskWaits, ThinRequests):
             raise ValidationError("result must be an object")
         if isinstance(body.get("result"), dict) and "outputs" in body["result"]:
             raise ValidationError("result.outputs is reserved; send outputs at the settlement top level")
+        if isinstance(body.get("result"), dict) and "thumbnail_intents" in body["result"]:
+            raise ValidationError("result.thumbnail_intents is reserved for durable Runtime settlement")
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
