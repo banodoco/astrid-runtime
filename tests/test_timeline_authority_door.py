@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from http_helpers import Api
-from runtime_protocol.daemon import RuntimeDaemon
+from migrated_realm import MigratedRealmDaemon
 from runtime_protocol.door import DoorConfig
 from precut_realm_fixture import load_precut_realm_fixture
 from tests.door_helpers import DoorWorld, HOSTED
@@ -27,7 +27,7 @@ def _snapshot(service):
 def realm(tmp_path):
     captured = load_precut_realm_fixture(tmp_path)
     credential_file = tmp_path / "astrid.json"
-    daemon = RuntimeDaemon(
+    daemon = MigratedRealmDaemon(
         captured.copy_roots[1], support_root=tmp_path / "support",
         door=DoorConfig(origin=HOSTED, port=0, credential_file=credential_file),
     ).start()

@@ -15,6 +15,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.timeline_commit_port import digest, route_path
 
 from timeline_commit_film_fixture import build_film_fixture
+from migrated_realm import open_migrated_service
 
 
 class _HostBoundaryProvider:
@@ -148,7 +149,7 @@ def test_bootstrap_command_then_history_revision_and_neutral_reads(tmp_path, mon
 
 def test_precut_catalog_reference_shot_and_binding_pins_survive_source_change(tmp_path):
     fixture = build_film_fixture(tmp_path)
-    service = RuntimeService(fixture.duplicate_root)
+    service = open_migrated_service(fixture.duplicate_root)
     try:
         parent = service.get_project_parent_composition_revision(
             fixture.project_id, fixture.timeline_id, fixture.parent_revision_id

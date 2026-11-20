@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from migrated_realm import MigratedRealmDaemon, open_migrated_service
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError, NotFoundError, RetiredRouteError, RuntimeErrorBase
 from runtime_protocol.service import RuntimeService
@@ -314,10 +315,10 @@ def historical_binding(request, tmp_path):
     root = captured.copy_roots[1]
     daemon = None
     if request.param == "http":
-        daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start()
+        daemon = MigratedRealmDaemon(root, support_root=tmp_path / "support").start()
         service = daemon.service
     else:
-        service = RuntimeService(root)
+        service = open_migrated_service(root)
     try:
         binding = service.get_project_shot_text_binding(captured.pins["project_id"], captured.pins["text_binding_id"])
         assert binding["kind"] == "transcript" and binding["head"] == 1

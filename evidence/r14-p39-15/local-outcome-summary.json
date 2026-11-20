@@ -1,0 +1,317 @@
+{
+  "status": "Completed local candidate observations; remaining failures preserved, no verdict",
+  "distinct_original_ids": 366,
+  "candidate_outcomes": {
+    "PASSED": 309,
+    "ERROR": 52,
+    "FAILED": 5
+  },
+  "transitions": {
+    "FAILED->PASSED": 19,
+    "ERROR->ERROR": 52,
+    "ERROR->PASSED": 290,
+    "ERROR->FAILED": 2,
+    "FAILED->FAILED": 3
+  },
+  "by_original_group": {
+    "process-registration": {
+      "PASSED": 1
+    },
+    "registration": {
+      "PASSED": 127,
+      "FAILED": 1
+    },
+    "verification-pending": {
+      "PASSED": 181,
+      "ERROR": 52,
+      "FAILED": 4
+    }
+  },
+  "lanes": [
+    {
+      "lane": "unit",
+      "native_ids": 358,
+      "missing": [],
+      "extra": [],
+      "candidate_head": "c0cf8bfdd5c28be09621a7886f5d33761c5b806e",
+      "candidate_committed_tree": "30dd0f79b5918a82c9eb695ae4cb2ebbfeb97da0",
+      "worktree_status": " M tests/historical_audio_fixture.py\n M tests/test_precut_variants.py\n M tests/test_realm_admission_hardening.py\n M tests/test_shot_composition_runtime.py\n M tests/test_streaming_media_io.py\n M tests/test_timeline_authority_door.py\n M tests/test_timeline_commit_crash.py\n M tests/test_timeline_cutover.py\n M tests/test_timeline_document_authority.py\n M tests/test_timeline_reads_after_cut.py\n M tests/test_timeline_shot_authority.py\n",
+      "agent_pin": "0e1543e0da2215db9cb3320cfd1083174c3c62a9",
+      "worker_environment": "python=3.13.5\nagent=0e1543e0da2215db9cb3320cfd1083174c3c62a9\nnode=v22.23.5\ntsc=Version 5.9.3\n",
+      "native_exit": 1,
+      "native_finish": {
+        "collected": 358,
+        "event": "finish",
+        "exitstatus": 1
+      },
+      "outcomes": {
+        "PASSED": 305,
+        "ERROR": 51,
+        "FAILED": 2
+      },
+      "phase_outcomes": {
+        "setup:passed": 307,
+        "call:passed": 305,
+        "teardown:passed": 358,
+        "setup:failed": 51,
+        "call:failed": 2
+      },
+      "transitions": {
+        "FAILED->PASSED": 15,
+        "ERROR->ERROR": 51,
+        "ERROR->PASSED": 290,
+        "ERROR->FAILED": 2
+      },
+      "source_files_snapshot_sha256": "26284ef0074bc4f6a79b9d24bdf32fbfafe351b8379d319e940e0192287c1778",
+      "original_receipts": {
+        "evidence-local/candidate-unit/invocation.json": "ced4789356937c33121201a6ac3acd4bc6fca5c6743f8fa661ce4e40fdd72ea0",
+        "evidence-local/candidate-unit/events.jsonl": "ad197120c6599733f5d06f4d5092eaf1be804f1bdf8eb42e6caff763dbc7e8d9",
+        "evidence-local/candidate-unit/native.xml": "cf46e1e071d08a2f6479d2c98c0b9a4fdf9f98ccf0580c63b30e14d39056dfd5",
+        "evidence-local/candidate-unit/terminal.log": "e8d027fdc3eb18217c830325db39614c623aa08a307bb75dec2e496d14e8bfc2",
+        "evidence-local/candidate-unit/exit.txt": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+      }
+    },
+    {
+      "lane": "nightly",
+      "native_ids": 8,
+      "missing": [],
+      "extra": [],
+      "candidate_head": "c0cf8bfdd5c28be09621a7886f5d33761c5b806e",
+      "candidate_committed_tree": "30dd0f79b5918a82c9eb695ae4cb2ebbfeb97da0",
+      "worktree_status": " M tests/historical_audio_fixture.py\n M tests/test_precut_variants.py\n M tests/test_realm_admission_hardening.py\n M tests/test_shot_composition_runtime.py\n M tests/test_streaming_media_io.py\n M tests/test_timeline_authority_door.py\n M tests/test_timeline_commit_crash.py\n M tests/test_timeline_cutover.py\n M tests/test_timeline_document_authority.py\n M tests/test_timeline_reads_after_cut.py\n M tests/test_timeline_shot_authority.py\n",
+      "agent_pin": "0e1543e0da2215db9cb3320cfd1083174c3c62a9",
+      "worker_environment": "python=3.13.5\nagent=0e1543e0da2215db9cb3320cfd1083174c3c62a9\nnode=v22.23.5\ntsc=Version 5.9.3\n",
+      "native_exit": 1,
+      "native_finish": {
+        "collected": 8,
+        "event": "finish",
+        "exitstatus": 1
+      },
+      "outcomes": {
+        "PASSED": 4,
+        "FAILED": 3,
+        "ERROR": 1
+      },
+      "phase_outcomes": {
+        "setup:passed": 7,
+        "call:passed": 4,
+        "teardown:passed": 8,
+        "call:failed": 3,
+        "setup:failed": 1
+      },
+      "transitions": {
+        "FAILED->PASSED": 4,
+        "FAILED->FAILED": 3,
+        "ERROR->ERROR": 1
+      },
+      "source_files_snapshot_sha256": "26284ef0074bc4f6a79b9d24bdf32fbfafe351b8379d319e940e0192287c1778",
+      "original_receipts": {
+        "evidence-local/candidate-nightly/invocation.json": "e50a515b830f291c8c59ba6545116857738db90f9ef508409223c9644b266cff",
+        "evidence-local/candidate-nightly/events.jsonl": "09838d96e5d9e8a70461028fd66a15cc3d4cf7d629c1db6cf68e893077da7960",
+        "evidence-local/candidate-nightly/native.xml": "a9b8e7c84387341d7c1d816222226052e8206dedf9ec3a0bb97e7b57ce8ed0a0",
+        "evidence-local/candidate-nightly/terminal.log": "65e40b8e06df81932dbd276af836554a05e605d6235989dc30a70758dd8cd8dd",
+        "evidence-local/candidate-nightly/exit.txt": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+      }
+    }
+  ],
+  "residual_categories": [
+    {
+      "lane": "unit",
+      "phase": "setup",
+      "exception_site": "runtime_protocol/v33_lifecycle.py:300: ConflictError",
+      "error_lines": [
+        "runtime_protocol.errors.ConflictError: v33 provider/baseline verification is pending; requests and fresh pins are fenced"
+      ],
+      "count": 51,
+      "nodes": [
+        "tests/test_project_reference_catalog.py::test_catalog_media_must_belong_to_reference_project[neutral-associate_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_media_must_belong_to_reference_project[neutral-create_project_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_mutation_and_receipt_roll_back_together[neutral-archive_project_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_mutation_and_receipt_roll_back_together[neutral-associate_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_mutation_and_receipt_roll_back_together[neutral-create_project_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_mutation_and_receipt_roll_back_together[neutral-link_references]",
+        "tests/test_project_reference_catalog.py::test_catalog_mutation_and_receipt_roll_back_together[neutral-recover_project_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_mutation_and_receipt_roll_back_together[neutral-set_primary_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_mutation_and_receipt_roll_back_together[neutral-update_project_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_stale_version_refuses_atomically[neutral-archive_project_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_stale_version_refuses_atomically[neutral-recover_project_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_stale_version_refuses_atomically[neutral-set_primary_reference]",
+        "tests/test_project_reference_catalog.py::test_catalog_stale_version_refuses_atomically[neutral-update_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_genuine_accepted_catalog_retry_replays_without_writes[neutral-associate_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_genuine_accepted_catalog_retry_replays_without_writes[neutral-create_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_private_reference_state_writer_is_also_retired[neutral-False]",
+        "tests/test_timeline_reference_authority.py::test_service_private_reference_state_writer_is_also_retired[neutral-None]",
+        "tests/test_timeline_reference_authority.py::test_service_private_reference_state_writer_is_also_retired[neutral-True]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-existing-update_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-existing-archive_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-fresh-archive_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-existing-associate_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-fresh-associate_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-existing-create_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-fresh-create_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-existing-link_references]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-existing-recover_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-fresh-link_references]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-fresh-recover_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-existing-set_primary_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-fresh-set_primary_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-fresh-update_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-unused-archive_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-unused-recover_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-unused-associate_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-unused-set_primary_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-unused-update_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-unused-create_project_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-existing-archive_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_project_catalog_keep_crud_and_exact_retry[neutral-unused-link_references]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-existing-create_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-fresh-archive_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-existing-recover_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-fresh-create_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-existing-update_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-fresh-recover_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-unused-archive_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-fresh-update_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-unused-create_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-unused-recover_reference]",
+        "tests/test_timeline_reference_authority.py::test_service_reference_writers_refuse_before_lookup_or_replay[neutral-unused-update_reference]"
+      ],
+      "representative_frames": [
+        "tests/test_timeline_reference_authority.py:78: ",
+        "tests/test_timeline_reference_authority.py:56: in seed",
+        "runtime_protocol/service.py:511: in wrapped",
+        "runtime_protocol/service.py:875: in _assert_mutation_admitted",
+        "runtime_protocol/v33_lifecycle.py:300: ConflictError"
+      ]
+    },
+    {
+      "lane": "unit",
+      "phase": "call",
+      "exception_site": "tests/http_helpers.py:43: RuntimeError",
+      "error_lines": [
+        "urllib.error.HTTPError: HTTP Error 409: Conflict",
+        "RuntimeError: {'code': 'verification_receipt_missing', 'message': 'Runtime verification receipt is missing', 'request_id': '<recorded-per-ID>'}"
+      ],
+      "count": 1,
+      "nodes": [
+        "tests/test_timeline_effect_authority.py::test_delegated_verified_final_publication_only_stores_artifacts[http]"
+      ],
+      "representative_frames": [
+        "tests/http_helpers.py:30: ",
+        "tests/test_timeline_effect_authority.py:517: ",
+        "tests/test_timeline_effect_authority.py:158: in _settle",
+        "tests/http_helpers.py:43: RuntimeError"
+      ]
+    },
+    {
+      "lane": "unit",
+      "phase": "call",
+      "exception_site": "runtime_protocol/service.py:6904: VerificationReceiptMissingError",
+      "error_lines": [
+        "runtime_protocol.errors.VerificationReceiptMissingError: Runtime verification receipt is missing"
+      ],
+      "count": 1,
+      "nodes": [
+        "tests/test_timeline_effect_authority.py::test_delegated_verified_final_publication_only_stores_artifacts[service]"
+      ],
+      "representative_frames": [
+        "tests/test_timeline_effect_authority.py:517: ",
+        "tests/test_timeline_effect_authority.py:160: in _settle",
+        "runtime_protocol/service.py:530: in wrapped",
+        "runtime_protocol/service.py:8888: in settle_attempt",
+        "runtime_protocol/service.py:6904: VerificationReceiptMissingError"
+      ]
+    },
+    {
+      "lane": "nightly",
+      "phase": "call",
+      "exception_site": "tests/test_timeline_commit_crash.py:79: AssertionError",
+      "error_lines": [
+        "assert 33 == 31"
+      ],
+      "count": 3,
+      "nodes": [
+        "tests/test_timeline_commit_crash.py::test_host_boundary_first_capture_process_death[after-config]",
+        "tests/test_timeline_commit_crash.py::test_host_boundary_first_capture_process_death[before-config]",
+        "tests/test_timeline_commit_crash.py::test_host_boundary_first_capture_process_death[pre-config]"
+      ],
+      "representative_frames": [
+        "tests/test_timeline_commit_crash.py:406: ",
+        "tests/test_timeline_commit_crash.py:416: in _crash_boundary",
+        "tests/test_timeline_commit_crash.py:79: AssertionError"
+      ]
+    },
+    {
+      "lane": "nightly",
+      "phase": "setup",
+      "exception_site": "runtime_protocol/service.py:452: RetiredRouteError",
+      "error_lines": [
+        "runtime_protocol.errors.RetiredRouteError: legacy timeline writes are retired; submit EditCommands through commitTimeline"
+      ],
+      "count": 1,
+      "nodes": [
+        "tests/test_timeline_public_s2_mixed_cli_journey.py::test_public_cli_stale_trim_rebases_label_lost_ack_restart_retry_and_undo[historical-audio]"
+      ],
+      "representative_frames": [
+        "tests/test_timeline_public_s2_mixed_cli_journey.py:42: ",
+        "tests/historical_audio_fixture.py:335: in prepare_pcm_historical_audio_film",
+        "runtime_protocol/service.py:3640: in publish_parent_composition",
+        "runtime_protocol/service.py:1814: in _require_timeline_command",
+        "runtime_protocol/service.py:452: RetiredRouteError"
+      ]
+    }
+  ],
+  "assertion_preservation": {
+    "base": "97321788fab40400878f9abf1860a7adbf6ddb92",
+    "candidate_head": "c0cf8bfdd5c28be09621a7886f5d33761c5b806e",
+    "candidate_committed_tree": "30dd0f79b5918a82c9eb695ae4cb2ebbfeb97da0",
+    "candidate_worktree_status_at_execution": " M tests/historical_audio_fixture.py\n M tests/test_precut_variants.py\n M tests/test_realm_admission_hardening.py\n M tests/test_shot_composition_runtime.py\n M tests/test_streaming_media_io.py\n M tests/test_timeline_authority_door.py\n M tests/test_timeline_commit_crash.py\n M tests/test_timeline_cutover.py\n M tests/test_timeline_document_authority.py\n M tests/test_timeline_reads_after_cut.py\n M tests/test_timeline_shot_authority.py\n",
+    "identity_limit": "Candidate includes the recorded worktree diff, not solely the committed HEAD tree.",
+    "original_python_files": 371,
+    "original_files_changed": 13,
+    "original_files_byte_identical": 358,
+    "original_test_source_snapshot_mismatches": [],
+    "totals": {
+      "assertions:original": 13489,
+      "assertions:current": 13490,
+      "assertions:removed_or_changed": 0,
+      "assertions:added": 1,
+      "all_pytest_calls:original": 3716,
+      "all_pytest_calls:current": 3716,
+      "all_pytest_calls:removed_or_changed": 0,
+      "all_pytest_calls:added": 0,
+      "pytest_oracles:original": 2364,
+      "pytest_oracles:current": 2364,
+      "pytest_oracles:removed_or_changed": 0,
+      "pytest_oracles:added": 0
+    },
+    "diff_name_status": [
+      "M\ttests/historical_audio_fixture.py",
+      "A\ttests/migrated_realm.py",
+      "A\ttests/test_migrated_realm_readiness.py",
+      "M\ttests/test_precut_variants.py",
+      "M\ttests/test_realm_admission_hardening.py",
+      "M\ttests/test_shot_candidate_promotion.py",
+      "M\ttests/test_shot_composition_runtime.py",
+      "M\ttests/test_streaming_media_io.py",
+      "M\ttests/test_timeline_authority_door.py",
+      "M\ttests/test_timeline_commit_crash.py",
+      "M\ttests/test_timeline_cutover.py",
+      "M\ttests/test_timeline_document_authority.py",
+      "M\ttests/test_timeline_effect_authority.py",
+      "M\ttests/test_timeline_reads_after_cut.py",
+      "M\ttests/test_timeline_shot_authority.py"
+    ],
+    "product_changes": [],
+    "root_audit_sha256": "c7d6e49c71065a20a7fe0ba18a339d030a6f982805e89a9cb56c6a2e93642c12",
+    "root_audit_verified": true,
+    "scope_limit": "AST counters and signatures are preservation facts, not an implementation review or evidence that every oracle was reached."
+  },
+  "limitations": [
+    "Candidate has committed head c0cf8bfd plus recorded worktree edits; outputs are not execution of the clean c0 tree alone.",
+    "Local CPython3.13.5 Linux observations do not replace hosted3.11, macOS or seccomp qualification.",
+    "52 setup errors leave 52 original calls unexecuted. Two original setup errors now reach a failing call; they are not repaired IDs.",
+    "The two source files retaining 51 neutral parameters are unchanged; no neutral-to-authoring substitution was made.",
+    "Traceback and source facts identify reached boundaries; they do not establish an introducing change or decide product defect versus fixture repair."
+  ]
+}
