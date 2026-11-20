@@ -5,11 +5,10 @@ import copy
 import pytest
 
 from http_helpers import Api
+from migrated_realm import MigratedRealmDaemon, open_migrated_service
 from precut_realm_fixture import load_precut_realm_fixture
 from runtime_protocol import service as service_module
-from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError, ValidationError
-from runtime_protocol.service import RuntimeService
 from runtime_protocol.timeline_commit_port import digest as commit_digest, route_path
 from runtime_protocol.util import canonical_json
 from tests.test_generation_publish_v1_settlement import _effect as publish_effect
@@ -44,7 +43,6 @@ def _seed(service):
     # Genuine public-API resources and receipts from the restored pre-cut
     # capture. They are unused by the separate task-authority timeline.
     project = service.get_project("synthetic-film")
-    service.register_timeline_commit_provider(PreparedProvider(_render_source_candidate))
     service.create_timeline(project["id"], "main", idempotency_key="bootstrap")
     binding = service.list_project_shot_text_bindings(project["id"])["items"][0]
     shot = service.get_project_shot(project["id"], binding["shot_id"])
@@ -88,8 +86,9 @@ def _render_source(service, project_id, body, *, idempotency_key):
 def boundary(request, tmp_path, monkeypatch):
     captured = load_precut_realm_fixture(tmp_path)
     root = captured.copy_roots[1]
-    daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start() if request.param == "http" else None
-    service = daemon.service if daemon else RuntimeService(root)
+    provider = PreparedProvider(_render_source_candidate)
+    daemon = MigratedRealmDaemon(root, support_root=tmp_path / "support", provider=provider).start() if request.param == "http" else None
+    service = daemon.service if daemon else open_migrated_service(root, provider=provider)
     try:
         monkeypatch.setattr(service_module, "evaluate_closure", _no_scene)
         project, binding, shot, reference = _seed(service)
