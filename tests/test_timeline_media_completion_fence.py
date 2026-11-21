@@ -82,6 +82,85 @@ def _api_invalidation(service, output, change):
         }, idempotency_key="change-output")
 
 
+def _assert_eligible_lifecycle_pin(service, project, output, other_output, phase, change):
+    selection = _capture(service, project, output)
+    original = copy.deepcopy(selection)
+    body = _request(service, project, selection)
+    hook = "before_capture" if phase == "capture" else "before_accept"
+    key = "eligible-media"
+
+    def change_lifecycle():
+        _api_invalidation(service, output, change)
+        updated = service.store.get_managed_output(output["association_id"])
+        assert updated["lifecycle"]["version"] == output["lifecycle"]["version"] + 1
+        before = snapshot(service)
+        with pytest.raises(ConflictError, match="captured output object or version changed"):
+            _capture(service, project, output)
+        assert snapshot(service) == before
+        verified = service.get_project_verified_media(project, selection, authorize=lambda: None)
+        assert verified["selection"] == original
+        assert verified["selection"]["object_id"] == output["object_id"]
+        assert snapshot(service) == before
+
+    provider = use_provider(service, _provider(selection, **{hook: change_lifecycle}))
+    accepted = commit(service, body, key=key)
+    assert accepted["data"]["status"] == "accepted"
+    assert provider.calls == 1
+    assert selection == original
+    assert service.store.conn.execute(
+        "SELECT COUNT(*) FROM timeline_commit_history WHERE intent='recorded'",
+    ).fetchone()[0] == 1
+
+    before = snapshot(service)
+    assert canonical_json(commit(service, body, key=key)) == canonical_json(accepted)
+    assert provider.calls == 1 and snapshot(service) == before
+    changed = copy.deepcopy(body)
+    changed["rationale"] = "changed replay payload"
+    with pytest.raises(RuntimeErrorBase) as error:
+        commit(service, changed, key=key)
+    assert error.value.details["reason"] == "idempotency_mismatch"
+    assert provider.calls == 1 and snapshot(service) == before
+
+    wrong_selection = {**selection, "object_id": other_output["object_id"]}
+    wrong_body = _request(service, project, wrong_selection)
+    provider = use_provider(service, _provider(wrong_selection))
+    before = snapshot(service)
+    with pytest.raises(RuntimeErrorBase) as error:
+        service.get_project_verified_media(project, wrong_selection, authorize=lambda: None)
+    assert error.value.status in {404, 409}
+    assert snapshot(service) == before
+    with pytest.raises(RuntimeErrorBase) as error:
+        commit(service, wrong_body, key="wrong-object")
+    assert error.value.status in {404, 409}
+    assert provider.calls == 1 and snapshot(service) == before
+
+    foreign = service.create_project({"slug": "foreign-settlement", "name": "Foreign settlement"})["id"]
+    conn = service.store.conn
+    scope_update = "UPDATE managed_output_associations SET project_id=? WHERE association_id=?"
+    for index, wrong_scope in enumerate((None, foreign)):
+        fresh_body = _request(service, project, selection)
+        before = None
+
+        def corrupt_scope():
+            nonlocal before
+            conn.execute(scope_update, (wrong_scope, output["association_id"]))
+            conn.commit()
+            before = snapshot(service)
+            with pytest.raises(RuntimeErrorBase, match="output association is outside the selected project") as error:
+                service.get_project_verified_media(project, selection, authorize=lambda: None)
+            assert error.value.status in {404, 409}
+            assert snapshot(service) == before
+
+        provider = use_provider(service, _provider(selection, **{hook: corrupt_scope}))
+        with pytest.raises(RuntimeErrorBase, match="output association is outside the selected project") as error:
+            commit(service, fresh_body, key=f"wrong-scope-{index}")
+        assert error.value.status in {404, 409}
+        assert provider.calls == 1 and before is not None
+        assert snapshot(service) == before
+        conn.execute(scope_update, (project, output["association_id"]))
+        conn.commit()
+
+
 @pytest.mark.parametrize("name", ["image", "old"], ids=["image", "video"])
 @pytest.mark.parametrize("phase", ["capture", "acceptance"])
 @pytest.mark.parametrize("change", ["retry", "replacement", "retry-cancel",
@@ -89,6 +168,13 @@ def _api_invalidation(service, output, change):
 def test_normal_api_invalidation_refuses_original_pin_without_writes(media, name, phase, change):
     service, project, outputs = media
     output = outputs[name]
+    # REVIEW: Plan 59's 14d68d21 (merged in e6f4d5c2) keeps eligible selections
+    # pinned to their object and bytes across lifecycle changes.
+    if change in {"promote", "pin", "lease"}:
+        other_output = outputs["old" if name == "image" else "image"]
+        _assert_eligible_lifecycle_pin(service, project, output, other_output, phase, change)
+        return
+
     selection = _capture(service, project, output)
     original = copy.deepcopy(selection)
     body = _request(service, project, selection)
