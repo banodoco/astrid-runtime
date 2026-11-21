@@ -964,7 +964,7 @@ class MediaReads:
             raise ConflictError("selected output historical attempt identity changed")
         return association, variant
 
-    def _selected_project_media(self, project_id, selection):
+    def _selected_project_media(self, project_id, selection, *, retained=False):
         """Reconstruct one record from managed authority; caller owns the mutex.
 
         This is also called within acceptance's BEGIN IMMEDIATE, never through
@@ -1031,9 +1031,11 @@ class MediaReads:
                                      "metadata": _media_metadata(generation_metadata)},
                       "variant": {"variant_type": row["variant_type"], "metadata": _media_metadata(variant_metadata)},
                       "entry": entry}
+            # The generation ID is global. Find the settlement before checking
+            # its project so a corrupt scope cannot hide a generated output.
             associations = self.store.conn.execute(
-                "SELECT association_id FROM managed_output_associations WHERE project_id=? AND generation_id=? AND object_digest=?",
-                (project_id, selection["generation_id"], row["object_digest"]),
+                "SELECT association_id FROM managed_output_associations WHERE generation_id=? AND object_digest=?",
+                (selection["generation_id"], row["object_digest"]),
             ).fetchall()
             matched = [self.store.get_managed_output(item["association_id"]) for item in associations]
             matched = [item for item in matched if self._variant_matches(item, variant_metadata)]
@@ -1058,19 +1060,29 @@ class MediaReads:
             self.service._verify_child_object_bytes(
                 row["object_digest"], row["size"], label="selected media CAS object",
             )
-            record["catalog_digest"] = digest(record)
+            # The pin protects what a command depends on: the object's identity and bytes, its
+            # generation/variant and its media facts. Mutable lifecycle and authoring metadata
+            # (managed-output lifecycle/durability/provenance/task/attempt, generation and variant
+            # metadata) change after import without changing the selected bytes, so they stay out.
+            legacy_digest = digest(record)
+            record["catalog_digest"] = digest({
+                **{key: record[key] for key in ("realm_id", "project_id", "asset", "generation_id", "variant_id", "object_id")},
+                "variant_type": row["variant_type"], "entry": entry})
         except (ValueError, TypeError, OverflowError) as exc:
             raise ValidationError("invalid selected media metadata") from exc
-        if "catalog_digest" in selection and selection["catalog_digest"] != record["catalog_digest"]:
+        # `retained` is only Service._verify_legacy_media_selections reading stored history: pins recorded before
+        # the digest covered identity alone hold the whole-record digest and must keep verifying there.
+        accepted = (record["catalog_digest"], legacy_digest) if retained else (record["catalog_digest"],)
+        if "catalog_digest" in selection and selection["catalog_digest"] not in accepted:
             raise ConflictError("selected media catalog digest changed")
         return record
 
-    def selected(self, project_id, selection):
+    def selected(self, project_id, selection, *, retained=False):
         from .timeline_commit_validation import validate_commit_value
         validate_commit_value(selection, "MediaSelection")
         if not isinstance(selection, dict) or set(selection) != {"asset", "generation_id", "variant_id", "object_id", "catalog_digest"}:
             raise ValidationError("selected media requires all five exact identity fields")
-        record = self._selected_project_media(project_id, selection)
+        record = self._selected_project_media(project_id, selection, retained=retained)
         return {"selection": {key: record[key] for key in selection},
                 **{key: record["entry"][key] for key in ("media_type", "size", "duration_seconds", "width", "height") if key in record["entry"]}}
 

@@ -4,7 +4,7 @@ import importlib
 import json
 import subprocess
 from pathlib import Path
-from typing import TypedDict, Union, get_args, get_origin, get_type_hints, is_typeddict
+from typing import Literal, TypedDict, Union, get_args, get_origin, get_type_hints, is_typeddict
 
 import pytest
 
@@ -23,30 +23,89 @@ def union_members(alias, namespace):
     return members
 
 
+def typed_dict_alternatives(annotation, namespace):
+    holder = TypedDict("Holder", {"args": annotation})
+    resolved = get_type_hints(holder, namespace)["args"]
+    members = get_args(resolved) if get_origin(resolved) is Union else (resolved,)
+    assert all(is_typeddict(member) for member in members)
+    return members
+
+
 @pytest.mark.parametrize(
     "module_name",
     ["runtime_protocol.timeline_commit_types", "astrid_runtime_client.timeline_commit_types"],
 )
-def test_track_label_union_imports_and_retains_field_types(module_name):
+def test_track_set_union_imports_and_retains_appearance_types(module_name):
     dto = importlib.import_module(module_name)
-    labeled, cleared = union_members(dto.TrackSetArgs, vars(dto))
-    for branch in (labeled, cleared):
+    branches = union_members(dto.TrackSetArgs, vars(dto))
+    expected_names = {"label", "fit", "scale", "opacity", "blendMode"}
+    for branch in branches:
         assert branch.__required_keys__ == {"values", "clear"}
         assert branch.__optional_keys__ == set()
-    label_values = get_type_hints(labeled)["values"]
-    clear_values = get_type_hints(cleared)["values"]
-    assert label_values.__required_keys__ == {"label"}
-    assert label_values.__optional_keys__ == set()
-    assert clear_values.__required_keys__ == set()
-    assert clear_values.__optional_keys__ == {"label"}
-    assert get_type_hints(label_values) == get_type_hints(clear_values) == {"label": str}
-    assert labeled(values=label_values(label="é 🎬"), clear=[]) == {
-        "values": {"label": "é 🎬"}, "clear": []
-    }
-    assert cleared(values=clear_values(), clear=["label"]) == {
-        "values": {}, "clear": ["label"]
+        values = get_type_hints(branch, vars(dto))["values"]
+        value_branches = typed_dict_alternatives(values, vars(dto))
+        if len(value_branches) > 1:
+            assert len(value_branches) == len(expected_names)
+            assert {tuple(value.__required_keys__) for value in value_branches} == {
+                (name,) for name in expected_names
+            }
+        else:
+            assert value_branches[0].__required_keys__ == set()
+            assert value_branches[0].__optional_keys__ == expected_names
+        for values_branch in value_branches:
+            types = get_type_hints(values_branch, vars(dto))
+            assert types["label"] is str
+            assert types["fit"] == Literal["cover", "contain", "manual"]
+            assert types["scale"] is float and types["opacity"] is float
+            assert types["blendMode"] == Literal[
+                "normal", "multiply", "screen", "overlay", "darken", "lighten", "soft-light", "hard-light"
+            ]
+        clear_item = get_type_hints(branch, vars(dto))["clear"].__args__[0]
+        literals = set()
+        for member in get_args(clear_item):
+            literals.update(get_args(member) if get_origin(member) is not None else (member,))
+        assert literals == {"label", "fit", "scale", "opacity", "blendMode"}
+    assert branches[0](values={"label": "é 🎬", "fit": "cover", "scale": 1.2,
+                               "opacity": 0.5, "blendMode": "screen"}, clear=[]) == {
+        "values": {"label": "é 🎬", "fit": "cover", "scale": 1.2,
+                   "opacity": 0.5, "blendMode": "screen"}, "clear": []
     }
 
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["runtime_protocol.timeline_commit_types", "astrid_runtime_client.timeline_commit_types"],
+)
+def test_clip_set_union_imports_and_retains_appearance_types(module_name):
+    dto = importlib.import_module(module_name)
+    branches = union_members(dto.ClipSetArgs, vars(dto))
+    expected_names = {
+        "hold", "fit", "x", "y", "width", "height", "cropTop", "cropBottom",
+        "cropLeft", "cropRight", "opacity",
+    }
+    for branch in branches:
+        values = get_type_hints(branch, vars(dto))["values"]
+        value_branches = typed_dict_alternatives(values, vars(dto))
+        if len(value_branches) > 1:
+            assert len(value_branches) == len(expected_names)
+            assert {tuple(value.__required_keys__) for value in value_branches} == {
+                (name,) for name in expected_names
+            }
+        else:
+            assert value_branches[0].__required_keys__ == set()
+            assert value_branches[0].__optional_keys__ == expected_names
+        for values_branch in value_branches:
+            value_types = get_type_hints(values_branch, vars(dto))
+            assert value_types["fit"] == Literal["contain", "cover"]
+            assert {name: value_types[name] for name in expected_names - {"fit"}} == {
+                name: float for name in expected_names - {"fit"}
+            }
+        clear = get_type_hints(branch, vars(dto))["clear"]
+        clear_item = get_args(clear)[0]
+        literals = set()
+        for member in get_args(clear_item):
+            literals.update(get_args(member) if get_origin(member) is not None else (member,))
+        assert literals == {"hold", "asset", "transition", *expected_names - {"hold"}}
 
 @pytest.mark.parametrize("keyword", ["oneOf", "anyOf"])
 def test_object_unions_keep_shared_and_branch_required_fields(tmp_path, monkeypatch, keyword):

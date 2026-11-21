@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import errno
 import json
 import math
 import re
+import select
 import socket
 import sys
 import threading
+import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +19,8 @@ from .errors import RuntimeErrorBase, AuthorizationError, BodyTooLargeError, Con
 from .service import reject_retired_timeline_writer, validate_idempotency_key
 from .cas import IO_CHUNK_BYTES
 from .store import PACK_ID_RE, PACK_DIGEST_RE, pack_asset_path
+
+REPLY_PIECE_BYTES = 64 * 1024
 
 
 def pack_http_route(target):
@@ -183,6 +188,53 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
+class _ReplyWriter:
+    """The one reply writer: headers, JSON bodies and file ranges all go through it.
+
+    Writes 64 KiB pieces. ENOBUFS (and EAGAIN) mean the kernel has no buffer
+    room right now, not that the peer is gone: wait for the socket to be
+    writable and continue, inside the socket timeout. Any other error
+    propagates unchanged.
+    """
+
+    def __init__(self, sock, timeout):
+        self._sock = sock
+        self._timeout = timeout or 30
+
+    def write(self, data):
+        view = memoryview(data)
+        total = len(view)
+        deadline = time.monotonic() + self._timeout
+        while view:
+            try:
+                sent = self._sock.send(view[:REPLY_PIECE_BYTES])
+            except (BlockingIOError, InterruptedError) as exc:
+                self._wait_writable(deadline, exc)
+                continue
+            except OSError as exc:
+                if exc.errno not in (errno.ENOBUFS, errno.EAGAIN):
+                    raise
+                self._wait_writable(deadline, exc)
+                continue
+            view = view[sent:]
+            deadline = time.monotonic() + self._timeout
+        return total
+
+    def _wait_writable(self, deadline, cause):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("reply write timed out") from cause
+        select.select([], [self._sock], [], left)
+
+    closed = False
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
 class RuntimeHandler(BaseHTTPRequestHandler):
     server_version = "AstridRuntime/0.1"
     # Bound abandoned request bodies and clients that stop consuming responses.
@@ -190,6 +242,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     MAX_BODY_BYTES = 64 * 1024 * 1024
     TIMELINE_BODY_BYTES = 1024 * 1024
     REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
+
+    def setup(self):
+        super().setup()
+        self.wfile = _ReplyWriter(self.connection, self.timeout)
 
     def log_message(self, *_):
         return
@@ -573,6 +629,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             print(f"Runtime internal error (request {request_id}, {getattr(self, 'command', '?')} {route}):\n"
                   + "".join(traceback.format_exception(exc)), file=sys.stderr, flush=True)
             self._send(500, error={"code": "internal_error", "message": "internal runtime error", "request_id": request_id})
+
+    def _is_health_probe(self):
+        """Health is a liveness read on its own snapshot, never behind the writer."""
+        return (getattr(self, "command", None) == "GET"
+                and urlsplit(getattr(self, "path", "")).path == "/v1/health") \
+            or self._is_owner_identity_probe()
 
     def _is_owner_identity_probe(self):
         """Select a read-only snapshot; route authentication is unchanged."""
@@ -1528,7 +1590,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     # outside the SQLite mutex. Credential authentication and
                     # publication use CredentialStore's short internal lock.
                     self._local_worker_control()
-                elif self._is_owner_identity_probe():
+                elif self._is_health_probe():
                     # Boundary identity probes use independent read-only
                     # snapshots while a lifecycle fence blocks the writer.
                     # Ordinary health/realm reads retain writer serialization.

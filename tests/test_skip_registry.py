@@ -15,6 +15,7 @@ import sys
 import textwrap
 import tomllib
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,82 @@ TESTS = REPO / "tests"
 LANE_NAMES = set(lanes.LANE_MARKERS)
 _this = sys.modules[__name__]
 AUTOMATIC_TRIGGERS = {"push", "pull_request", "schedule"}
+
+
+def _valid_xfail(
+    name: str = "known-gap", nodeids: tuple[str, ...] = ("tests/test_example.py::test_gap",)
+) -> lanes.DeclaredXfail:
+    return lanes.DeclaredXfail(
+        name=name,
+        nodeids=nodeids,
+        reason="Synthetic test declaration",
+        raises="builtins.RuntimeError",
+        strict=True,
+        issue="https://example.invalid/issues/123",
+        owner="test-owner",
+        expires=(date.today() + timedelta(days=7)).isoformat(),
+    )
+
+
+def test_declared_xfail_registry_has_required_metadata_and_is_within_cap() -> None:
+    errors = lanes.declared_xfail_errors()
+    assert not errors, "invalid declared xfail registry: " + "; ".join(errors)
+
+
+def test_xfail_validator_accepts_a_valid_exact_declaration() -> None:
+    assert lanes.declared_xfail_errors({"known-gap": _valid_xfail()}) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [("issue", "missing issue URL"), ("owner", "missing owner"), ("expires", "missing expiry")],
+)
+def test_xfail_validator_rejects_missing_metadata(field: str, message: str) -> None:
+    from dataclasses import replace
+
+    declaration = replace(_valid_xfail(), **{field: None})
+
+    errors = lanes.declared_xfail_errors({"known-gap": declaration})
+
+    assert any(message in error for error in errors)
+
+
+@pytest.mark.parametrize("days", [-1, 0, lanes.MAX_XFAIL_DAYS + 1])
+def test_xfail_validator_rejects_expiry_outside_the_allowed_window(days: int) -> None:
+    from dataclasses import replace
+
+    declaration = replace(_valid_xfail(), expires=(date.today() + timedelta(days=days)).isoformat())
+
+    errors = lanes.declared_xfail_errors({"known-gap": declaration})
+
+    assert any("expiry must be a future ISO date within" in error for error in errors)
+
+
+def test_xfail_validator_rejects_non_strict_declarations() -> None:
+    from dataclasses import replace
+
+    declaration = replace(_valid_xfail(), strict=False)
+
+    assert any("strict must be true" in error for error in lanes.declared_xfail_errors({"known-gap": declaration}))
+
+
+def test_xfail_limit_counts_exact_node_ids_even_when_grouped() -> None:
+    count = lanes.MAX_DECLARED_XFAIL_TESTS + 1
+    nodeids = tuple(f"tests/test_example.py::test_gap_{index}" for index in range(count))
+    declaration = _valid_xfail(nodeids=nodeids)
+
+    errors = lanes.declared_xfail_errors({"grouped": declaration})
+
+    message = f"{count} quarantined test node IDs exceed the limit of {lanes.MAX_DECLARED_XFAIL_TESTS}"
+    assert any(message in error for error in errors)
+
+
+def test_xfail_limit_accepts_exactly_the_cap() -> None:
+    nodeids = tuple(
+        f"tests/test_example.py::test_gap_{index}" for index in range(lanes.MAX_DECLARED_XFAIL_TESTS)
+    )
+
+    assert lanes.declared_xfail_errors({"grouped": _valid_xfail(nodeids=nodeids)}) == []
 
 
 # --- workflows -----------------------------------------------------------------

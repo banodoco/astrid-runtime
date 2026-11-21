@@ -17,6 +17,7 @@ from runtime_protocol.timeline_commit_validation import validate_commit_value
 
 service = support.service
 ROOT = Path(__file__).resolve().parents[1]
+TSC = ROOT / "packages/typescript/node_modules/.bin/tsc"
 DIGEST = "sha256:" + "a" * 64
 PIN = {"document_id": "pack", "version": 1, "content_digest": DIGEST}
 MEDIA = {"asset": "asset", "generation_id": "g", "variant_id": "v",
@@ -27,10 +28,15 @@ CASES = [
     ("clip.move", "parent/clip:c", {"on": 1.5}),
     ("clip.delete", "parent/clip:c", {}),
     ("track.set", "parent/track:video", {"values": {"label": ""}, "clear": []}),
+    ("track.set", "parent/track:video", {"values": {"fit": "cover", "scale": 1.2,
+                                                        "opacity": 0.5, "blendMode": "screen"}, "clear": []}),
     ("track.create", "parent", {"row": {"id": "v", "kind": "video", "future": None}}),
     ("clip.set-params", "parent/clip:c", {"values": {"literal.key": None}, "clear": [], "schema_source": PIN}),
     ("clip.add", "parent", {"row": ROW}),
     ("clip.set", "occurrence:o/clip:c", {"values": {}, "clear": ["hold", "asset", "transition"]}),
+    ("clip.set", "occurrence:o/clip:c", {"values": {"fit": "contain", "x": 10, "y": -4,
+                                                        "width": 1280, "height": 720, "cropLeft": 0.1,
+                                                        "opacity": 0.9}, "clear": []}),
     ("clip.trim", "parent/clip:c", {"in_s": None, "out_s": 2.5}),
     ("clip.split", "parent/clip:c", {"on": 2.5, "right_id": "right"}),
     ("occurrence.add-media", "occurrence:o", {"row": ROW, "media": MEDIA}),
@@ -90,6 +96,6 @@ def test_python_package_exports_native_args_and_nested_row_type():
 
 def test_typescript_package_exports_native_args_and_open_rows():
     subprocess.run([
-        "tsc", "--noEmit", "--strict", "--module", "NodeNext", "--target", "ES2022",
+        str(TSC), "--noEmit", "--strict", "--module", "NodeNext", "--target", "ES2022",
         str(ROOT / "tests/fixtures/timeline-bundle2-types.mts"),
     ], check=True)

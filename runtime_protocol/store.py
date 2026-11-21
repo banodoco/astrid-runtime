@@ -1081,6 +1081,10 @@ class RealmStore:
         self.lock_path = self.root / "owner.lock"
         self.db_path = self.root / "realm.sqlite3"
         self.cas_root = self.root / "cas" / "sha256"
+        # digest -> file_identity of the CAS file whose bytes were hashed. Shared
+        # by service reads and commit-store confirms; never cleared by memo
+        # resets, refusals or database writes (objects are immutable).
+        self.verified_cas = {}
         self.staging_root = self.root / "staging"
         self._lock_file = None
         self._admission_lock_file = None
