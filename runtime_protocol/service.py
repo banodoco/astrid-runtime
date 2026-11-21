@@ -859,8 +859,8 @@ class RuntimeService:
             if not identity_probe and not self.store.root.exists() and not self.store.root.is_symlink():
                 with self.store._mutex:
                     try:
-                        row = self.store.conn.execute("SELECT 1").fetchone()
-                        live = row is not None and row[0] == 1
+                        row = self.store.conn.execute("SELECT id FROM realm LIMIT 1").fetchone()
+                        live = row is not None and row[0] == self.realm["id"]
                     except (sqlite3.DatabaseError, OSError, ValueError, TypeError, AttributeError):
                         live = False
         if not live:

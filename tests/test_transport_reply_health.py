@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import sqlite3
 import threading
 
 import pytest
@@ -94,3 +95,41 @@ def test_missing_realm_path_preserves_ordinary_health_but_identity_probe_revokes
         if moved.exists():
             moved.rename(root)
         service.close()
+
+
+@pytest.mark.parametrize("failure", ["wrong-identity", "corrupt-schema", "corrupt-read", "closed-handle"])
+def test_missing_realm_path_rejects_broken_primary_handle(tmp_path, failure):
+    root = tmp_path / "realm"
+    moved = tmp_path / "moved"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
+    try:
+        root.rename(moved)
+        if failure == "closed-handle":
+            service.store.conn.close()
+        elif failure == "corrupt-read":
+            class CorruptConnection:
+                def __init__(self, connection):
+                    self.connection = connection
+
+                def execute(self, _query):
+                    raise sqlite3.DatabaseError("database disk image is malformed")
+
+                def __getattr__(self, name):
+                    return getattr(self.connection, name)
+
+            service.store.conn = CorruptConnection(service.store.conn)
+        else:
+            service.store.conn.execute("PRAGMA foreign_keys=OFF")
+            if failure == "wrong-identity":
+                service.store.conn.execute("UPDATE realm SET id = 'wrong-realm'")
+            else:
+                service.store.conn.execute("DROP TABLE realm")
+        assert service.health()["status"] == "degraded"
+        assert service._admission_failure == {"reason": "runtime_liveness_failed"}
+        moved.rename(root)
+        assert service.health()["status"] == "degraded"
+    finally:
+        if moved.exists():
+            moved.rename(root)
+        service.store.close(orderly=False)
