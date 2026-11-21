@@ -439,6 +439,28 @@ def _wait_for_door(paths: RuntimePaths, result: BootstrapResult, boundary: Local
     raise BootstrapError("browser door did not become ready before the startup deadline: " + reason)
 
 
+class _FailClosedLogStream:
+    """Keep redirected stderr safe even for handlers still emitting at shutdown."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, value):
+        try:
+            return self._stream.write(value)
+        except Exception:
+            return len(value)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 class _PrivateStreamHandler(logging.StreamHandler):
     def handleError(self, record):
         # logging's default error handler prints the record and active exception,
@@ -455,8 +477,8 @@ def _foreground_logging(stream):
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     # Install before removing the previous handlers: module-level logging must
     # never observe an empty root and auto-configure against redirected stderr.
-    root.addHandler(handler)
     try:
+        root.addHandler(handler)
         for previous in previous_handlers:
             root.removeHandler(previous)
         root.setLevel(logging.INFO)
@@ -489,7 +511,8 @@ def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: 
     try:
         with RotatingLog(log_path) as log:
             platform.owner_only(log_path)
-            with _foreground_logging(log), contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            safe_stderr = _FailClosedLogStream(log)
+            with _foreground_logging(safe_stderr), contextlib.redirect_stdout(log), contextlib.redirect_stderr(safe_stderr):
                 try:
                     with cancellation.startup_scope(stopped):
                         result = bootstrap(paths, boundary, config)
