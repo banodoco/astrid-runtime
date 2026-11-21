@@ -29,6 +29,7 @@ from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
 from .render_observer import admitted_run_id
 from .idempotency import command_result, compact_result
 import hashlib
+import io
 import json
 import sqlite3
 import base64
@@ -114,6 +115,11 @@ DISCOVERY_GRANT_CEILINGS = {
     "max_child_media_bindings": 1,
     "max_child_media_bytes": 16 * 1024 * 1024,
 }
+PROJECT_ELEMENTS_PREFIX = "/api/runtime/packs/project-elements"
+
+
+def _project_pack_command(verb, realm, project_id):
+    return f"python3 -m astrid.core.element.cli project-pack {verb} --realm {realm} --project {project_id}"
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
 MANAGED_COVERAGE_MODES = frozenset({"interval", "clips", "cuts", "shots"})
 MANAGED_COVERAGE_REASONS = frozenset({"interval", "before_cut", "after_cut", "clip_first", "shot_midpoint"})
@@ -4937,9 +4943,10 @@ class RuntimeService:
     def _validate_project_document(self, project_id, document_id, kind, content):
         self._validate_preference_document(project_id, document_id, kind, content)
         self._validate_transcript_document(project_id, document_id, kind, content)
-        from .timeline_commit_inputs import PROJECT_PACK_KIND, validate_pack_snapshot_objects
+        from .timeline_commit_inputs import PROJECT_PACK_KIND, validate_pack_compiled_listing, validate_pack_snapshot_objects
         if kind == PROJECT_PACK_KIND:
             validate_pack_snapshot_objects(self.store.conn, project_id, content)
+            validate_pack_compiled_listing(content)
 
     def _document_resource(self, row):
         content = json.loads(row["content_json"])
@@ -5928,6 +5935,96 @@ class RuntimeService:
             item["artifactManifest"] = record["artifactManifest"]
             packs.append(item)
         return {"version": 1, "revision": revision, "packs": packs}
+
+    def _project_pack_elements(self, project_id):
+        """The project's admitted elements that name compiled bytes, plus the admissions that do not, re-read now.
+
+        Returns (entries, legacy). `legacy` lists `{packId, kind, id}` for each admission recorded before
+        compiled bytes existed: it cannot be served, and the editor tells the user to re-admit it.
+
+        The project-pack Documents are the only authority. Copy the admitted
+        metadata under the store mutex, without reading any snapshot bytes.
+        A re-admit is visible on the next request; only a bytes request reads
+        and verifies the selected portable snapshot, after releasing the mutex.
+        """
+        from .timeline_commit_inputs import PROJECT_PACK_KIND
+        entries = []
+        legacy = []
+        with self.store._mutex:
+            rows = self.store.conn.execute(
+                "SELECT id, kind, content_json FROM project_documents WHERE project_id=? AND kind=? ORDER BY id",
+                (project_id, PROJECT_PACK_KIND)).fetchall()
+            refs = set()
+            for row in rows:
+                content = json.loads(row["content_json"])
+                self._validate_project_document(project_id, row["id"], row["kind"], content)
+                for admission in content["admissions"]:
+                    compiled = admission.get("compiled")
+                    if compiled is None:
+                        legacy.append({"packId": content["pack_id"], "kind": admission["kind"], "id": admission["id"]})
+                        continue
+                    ref = (content["pack_id"], admission["kind"], admission["id"], admission["revision"])
+                    if ref in refs:
+                        raise ConflictError("project pack admitted element identity is ambiguous")
+                    refs.add(ref)
+                    entries.append({"packId": content["pack_id"], "descriptor": admission["descriptor"],
+                                    "authoring": admission["authoring"], "digest": compiled["sha256"],
+                                    "compiled": compiled, "snapshot_object": admission["snapshot_object"]})
+        return entries, legacy
+
+    def project_pack_elements(self, project_id):
+        """The project's current admitted element bundles, addressed by compiled digest."""
+        project_id = self.store.get_project(project_id)["id"]
+        entries, legacy = self._project_pack_elements(project_id)
+        realm = self.realm["id"]
+        projects = {}
+        elements = []
+        for entry in entries:
+            descriptor = entry["descriptor"]
+            ref = {"packId": entry["packId"], "kind": descriptor["kind"], "id": descriptor["id"],
+                   "revision": descriptor["revision"]}
+            elements.append({"ref": ref, "digest": entry["digest"], "descriptor": descriptor,
+                             "authoring": entry["authoring"],
+                             "url": f"{PROJECT_ELEMENTS_PREFIX}/{project_id}/{entry['digest']}.js"})
+            projects.setdefault(entry["packId"], {
+                "projectId": project_id, "packId": entry["packId"], "packRoot": entry["authoring"]["packRoot"],
+                "status": "admitted",
+                "initCommand": _project_pack_command("init", realm, project_id),
+                "admitCommand": _project_pack_command("admit", realm, project_id),
+                "inspectCommand": _project_pack_command("inspect", realm, project_id),
+            })
+        selection = sha256_bytes(canonical_json({"projectId": project_id, "realmId": realm, "refs": [
+            [e["ref"], e["digest"]] for e in elements]}).encode("utf-8"))
+        return {"version": 1, "projectId": project_id, "realmId": realm, "selectionDigest": selection,
+                "projects": list(projects.values()), "elements": elements, "legacy": legacy}
+
+    def open_project_pack_element(self, project_id, digest):
+        """Serve only compiled bytes the project's current admissions name."""
+        from .timeline_commit_inputs import read_pack_snapshot_bytes, validate_pack_snapshot_objects
+
+        project_id = self.store.get_project(project_id)["id"]
+        for entry in self._project_pack_elements(project_id)[0]:
+            if entry["digest"] == digest:
+                # SQLite validation stays under the mutex (shared connection);
+                # the CAS read and snapshot decoding run after it is released.
+                with self.store._mutex:
+                    validate_pack_snapshot_objects(
+                        self.store.conn, project_id, {"admissions": [{"snapshot_object": entry["snapshot_object"]}]})
+                data, _identity = read_pack_snapshot_bytes(
+                    self.cas, entry["snapshot_object"], max_bytes=self.max_object_bytes)
+                files = {item["path"]: item for item in json.loads(data)["files"]}
+                item = files.get(entry["compiled"]["path"])
+                raw = None
+                if item is not None:
+                    try:
+                        raw = base64.b64decode(item["bytes_base64"], validate=True)
+                    except (TypeError, ValueError):
+                        raw = None
+                if raw is None or hashlib.sha256(raw).hexdigest() != digest or item["sha256"] != digest:
+                    raise ConflictError("project pack compiled element bytes are missing or corrupt; re-admit the pack",
+                                        details={"packId": entry["packId"], "id": entry["descriptor"]["id"]})
+                return {"digest": digest, "size": len(raw), "media_type": "text/javascript"}, io.BytesIO(raw)
+        raise NotFoundError("project pack element is not admitted for this project")
 
     def _prune_pack_leases(self, records):
         """Disable/uninstall revokes retention, including not-yet-imported chunks."""

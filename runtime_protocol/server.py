@@ -16,11 +16,24 @@ from socketserver import TCPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .errors import RuntimeErrorBase, AuthorizationError, BodyTooLargeError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError, RetiredRouteError
-from .service import reject_retired_timeline_writer, validate_idempotency_key
+from .service import PROJECT_ELEMENTS_PREFIX, reject_retired_timeline_writer, validate_idempotency_key
 from .cas import IO_CHUNK_BYTES
 from .store import PACK_ID_RE, PACK_DIGEST_RE, pack_asset_path
 
 REPLY_PIECE_BYTES = 64 * 1024
+
+
+PROJECT_ID_TEXT = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+
+
+def _project_elements_route(target):
+    """The project's admitted element list (?project=) and one compiled element by digest."""
+    rest = target[len(PROJECT_ELEMENTS_PREFIX):]
+    if rest.startswith("?"):
+        match = re.fullmatch(r"\?project=(" + PROJECT_ID_TEXT + r")", rest)
+        return ("project-elements", match.group(1)) if match else None
+    match = re.fullmatch(r"/(" + PROJECT_ID_TEXT + r")/([0-9a-f]{64})\.js", rest)
+    return ("project-element", *match.groups()) if match else None
 
 
 def pack_http_route(target):
@@ -29,6 +42,8 @@ def pack_http_route(target):
     The browser door and the direct listener judge the same selected path.
     No query, fragment, empty component or encoded separator is an alias.
     """
+    if isinstance(target, str) and target.startswith(PROJECT_ELEMENTS_PREFIX):
+        return _project_elements_route(target)
     if not isinstance(target, str) or any(c in target for c in "?#\\"):
         return None
     if any(ord(c) < 32 or ord(c) == 127 for c in target):
@@ -748,8 +763,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
         if self.path.startswith("/api/runtime/packs/"):
-            self._identity("objects:read")
             route = pack_http_route(self.path)
+            # A project's admitted elements are project documents: read them with the project-document read scope.
+            self._identity("projects:read" if route and route[0] in ("project-elements", "project-element") else "objects:read")
             if route is None or method not in ({"lease": ("POST",), "release": ("DELETE",)}.get(route[0], ("GET", "HEAD"))):
                 raise NotFoundError("pack route requires an exact admitted path and method")
             if route[0] == "lease":
@@ -758,6 +774,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.release_pack_lease(route[1]))
             if route[0] == "inventory":
                 return self._send(200, self.runtime.pack_inventory())
+            if route[0] == "project-elements":
+                return self._send(200, self.runtime.project_pack_elements(route[1]))
+            if route[0] == "project-element":
+                metadata, stream = self.runtime.open_project_pack_element(*route[1:])
+                return self._serve_verified_file(metadata, stream)
             metadata, stream = self.runtime.open_pack_asset(*route[1:])
             return self._serve_verified_file(metadata, stream)
         if method == "POST" and len(path) == 5 and path[:3] == ["v1", "control", "tasks"] and path[4] == "abandon":
