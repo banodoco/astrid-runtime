@@ -4962,6 +4962,28 @@ class RealmStore:
             group["thumbnail"] = thumbnails_by_source.get(primary_output["digest"])
         return plan
 
+    @staticmethod
+    def _is_canonical_durable_job_log(output):
+        """Only the host's ordinary stdout/stderr are auxiliary to legacy GEN."""
+        name = output.get("name")
+        return (
+            name in {"job.stdout", "job.stderr"}
+            and output.get("kind") == "object"
+            and output.get("role") == "log"
+            and output.get("output_port") == "logs"
+            and output.get("variant_key") == name
+            and output.get("filename") == name + ".log"
+            and output.get("media_type") == "text/plain"
+            and output.get("durability", "durable") == "durable"
+            and output.get("group_key", "default") == "default"
+            and output.get("ordinal", 0) == 0
+            and output.get("is_primary", False) is False
+            and not any(field in output for field in (
+                "generation_id", "duration_seconds", "producer", "provenance",
+                "regeneration", "coverage",
+            ))
+        )
+
     def _validate_generation_create_with_variant_effect(
         self,
         effect,
@@ -5036,7 +5058,9 @@ class RealmStore:
         outputs = result.get("outputs") if isinstance(result, dict) else None
         if not isinstance(outputs, list):
             raise ValidationError("generation.create_with_variant settlement requires an outputs list")
-        creative_outputs = [output for output in outputs if isinstance(output, dict) and output.get("role") != "thumbnail"]
+        creative_outputs = [output for output in outputs if isinstance(output, dict)
+                            and output.get("role") != "thumbnail"
+                            and not self._is_canonical_durable_job_log(output)]
         if len(creative_outputs) != 1:
             raise ValidationError("generation.create_with_variant requires exactly one settlement output plus optional thumbnail outputs")
         selected = creative_outputs[0]
@@ -5171,7 +5195,9 @@ class RealmStore:
         outputs = result.get("outputs") if isinstance(result, dict) else None
         if not isinstance(outputs, list):
             raise ValidationError("generation.variant.append settlement requires an outputs list")
-        creative_outputs = [output for output in outputs if isinstance(output, dict) and output.get("role") != "thumbnail"]
+        creative_outputs = [output for output in outputs if isinstance(output, dict)
+                            and output.get("role") != "thumbnail"
+                            and not self._is_canonical_durable_job_log(output)]
         if len(creative_outputs) != 1:
             raise ValidationError("generation.variant.append requires exactly one settlement output plus optional thumbnail outputs")
         selected = creative_outputs[0]
@@ -5887,6 +5913,22 @@ class RealmStore:
                 generation_id = None
             role = output.get("role") or "output"
             durability = output.get("durability", "durable")
+            if role == "log" and output_port == "logs" and durability == "durable" and group_key == "default":
+                # Default job-log selectors repeat on every owner retry. Scope
+                # new associations to the fenced attempt without changing the
+                # immutable fields or replacing an earlier attempt's logs.
+                # An existing pre-fix association keeps its identity on replay;
+                # a non-log collision still reaches the immutable-output guard.
+                legacy = self.conn.execute(
+                    "SELECT attempt_id, role, durability FROM managed_output_associations "
+                    "WHERE task_id=? AND output_port=? AND group_key=? AND ordinal=? AND variant_key=?",
+                    (str(task_id), output_port, group_key, ordinal, variant_key),
+                ).fetchone()
+                if legacy is None or (
+                    legacy["role"] == "log" and legacy["durability"] == "durable"
+                    and legacy["attempt_id"] != str(attempt_id)
+                ):
+                    group_key = f"log-attempt:{attempt_id}"
             producer = dict(output.get("producer") or {})
             provenance = dict(output.get("provenance") or {})
             if publish_override.get("selector") is not None:
