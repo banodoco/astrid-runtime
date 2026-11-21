@@ -898,6 +898,24 @@ def _occurrence_order_observation(boundary, capture, change, identity_scope):
     return {"state": "present", "value": [copy.deepcopy(physical[key]) for key in after_ids]}
 
 
+def _member_removal_state(boundary, result, step, records, effect, ref, path, payload):
+    """Project a member-scoped removal: the Agent records the removed row's clear, not the collection."""
+    member = "id:" + str(effect.get("id"))
+    clears = [write for ordinal in step["command_ordinals"]
+              for write in records["commands"][ordinal]["writes"]
+              if site(boundary, write["ref"], write["path"]) == (ref, [*path, member])]
+    require(len(clears) == 1 and clears[0]["after"].get("state") == "absent"
+            and value_equal(clears[0]["before"], effect["before"]),
+            "provider list effect lacks a full collection observation")
+    rows = location(payload, stored_path(payload, ref, path)).get("value")
+    require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows)
+            and [row.get("id") for row in rows] == effect.get("order_before"),
+            "provider member removal differs from its collection order")
+    kept = [copy.deepcopy(row) for row in rows if row.get("id") != effect["id"]]
+    require(len(kept) == len(rows) - 1, "provider member removal does not name one row")
+    return {"state": "present", "value": kept}
+
+
 def step_output(boundary, step, records, accepted, original=None, authenticated=None, *, identity_scope=None):
     """Project complete authoritative effects solely to authenticate their boundaries."""
     expected = authenticated if authenticated is not None else accepted
@@ -940,8 +958,11 @@ def step_output(boundary, step, records, accepted, original=None, authenticated=
             observations = [write for ordinal in step["command_ordinals"]
                             for write in records["commands"][ordinal]["writes"]
                             if site(boundary, write["ref"], write["path"]) == (ref, path)]
-            require(bool(observations), "provider list effect lacks a full collection observation")
-            state = observations[-1]["after"]
+            if not observations and effect["op"] == "list.remove":
+                state = _member_removal_state(boundary, result, step, records, effect, ref, path, payload)
+            else:
+                require(bool(observations), "provider list effect lacks a full collection observation")
+                state = observations[-1]["after"]
         else:
             require(value_equal(location(payload, observed_path), effect["before"])
                     or _materialization_input(boundary, original, effect, observed_path, step["patch"]),

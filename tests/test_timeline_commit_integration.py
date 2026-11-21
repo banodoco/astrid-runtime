@@ -372,6 +372,31 @@ def test_agent_written_visual_fields_validate_and_read_back_from_published_revis
                                    "expected_agent_pin": expected_pin, "cases": handoff},
                                   indent=2, sort_keys=True) + "\n")
         print(f"Agent pin={pin} imported={agent_commit.__file__} readback={path}")
+def test_runtime_commit_and_read_preserve_track_appearance_markers(editing):
+    from astrid.sdk.timeline._command_state import present
+
+    document = editing.document()
+    before_config = copy.deepcopy(document["parent_revision"]["payload"]["config"])
+    after_config = copy.deepcopy(before_config)
+    track = next(row for row in after_config["tracks"] if row["kind"] == "visual")
+    app = copy.deepcopy(track.get("app", {}))
+    app.update(clipPlacementVersion=1, scaleAppliesToPositionedClips=True)
+    track["app"] = app
+    change = {"op": "set", "ref": "parent", "path": ["config"],
+              "before": present(before_config), "value": after_config}
+    command = {"schema_version": 1, "op": "doc.patch", "version": "1", "select": None,
+               "args": {"changes": [change]}}
+    body = editing.body([command])
+    body["steps"][0]["patch"] = [change]
+
+    accepted = editing.commit(body, "track-appearance-markers")
+    editing.assert_readback(accepted)
+    revision = accepted["data"]["accepted_revision_id"]
+    readback = editing.service.get_project_parent_composition_revision(
+        editing.project, editing.timeline, revision,
+    )
+    stored = next(row for row in readback["payload"]["config"]["tracks"] if row["id"] == track["id"])
+    assert stored["app"] == app
 
 
 @pytest.mark.parametrize("field,value", [

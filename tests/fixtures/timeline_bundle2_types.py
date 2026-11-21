@@ -26,10 +26,12 @@ moved: ClipMoveArgs = {"on": 1.25}
 deleted: ClipDeleteArgs = {}
 params: ClipSetParamsArgs = {"values": {"literal.key": None}, "clear": [], "schema_source": source}
 scalar: ClipSetArgs = {"values": {"hold": 1.5}, "clear": ["asset", "transition"]}
+appearance: ClipSetArgs = {"values": {"fit": "cover", "x": -224, "y": 0, "width": 1280, "height": 720, "cropLeft": 0.1, "opacity": 0.9}, "clear": []}
 trim: ClipTrimArgs = {"in_s": None, "out_s": 2.5}
 split: ClipSplitArgs = {"on": 2.5, "right_id": "right"}
 track: TrackCreateArgs = {"row": {"id": "v", "kind": "video"}}
 label: TrackSetArgs = {"values": {"label": ""}, "clear": []}
+track_appearance: TrackSetArgs = {"values": {"fit": "manual", "scale": 1.2, "opacity": 0.5, "blendMode": "screen"}, "clear": []}
 inverse: InverseArgs = {"publications": ["receipt"]}
 restore: RestoreArgs = {"revision_id": "r", "content_digest": source["content_digest"]}
 object_value: VerifiedDocumentObject = {"object_id": media["object_id"], "digest": media["object_id"], "size": 2, "media_type": "application/json", "bytes_base64": "e30="}

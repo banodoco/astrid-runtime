@@ -78,11 +78,12 @@ def test_public_verified_image_old_new_video_and_closed_query_without_writes(wor
         "operation": "pin", "expected_version": 1,
     }, idempotency_key="pin-between-public-reads")
     after_pin = snapshot(service)
-    for read in (lambda: client.get_project_verified_media(project, selected),
-                 lambda: client.get_project_media_selection(project, selector(outputs["old"]))):
-        with pytest.raises(ApiError) as caught:
-            read()
-        assert caught.value.status == 409
+    # A lifecycle operation changes no selected bytes, so the pinned selection still verifies;
+    # only the stale lifecycle-version selector is refused.
+    assert client.get_project_verified_media(project, selected)["selection"] == selected
+    with pytest.raises(ApiError) as caught:
+        client.get_project_media_selection(project, selector(outputs["old"]))
+    assert caught.value.status == 409
     assert selected == selections["old"]
     assert snapshot(service) == after_pin
 

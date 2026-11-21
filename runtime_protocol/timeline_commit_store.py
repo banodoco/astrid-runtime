@@ -21,7 +21,7 @@ from functools import wraps
 from typing import cast
 
 from . import platform as runtime_platform
-from .errors import ConflictError, ProtocolError, ValidationError
+from .errors import ConflictError, HeadBusyError, ProtocolError, ValidationError
 from .idempotency import command_result
 from .timeline_commit_validation import detached, digest
 from .timeline_materialization import has_materialization, item_identity, materialization_join, root_identity
@@ -50,6 +50,26 @@ def reject(reason, message=None, *, status=409, diagnostic_reason=None, safe_det
     if diagnostic_reason is not None:
         error.__dict__["_diagnostic_reason"] = diagnostic_reason
     raise error
+
+
+_SEQUENCE_QUERY = "SELECT next_seq FROM project_sequences WHERE project_id=?"
+_VERSION_PARTS = ("connection", "total_changes", "data_version", "files", "package_owner")
+
+
+def _moved_components(before, after):
+    """Names of the store-version components that differ, for the log."""
+    if before is None or after is None:
+        return "version " + ("unset" if before is None else "set") + " -> " + ("unset" if after is None else "set")
+    moved = [name for name, old, new in zip(_VERSION_PARTS, before, after) if old != new]
+    if "files" in moved:
+        moved += [f"files[{label}]" for label, old, new in zip(("DB", "WAL", "SHM", "dir"), before[3], after[3]) if old != new]
+    return ", ".join(moved) or "none"
+
+
+def _head_busy(site, moved):
+    """The retryable refusal for inputs that moved while a request verified them."""
+    _LOGGER.warning("accepted commit inputs changed during verification at %s: moved %s", site, moved)
+    return HeadBusyError("accepted commit inputs changed during verification")
 
 
 def request_identity(context):
@@ -184,12 +204,20 @@ def _evaluation(method):
                 self._sync_replay_memo()
                 version = self._replay_store_version
                 boundary = self._history_inputs is None
-                result = method(self, *args, **kwargs)
+                current = self._verification.current
+                current["depth"] += 1
+                try:
+                    result = method(self, *args, **kwargs)
+                finally:
+                    current["depth"] -= 1
                 if boundary:
-                    self._check_history_objects()
+                    # Nested boundaries reuse bytes this request already
+                    # confirmed; the outermost one re-reads every object
+                    # before any result or proof leaves the request.
+                    self._check_history_objects(final=not current["depth"])
                 self._check_history_version()
                 if method.__name__ != "accept" and version != self._replay_store_version:
-                    raise ProtocolError("accepted commit inputs changed during verification")
+                    raise _head_busy("evaluate", _moved_components(version, self._replay_store_version))
                 return result
         except BaseException:
             self.clear_replay_memo()
@@ -208,7 +236,7 @@ class _HistoryReadCursor:
         snapshot = tuple(None if row is None else tuple(row) for row in rows)
         key = (self.query, self.parameters, method)
         if key in self.inputs.rows and self.inputs.rows[key] != snapshot:
-            raise ProtocolError("accepted commit inputs changed during verification")
+            raise _head_busy("row-read", f"rows of {self.query[:80]!r}")
         self.inputs.rows[key] = snapshot
         return value
 
@@ -224,15 +252,19 @@ class _HistoryReadCursor:
 
 class _HistoryReadInputs:
     """Exact consumed SQL results and CAS bytes for one authoritative read."""
-    def __init__(self, connection, read_object):
+    def __init__(self, connection, read_object, confirm_object=None):
         self.connection, self.read_object = connection, read_object
+        self.confirm_object = confirm_object
         self.rows, self.objects = {}, {}
 
     def execute(self, query, parameters=()):
         return _HistoryReadCursor(self, query, tuple(parameters))
 
-    def check(self):
+    def check(self, *, final=True):
         for object_id, expected in self.objects.items():
+            if self.confirm_object is not None:
+                self.confirm_object(object_id, expected, final=final)
+                continue
             data = self.read_object(object_id)
             if (len(data), hashlib.sha256(data).digest()) != expected:
                 raise ProtocolError("accepted commit object changed during verification")
@@ -240,7 +272,7 @@ class _HistoryReadInputs:
             value = getattr(self.connection.execute(query, parameters), method)()
             rows = [value] if method == "fetchone" else value
             if tuple(None if row is None else tuple(row) for row in rows) != expected:
-                raise ProtocolError("accepted commit inputs changed during verification")
+                raise _head_busy("row-recheck", f"rows of {query[:80]!r}")
 
 
 class TimelineCommitStore:
@@ -255,6 +287,8 @@ class TimelineCommitStore:
         self._replay_generation = 0
         self._replay_store_version = None
         self._history_state = {}
+        # Every SQL result a retained proof consumed: (query, parameters, method) -> rows.
+        self._retained_rows = {}
         self._connection = self.store.conn
         self._reading = False
         self._acceptance_transaction = False
@@ -262,13 +296,59 @@ class TimelineCommitStore:
         self._database_identity = (value.st_dev, value.st_ino)
         self._wal_identity = None
         self.clear_replay_memo()
+        # The store calls this after any other committed write (see _absorb_own_write).
+        self.store._after_commit = self._absorb_own_write
 
     def clear_replay_memo(self):
         with self.store._mutex:
             self._replay_memo.clear()
             self._history_state = {key: {} for key in
                                    ("records", "entries", "closures", "heads", "chains", "chain_tails", "events", "objects")}
+            self._retained_rows = {}
             self._replay_generation += 1
+
+    def _absorb_own_write(self):
+        """Keep verified history across an unrelated write by this Runtime.
+
+        Accepted history is immutable and each proof is valid for exactly the
+        SQL results and CAS bytes it consumed. After any other committed write
+        (a media import, say) proofs survive when no other process wrote (the
+        external-write counter, file identities and ownership are as sampled)
+        and every retained SQL result still reads back identically; otherwise
+        everything is discarded, as before. A new head then costs only its own
+        verification, not a replay of each entry the caller loads next.
+        """
+        with self.store._mutex:
+            if self._acceptance_transaction or getattr(self._verification, "current", None) is not None:
+                return
+            try:
+                version, previous = self._store_version(), self._replay_store_version
+                if previous is None or version == previous:
+                    return
+                if (self._memo_failure(version) is None and version[0] == previous[0]
+                        and version[2] == previous[2] and version[4] == previous[4]
+                        and all(old is None or (new is not None and old[:2] == new[:2] and old[-2:] == new[-2:])
+                                for old, new in zip(previous[3], version[3]))
+                        and self._retained_rows_unchanged()):
+                    self._history_state["heads"].clear()
+                    self._replay_store_version = version
+                else:
+                    self.clear_replay_memo()
+            except Exception:
+                self.clear_replay_memo()
+
+    def _retained_rows_unchanged(self):
+        for (query, parameters, method), expected in list(self._retained_rows.items()):
+            value = getattr(self.store.conn.execute(query, parameters), method)()
+            rows = [value] if method == "fetchone" else value
+            live = tuple(None if row is None else tuple(row) for row in rows)
+            if query == _SEQUENCE_QUERY:
+                # A proof only needs ``project_seq < next_seq``, and the counter only grows.
+                if live[0] is None or expected[0] is None or live[0][0] < expected[0][0]:
+                    return False
+            elif live != expected:
+                return False
+        return True
 
     def _physical_version(self):
         files = []
@@ -417,16 +497,103 @@ class TimelineCommitStore:
                 raise
 
     def _check_history_version(self):
-        if self._store_version() != self._replay_store_version:
-            raise ProtocolError("accepted commit inputs changed during verification")
+        version = self._store_version()
+        if version != self._replay_store_version:
+            raise _head_busy("version-check", _moved_components(self._replay_store_version, version))
 
-    def _check_history_objects(self):
+    def _check_history_objects(self, *, final=True):
         # CAS is outside SQLite's change boundary. Keep the existing physical
         # byte verification, including for objects consumed by cached ancestry.
         for object_id, expected in self._history_state["objects"].items():
-            data = self._read_object(object_id)
-            if (len(data), hashlib.sha256(data).digest()) != expected:
-                raise ProtocolError("accepted commit object changed during verification")
+            self._confirm_object(object_id, expected, final=final)
+
+    def _confirm_object(self, object_id, expected, *, final=True):
+        """Require the physical CAS bytes of ``object_id`` to still be ``expected``.
+
+        A read physically re-reads and hashes the object at most once per
+        verification scope plus once at its final (outermost) check.  Without
+        this, every nested boundary re-hashed every object consumed so far:
+        listing a film's history read its whole media closure several times
+        per revision and grew with revisions times media bytes.  Any change
+        is still detected by the final re-read before results or proofs
+        leave the scope, and a failure there discards every retained proof.
+        """
+        current = getattr(self._verification, "current", None)
+        confirmed = current["physical"] if current is not None else None
+        if not final and confirmed is not None and confirmed.get(object_id) == expected:
+            return
+        if self._file_unchanged(object_id, expected):
+            # Objects are immutable: the file whose bytes were hashed is still
+            # the file here (same inode, size, mtime and ctime), so one lstat
+            # replaces the open, read and hash. A changed identity falls
+            # through to the physical read below, exactly as before.
+            if confirmed is not None:
+                confirmed[object_id] = expected
+            return
+        data = self._read_object(object_id)
+        value = self._object_value(object_id, data)
+        if value != expected:
+            raise ProtocolError("accepted commit object changed during verification")
+        if confirmed is not None:
+            confirmed[object_id] = value
+
+    def _verified_cas(self):
+        """The store-wide digest -> file identity map, or None when reads are pinned."""
+        if getattr(self.store, "_read_cas_object", None) is not None:
+            return None
+        return getattr(self.store, "verified_cas", None)
+
+    def _file_unchanged(self, object_id, expected):
+        from .cas import ContentAddressedStore
+
+        verified = self._verified_cas()
+        if verified is None:
+            return False
+        trusted = verified.get(object_id)
+        if trusted is None or expected != (trusted[2], bytes.fromhex(object_id)):
+            return False
+        return self._cas().current_identity(object_id) == trusted
+
+    def _cas(self):
+        """One ContentAddressedStore per CAS root (its constructor resolves and mkdirs)."""
+        from .cas import ContentAddressedStore
+
+        root = self.store.cas_root
+        cached = self.__dict__.get("_cas_instance")
+        if cached is None or cached[0] != root:
+            cached = self.__dict__["_cas_instance"] = (root, ContentAddressedStore(root))
+        return cached[1]
+
+    @staticmethod
+    def _object_value(object_id, data):
+        # ``_read_object`` only returns bytes whose SHA-256 is ``object_id``.
+        return len(data), bytes.fromhex(object_id)
+
+    def _history_object_value(self, object_id):
+        """(size, sha256) of one consumed CAS object, read physically once per scope.
+
+        For callers that only need to authenticate an object's identity (a
+        closure's media pins), not its bytes.
+        """
+        current = getattr(self._verification, "current", None)
+        confirmed = current["physical"] if current is not None else None
+        retained = self._history_state["objects"].get(object_id)
+        if confirmed is not None and retained is not None and confirmed.get(object_id) == retained:
+            inputs = self._history_inputs
+            if inputs is not None:
+                if object_id in inputs.objects and inputs.objects[object_id] != retained:
+                    raise ProtocolError("accepted commit object changed during verification")
+                inputs.objects[object_id] = retained
+            return retained
+        trusted = (self._verified_cas() or {}).get(object_id)
+        if trusted is not None and self._cas().current_identity(object_id) == trusted:
+            # Immutable and unchanged since it was hashed: the pin needs only
+            # (size, sha256), so the file is not opened or read.
+            value = (trusted[2], bytes.fromhex(object_id))
+            self._record_history_object(object_id, value)
+            return value
+        data = self._read_history_object(object_id)
+        return self._object_value(object_id, data)
 
     def _sync_replay_memo(self):
         version = self._store_version()
@@ -500,7 +667,8 @@ class TimelineCommitStore:
         """Start an independent evaluation, including when another is nested."""
         previous = getattr(self._verification, "current", None)
         current = {"verified": set(), "active": set(), "traversal": None, "inputs": None,
-                   "generation": self._replay_generation, "accepting": False, "memo_fallback": False}
+                   "generation": self._replay_generation, "accepting": False, "memo_fallback": False,
+                   "depth": 0, "physical": {}}
         self._verification.current = current
         try:
             yield
@@ -510,6 +678,7 @@ class TimelineCommitStore:
         finally:
             current["verified"].clear()
             current["active"].clear()
+            current["physical"].clear()
             self._verification.current = previous
 
     @contextmanager
@@ -525,7 +694,8 @@ class TimelineCommitStore:
                 yield
             return
         previous = current["inputs"]
-        inputs = previous if previous is not None else _HistoryReadInputs(self.store.conn, self._read_object)
+        inputs = previous if previous is not None else _HistoryReadInputs(
+            self.store.conn, self._read_object, self._confirm_object)
         current["inputs"] = inputs
         try:
             self._sync_replay_memo()
@@ -534,8 +704,9 @@ class TimelineCommitStore:
             yield
             inputs.check()
             self._check_history_objects()
-            if self._store_version() != version:
-                raise ProtocolError("accepted commit inputs changed during verification")
+            after = self._store_version()
+            if after != version:
+                raise _head_busy("read-scope-exit", _moved_components(version, after))
         except BaseException:
             self.clear_replay_memo()
             raise
@@ -568,22 +739,28 @@ class TimelineCommitStore:
             return reader(object_id)
         from .cas import ContentAddressedStore
 
-        return ContentAddressedStore(self.store.cas_root).read(object_id)
+        return self._cas().read(object_id, verified=self._verified_cas())
 
     def _read_history_object(self, object_id):
         data = self._read_object(object_id)
-        value = (len(data), hashlib.sha256(data).digest())
+        value = self._object_value(object_id, data)
+        self._record_history_object(object_id, value)
+        return data
+
+    def _record_history_object(self, object_id, value):
         previous = self._history_state["objects"].get(object_id)
         if previous is not None and previous != value:
             raise ProtocolError("accepted commit object changed during verification")
         self._history_state["objects"][object_id] = value
+        current = getattr(self._verification, "current", None)
+        if current is not None:
+            current["physical"][object_id] = value
         inputs = self._history_inputs
         if inputs is not None:
             objects = inputs.objects
             if object_id in objects and objects[object_id] != value:
                 raise ProtocolError("accepted commit object changed during verification")
             objects[object_id] = value
-        return data
 
     def _membership(self, project_id, timeline_id):
         row = self.conn.execute("SELECT p.realm_id FROM timelines t JOIN projects p ON p.id=t.project_id "
@@ -658,7 +835,7 @@ class TimelineCommitStore:
                      "dependencies": {identity: set()}, "pending": deque([identity]),
                      "replays": {}, "current": identity,
                      "inputs": current["inputs"] if current["inputs"] is not None else
-                               _HistoryReadInputs(self.store.conn, self._read_object)}
+                               _HistoryReadInputs(self.store.conn, self._read_object, self._confirm_object)}
         current["traversal"] = traversal
         try:
             while traversal["pending"]:
@@ -696,7 +873,7 @@ class TimelineCommitStore:
             # Callbacks during collection may have changed an already checked
             # dependency. Re-read every consumed result, including empty SQL
             # results and physical object bytes, before using queued proofs.
-            traversal["inputs"].check()
+            traversal["inputs"].check(final=False)
             proofs = set()
             generation = self._replay_generation
             for node in ordered:
@@ -709,13 +886,20 @@ class TimelineCommitStore:
                         proofs.add(key)
             # Replay/capture validation can also call back into the runtime.
             # Publish no proofs or history until all inputs still match.
-            traversal["inputs"].check()
+            # Bytes already confirmed in this scope are not re-hashed here:
+            # the outermost evaluation re-reads them under the same mutex
+            # before returning, and its failure clears these proofs again.
+            traversal["inputs"].check(final=False)
             self._sync_replay_memo()
             if generation == self._replay_generation:
                 current["verified"].update(proofs)
                 self._replay_memo.update(proofs)
                 for node, (ledger, history, _) in traversal["nodes"].items():
                     self._history_state["records"][node] = (dict(ledger), dict(history))
+                for key, snapshot in traversal["inputs"].rows.items():
+                    # A key already retained with other rows stays as first seen:
+                    # the recheck then fails and discards, never absorbs.
+                    self._retained_rows.setdefault(key, snapshot)
         except (KeyError, TypeError, ValueError, IndexError, ValidationError, CommitRejected) as exc:
             raise ProtocolError("accepted commit record is corrupt") from exc
         finally:
@@ -768,8 +952,7 @@ class TimelineCommitStore:
             # Replay verifies the accepted prefix, independent of later writes.
             prefix = self._event_prefix(edge["project_id"], edge["timeline_id"], through=seq)
             valid = valid and isinstance(ids, list) and 0 < len(ids) <= seq <= len(prefix)
-            project_seq = self.conn.execute("SELECT next_seq FROM project_sequences WHERE project_id=?",
-                                            (edge["project_id"],)).fetchone()
+            project_seq = self.conn.execute(_SEQUENCE_QUERY, (edge["project_id"],)).fetchone()
             valid = valid and project_seq is not None and 0 < edge["project_seq"] < project_seq[0]
             valid = valid and ids == [str(e["id"]) for e in prefix[seq - len(ids):seq]]
             event = self.conn.execute("SELECT * FROM timeline_events WHERE id=? AND timeline_id=?",
@@ -1446,8 +1629,8 @@ class TimelineCommitStore:
                                     "WHERE p.project_id=? AND p.relation='managed' AND o.digest=?", (project_id, pin["media_id"][7:])).fetchone()
             if row is None:
                 reject("dependency_unavailable")
-            data = self._read_history_object(pin["media_id"][7:])
-            if len(data) != row["size"] or "sha256:" + hashlib.sha256(data).hexdigest() != pin["media_id"]:
+            size, sha = self._history_object_value(pin["media_id"][7:])
+            if size != row["size"] or "sha256:" + sha.hex() != pin["media_id"]:
                 reject("dependency_unavailable")
         payload_media = set()
         def collect(value):

@@ -638,7 +638,9 @@ class RuntimeService:
         if not configured_allowlist or not configured_allowlist.issubset(REBOOT_COMMAND_ALLOWLIST):
             raise ValidationError("reboot allowlist contains an unsupported command", details={"allowlist": sorted(configured_allowlist), "supported": sorted(REBOOT_COMMAND_ALLOWLIST)})
         self.reboot_allowlist = configured_allowlist
-        self._verified_cas_objects = {}
+        self._verified_cas_objects = getattr(self.store, "verified_cas", None)
+        if self._verified_cas_objects is None:
+            self._verified_cas_objects = {}
         self._recover_cas_publication_journals()
         # Only startup may remove abandoned transfers: live handlers own their files.
         upload_dir = self.store.staging_root / "uploads"
@@ -839,34 +841,20 @@ class RuntimeService:
 
     def health(self, *, identity_probe=False):
         # ``doctor`` performs the full quick-check, foreign-key, event-chain,
-        # and CAS walk. Health is called frequently, so keep it to a cheap
-        # liveness query while retaining the cached startup admission state.
-        # Ordinary health retains the primary handle and mutation ordering;
-        # boundary identity probes must observe a separate committed snapshot.
-        if identity_probe:
-            try:
-                with self.store._read_snapshot() as connection:
-                    row = connection.execute("SELECT id FROM realm LIMIT 1").fetchone()
-                    live = row is not None and row[0] == self.realm["id"]
-            except (sqlite3.DatabaseError, OSError, ValueError, TypeError):
-                live = False
-            if not live:
-                # Admission loss remains serialized with whole mutations. A
-                # successful identity probe must not wait on a fenced writer.
-                with self.store._mutex:
-                    self._verified = False
-                    self._admission_failure = {"reason": "runtime_liveness_failed"}
-        else:
+        # and CAS walk. Health is called before every editor mutation, so it is
+        # one cheap liveness read on a separate committed snapshot (WAL): it
+        # never waits behind a commit. Only losing admission takes the mutex.
+        # ``identity_probe`` is kept for callers; both paths read the same way.
+        try:
+            with self.store._read_snapshot() as connection:
+                row = connection.execute("SELECT id FROM realm LIMIT 1").fetchone()
+                live = row is not None and row[0] == self.realm["id"]
+        except (sqlite3.DatabaseError, OSError, ValueError, TypeError):
+            live = False
+        if not live:
             with self.store._mutex:
-                try:
-                    if self.store.conn is None:
-                        raise sqlite3.ProgrammingError("realm store is closed")
-                    row = self.store.conn.execute("SELECT 1").fetchone()
-                    live = row is not None and int(row[0]) == 1
-                except (sqlite3.DatabaseError, OSError, ValueError, TypeError):
-                    live = False
-                    self._verified = False
-                    self._admission_failure = {"reason": "runtime_liveness_failed"}
+                self._verified = False
+                self._admission_failure = {"reason": "runtime_liveness_failed"}
         return {"status": "ok" if self._verified and live else "degraded", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"], "runtime_session_id": self.runtime_session_id}
 
     def _assert_mutation_admitted(self):
@@ -3077,7 +3065,7 @@ class RuntimeService:
             if isinstance(value, dict):
                 if set(value) == {"asset", "generation_id", "variant_id", "object_id", "catalog_digest"}:
                     try:
-                        MediaReads(self).selected(document["project_id"], value)
+                        MediaReads(self).selected(document["project_id"], value, retained=True)
                     except (ConflictError, ValidationError, NotFoundError) as exc:
                         raise ConflictError("Timeline is read-only because a retained media selection changed. Inspect/export the original or restore the matching backup.",
                             details={"reason": "history_unavailable", "integrity_reason": "retained_media_selection_changed", "input": value}) from exc
