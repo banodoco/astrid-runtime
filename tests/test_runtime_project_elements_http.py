@@ -11,6 +11,8 @@ import base64
 import hashlib
 import json
 import pathlib
+import urllib.error
+import urllib.request
 import uuid
 
 import pytest
@@ -72,6 +74,26 @@ def admission(service, project: str, descriptor_object: dict, compiled: bytes, *
     }
 
 
+def legacy_admission(service, project: str) -> dict:
+    """An admission recorded before compiled bytes existed: identity and snapshot only."""
+    value = admission(service, project, ingest_snapshot(service, project, compiled_bytes("legacy")),
+                      compiled_bytes("legacy"), revision="3")
+    value["id"], value["kind"] = "wipe", "transition"
+    del value["compiled"], value["descriptor"], value["authoring"]
+    return value
+
+
+def direct(world, path: str, token: str):
+    """A request straight to the Runtime listener with a chosen bearer: (status, body bytes)."""
+    request = urllib.request.Request(world.daemon.endpoint + path, method="GET")
+    request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
 def pack_document(service, project: str, admissions: list[dict]) -> tuple[str, dict]:
     realm = service.realm["id"]
     owner = owner_id(service, project)
@@ -126,8 +148,8 @@ def project(world):
 def test_list_and_element_bytes_are_served_through_the_door(world, project):
     service = world.daemon.service
     compiled = compiled_bytes("a")
-    publish(service, project, [admission(service, project, ingest_snapshot(service, project, compiled), compiled)],
-            "pack-a")
+    publish(service, project, [admission(service, project, ingest_snapshot(service, project, compiled), compiled),
+                               legacy_admission(service, project)], "pack-a")
     digest = sha(compiled)
 
     listed = world.call(list_path(project))
@@ -210,15 +232,76 @@ def test_current_admissions_are_reread_on_every_request(world, project):
     assert world.call(element_path(project, sha(second))).body == second
 
 
-def test_admissions_without_compiled_bytes_are_not_listed(world, project):
+def test_admissions_without_compiled_bytes_are_reported_not_listed(world, project):
     service = world.daemon.service
-    legacy = admission(service, project, ingest_snapshot(service, project, compiled_bytes("legacy")),
-                       compiled_bytes("legacy"))
-    del legacy["compiled"], legacy["descriptor"], legacy["authoring"]
-    publish(service, project, [legacy], "pack-legacy")
+    publish(service, project, [legacy_admission(service, project)], "pack-legacy")
     listed = json.loads(world.call(list_path(project)).body)
     assert listed["elements"] == []
     assert listed["projects"] == []
+    assert listed["legacy"] == [{"packId": owner_id(service, project), "kind": "transition", "id": "wipe"}]
+
+
+def test_list_has_an_empty_legacy_report_when_every_admission_is_current(world, project):
+    assert json.loads(world.call(list_path(project)).body)["legacy"] == []
+
+
+def test_project_elements_need_the_project_document_read_scope(world, project):
+    service = world.daemon.service
+    compiled = compiled_bytes("auth")
+    publish(service, project, [admission(service, project, ingest_snapshot(service, project, compiled), compiled)],
+            "pack-auth")
+    digest = sha(compiled)
+    # The broad pre-change scope no longer reads project elements; neither do write-only or unrelated scopes.
+    for actor, scopes in (("objects-only", ["objects:read"]), ("writer-only", ["projects:write", "tasks:read"])):
+        token, _ = world.daemon.credentials.provision(actor, scopes)
+        for path in (list_path(project), element_path(project, digest)):
+            status, body = direct(world, path, token)
+            assert status == 401 and b"lacks required scope" in body, (path, status, body)
+    token, _ = world.daemon.credentials.provision("reader", ["projects:read"])
+    status, body = direct(world, list_path(project), token)
+    assert status == 200 and json.loads(body)["elements"][0]["digest"] == digest
+    status, body = direct(world, element_path(project, digest), token)
+    assert status == 200 and body == compiled
+    # Like the project document read, an unknown project is not found.
+    assert direct(world, list_path("no-such-project"), token)[0] == 404
+
+
+@pytest.mark.parametrize("damage", [
+    "no-renderability", "renderability-other-value", "renderability-extra-key", "renderability-missing-key",
+    "no-label", "empty-label", "no-description", "no-component-path", "defaults-list", "no-parameters",
+    "parameter-not-object", "parameter-no-name",
+])
+def test_document_refuses_descriptors_the_editor_cannot_read(world, project, damage):
+    service = world.daemon.service
+    compiled = compiled_bytes("shape")
+    value = admission(service, project, ingest_snapshot(service, project, compiled), compiled)
+    descriptor = value["descriptor"]
+    if damage == "no-renderability":
+        del descriptor["renderability"]
+    elif damage == "renderability-other-value":
+        descriptor["renderability"]["preview"] = "maybe"
+    elif damage == "renderability-extra-key":
+        descriptor["renderability"]["extra"] = "supported"
+    elif damage == "renderability-missing-key":
+        del descriptor["renderability"]["workerExport"]
+    elif damage == "no-label":
+        del descriptor["label"]
+    elif damage == "empty-label":
+        descriptor["label"] = ""
+    elif damage == "no-description":
+        del descriptor["description"]
+    elif damage == "no-component-path":
+        del descriptor["componentPath"]
+    elif damage == "defaults-list":
+        descriptor["defaults"] = []
+    elif damage == "no-parameters":
+        del descriptor["parameters"]
+    elif damage == "parameter-not-object":
+        descriptor["parameters"] = ["size"]
+    else:
+        descriptor["parameters"] = [{"type": "number"}]
+    with pytest.raises(RuntimeErrorBase):
+        publish(service, project, [value], "pack-shape-" + damage)
 
 
 def test_compiled_bytes_that_disagree_with_their_snapshot_fail_closed(world, project):

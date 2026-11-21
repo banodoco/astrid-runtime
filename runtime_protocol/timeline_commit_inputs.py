@@ -244,6 +244,26 @@ def _project_pack_source(connection: sqlite3.Connection, project_id: str,
     validate_pack_snapshot_objects(connection, project_id, content)
 
 
+_RENDERABILITY = {"supported", "blocked", "unknown"}
+
+
+def _require_editor_descriptor(descriptor: Mapping[str, Any]) -> None:
+    """Exactly the descriptor fields the editor's catalog reads, so a malformed one is refused when written."""
+    renderability = descriptor.get("renderability")
+    parameters = descriptor.get("parameters")
+    if (not isinstance(descriptor.get("label"), str) or not descriptor["label"]
+            or not isinstance(descriptor.get("description"), str)
+            or not isinstance(descriptor.get("componentPath"), str) or not descriptor["componentPath"]
+            or not isinstance(descriptor.get("defaults"), dict)
+            or not isinstance(parameters, list)
+            or any(not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"]
+                   or not isinstance(item.get("type"), str) or not item["type"] for item in parameters)
+            or not isinstance(renderability, dict)
+            or set(renderability) != {"preview", "browserExport", "workerExport"}
+            or any(value not in _RENDERABILITY for value in renderability.values())):
+        raise ConflictError("project pack listed element descriptor is missing the fields the editor reads")
+
+
 def _compiled_descriptor(admission: Mapping[str, Any]) -> dict[str, str]:
     """The compiled element file an admission names inside its snapshot object.
 
@@ -269,6 +289,7 @@ def _compiled_descriptor(admission: Mapping[str, Any]) -> dict[str, str]:
             or any(not isinstance(admission.get(key), str) or descriptor.get(key) != admission[key]
                    for key in ("id", "kind", "revision"))):
         raise ConflictError("project pack listed element descriptor does not name its admission")
+    _require_editor_descriptor(descriptor)
     if (not isinstance(authoring, dict) or set(authoring) != {"packRoot", "descriptorPath", "componentPath", "status"}
             or not all(isinstance(item, str) and item for item in authoring.values())):
         raise ConflictError("project pack listed element authoring is invalid")

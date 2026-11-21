@@ -5949,7 +5949,10 @@ class RuntimeService:
         return {"version": 1, "revision": revision, "packs": packs}
 
     def _project_pack_elements(self, project_id):
-        """Every admitted element of the project that names compiled bytes, re-read now.
+        """The project's admitted elements that name compiled bytes, plus the admissions that do not, re-read now.
+
+        Returns (entries, legacy). `legacy` lists `{packId, kind, id}` for each admission recorded before
+        compiled bytes existed: it cannot be served, and the editor tells the user to re-admit it.
 
         The project-pack Documents are the only authority. Each admission's
         compiled file lives in the portable snapshot object the Agent ingested
@@ -5959,6 +5962,7 @@ class RuntimeService:
         """
         from .timeline_commit_inputs import PROJECT_PACK_KIND, read_pack_snapshot_object
         entries = []
+        legacy = []
         with self.store._mutex:
             rows = self.store.conn.execute(
                 "SELECT id, kind, content_json FROM project_documents WHERE project_id=? AND kind=? ORDER BY id",
@@ -5971,6 +5975,7 @@ class RuntimeService:
                 for admission in content["admissions"]:
                     compiled = admission.get("compiled")
                     if compiled is None:
+                        legacy.append({"packId": content["pack_id"], "kind": admission["kind"], "id": admission["id"]})
                         continue
                     ref = (content["pack_id"], admission["kind"], admission["id"], admission["revision"])
                     if ref in refs:
@@ -5994,11 +5999,12 @@ class RuntimeService:
                                             details={"packId": content["pack_id"], "id": admission["id"]})
                     entries.append({"packId": content["pack_id"], "descriptor": admission["descriptor"],
                                     "authoring": admission["authoring"], "digest": compiled["sha256"], "raw": raw})
-        return entries
+        return entries, legacy
 
     def project_pack_elements(self, project_id):
         """The project's current admitted element bundles, addressed by compiled digest."""
-        entries = self._project_pack_elements(project_id)
+        project_id = self.store.get_project(project_id)["id"]
+        entries, legacy = self._project_pack_elements(project_id)
         realm = self.realm["id"]
         projects = {}
         elements = []
@@ -6019,11 +6025,12 @@ class RuntimeService:
         selection = sha256_bytes(canonical_json({"projectId": project_id, "realmId": realm, "refs": [
             [e["ref"], e["digest"]] for e in elements]}).encode("utf-8"))
         return {"version": 1, "projectId": project_id, "realmId": realm, "selectionDigest": selection,
-                "projects": list(projects.values()), "elements": elements}
+                "projects": list(projects.values()), "elements": elements, "legacy": legacy}
 
     def open_project_pack_element(self, project_id, digest):
         """Serve only compiled bytes the project's current admissions name."""
-        for entry in self._project_pack_elements(project_id):
+        project_id = self.store.get_project(project_id)["id"]
+        for entry in self._project_pack_elements(project_id)[0]:
             if entry["digest"] == digest:
                 raw = entry["raw"]
                 return {"digest": digest, "size": len(raw), "media_type": "text/javascript"}, io.BytesIO(raw)

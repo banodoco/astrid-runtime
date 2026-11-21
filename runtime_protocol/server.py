@@ -701,8 +701,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
         if self.path.startswith("/api/runtime/packs/"):
-            self._identity("objects:read")
             route = pack_http_route(self.path)
+            # A project's admitted elements are project documents: read them with the project-document read scope.
+            self._identity("projects:read" if route and route[0] in ("project-elements", "project-element") else "objects:read")
             if route is None or method not in ({"lease": ("POST",), "release": ("DELETE",)}.get(route[0], ("GET", "HEAD"))):
                 raise NotFoundError("pack route requires an exact admitted path and method")
             if route[0] == "lease":
