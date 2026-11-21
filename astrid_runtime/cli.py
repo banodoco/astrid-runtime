@@ -439,6 +439,34 @@ def _wait_for_door(paths: RuntimePaths, result: BootstrapResult, boundary: Local
     raise BootstrapError("browser door did not become ready before the startup deadline: " + reason)
 
 
+class _PrivateStreamHandler(logging.StreamHandler):
+    def handleError(self, record):
+        # logging's default error handler prints the record and active exception,
+        # which can contain provider secrets. A failed log write must fail closed.
+        pass
+
+
+@contextlib.contextmanager
+def _foreground_logging(stream):
+    root = logging.getLogger()
+    previous_handlers = root.handlers[:]
+    previous_level = root.level
+    handler = _PrivateStreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    for previous in previous_handlers:
+        root.removeHandler(previous)
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        handler.close()
+        for previous in previous_handlers:
+            root.addHandler(previous)
+        root.setLevel(previous_level)
+
+
 def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: bool) -> int:
     from runtime_protocol.logs import RotatingLog
     logs = platform.log_dir(paths.home)
@@ -454,10 +482,7 @@ def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: 
     try:
         with RotatingLog(log_path) as log:
             platform.owner_only(log_path)
-            with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
-                # Bound to the redirected stderr, so runtime.log lines carry a time.
-                logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True,
-                                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+            with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log), _foreground_logging(log):
                 try:
                     with cancellation.startup_scope(stopped):
                         result = bootstrap(paths, boundary, config)
