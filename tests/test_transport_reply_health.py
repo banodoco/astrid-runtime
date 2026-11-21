@@ -76,3 +76,21 @@ def test_health_is_served_without_the_store_mutex_and_returns_while_it_is_held(t
         assert result["status"] == "ok"
     finally:
         service.close()
+
+
+def test_missing_realm_path_preserves_ordinary_health_but_identity_probe_revokes(tmp_path):
+    root = tmp_path / "realm"
+    moved = tmp_path / "moved"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
+    try:
+        root.rename(moved)
+        assert service.health()["status"] == "ok"
+        assert service.health(identity_probe=True)["status"] == "degraded"
+        assert service._admission_failure == {"reason": "runtime_liveness_failed"}
+        moved.rename(root)
+        assert service.health()["status"] == "degraded"
+    finally:
+        if moved.exists():
+            moved.rename(root)
+        service.close()
