@@ -11,17 +11,20 @@ import base64
 import hashlib
 import json
 import pathlib
+import threading
 import urllib.error
 import urllib.request
 import uuid
 
 import pytest
 
-from runtime_protocol.errors import RuntimeErrorBase
+from runtime_protocol import timeline_commit_inputs
+from runtime_protocol.errors import ConflictError, NotFoundError, RuntimeErrorBase
+from runtime_protocol.service import RuntimeService
 from runtime_protocol.util import canonical_json
 from runtime_protocol.server import pack_http_route
 from runtime_protocol.timeline_commit_inputs import PROJECT_PACK_KIND, PROJECT_PACK_SCHEMA
-from tests.door_helpers import HOSTED, start_door_world
+from tests.door_helpers import HOSTED, create_realm, start_door_world
 
 TSX = "elements/reveal/component.tsx"
 COMPILED = "elements/reveal/component.js"
@@ -145,6 +148,17 @@ def project(world):
     return world.daemon.service.create_project({"slug": "elements", "name": "Elements"})["id"]
 
 
+@pytest.fixture
+def service_project(tmp_path):
+    root = tmp_path / "realm"
+    create_realm(root)
+    service = RuntimeService(root)
+    try:
+        yield service, service.create_project({"slug": "elements", "name": "Elements"})["id"]
+    finally:
+        service.close()
+
+
 def test_list_and_element_bytes_are_served_through_the_door(world, project):
     service = world.daemon.service
     compiled = compiled_bytes("a")
@@ -199,6 +213,95 @@ def test_door_refuses_foreign_origins_and_non_exact_routes(world, project):
         f"/api/runtime/packs/project-elements/{project}/{digest}.js?x=1",
     ):
         assert world.call(path).status == 404, path
+
+
+def test_list_reads_only_admission_metadata_without_cas_reads(service_project, monkeypatch):
+    service, project = service_project
+    compiled = compiled_bytes("a")
+    publish(service, project, [admission(service, project, ingest_snapshot(service, project, compiled), compiled),
+                               legacy_admission(service, project)], "pack-metadata")
+    reads = []
+
+    def unexpected_read(*args, **kwargs):
+        reads.append((args, kwargs))
+        raise AssertionError("listing must not read snapshot bytes")
+
+    monkeypatch.setattr(timeline_commit_inputs, "read_pack_snapshot_object", unexpected_read)
+    monkeypatch.setattr(timeline_commit_inputs, "read_pack_snapshot_bytes", unexpected_read)
+    monkeypatch.setattr(service.cas, "open", unexpected_read)
+    listed = service.project_pack_elements(project)
+    assert reads == []
+    expected = json.loads(FIXTURE.read_text().replace(FIXTURE_PROJECT, project)
+                          .replace(FIXTURE_REALM, service.realm["id"]).replace(FIXTURE_PACK, owner_id(service, project)))
+    refs = [[element["ref"], element["digest"]] for element in expected["elements"]]
+    expected["selectionDigest"] = sha(canonical_json({"projectId": project, "realmId": service.realm["id"], "refs": refs}).encode())
+    assert canonical_json(listed) == canonical_json(expected)
+
+
+@pytest.mark.parametrize("selected_first", [True, False])
+def test_bytes_read_only_selected_snapshot_without_holding_store_mutex(service_project, monkeypatch, selected_first):
+    service, project = service_project
+    compiled = compiled_bytes("selected")
+    snapshot = ingest_snapshot(service, project, compiled)
+    selected = admission(service, project, snapshot, compiled)
+    other_bytes = compiled_bytes("unrelated")
+    other = admission(service, project, ingest_snapshot(service, project, other_bytes), other_bytes)
+    other["id"] = other["descriptor"]["id"] = "other"
+    # An unrelated corrupt compiled file must not prevent serving the selected one.
+    other["compiled"]["sha256"] = "0" * 64
+    publish(service, project, [selected, other] if selected_first else [other, selected], "pack-selected")
+    reads, probes = [], []
+    validate_snapshot = timeline_commit_inputs.validate_pack_snapshot_objects
+    read_snapshot = timeline_commit_inputs.read_pack_snapshot_bytes
+    decode = base64.b64decode
+    encoded = b64(compiled)
+
+    def probe(stage):
+        """Record whether another thread can take the store mutex right now."""
+        acquired = []
+
+        def try_lock():
+            held = service.store._mutex.acquire(blocking=False)
+            acquired.append(held)
+            if held:
+                service.store._mutex.release()
+
+        thread = threading.Thread(target=try_lock)
+        thread.start()
+        thread.join(timeout=2)
+        probes.append((stage, acquired))
+
+    def validate_under_mutex(connection, project_id, content):
+        probe("validate")
+        return validate_snapshot(connection, project_id, content)
+
+    def read_without_mutex(cas, descriptor, **kwargs):
+        reads.append(descriptor["object_id"])
+        probe("read")
+        return read_snapshot(cas, descriptor, **kwargs)
+
+    def decode_without_mutex(data, *args, **kwargs):
+        if data == encoded:
+            probe("decode")
+        return decode(data, *args, **kwargs)
+
+    monkeypatch.setattr(timeline_commit_inputs, "validate_pack_snapshot_objects", validate_under_mutex)
+    monkeypatch.setattr(timeline_commit_inputs, "read_pack_snapshot_bytes", read_without_mutex)
+    monkeypatch.setattr(base64, "b64decode", decode_without_mutex)
+    with pytest.raises(NotFoundError):
+        service.open_project_pack_element(project, "3" * 64)
+    assert reads == []
+    metadata, stream = service.open_project_pack_element(project, sha(compiled))
+    with stream:
+        assert stream.read() == compiled
+    assert metadata == {"digest": sha(compiled), "size": len(compiled), "media_type": "text/javascript"}
+    assert reads == [snapshot["object_id"]]
+    # Validation runs while the mutex is held (no other thread can take it);
+    # the CAS read and the decode run after it is released.
+    assert probes[-2:] == [("read", [True]), ("decode", [True])]
+    assert probes and all(held == [False] for stage, held in probes if stage == "validate")
+    with pytest.raises(ConflictError, match="compiled element bytes are missing or corrupt"):
+        service.open_project_pack_element(project, other["compiled"]["sha256"])
 
 
 def test_unknown_digest_and_other_projects_are_not_found(world, project):
@@ -311,7 +414,9 @@ def test_compiled_bytes_that_disagree_with_their_snapshot_fail_closed(world, pro
     drifted["compiled"] = {"path": COMPILED, "sha256": sha(b"not the bytes in the snapshot")}
     publish(service, project, [drifted], "pack-drift")
 
-    assert world.call(list_path(project)).status == 409
+    listed = world.call(list_path(project))
+    assert listed.status == 200
+    assert listed.json()["elements"][0]["digest"] == drifted["compiled"]["sha256"]
     assert world.call(element_path(project, sha(b"not the bytes in the snapshot"))).status == 409
 
 

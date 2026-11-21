@@ -337,8 +337,13 @@ def validate_pack_snapshot_objects(connection: sqlite3.Connection, project_id: s
 
 def read_pack_snapshot_object(connection: sqlite3.Connection, cas, project_id: str,
                               descriptor: Mapping[str, Any], *, max_bytes: int):
-    """Read managed CAS bytes and their file identity, never a source/cache path."""
+    """Validate the managed descriptor in SQLite, then read its CAS bytes."""
     validate_pack_snapshot_objects(connection, project_id, {"admissions": [{"snapshot_object": descriptor}]})
+    return read_pack_snapshot_bytes(cas, descriptor, max_bytes=max_bytes)
+
+
+def read_pack_snapshot_bytes(cas, descriptor: Mapping[str, Any], *, max_bytes: int):
+    """Read and verify one validated CAS object. Touches no SQLite connection."""
     if descriptor["size"] > max_bytes:
         raise ValidationError("project pack snapshot object exceeds the object byte limit")
     try:

@@ -5954,20 +5954,18 @@ class RuntimeService:
         Returns (entries, legacy). `legacy` lists `{packId, kind, id}` for each admission recorded before
         compiled bytes existed: it cannot be served, and the editor tells the user to re-admit it.
 
-        The project-pack Documents are the only authority. Each admission's
-        compiled file lives in the portable snapshot object the Agent ingested
-        (`snapshot_object`), so the bytes are read from the Runtime CAS, verified
-        against the blob's own digest and re-hashed against the admitted sha256.
-        Nothing is cached; a re-admit is visible on the next request.
+        The project-pack Documents are the only authority. Copy the admitted
+        metadata under the store mutex, without reading any snapshot bytes.
+        A re-admit is visible on the next request; only a bytes request reads
+        and verifies the selected portable snapshot, after releasing the mutex.
         """
-        from .timeline_commit_inputs import PROJECT_PACK_KIND, read_pack_snapshot_object
+        from .timeline_commit_inputs import PROJECT_PACK_KIND
         entries = []
         legacy = []
         with self.store._mutex:
             rows = self.store.conn.execute(
                 "SELECT id, kind, content_json FROM project_documents WHERE project_id=? AND kind=? ORDER BY id",
                 (project_id, PROJECT_PACK_KIND)).fetchall()
-            snapshots = {}
             refs = set()
             for row in rows:
                 content = json.loads(row["content_json"])
@@ -5981,24 +5979,9 @@ class RuntimeService:
                     if ref in refs:
                         raise ConflictError("project pack admitted element identity is ambiguous")
                     refs.add(ref)
-                    descriptor = admission["snapshot_object"]
-                    key = descriptor["object_id"]
-                    if key not in snapshots:
-                        data, _identity = read_pack_snapshot_object(
-                            self.store.conn, self.cas, project_id, descriptor, max_bytes=self.max_object_bytes)
-                        snapshots[key] = {item["path"]: item for item in json.loads(data)["files"]}
-                    item = snapshots[key].get(compiled["path"])
-                    raw = None
-                    if item is not None:
-                        try:
-                            raw = base64.b64decode(item["bytes_base64"], validate=True)
-                        except (TypeError, ValueError):
-                            raw = None
-                    if raw is None or hashlib.sha256(raw).hexdigest() != compiled["sha256"] or item["sha256"] != compiled["sha256"]:
-                        raise ConflictError("project pack compiled element bytes are missing or corrupt; re-admit the pack",
-                                            details={"packId": content["pack_id"], "id": admission["id"]})
                     entries.append({"packId": content["pack_id"], "descriptor": admission["descriptor"],
-                                    "authoring": admission["authoring"], "digest": compiled["sha256"], "raw": raw})
+                                    "authoring": admission["authoring"], "digest": compiled["sha256"],
+                                    "compiled": compiled, "snapshot_object": admission["snapshot_object"]})
         return entries, legacy
 
     def project_pack_elements(self, project_id):
@@ -6029,10 +6012,29 @@ class RuntimeService:
 
     def open_project_pack_element(self, project_id, digest):
         """Serve only compiled bytes the project's current admissions name."""
+        from .timeline_commit_inputs import read_pack_snapshot_bytes, validate_pack_snapshot_objects
+
         project_id = self.store.get_project(project_id)["id"]
         for entry in self._project_pack_elements(project_id)[0]:
             if entry["digest"] == digest:
-                raw = entry["raw"]
+                # SQLite validation stays under the mutex (shared connection);
+                # the CAS read and snapshot decoding run after it is released.
+                with self.store._mutex:
+                    validate_pack_snapshot_objects(
+                        self.store.conn, project_id, {"admissions": [{"snapshot_object": entry["snapshot_object"]}]})
+                data, _identity = read_pack_snapshot_bytes(
+                    self.cas, entry["snapshot_object"], max_bytes=self.max_object_bytes)
+                files = {item["path"]: item for item in json.loads(data)["files"]}
+                item = files.get(entry["compiled"]["path"])
+                raw = None
+                if item is not None:
+                    try:
+                        raw = base64.b64decode(item["bytes_base64"], validate=True)
+                    except (TypeError, ValueError):
+                        raw = None
+                if raw is None or hashlib.sha256(raw).hexdigest() != digest or item["sha256"] != digest:
+                    raise ConflictError("project pack compiled element bytes are missing or corrupt; re-admit the pack",
+                                        details={"packId": entry["packId"], "id": entry["descriptor"]["id"]})
                 return {"digest": digest, "size": len(raw), "media_type": "text/javascript"}, io.BytesIO(raw)
         raise NotFoundError("project pack element is not admitted for this project")
 
