@@ -1,0 +1,8 @@
+{
+  "native-evidence.tar.gz": {
+    "sha256": "bb820e82b3b8016368f9f51c12de38f8a246db72368510096786ace7b4dda527",
+    "bytes": 754168,
+    "members": 79
+  },
+  "omitted_whole_archives": "All four original G2 ZIPs, four destination ZIPs and the canonical 5,665,973-byte G2 blob remain bound by original URLs and SHA256 digests. All scoped native phases and full selected error detail are included in this capsule, along with complete local logs/XML/events/commands/exits. No original scoped event is replaced by a summary."
+}

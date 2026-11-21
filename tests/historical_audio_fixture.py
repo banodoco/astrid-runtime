@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from runtime_protocol.service import RuntimeService
+from migrated_realm import open_migrated_service
 from runtime_protocol.timeline_commit_baseline import verify_baseline
 from runtime_protocol.timeline_commit_store import digest
 from runtime_protocol.util import now
@@ -189,7 +190,7 @@ def prepare_pcm_historical_audio_film(film, tmp_path):
     prepared = None
 
     for root in (film.fixture.source_root, film.fixture.duplicate_root):
-        service = RuntimeService(root)
+        service = open_migrated_service(root)
         try:
             old_baseline = verify_baseline(
                 service.store.conn,

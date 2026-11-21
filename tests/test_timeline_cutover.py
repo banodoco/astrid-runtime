@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from baseline_fixture import load_baseline_fixture
-from runtime_protocol.daemon import RuntimeDaemon
+from migrated_realm import MigratedRealmDaemon, register_migrated_provider
 from runtime_protocol.timeline_cutover import audit_active_timeline_heads
 from tests.http_helpers import Api
 
@@ -84,10 +84,11 @@ def test_active_head_audit_accepts_canonical_cutover_tombstone(tmp_path):
 
 def test_public_timeline_document_routes_are_retired(tmp_path):
     service, project_id, _ = load_baseline_fixture(tmp_path)
+    register_migrated_provider(service)
     root = service.store.root
     service.rename_timeline(project_id, "main", {"name": "Main"}, idempotency_key="timeline-name")
     service.close()
-    daemon = RuntimeDaemon(root, support_root=tmp_path / "support").start()
+    daemon = MigratedRealmDaemon(root, support_root=tmp_path / "support").start()
     try:
         api = Api(daemon.endpoint, daemon.token)
         # GET /v1/projects/{project_id}/timelines/{timeline_id} is deliberately live again (5a4087c: get returns

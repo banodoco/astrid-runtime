@@ -26,6 +26,7 @@ from runtime_protocol.server import RuntimeHandler
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 from precut_realm_fixture import load_precut_realm_fixture
+from migrated_realm import MigratedRealmDaemon
 
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aKz8AAAAASUVORK5CYII=')
 
@@ -49,7 +50,7 @@ def daemon(tmp_path):
 @pytest.fixture
 def precut_daemon(tmp_path):
     captured = load_precut_realm_fixture(tmp_path)
-    value = RuntimeDaemon(
+    value = MigratedRealmDaemon(
         captured.copy_roots[1], support_root=tmp_path / 'support',
     ).start()
     yield value, captured

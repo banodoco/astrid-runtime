@@ -7,9 +7,8 @@ import json
 import pytest
 
 from http_helpers import Api
-from runtime_protocol.daemon import RuntimeDaemon
+from migrated_realm import MigratedRealmDaemon, open_migrated_service
 from runtime_protocol.errors import RetiredRouteError
-from runtime_protocol.service import RuntimeService
 from runtime_protocol.timeline_commit_baseline import verify_baseline
 from runtime_protocol.util import canonical_json
 from precut_realm_fixture import load_precut_realm_fixture
@@ -21,7 +20,7 @@ def documents(request, tmp_path_factory):
         tmp_path_factory.mktemp(request.param), variant="music-documents",
     )
     root = captured.copy_roots[1]
-    service = RuntimeService(root)
+    service = open_migrated_service(root)
     project = captured.pins["project_id"]
     baseline = verify_baseline(
         service.store.conn, project, captured.pins["timeline_id"],
@@ -61,7 +60,7 @@ def documents(request, tmp_path_factory):
     api = None
     if request.param == "http":
         service.close()
-        daemon = RuntimeDaemon(root, support_root=root.parent / "support").start()
+        daemon = MigratedRealmDaemon(root, support_root=root.parent / "support").start()
         service = daemon.service
         token, _ = daemon.credentials.provision("document-editor", ["projects:read", "projects:write"])
         api = Api(daemon.endpoint, token)

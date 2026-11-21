@@ -15,6 +15,7 @@ from precut_realm_fixture import (
 )
 from runtime_protocol.errors import RetiredRouteError
 from runtime_protocol.service import RuntimeService
+from migrated_realm import open_migrated_service
 from runtime_protocol.timeline_commit_baseline import verify_baseline
 from runtime_protocol.timeline_commit_validation import validate_commit_value
 from runtime_protocol.util import canonical_json
@@ -159,7 +160,7 @@ def test_variants_restore_exact_historical_images_and_publication_identity(tmp_p
 
 def test_canonical_documents_have_genuine_create_receipts_and_refuse_bypass(tmp_path):
     captured = load_precut_realm_fixture(tmp_path, variant="music-documents")
-    service = RuntimeService(captured.copy_roots[0])
+    service = open_migrated_service(captured.copy_roots[0])
     project = captured.pins["project_id"]
     try:
         parent = service.get_project_parent_composition_revision(project, "film", "film-parent-v1")["payload"]

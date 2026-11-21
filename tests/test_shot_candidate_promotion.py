@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from astrid_runtime_client import ApiError, WorkspaceClient
+from migrated_realm import open_migrated_service
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.store import RealmStore
 from runtime_protocol.util import now
@@ -144,9 +145,8 @@ def test_catalog_promotion_preserves_accepted_film_and_retries_before_live_guard
     assert service.get_project_shot(project, shot.shot_id)["version"] == shot.version + 1
     assert result["receipt"]["result"] == result["data"]
     from runtime_protocol.errors import ConflictError
-    from runtime_protocol.service import RuntimeService
     service.close()
-    restarted = RuntimeService(editing.film.fixture.duplicate_root)
+    restarted = open_migrated_service(editing.film.fixture.duplicate_root, provider=editing.agent.provider())
     try:
         before_retry = rows(restarted)
         monkeypatch.setattr(restarted.store, "get_project", lambda *_: pytest.fail("retry read current project"))

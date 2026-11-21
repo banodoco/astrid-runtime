@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 from astrid_runtime_client import ApiError, WorkspaceClient
-from runtime_protocol.daemon import RuntimeDaemon
+from migrated_realm import MigratedRealmDaemon, register_migrated_provider
 from runtime_protocol.errors import ConflictError, NotFoundError, ValidationError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
@@ -129,7 +129,10 @@ def restore_provider(astrid_importable):
 
 def _select_restore_provider(service, project_id, provider):
     # Historical source capture or host acceptance is complete before Agent startup.
-    service.register_timeline_commit_provider(provider)
+    if service._timeline_commit_provider is None:
+        register_migrated_provider(service, provider)
+    else:
+        assert service._timeline_commit_provider is provider
     head = service.get_project_timeline(project_id, "main")
     return {"expected_head": head["head_revision_id"],
             "expected_publication_id": head["head_publication_id"]}
@@ -1096,7 +1099,7 @@ def test_missing_selected_media_rejects_publication_without_identity_leak(tmp_pa
 def test_parent_composition_history_paginates_and_restores_exact_closure_over_http(tmp_path, restore_provider):
     fixture = load_restore_history_fixture(tmp_path)
     project_id = fixture.project_id
-    daemon = RuntimeDaemon(fixture.root, support_root=tmp_path / "support").start()
+    daemon = MigratedRealmDaemon(fixture.root, support_root=tmp_path / "support", provider=restore_provider).start()
     try:
         service = daemon.service
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -1205,6 +1208,7 @@ def test_parent_composition_restore_preserves_payload_and_declared_media_depende
     service, fixture = _restore_history_service(tmp_path)
     project_id = fixture.project_id
     try:
+        register_migrated_provider(service, restore_provider)
         payload_media = service.ingest(
             project_id, b"history-payload-media", media_type="audio/wav",
             idempotency_key="history-payload-media",
@@ -1330,7 +1334,7 @@ def test_stale_head_conflict_carries_machine_readable_reason_over_http(tmp_path,
     """Clients classify a lost head race by details.reason, never by message text."""
     fixture = load_restore_history_fixture(tmp_path)
     project_id = fixture.project_id
-    daemon = RuntimeDaemon(fixture.root, support_root=tmp_path / "support").start()
+    daemon = MigratedRealmDaemon(fixture.root, support_root=tmp_path / "support", provider=restore_provider).start()
     try:
         service = daemon.service
         client = WorkspaceClient(daemon.endpoint, daemon.token)

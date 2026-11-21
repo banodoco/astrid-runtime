@@ -21,6 +21,7 @@ from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError, OwnerBusyError, RealmAdmissionError, ValidationError
 from runtime_protocol.canonical_schema import CANONICAL_FORMAT_ID
 from runtime_protocol.service import RuntimeService
+from migrated_realm import register_migrated_provider
 from runtime_protocol.store import SCHEMA_VERSION, RealmStore
 from runtime_protocol.timeline_commit_port import RequestCommitPort
 from runtime_protocol.timeline_commit_store import digest, request_identity
@@ -398,6 +399,7 @@ def test_revision_admission_legacy_declared_media_boundaries(tmp_path, case, exp
     parent_revision_id = captured.pins["parent_revision_id"]
     service = RuntimeService(root)
     try:
+        register_migrated_provider(service)
         parent_payload = service.get_project_parent_composition_revision(
             project_id, timeline_id, parent_revision_id,
         )["payload"]
@@ -550,6 +552,7 @@ def test_omitted_occurrence_gain_admits_but_stored_gain_corruption_refuses_befor
     parent_revision_id = captured.pins["parent_revision_id"]
     service = RuntimeService(root)
     try:
+        register_migrated_provider(service)
         connection = service.store.conn
         assert connection is not None
         original = service.get_project_parent_composition_revision(

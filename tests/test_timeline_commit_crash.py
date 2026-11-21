@@ -23,6 +23,7 @@ import pytest
 
 from runtime_protocol.contract_metadata import SCHEMA_DIGEST
 from runtime_protocol.daemon import RuntimeDaemon
+from migrated_realm import open_migrated_service
 from runtime_protocol.door import DoorConfig
 from runtime_protocol.store import SCHEMA_VERSION, RealmStore
 from runtime_protocol.timeline_commit_port import RequestCommitPort, digest
@@ -391,10 +392,8 @@ def test_retained_inputs_process_death(retained, tmp_path, monkeypatch, operatio
 @pytest.mark.parametrize("stage", ["pre", "before", "after"])
 def test_host_boundary_first_capture_process_death(tmp_path, astrid_importable, monkeypatch, source_kind, stage):
     # HOST-BOUNDARY: proves input blob/header/link atomicity, not Agent semantics.
-    from runtime_protocol.service import RuntimeService
-
     film = build_film_fixture(tmp_path)
-    with closing(RuntimeService(film.duplicate_root)) as service:
+    with closing(open_migrated_service(film.duplicate_root)) as service:
         if source_kind == "config":
             source = service.create_document(film.project_id, {
                 "document_id": "film.config", "kind": "film.config",
