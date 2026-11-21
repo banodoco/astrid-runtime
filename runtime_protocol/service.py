@@ -856,7 +856,15 @@ class RuntimeService:
             # that handle; do not permanently revoke admission just because a
             # fresh pathname-based connection cannot reach it. Identity probes
             # still fail closed, as do failures with an accessible realm root.
-            if not identity_probe and not self.store.root.exists() and not self.store.root.is_symlink():
+            missing_root = False
+            if not identity_probe:
+                try:
+                    self.store.root.lstat()
+                except FileNotFoundError:
+                    missing_root = True
+                except OSError:
+                    pass
+            if missing_root:
                 with self.store._mutex:
                     try:
                         row = self.store.conn.execute("SELECT id FROM realm LIMIT 1").fetchone()

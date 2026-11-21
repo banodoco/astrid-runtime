@@ -133,3 +133,28 @@ def test_missing_realm_path_rejects_broken_primary_handle(tmp_path, failure):
         if moved.exists():
             moved.rename(root)
         service.store.close(orderly=False)
+
+
+@pytest.mark.parametrize("replacement", ["file", "symlink-loop"])
+def test_unresolvable_realm_ancestor_revokes_admission(tmp_path, replacement):
+    parent = tmp_path / "parent"
+    root = parent / "realm"
+    moved = tmp_path / "moved"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
+    try:
+        parent.rename(moved)
+        if replacement == "file":
+            parent.write_text("replacement", encoding="utf-8")
+        else:
+            parent.symlink_to(parent, target_is_directory=True)
+        assert service.health()["status"] == "degraded"
+        assert service._admission_failure == {"reason": "runtime_liveness_failed"}
+        parent.unlink()
+        moved.rename(parent)
+        assert service.health()["status"] == "degraded"
+    finally:
+        if moved.exists():
+            parent.unlink(missing_ok=True)
+            moved.rename(parent)
+        service.close()
