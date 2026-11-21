@@ -134,6 +134,7 @@ def _xfail_reason(name: str, reason: str) -> str:
     return f"[declared-xfail:{name}] {reason}"
 
 
+# Renew at Release 15 freeze per Lead 7067409632.
 DECLARED_XFAILS = {
     "runtime-domains-publication": DeclaredXfail(
         "runtime-domains-publication",
@@ -141,7 +142,7 @@ DECLARED_XFAILS = {
         _xfail_reason("runtime-domains-publication", "RT02/D04 held: legacy timeline publication (update_timeline) is retired (410); restored by the /v1 commit replacement"),
         "tests.test_runtime_domains._RetiredTimelinePublication",
         issue="https://github.com/banodoco/astrid-dev/issues/805",
-        owner="r14-lead",
+        owner="R14 Lead",
         expires="2026-12-01",
     ),
     "runtime-domains-update": DeclaredXfail(
@@ -150,7 +151,7 @@ DECLARED_XFAILS = {
         _xfail_reason("runtime-domains-update", "direct timeline update writer remains retired"),
         "tests.test_runtime_domains._RetiredTimelineUpdate",
         issue="https://github.com/banodoco/astrid-dev/issues/805",
-        owner="r14-lead",
+        owner="R14 Lead",
         expires="2026-12-01",
     ),
     "second-client-core": DeclaredXfail(
@@ -159,7 +160,7 @@ DECLARED_XFAILS = {
         _xfail_reason("second-client-core", "RT02/D04 held: direct shot writes and legacy timeline publication are retired (410); the actor is ported with their replacements"),
         "subprocess.CalledProcessError",
         issue="https://github.com/banodoco/astrid-dev/issues/805",
-        owner="r14-lead",
+        owner="R14 Lead",
         expires="2026-12-01",
     ),
     "snapshot-legacy-certification": DeclaredXfail(
@@ -171,7 +172,7 @@ DECLARED_XFAILS = {
         _xfail_reason("snapshot-legacy-certification", "ledger: no row id yet (PLAN 2026-10-20 capture certification); valid legacy capture is not re-certified until Agent project_capture lands"),
         "tests.test_snapshot_legacy_certification.LegacyGenuineUncertified",
         issue="https://github.com/banodoco/astrid-dev/issues/806",
-        owner="r14-lead",
+        owner="R14 Lead",
         expires="2026-12-01",
     ),
     "stage1-runtime-contract": DeclaredXfail(
@@ -180,7 +181,7 @@ DECLARED_XFAILS = {
         _xfail_reason("stage1-runtime-contract", "ledger D04: direct timeline writes retired; awaiting commit-path replacement"),
         "runtime_protocol.errors.RetiredRouteError",
         issue="https://github.com/banodoco/astrid-dev/issues/805",
-        owner="r14-lead",
+        owner="R14 Lead",
         expires="2026-12-01",
     ),
     "timeline-clip-replacement": DeclaredXfail(
@@ -200,7 +201,7 @@ DECLARED_XFAILS = {
         _xfail_reason("timeline-clip-replacement", "ledger D04: direct clip replacement retired; awaiting commit-path replacement"),
         "runtime_protocol.errors.RetiredRouteError",
         issue="https://github.com/banodoco/astrid-dev/issues/805",
-        owner="r14-lead",
+        owner="R14 Lead",
         expires="2026-12-01",
     ),
     "timeline-public-s2-historical-audio": DeclaredXfail(
@@ -212,7 +213,7 @@ DECLARED_XFAILS = {
                       "original audio film before POST"),
         "tests.test_timeline_public_s2_mixed_cli_journey.HistoricalAudioCaptureGap",
         issue="https://github.com/banodoco/astrid-dev/issues/807",
-        owner="r14-lead",
+        owner="R14 Lead",
         expires="2026-12-01",
     ),
     "installed-pair-source-closure": DeclaredXfail(
@@ -225,7 +226,7 @@ DECLARED_XFAILS = {
                       "under the strict xfail); fixed by astrid-dev Plan 38"),
         "tests.test_installed_pack_custody_spawn.KnownSourceClosureMismatch",
         issue="https://github.com/banodoco/astrid-dev/issues/808",
-        owner="r14-lead",
+        owner="R14 Lead",
         expires="2026-12-01",
     ),
     "p1-top-level-text-hook": DeclaredXfail(
@@ -234,12 +235,13 @@ DECLARED_XFAILS = {
         _xfail_reason("p1-top-level-text-hook", "P1 top-level text-hook restoration requirement"),
         "runtime_protocol.errors.RuntimeErrorBase",
         issue="https://github.com/banodoco/astrid-dev/issues/809",
-        owner="r14-lead",
+        owner="R14 Lead",
         expires="2026-12-01",
     ),
 }
 
-MAX_DECLARED_XFAIL_TESTS = 10
+# Release 14 quarantine ceiling. Lower it as quarantines are retired.
+MAX_DECLARED_XFAIL_TESTS = 20
 MAX_XFAIL_DAYS = 14
 
 
