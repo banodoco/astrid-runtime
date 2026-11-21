@@ -498,6 +498,9 @@ def _foreground_logging(stream):
 
 def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: bool) -> int:
     from runtime_protocol.logs import RotatingLog
+    # In-flight handlers may outlive this call; retain the production error
+    # policy for the lifetime of the foreground process.
+    logging.raiseExceptions = False
     logs = platform.log_dir(paths.home)
     logs.mkdir(parents=True, exist_ok=True)
     platform.owner_only(logs)

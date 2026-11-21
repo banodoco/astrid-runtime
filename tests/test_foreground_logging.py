@@ -151,3 +151,54 @@ def test_inflight_forced_handler_does_not_leak_after_foreground_closes(tmp_path,
             worker.join(5)
     assert worker and not worker.is_alive()
     assert secret not in capsys.readouterr().err
+
+
+def test_inflight_stdout_handler_does_not_leak_after_foreground_closes(tmp_path, monkeypatch, capsys):
+    import threading
+
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    entered = threading.Event()
+    resume = threading.Event()
+    secret = "stdout-private-message-and-note"
+    worker = None
+    monkeypatch.setattr(cli, "platform", SimpleNamespace(
+        log_dir=lambda _: tmp_path / "logs", owner_only=lambda _: None,
+        install_stop_handlers=lambda _: lambda: None,
+    ))
+    monkeypatch.setattr(cli, "ForegroundRuntimeBoundary", lambda: SimpleNamespace(stop=lambda: None))
+
+    def bootstrap(*_):
+        nonlocal worker
+        import sys
+        logging.basicConfig(force=True, stream=sys.stdout)
+        handler = logging.getLogger().handlers[0]
+        emit = handler.emit
+        def delayed_emit(record):
+            entered.set()
+            assert resume.wait(5)
+            emit(record)
+        handler.emit = delayed_emit
+        def log_exception():
+            try:
+                error = RuntimeError(secret)
+                error.add_note(secret)
+                raise error
+            except RuntimeError:
+                logging.exception("private record %s", secret)
+        worker = threading.Thread(target=log_exception)
+        worker.start()
+        assert entered.wait(5)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(cli, "bootstrap", bootstrap)
+    try:
+        assert cli._run_foreground(RuntimePaths.sandbox(tmp_path), cli.BootstrapConfig(), json_mode=True) == 1
+    finally:
+        resume.set()
+        if worker:
+            worker.join(5)
+    assert worker and not worker.is_alive()
+    stderr = capsys.readouterr().err
+    assert "--- Logging error ---" not in stderr
+    assert "private record" not in stderr
+    assert secret not in stderr
