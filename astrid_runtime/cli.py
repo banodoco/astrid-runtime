@@ -449,28 +449,28 @@ class _PrivateStreamHandler(logging.StreamHandler):
 @contextlib.contextmanager
 def _foreground_logging(stream):
     root = logging.getLogger()
+    previous_handlers = root.handlers[:]
+    previous_level = root.level
     handler = _PrivateStreamHandler(stream)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-    # basicConfig takes this same lock and rechecks for handlers. Never expose
-    # an empty list while redirecting stderr, even to module-level logging.
-    logging._acquireLock()
+    # Install before removing the previous handlers: module-level logging must
+    # never observe an empty root and auto-configure against redirected stderr.
+    root.addHandler(handler)
     try:
-        previous_handlers = root.handlers[:]
-        previous_level = root.level
-        root.handlers = [handler]
+        for previous in previous_handlers:
+            root.removeHandler(previous)
         root.setLevel(logging.INFO)
-    finally:
-        logging._releaseLock()
-    try:
         yield
     finally:
-        logging._acquireLock()
-        try:
-            added_handlers = [h for h in root.handlers if h is not handler and h not in previous_handlers]
-            root.handlers = previous_handlers + added_handlers
-            root.setLevel(previous_level)
-        finally:
-            logging._releaseLock()
+        # stderr is restored before this scope exits. Adding a handler also
+        # synchronizes with any basicConfig already in progress.
+        root.addHandler(handler)
+        for previous in previous_handlers:
+            root.addHandler(previous)
+        for current in root.handlers[:]:
+            if current is handler or getattr(current, "stream", None) is stream:
+                root.removeHandler(current)
+        root.setLevel(previous_level)
         handler.close()
 
 

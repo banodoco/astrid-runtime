@@ -81,3 +81,27 @@ def test_concurrent_module_logging_cannot_install_closed_stream_handler(monkeypa
         thread.join(5)
         root.handlers = saved_handlers
         root.setLevel(saved_level)
+
+
+def test_force_reconfiguration_does_not_retain_redirected_stream():
+    import contextlib
+    import io
+    import threading
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    original = logging.NullHandler()
+    stream = io.StringIO()
+    root.handlers = [original]
+    try:
+        with cli._foreground_logging(stream), contextlib.redirect_stderr(stream):
+            thread = threading.Thread(target=lambda: logging.basicConfig(force=True))
+            thread.start()
+            thread.join(5)
+            assert not thread.is_alive()
+            assert any(getattr(h, "stream", None) is stream for h in root.handlers)
+        stream.close()
+        assert root.handlers == [original]
+    finally:
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
