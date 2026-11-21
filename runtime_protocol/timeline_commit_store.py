@@ -223,9 +223,9 @@ class _HistoryReadCursor:
 
 
 class _HistoryReadInputs:
-    """Exact consumed SQL results and CAS bytes for one authoritative read."""
-    def __init__(self, connection, read_object):
-        self.connection, self.read_object = connection, read_object
+    """Exact consumed SQL results and verified CAS objects for one authoritative read."""
+    def __init__(self, connection, check_object):
+        self.connection, self.check_object = connection, check_object
         self.rows, self.objects = {}, {}
 
     def execute(self, query, parameters=()):
@@ -233,9 +233,7 @@ class _HistoryReadInputs:
 
     def check(self):
         for object_id, expected in self.objects.items():
-            data = self.read_object(object_id)
-            if (len(data), hashlib.sha256(data).digest()) != expected:
-                raise ProtocolError("accepted commit object changed during verification")
+            self.check_object(object_id, expected)
         for (query, parameters, method), expected in self.rows.items():
             value = getattr(self.connection.execute(query, parameters), method)()
             rows = [value] if method == "fetchone" else value
@@ -421,12 +419,25 @@ class TimelineCommitStore:
             raise ProtocolError("accepted commit inputs changed during verification")
 
     def _check_history_objects(self):
-        # CAS is outside SQLite's change boundary. Keep the existing physical
-        # byte verification, including for objects consumed by cached ancestry.
+        # CAS is outside SQLite's change boundary. Check every retained file's
+        # identity, but read/hash bytes only when that identity is new.
         for object_id, expected in self._history_state["objects"].items():
+            self._check_history_object(object_id, expected)
+
+    def _check_history_object(self, object_id, expected=None):
+        if getattr(self.store, "_read_cas_object", None) is not None:
+            # Backup inspection's descriptor-pinned reader owns its own trust
+            # boundary; it cannot inherit verification from a live CAS path.
             data = self._read_object(object_id)
-            if (len(data), hashlib.sha256(data).digest()) != expected:
-                raise ProtocolError("accepted commit object changed during verification")
+            actual = (len(data), hashlib.sha256(data).digest())
+        else:
+            from .cas import ContentAddressedStore
+
+            identity = ContentAddressedStore(self.store.cas_root).verified_identity(object_id)
+            actual = (identity[2], bytes.fromhex(object_id))
+        if expected is not None and actual != expected:
+            raise ProtocolError("accepted commit object changed during verification")
+        return actual
 
     def _sync_replay_memo(self):
         version = self._store_version()
@@ -525,7 +536,7 @@ class TimelineCommitStore:
                 yield
             return
         previous = current["inputs"]
-        inputs = previous if previous is not None else _HistoryReadInputs(self.store.conn, self._read_object)
+        inputs = previous if previous is not None else _HistoryReadInputs(self.store.conn, self._check_history_object)
         current["inputs"] = inputs
         try:
             self._sync_replay_memo()
@@ -572,7 +583,15 @@ class TimelineCommitStore:
 
     def _read_history_object(self, object_id):
         data = self._read_object(object_id)
-        value = (len(data), hashlib.sha256(data).digest())
+        # Ordinary CAS reads already authenticate the digest. Custom backup
+        # readers retain the exact-byte check used before process memoization.
+        content_digest = (hashlib.sha256(data).digest() if getattr(self.store, "_read_cas_object", None) is not None
+                          else bytes.fromhex(object_id))
+        value = (len(data), content_digest)
+        self._remember_history_object(object_id, value)
+        return data
+
+    def _remember_history_object(self, object_id, value):
         previous = self._history_state["objects"].get(object_id)
         if previous is not None and previous != value:
             raise ProtocolError("accepted commit object changed during verification")
@@ -583,7 +602,6 @@ class TimelineCommitStore:
             if object_id in objects and objects[object_id] != value:
                 raise ProtocolError("accepted commit object changed during verification")
             objects[object_id] = value
-        return data
 
     def _membership(self, project_id, timeline_id):
         row = self.conn.execute("SELECT p.realm_id FROM timelines t JOIN projects p ON p.id=t.project_id "
@@ -658,7 +676,7 @@ class TimelineCommitStore:
                      "dependencies": {identity: set()}, "pending": deque([identity]),
                      "replays": {}, "current": identity,
                      "inputs": current["inputs"] if current["inputs"] is not None else
-                               _HistoryReadInputs(self.store.conn, self._read_object)}
+                               _HistoryReadInputs(self.store.conn, self._check_history_object)}
         current["traversal"] = traversal
         try:
             while traversal["pending"]:
@@ -1446,8 +1464,12 @@ class TimelineCommitStore:
                                     "WHERE p.project_id=? AND p.relation='managed' AND o.digest=?", (project_id, pin["media_id"][7:])).fetchone()
             if row is None:
                 reject("dependency_unavailable")
-            data = self._read_history_object(pin["media_id"][7:])
-            if len(data) != row["size"] or "sha256:" + hashlib.sha256(data).hexdigest() != pin["media_id"]:
+            object_id = pin["media_id"][7:]
+            value = self._check_history_object(object_id, self._history_state["objects"].get(object_id))
+            self._remember_history_object(object_id, value)
+            size, content_digest = value
+            # The live CAS path verified object_id; pinned backup readers hash these bytes here.
+            if size != row["size"] or content_digest.hex() != object_id:
                 reject("dependency_unavailable")
         payload_media = set()
         def collect(value):

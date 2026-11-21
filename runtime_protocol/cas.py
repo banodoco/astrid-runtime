@@ -15,6 +15,9 @@ from .errors import ConflictError, NotFoundError, ValidationError
 IO_CHUNK_BYTES = 1024 * 1024
 DEFAULT_MAX_OBJECT_BYTES = 5 * 1024 ** 3
 
+# Store metadata only, shared by the short-lived CAS instances used by readers.
+_VERIFIED_OBJECTS = {}
+
 
 def file_identity(value):
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
@@ -120,18 +123,29 @@ class ContentAddressedStore:
             return None
 
     @staticmethod
-    def _verify_open_stream(stream, digest, expected_size):
+    def _verify_open_stream(stream, digest, expected_size, *, use_cache=True):
         initial = os.fstat(stream.fileno())
         if not stat.S_ISREG(initial.st_mode) or initial.st_size != expected_size:
             raise ConflictError("CAS collision or corrupt existing object")
-        stream.seek(0)
-        hasher = hashlib.sha256()
-        while chunk := stream.read(IO_CHUNK_BYTES):
-            hasher.update(chunk)
-        final = os.fstat(stream.fileno())
-        if file_identity(initial) != file_identity(final) or hasher.hexdigest() != digest:
-            raise ConflictError("CAS collision or corrupt existing object")
+        identity = file_identity(initial)
+        key = (digest, initial.st_dev, initial.st_ino)
+        if not use_cache or _VERIFIED_OBJECTS.get(key) != identity:
+            stream.seek(0)
+            hasher = hashlib.sha256()
+            while chunk := stream.read(IO_CHUNK_BYTES):
+                hasher.update(chunk)
+            final = os.fstat(stream.fileno())
+            if identity != file_identity(final) or hasher.hexdigest() != digest:
+                raise ConflictError("CAS collision or corrupt existing object")
+            if use_cache:
+                _VERIFIED_OBJECTS[key] = identity
         return initial
+
+    def verified_identity(self, digest):
+        """Verify a new file identity, or cheaply check a previously verified one."""
+        with self.open(digest) as stream:
+            initial = self._verify_open_stream(stream, digest, os.fstat(stream.fileno()).st_size)
+            return file_identity(initial)
 
     def wav_duration(self, digest, size):
         """Read a verified WAV header without buffering the CAS object."""
@@ -187,13 +201,20 @@ class ContentAddressedStore:
 
     def read(self, digest: str) -> bytes:
         with self.open(digest) as stream:
+            initial = os.fstat(stream.fileno())
+            identity = file_identity(initial)
+            key = (digest, initial.st_dev, initial.st_ino)
             data = stream.read()
-        if hashlib.sha256(data).hexdigest() != digest:
-            raise ConflictError("CAS object failed hash verification")
+            if identity != file_identity(os.fstat(stream.fileno())) or len(data) != initial.st_size:
+                raise ConflictError("CAS object changed during read")
+            if _VERIFIED_OBJECTS.get(key) != identity:
+                if hashlib.sha256(data).hexdigest() != digest:
+                    raise ConflictError("CAS object failed hash verification")
+                _VERIFIED_OBJECTS[key] = identity
         return data
 
     def verify(self, digest: str) -> dict:
         with self.open(digest) as stream:
             size = os.fstat(stream.fileno()).st_size
-        self.existing_identity(digest, size)
+            self._verify_open_stream(stream, digest, size, use_cache=False)
         return {"digest": digest, "size": size, "verified": True}
