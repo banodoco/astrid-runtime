@@ -11,7 +11,7 @@ import pytest
 
 from runtime_protocol.errors import HeadBusyError, ProtocolError
 from runtime_protocol.store import RealmStore
-from runtime_protocol.timeline_commit_store import TimelineCommitStore
+from runtime_protocol.timeline_commit_store import TimelineCommitStore, _same_store_version
 
 
 def _commit_store(root):
@@ -35,6 +35,22 @@ def test_external_committed_sqlite_write_changes_data_version(tmp_path):
 
         after = commits._store_version()
         assert after[2] != before[2]
+    finally:
+        store.close()
+
+
+def test_database_shrink_during_checkpoint_allowance_is_refused(tmp_path):
+    store, commits = _commit_store(tmp_path / "realm")
+    try:
+        before = commits._store_version()
+        files = list(before[3])
+        database = list(files[0])
+        database[2] -= 1
+        files[0] = tuple(database)
+        after = (*before[:3], tuple(files), *before[4:])
+
+        assert files[0][:2] == before[3][0][:2]
+        assert not _same_store_version(before, after, allow_checkpoint=True)
     finally:
         store.close()
 

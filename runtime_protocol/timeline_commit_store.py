@@ -81,7 +81,9 @@ def _same_store_version(before, after, *, allow_checkpoint=False):
         if old[:2] != new[:2] or old[-2:] != new[-2:]:
             return False
         if index < 2 and old[2] != new[2] and (
-                not allow_checkpoint or (index == 1 and new[2] > old[2])):
+                not allow_checkpoint
+                or (index == 0 and new[2] < old[2])
+                or (index == 1 and new[2] > old[2])):
             # During a read, SQLite may grow the DB by backfilling pages or
             # truncate the WAL. Appended WAL frames can hide a committed write
             # while data_version still reflects the read snapshot.
@@ -239,6 +241,7 @@ def _evaluation(method):
                     try:
                         self._check_history_objects(final=not current["depth"])
                     except (ConflictError, NotFoundError):
+                        # Match by name because a new-key lookup drops stale CAS proofs.
                         if method.__name__ != "lookup" or result is not None:
                             raise
                         # A ledger miss consumed no historical objects.
