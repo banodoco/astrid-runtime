@@ -138,6 +138,7 @@ def test_doctor_distinguishes_missing_cas_from_missing_dependency_pointer(closur
     missing = [bare] if fault == "missing-cas" else []
     assert report["checks"]["cas_missing"] == missing
     assert report["checks"]["reachable_cas"]["missing"] == missing
+
     assert report["checks"]["reachable_cas"]["ok"] is (fault != "missing-cas")
     if fault == "missing-pointer":
         assert "dependency_graph_mismatch" in {
@@ -152,6 +153,91 @@ def test_doctor_distinguishes_missing_cas_from_missing_dependency_pointer(closur
     assert observed["ok"] == report["ok"]
     assert observed["checks"]["cas_missing"] == missing
     assert snapshot(service) == before
+
+
+def test_unchanged_evaluations_reuse_history_objects_and_records(closure, monkeypatch):
+    service, commits, project, _, _, accepted = closure
+    publication = accepted["receipt"]["receipt_id"]
+    commits.clear_replay_memo()
+    reads, records = [], []
+    read_object, verify = commits._read_object, commits._verify_accepted_record
+
+    def counted_read(object_id):
+        reads.append(object_id)
+        return read_object(object_id)
+
+    def counted_record(*args, **kwargs):
+        records.append(True)
+        return verify(*args, **kwargs)
+
+    monkeypatch.setattr(commits, "_read_object", counted_read)
+    monkeypatch.setattr(commits, "_verify_accepted_record", counted_record)
+    expected = commits.history_entry(project, "main", publication)
+    head = commits.head(project, "main")
+    document = commits.revision_closure(project, "main", head["revision_id"])
+    assert commits._history_state["objects"] and records, "the initial evaluation must verify real media and history"
+    reads.clear()
+    records.clear()
+    for _ in range(3):
+        assert commits.history_entry(project, "main", publication) == expected
+        assert commits.head(project, "main") == head
+        assert commits.revision_closure(project, "main", head["revision_id"]) == document
+        with commits.history_read_scope():
+            assert commits.head(project, "main") == head
+    assert reads == []
+    assert records == []
+
+    # A write to history must discard the retained results even if it keeps
+    # the same head and bytes. Existing corruption tests cover forged values.
+    service.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=metadata_json WHERE publication_id=?",
+                               (publication,))
+    assert commits.history_entry(project, "main", publication) == expected
+    assert commits.revision_closure(project, "main", head["revision_id"]) == document
+    assert commits._history_state["objects"] and records
+
+
+@pytest.mark.parametrize("mutation", ["rewrite", "replace", "missing"])
+def test_warm_history_still_rejects_changed_cas(closure, tmp_path, mutation):
+    service, commits, project, _, item, accepted = closure
+    from runtime_protocol.errors import RuntimeErrorBase
+
+    publication = accepted["receipt"]["receipt_id"]
+    commits.history_entry(project, "main", publication)
+    path = service.cas.path_for(item["media_id"].removeprefix("sha256:"))
+    if mutation == "missing":
+        path.unlink()
+    else:
+        damaged = bytes([path.read_bytes()[0] ^ 1]) + path.read_bytes()[1:]
+        if mutation == "replace":
+            replacement = tmp_path / "replacement"
+            replacement.write_bytes(damaged)
+            replacement.replace(path)
+        else:
+            path.write_bytes(damaged)
+    before = snapshot(service)
+    with pytest.raises(RuntimeErrorBase):
+        commits.history_entry(project, "main", publication)
+    assert snapshot(service) == before
+    assert not any(commits._history_state.values())
+
+
+@pytest.mark.xfail(strict=True, reason="banodoco/astrid-dev#1222: Plan 59's verify-once design trusts _read_object; open whether a pinned read can return unverified bytes")
+def test_descriptor_reader_does_not_inherit_live_cas_proofs(closure, monkeypatch):
+    service, commits, project, _, item, accepted = closure
+    from runtime_protocol.errors import ProtocolError
+
+    publication = accepted["receipt"]["receipt_id"]
+    commits.history_entry(project, "main", publication)
+    object_id = item["media_id"].removeprefix("sha256:")
+    original = service.cas.read(object_id)
+    damaged = bytes([original[0] ^ 1]) + original[1:]
+    monkeypatch.setattr(service.store, "_read_cas_object",
+                        lambda value: damaged if value == object_id else service.cas.read(value), raising=False)
+    before = snapshot(service)
+    with pytest.raises(ProtocolError, match="object changed"):
+        commits.history_entry(project, "main", publication)
+    assert snapshot(service) == before
+    assert not any(commits._history_state.values())
 
 
 @pytest.mark.parametrize("tamper,reason", [
