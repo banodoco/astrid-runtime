@@ -657,7 +657,7 @@ class TimelineCommitStore:
             self.clear_replay_memo()
             current["memo_fallback"] = True
             _LOGGER.warning("timeline history memo disabled; full verification for this request: %s", failure)
-        if self._read_version_pin is None and not _same_store_version(self._replay_store_version, version):
+        if self._read_version_pin is None and version != self._replay_store_version:
             previous = self._replay_store_version
             if (current["accepting"] and self.store.conn.in_transaction and previous is not None
                     and version[0] == previous[0] and version[2] == previous[2] and version[4] == previous[4]

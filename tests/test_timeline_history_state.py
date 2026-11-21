@@ -260,7 +260,7 @@ def test_external_write_after_own_commit_is_not_a_new_trusted_baseline(service, 
 
 @pytest.mark.parametrize("component", ["database", "wal"])
 @pytest.mark.parametrize("timestamp", ["mtime", "ctime"])
-def test_same_size_file_timestamp_change_keeps_verified_state_under_checkpoint_ruling(service, monkeypatch, component, timestamp):
+def test_same_size_file_timestamp_change_invalidates_verified_state(service, monkeypatch, component, timestamp):
     commits, publication, expected, calls = warm(service, monkeypatch)
     path = service.store.db_path if component == "database" else service.store.db_path.with_name("realm.sqlite3-wal")
     before = path.stat()
@@ -271,10 +271,9 @@ def test_same_size_file_timestamp_change_keeps_verified_state_under_checkpoint_r
         assert path.stat().st_mtime_ns == before.st_mtime_ns
         assert path.stat().st_ctime_ns != before.st_ctime_ns
     assert path.stat().st_size == before.st_size
-    # Lead ruling, 21 Nov, R14-INT-WAL: checkpoint metadata is not an input change.
     assert commits._store_version() != version
     assert commits.history_entry(service.test_project, "main", publication) == expected
-    assert calls[publication] == 1
+    assert calls[publication] == 2
 
 
 def test_external_commit_in_outer_snapshot_with_reused_wal_refuses_cached_read(service, monkeypatch):
