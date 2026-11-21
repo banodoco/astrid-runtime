@@ -175,6 +175,24 @@ def test_corrupt_settlement_refuses_without_writes(media, name, phase, change):
     assert before is not None and snapshot(service) == before
 
 
+def test_verified_media_refuses_settlement_rebound_to_another_project(media):
+    service, project, outputs = media
+    output = outputs["image"]
+    selection = _capture(service, project, output)
+    foreign = service.create_project({"slug": "foreign-settlement", "name": "Foreign settlement"})["id"]
+    service.store.conn.execute(
+        "UPDATE managed_output_associations SET project_id=? WHERE association_id=?",
+        (foreign, output["association_id"]),
+    )
+    service.store.conn.commit()
+    before = snapshot(service)
+
+    with pytest.raises(RuntimeErrorBase) as error:
+        service.get_project_verified_media(project, selection, authorize=lambda: None)
+    assert error.value.status in {404, 409}
+    assert snapshot(service) == before
+
+
 @pytest.mark.parametrize("name", ["image", "old"], ids=["image", "video"])
 @pytest.mark.parametrize("change", ["completed-cancel", "boot", "executor-refresh", "viewed", "unrelated-output"])
 def test_completed_authority_survives_noninvalidating_api_changes(media, name, change):
