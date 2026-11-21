@@ -282,42 +282,94 @@ def test_same_size_file_timestamp_change_invalidates_verified_state(service, mon
     assert calls[publication] == 1
 
 
-def test_external_commit_then_truncate_checkpoint_before_final_sample_refuses_cached_read(service, monkeypatch):
-    """A commit plus TRUNCATE between the snapshot's end and the final sample fails closed.
-
-    The checkpoint leaves only file metadata that the allowance accepts, but the
-    commit moved data_version, so the cached head built from the old snapshot
-    must not be returned.
-    """
-    commits, publication, expected, calls = warm(service, monkeypatch)
-    connection = service.store.conn
-    database = service.store.db_path
-    wal = Path(str(database) + "-wal")
-    assert commits.history_entry(service.test_project, "main", publication) == expected
-    verified = calls[publication]
-    assert wal.stat().st_size > 0
-    version = connection.execute("PRAGMA data_version").fetchone()[0]
+def _commit_then_truncate_after_snapshot(commits, connection, database, write, *, limit):
+    """Run ``write`` on another connection, then TRUNCATE, before each final sample."""
     sample = commits._store_version
     raced = []
 
     def sample_after_race():
-        if not connection.in_transaction and commits._read_version_pin is not None and not raced:
-            # The snapshot is released; the final sample is next.
+        # The snapshot is released and the pin is still held: the final sample is next.
+        if not connection.in_transaction and commits._read_version_pin is not None and len(raced) < limit:
             with closing(sqlite3.connect(database, timeout=5, isolation_level=None)) as writer:
-                writer.execute(
-                    "UPDATE timelines SET name = COALESCE(name, '') || ' committed' WHERE id = ?",
-                    ("main",),
-                )
+                write(writer)
                 raced.append(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
-            assert wal.stat().st_size == 0
+            assert raced[-1][0] == 0
+            assert Path(str(database) + "-wal").stat().st_size == 0
         return sample()
 
-    monkeypatch.setattr(commits, "_store_version", sample_after_race)
-    with pytest.raises(HeadBusyError):
+    return sample_after_race, raced
+
+
+def _second_body(service):
+    next_body = body(service)
+    change = next_body["commands"][0]["args"]["changes"][0]
+    change["before"] = {"state": "present", "value": copy.deepcopy(change["value"])}
+    change["value"] = {"org.example.timeline": {"note": "closing"}}
+    next_body["steps"][0]["patch"] = [copy.deepcopy(change)]
+    return next_body
+
+
+def _copy_database(source, target):
+    with closing(sqlite3.connect(source)) as reader, closing(sqlite3.connect(target)) as writer:
+        reader.backup(writer)
+
+
+def test_external_commit_then_truncate_before_final_sample_rereads_new_head(service, monkeypatch, tmp_path):
+    """A commit plus TRUNCATE between the snapshot's end and the final sample never returns the old head.
+
+    The checkpoint leaves only file metadata that the allowance accepts, but the
+    commit moved data_version. The cached head built from the old snapshot is
+    discarded and one bounded re-read returns the new head.
+    """
+    commits, first, _, calls = warm(service, monkeypatch)
+    connection = service.store.conn
+    database = service.store.db_path
+    first_state, second_state = tmp_path / "first.sqlite3", tmp_path / "second.sqlite3"
+    _copy_database(database, first_state)
+    second = commit(service, _second_body(service), key="edit-2")["receipt"]["receipt_id"]
+    assert second != first
+    _copy_database(database, second_state)
+    # Another connection rewinds the realm to the first head, which this
+    # process then verifies and caches.
+    _copy_database(first_state, database)
+    assert commits.head(service.test_project, "main")["publication_id"] == first
+    assert commits.head(service.test_project, "main")["publication_id"] == first
+    verified = calls[first]
+    assert Path(str(database) + "-wal").stat().st_size > 0
+
+    def commit_second_head(writer):
+        with closing(sqlite3.connect(second_state)) as reader:
+            reader.backup(writer)
+
+    racing, raced = _commit_then_truncate_after_snapshot(commits, connection, database, commit_second_head, limit=1)
+    monkeypatch.setattr(commits, "_store_version", racing)
+    head = commits.head(service.test_project, "main")
+    assert len(raced) == 1
+    assert head["publication_id"] == second, "the old cached head was returned"
+    # The re-read verified the new head under its own snapshot.
+    assert calls[second] >= 1
+    assert calls[first] == verified
+    assert not connection.in_transaction
+
+
+def test_counters_moving_after_both_reads_refuse_with_head_busy(service, monkeypatch):
+    """The re-read is bounded to one: a second post-read move raises the retryable HeadBusyError."""
+    commits, publication, expected, calls = warm(service, monkeypatch)
+    connection = service.store.conn
+    database = service.store.db_path
+    assert commits.history_entry(service.test_project, "main", publication) == expected
+    assert Path(str(database) + "-wal").stat().st_size > 0
+
+    def update(writer):
+        writer.execute("UPDATE timelines SET name = COALESCE(name, '') || ' committed' WHERE id = ?", ("main",))
+
+    racing, raced = _commit_then_truncate_after_snapshot(commits, connection, database, update, limit=3)
+    monkeypatch.setattr(commits, "_store_version", racing)
+    with pytest.raises(HeadBusyError) as refused:
         commits.history_entry(service.test_project, "main", publication)
-    assert len(raced) == 1 and raced[0][0] == 0
-    assert connection.execute("PRAGMA data_version").fetchone()[0] != version
-    assert calls[publication] == verified
+    assert type(refused.value) is HeadBusyError
+    assert len(raced) == 2
+    assert calls[publication] == 2
     assert not any(commits._history_state.values())
     assert not connection.in_transaction
 

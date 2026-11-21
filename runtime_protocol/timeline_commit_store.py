@@ -91,10 +91,14 @@ def _same_store_version(before, after, *, allow_checkpoint=False):
     return True
 
 
-def _head_busy(site, moved):
+def _head_busy(site, moved, error=HeadBusyError):
     """The retryable refusal for inputs that moved while a request verified them."""
     _LOGGER.warning("accepted commit inputs changed during verification at %s: moved %s", site, moved)
-    return HeadBusyError("accepted commit inputs changed during verification")
+    return error("accepted commit inputs changed during verification")
+
+
+class _PostReadMovement(HeadBusyError):
+    """The counters moved between the released snapshot and its final sample."""
 
 
 def request_identity(context):
@@ -224,8 +228,20 @@ def _evaluation(method):
                     with self.verification_scope():
                         return evaluate(self, *args, **kwargs)
                 if method.__name__ != "accept" and not self._reading:
-                    with self._read_transaction():
-                        return evaluate(self, *args, **kwargs)
+                    try:
+                        with self._read_transaction():
+                            return evaluate(self, *args, **kwargs)
+                    except _PostReadMovement:
+                        # Lead ruling, 21 Nov: one bounded re-read on post-read
+                        # counter movement; a known cause, a WAL checkpoint or a
+                        # concurrent commit. The first result is never returned,
+                        # and nothing it verified is reused by the re-read.
+                        self._discard_read_attempt()
+                    try:
+                        with self._read_transaction():
+                            return evaluate(self, *args, **kwargs)
+                    except _PostReadMovement as exc:
+                        raise HeadBusyError(*exc.args) from None
                 self._sync_replay_memo()
                 boundary = self._history_inputs is None
                 current = self._verification.current
@@ -484,6 +500,13 @@ class TimelineCommitStore:
             finally:
                 self._read_version_pin = None
 
+    def _discard_read_attempt(self):
+        """Drop every proof and confirmation a refused read attempt produced."""
+        self.clear_replay_memo()
+        current = self._verification.current
+        current["verified"].clear()
+        current["physical"].clear()
+
     def _check_history_version(self, *, version=None, after_read=False):
         before = self._read_version_pin or self._replay_store_version
         after = self._store_version() if version is None else version
@@ -493,8 +516,11 @@ class TimelineCommitStore:
             # so changed counters can never be read as checkpoint-only: the
             # result was built from the pinned snapshot and must not be
             # returned. The checkpoint allowance covers file metadata alone,
-            # with data_version and total_changes unchanged.
-            raise _head_busy("version-check", _moved_components(before, after))
+            # with data_version and total_changes unchanged. A post-read move
+            # is refused as _PostReadMovement so the evaluation can re-read.
+            raise _head_busy("post-read" if after_read else "version-check",
+                             _moved_components(before, after),
+                             _PostReadMovement if after_read else HeadBusyError)
         if after_read:
             self._replay_store_version = after
 
