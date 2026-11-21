@@ -9,6 +9,7 @@ import base64
 import copy
 import hashlib
 import json
+import logging
 import math
 import re
 from urllib.parse import quote
@@ -16,6 +17,8 @@ from urllib.parse import quote
 from .errors import AuthorizationError, ConflictError, NotFoundError, RuntimeErrorBase, ValidationError
 from .timeline_commit_validation import detached, digest
 from .util import canonical_json
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class CommitUnavailable(RuntimeErrorBase):
@@ -862,6 +865,27 @@ def _verify_text_object(conn, cas, project_id, selection, media_type):
     return {**selection, "utf8": True}
 
 
+
+def _digest_mismatch_fields(record, pinned):
+    """Name the digest components that cannot account for a stale pin (names only, never values).
+
+    The request carries one digest, so values cannot be diffed. generation_id, variant_id and
+    object_id are exact lookup keys: they matched or the row would not have resolved. The facts
+    are tested by omission: a fact the pin was computed without (or that was added since) is named
+    when dropping it from the recomputed digest reproduces the pin. Anything else is undetermined.
+    """
+    entry = record["entry"]
+    base = {key: record[key] for key in ("realm_id", "project_id", "asset", "generation_id", "variant_id", "object_id")}
+    variant_type = record["variant"]["variant_type"]
+    found = []
+    for fact in ("media_type", "size", "filename", "width", "height", "duration_seconds"):
+        if fact in entry and digest({**base, "variant_type": variant_type,
+                                      "entry": {k: v for k, v in entry.items() if k != fact}}) == pinned:
+            found.append(fact)
+    if digest({**base, "entry": entry}) == pinned:
+        found.append("variant_type")
+    return found or ["facts: undetermined"]
+
 class MediaReads:
     def __init__(self, service):
         self.service = service
@@ -1072,7 +1096,13 @@ class MediaReads:
         # the digest covered identity alone hold the whole-record digest and must keep verifying there.
         accepted = (record["catalog_digest"], legacy_digest) if retained else (record["catalog_digest"],)
         if "catalog_digest" in selection and selection["catalog_digest"] not in accepted:
-            raise ConflictError("selected media catalog digest changed")
+            fields = _digest_mismatch_fields(record, selection["catalog_digest"])
+            _LOGGER.info(
+                "selected media catalog digest changed: asset=%s generation_id=%s variant_id=%s object_id=%s fields=%s",
+                selection["asset"], selection["generation_id"], selection["variant_id"],
+                selection.get("object_id"), ",".join(fields))
+            raise ConflictError("selected media catalog digest changed (fields: " + ", ".join(fields) + ")",
+                                details={"fields": fields})
         return record
 
     def selected(self, project_id, selection, *, retained=False):
