@@ -449,22 +449,29 @@ class _PrivateStreamHandler(logging.StreamHandler):
 @contextlib.contextmanager
 def _foreground_logging(stream):
     root = logging.getLogger()
-    previous_handlers = root.handlers[:]
-    previous_level = root.level
     handler = _PrivateStreamHandler(stream)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-    for previous in previous_handlers:
-        root.removeHandler(previous)
-    root.addHandler(handler)
-    root.setLevel(logging.INFO)
+    # basicConfig takes this same lock and rechecks for handlers. Never expose
+    # an empty list while redirecting stderr, even to module-level logging.
+    logging._acquireLock()
+    try:
+        previous_handlers = root.handlers[:]
+        previous_level = root.level
+        root.handlers = [handler]
+        root.setLevel(logging.INFO)
+    finally:
+        logging._releaseLock()
     try:
         yield
     finally:
-        root.removeHandler(handler)
+        logging._acquireLock()
+        try:
+            added_handlers = [h for h in root.handlers if h is not handler and h not in previous_handlers]
+            root.handlers = previous_handlers + added_handlers
+            root.setLevel(previous_level)
+        finally:
+            logging._releaseLock()
         handler.close()
-        for previous in previous_handlers:
-            root.addHandler(previous)
-        root.setLevel(previous_level)
 
 
 def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: bool) -> int:
@@ -482,7 +489,7 @@ def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: 
     try:
         with RotatingLog(log_path) as log:
             platform.owner_only(log_path)
-            with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log), _foreground_logging(log):
+            with _foreground_logging(log), contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
                 try:
                     with cancellation.startup_scope(stopped):
                         result = bootstrap(paths, boundary, config)

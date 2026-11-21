@@ -39,3 +39,45 @@ def test_foreground_logging_write_failure_never_prints_exception(capsys):
         except RuntimeError:
             logging.getLogger("runtime.test").exception("record " + secret)
     assert secret not in capsys.readouterr().err
+
+
+def test_concurrent_module_logging_cannot_install_closed_stream_handler(monkeypatch):
+    import contextlib
+    import io
+    import threading
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    original = logging.NullHandler()
+    stream = io.StringIO()
+    trigger = threading.Event()
+    done = threading.Event()
+    real_remove = root.removeHandler
+
+    def concurrent_log():
+        trigger.wait()
+        logging.warning("concurrent event")
+        done.set()
+
+    def remove_with_race(handler):
+        real_remove(handler)
+        if not root.handlers:
+            trigger.set()
+            assert done.wait(5)
+
+    root.handlers = [original]
+    monkeypatch.setattr(root, "removeHandler", remove_with_race)
+    thread = threading.Thread(target=concurrent_log)
+    thread.start()
+    try:
+        with contextlib.redirect_stderr(stream), cli._foreground_logging(stream):
+            trigger.set()
+            assert done.wait(5)
+        stream.close()
+        assert root.handlers == [original]
+        assert not any(getattr(h, "stream", None) is stream for h in root.handlers)
+    finally:
+        trigger.set()
+        thread.join(5)
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
