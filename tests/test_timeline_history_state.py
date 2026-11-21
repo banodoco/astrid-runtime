@@ -21,7 +21,7 @@ from test_timeline_commit_port import commit, rows
 
 from runtime_protocol import platform as runtime_platform
 from runtime_protocol import timeline_commit_store as store_module
-from runtime_protocol.errors import AuthorizationError, ProtocolError, RuntimeErrorBase
+from runtime_protocol.errors import AuthorizationError, HeadBusyError, ProtocolError, RuntimeErrorBase
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.timeline_commit_store import TimelineCommitStore
 
@@ -260,7 +260,7 @@ def test_external_write_after_own_commit_is_not_a_new_trusted_baseline(service, 
 
 @pytest.mark.parametrize("component", ["database", "wal"])
 @pytest.mark.parametrize("timestamp", ["mtime", "ctime"])
-def test_same_size_file_timestamp_change_invalidates_verified_state(service, monkeypatch, component, timestamp):
+def test_same_size_file_timestamp_change_keeps_verified_state_under_checkpoint_ruling(service, monkeypatch, component, timestamp):
     commits, publication, expected, calls = warm(service, monkeypatch)
     path = service.store.db_path if component == "database" else service.store.db_path.with_name("realm.sqlite3-wal")
     before = path.stat()
@@ -271,9 +271,39 @@ def test_same_size_file_timestamp_change_invalidates_verified_state(service, mon
         assert path.stat().st_mtime_ns == before.st_mtime_ns
         assert path.stat().st_ctime_ns != before.st_ctime_ns
     assert path.stat().st_size == before.st_size
+    # Lead ruling, 21 Nov, R14-INT-WAL: checkpoint metadata is not an input change.
     assert commits._store_version() != version
     assert commits.history_entry(service.test_project, "main", publication) == expected
-    assert calls[publication] == 2
+    assert calls[publication] == 1
+
+
+def test_external_commit_in_outer_snapshot_with_reused_wal_refuses_cached_read(service, monkeypatch):
+    commits, publication, expected, calls = warm(service, monkeypatch)
+    connection = service.store.conn
+    database = service.store.db_path
+    wal = Path(str(database) + "-wal")
+    # Prebackfill the existing WAL, leaving its allocation available for reuse.
+    busy, frames, backfilled = connection.execute("PRAGMA wal_checkpoint(RESTART)").fetchone()
+    assert busy == 0 and frames == backfilled
+    wal_size = wal.stat().st_size
+    assert wal_size > 0
+    assert commits.history_entry(service.test_project, "main", publication) == expected
+    verified = calls[publication]
+    with pytest.raises(HeadBusyError):
+        with commits.verification_scope(), commits._read_transaction():
+            version = connection.execute("PRAGMA data_version").fetchone()[0]
+            with closing(sqlite3.connect(database, timeout=5, isolation_level=None)) as writer:
+                writer.execute(
+                    "UPDATE timelines SET name = COALESCE(name, '') || ' committed' WHERE id = ?",
+                    ("main",),
+                )
+            assert wal.stat().st_size == wal_size, "external commit unexpectedly grew the preallocated WAL"
+            assert connection.execute("PRAGMA data_version").fetchone()[0] == version
+            assert commits.history_entry(service.test_project, "main", publication) == expected
+    assert connection.execute("PRAGMA data_version").fetchone()[0] != version
+    assert calls[publication] == verified
+    assert not any(commits._history_state.values())
+    assert not connection.in_transaction
 
 
 def test_every_cached_read_checks_after_begin_and_across_threads(service, monkeypatch):
