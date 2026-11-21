@@ -113,14 +113,17 @@ def test_sqlite_file_replacement_during_snapshot_is_refused(tmp_path, suffix):
         connection = commits._connection
         target = Path(str(store.db_path) + suffix)
         replacement = tmp_path / "replacement"
-        with pytest.raises(ProtocolError, match="identity changed during a transaction"):
+        # Either the store refuses the swapped file, or (Windows) the platform
+        # refuses to replace an open SQLite file; neither lets the read finish.
+        with pytest.raises((ProtocolError, PermissionError)) as refused:
             with commits.verification_scope(), commits._read_transaction():
                 connection.execute("SELECT name FROM sqlite_master ORDER BY name LIMIT 1").fetchone()
                 shutil.copyfile(target, replacement)
-                try:
-                    replacement.replace(target)
-                except PermissionError as exc:
-                    pytest.skip(f"platform does not permit replacing an open SQLite database: {exc}")
+                replacement.replace(target)
+        if isinstance(refused.value, PermissionError):
+            assert os.name == "nt", refused.value
+        else:
+            assert "identity changed during a transaction" in str(refused.value)
         assert not any(commits._history_state.values())
         assert not connection.in_transaction
     finally:

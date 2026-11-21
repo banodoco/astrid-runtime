@@ -92,10 +92,14 @@ def _same_store_version(before, after, *, allow_checkpoint=False):
     return True
 
 
-def _head_busy(site, moved):
+def _head_busy(site, moved, error=HeadBusyError):
     """The retryable refusal for inputs that moved while a request verified them."""
     _LOGGER.warning("accepted commit inputs changed during verification at %s: moved %s", site, moved)
-    return HeadBusyError("accepted commit inputs changed during verification")
+    return error("accepted commit inputs changed during verification")
+
+
+class _PostReadMovement(HeadBusyError):
+    """Counters moved after a read-owned snapshot was released."""
 
 
 def request_identity(context):
@@ -225,8 +229,17 @@ def _evaluation(method):
                     with self.verification_scope():
                         return evaluate(self, *args, **kwargs)
                 if method.__name__ != "accept" and not self._reading:
-                    with self._read_transaction():
-                        return evaluate(self, *args, **kwargs)
+                    try:
+                        with self._read_transaction():
+                            return evaluate(self, *args, **kwargs)
+                    except _PostReadMovement:
+                        # Never return the first result or reuse its proofs.
+                        self._discard_read_attempt()
+                    try:
+                        with self._read_transaction():
+                            return evaluate(self, *args, **kwargs)
+                    except _PostReadMovement as exc:
+                        raise HeadBusyError(*exc.args) from None
                 self._sync_replay_memo()
                 boundary = self._history_inputs is None
                 current = self._verification.current
@@ -533,21 +546,30 @@ class TimelineCommitStore:
             finally:
                 self._read_version_pin = None
 
+    def _discard_read_attempt(self):
+        """Drop every proof and confirmation from the refused snapshot."""
+        self.clear_replay_memo()
+        current = self._verification.current
+        current["verified"].clear()
+        current["physical"].clear()
+
     def _check_history_version(self, *, version=None, after_read=False):
         before = self._read_version_pin or self._replay_store_version
         after = self._store_version() if version is None else version
         if not _same_store_version(before, after, allow_checkpoint=True):
-            old_wal, new_wal = before[3][1] if before is not None else None, after[3][1]
-            if (after_read and old_wal is not None and new_wal is not None
-                    and old_wal[2] > new_wal[2] == 0
-                    and _same_store_version(before, (*after[:2], before[2], *after[3:]),
-                                            allow_checkpoint=True)):
-                # TRUNCATE can advance SQLite's pager data_version even when
-                # rows are unchanged. The snapshot is usable, but that counter
-                # change cannot establish a new baseline for any saved proof.
-                self.clear_replay_memo()
-            else:
-                raise _head_busy("version-check", _moved_components(before, after))
+            # Only counter movement can trigger a fresh read. The unchanged
+            # identity and file bounds still guard against replacement or DB
+            # shrink; WAL shrink is permitted only for a complete TRUNCATE.
+            old_wal = before[3][1] if before is not None else None
+            new_wal = after[3][1]
+            counters_only = (before is not None and before[1:3] != after[1:3]
+                             and _same_store_version(before, (after[0], *before[1:3], *after[3:]),
+                                                     allow_checkpoint=True)
+                             and (old_wal is None or new_wal is None
+                                  or new_wal[2] >= old_wal[2] or new_wal[2] == 0))
+            raise _head_busy("post-read" if after_read else "version-check",
+                             _moved_components(before, after),
+                             _PostReadMovement if after_read and counters_only else HeadBusyError)
         if after_read:
             self._replay_store_version = after
 
