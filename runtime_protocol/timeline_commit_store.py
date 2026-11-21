@@ -488,17 +488,13 @@ class TimelineCommitStore:
         before = self._read_version_pin or self._replay_store_version
         after = self._store_version() if version is None else version
         if not _same_store_version(before, after, allow_checkpoint=True):
-            old_wal, new_wal = before[3][1] if before is not None else None, after[3][1]
-            if (after_read and old_wal is not None and new_wal is not None
-                    and old_wal[2] > new_wal[2] == 0
-                    and _same_store_version(before, (*after[:2], before[2], *after[3:]),
-                                            allow_checkpoint=True)):
-                # TRUNCATE can advance SQLite's pager data_version even when
-                # rows are unchanged. The snapshot is usable, but that counter
-                # change cannot establish a new baseline for any saved proof.
-                self.clear_replay_memo()
-            else:
-                raise _head_busy("version-check", _moved_components(before, after))
+            # Fail closed. Once the snapshot is released, another connection
+            # can commit and then TRUNCATE-checkpoint before this final sample,
+            # so changed counters can never be read as checkpoint-only: the
+            # result was built from the pinned snapshot and must not be
+            # returned. The checkpoint allowance covers file metadata alone,
+            # with data_version and total_changes unchanged.
+            raise _head_busy("version-check", _moved_components(before, after))
         if after_read:
             self._replay_store_version = after
 

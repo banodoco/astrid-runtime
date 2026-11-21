@@ -260,7 +260,12 @@ def test_external_write_after_own_commit_is_not_a_new_trusted_baseline(service, 
 
 @pytest.mark.parametrize("component", ["database", "wal"])
 @pytest.mark.parametrize("timestamp", ["mtime", "ctime"])
-def test_same_size_file_timestamp_change_keeps_verified_state_under_checkpoint_ruling(service, monkeypatch, component, timestamp):
+def test_same_size_file_timestamp_change_invalidates_verified_state(service, monkeypatch, component, timestamp):
+    """A same-size DB/WAL timestamp change is checkpoint metadata, not an input change.
+
+    Under the Lead's 21 Nov checkpoint ruling (R14-INT-WAL), a same-size
+    timestamp-only change keeps verified state; the name and IDs are historical.
+    """
     commits, publication, expected, calls = warm(service, monkeypatch)
     path = service.store.db_path if component == "database" else service.store.db_path.with_name("realm.sqlite3-wal")
     before = path.stat()
@@ -275,6 +280,46 @@ def test_same_size_file_timestamp_change_keeps_verified_state_under_checkpoint_r
     assert commits._store_version() != version
     assert commits.history_entry(service.test_project, "main", publication) == expected
     assert calls[publication] == 1
+
+
+def test_external_commit_then_truncate_checkpoint_before_final_sample_refuses_cached_read(service, monkeypatch):
+    """A commit plus TRUNCATE between the snapshot's end and the final sample fails closed.
+
+    The checkpoint leaves only file metadata that the allowance accepts, but the
+    commit moved data_version, so the cached head built from the old snapshot
+    must not be returned.
+    """
+    commits, publication, expected, calls = warm(service, monkeypatch)
+    connection = service.store.conn
+    database = service.store.db_path
+    wal = Path(str(database) + "-wal")
+    assert commits.history_entry(service.test_project, "main", publication) == expected
+    verified = calls[publication]
+    assert wal.stat().st_size > 0
+    version = connection.execute("PRAGMA data_version").fetchone()[0]
+    sample = commits._store_version
+    raced = []
+
+    def sample_after_race():
+        if not connection.in_transaction and commits._read_version_pin is not None and not raced:
+            # The snapshot is released; the final sample is next.
+            with closing(sqlite3.connect(database, timeout=5, isolation_level=None)) as writer:
+                writer.execute(
+                    "UPDATE timelines SET name = COALESCE(name, '') || ' committed' WHERE id = ?",
+                    ("main",),
+                )
+                raced.append(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+            assert wal.stat().st_size == 0
+        return sample()
+
+    monkeypatch.setattr(commits, "_store_version", sample_after_race)
+    with pytest.raises(HeadBusyError):
+        commits.history_entry(service.test_project, "main", publication)
+    assert len(raced) == 1 and raced[0][0] == 0
+    assert connection.execute("PRAGMA data_version").fetchone()[0] != version
+    assert calls[publication] == verified
+    assert not any(commits._history_state.values())
+    assert not connection.in_transaction
 
 
 def test_external_commit_in_outer_snapshot_with_reused_wal_refuses_cached_read(service, monkeypatch):
