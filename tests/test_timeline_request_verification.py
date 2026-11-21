@@ -194,15 +194,13 @@ def test_nested_public_history_api_has_fresh_scope(service, monkeypatch):
         assert list(calls.values()) == [1]
 
 
-def test_unrelated_store_write_keeps_successful_replay(service, monkeypatch):
+def test_store_write_outside_accept_discards_successful_replay(service, monkeypatch):
     commits, publication, calls = accepted(service, monkeypatch)
     expected = read(service, commits, publication)
     assert commits._replay_memo
-    # An unrelated write by this Runtime changes nothing a proof consumed; a
-    # write that does is covered in tests/test_timeline_commit_ancestry.py.
     service.create_timeline(service.test_project, "another", idempotency_key="another")
     assert read(service, commits, publication) == expected
-    assert list(calls.values()) == [1]
+    assert list(calls.values()) == [2]
 
 
 def test_public_authorization_refusal_discards_successful_replay(service, monkeypatch):
