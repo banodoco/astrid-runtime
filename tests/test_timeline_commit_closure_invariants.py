@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import shutil
+import sqlite3
 import subprocess
 import sys
 
@@ -221,23 +224,60 @@ def test_warm_history_still_rejects_changed_cas(closure, tmp_path, mutation):
     assert not any(commits._history_state.values())
 
 
-@pytest.mark.xfail(strict=True, reason="banodoco/astrid-dev#1222: Plan 59's verify-once design trusts _read_object; open whether a pinned read can return unverified bytes")
-def test_descriptor_reader_does_not_inherit_live_cas_proofs(closure, monkeypatch):
-    service, commits, project, _, item, accepted = closure
-    from runtime_protocol.errors import ProtocolError
+def test_descriptor_reader_does_not_inherit_live_cas_proofs(closure, monkeypatch, tmp_path):
+    from runtime_protocol import backup
+    from runtime_protocol.cas import ContentAddressedStore
+    from runtime_protocol.errors import ConflictError
+    from runtime_protocol.store import RealmStore
+    from runtime_protocol.timeline_commit_store import TimelineCommitStore
 
+    service, commits, project, _, item, accepted = closure
     publication = accepted["receipt"]["receipt_id"]
-    commits.history_entry(project, "main", publication)
-    object_id = item["media_id"].removeprefix("sha256:")
-    original = service.cas.read(object_id)
-    damaged = bytes([original[0] ^ 1]) + original[1:]
-    monkeypatch.setattr(service.store, "_read_cas_object",
-                        lambda value: damaged if value == object_id else service.cas.read(value), raising=False)
+    expected = commits.history_entry(project, "main", publication)
+    expected_closure = commits.revision_closure(project, "main", "parent-v1")
     before = snapshot(service)
-    with pytest.raises(ProtocolError, match="object changed"):
-        commits.history_entry(project, "main", publication)
+    object_id = item["media_id"].removeprefix("sha256:")
+    root = tmp_path / "consolidated"
+    root.mkdir()
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        service.store.conn.backup(connection)
+    shutil.copytree(service.store.cas_root, root / "cas" / "sha256")
+    path = root / "cas" / "sha256" / object_id[:2] / object_id[2:]
+    verified = {}
+    original = ContentAddressedStore(root / "cas" / "sha256").read(object_id, verified=verified)
+    assert object_id in verified
+
+    def inspect_history(inspector, **kwargs):
+        inspector.verified_cas = verified
+        reader = inspector._read_cas_object
+        reads = []
+
+        def observed_reader(value):
+            reads.append(value)
+            return reader(value)
+
+        inspector._read_cas_object = observed_reader
+        history = TimelineCommitStore(inspector, validate_prepared=None)
+        assert history.history_entry(project, "main", publication) == expected
+        assert history.revision_closure(project, "main", "parent-v1") == expected_closure
+        assert object_id in reads  # The matching live-style proof cannot skip the pinned reader.
+        assert object_id in history._history_state["objects"]
+        changes = inspector.conn.total_changes
+        path.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        with pytest.raises(ConflictError, match="hash verification"):
+            history.history_entry(project, "main", publication)
+        assert not any(history._history_state.values())
+        assert inspector.conn.total_changes == changes
+        return {"ok": True}
+
+    monkeypatch.setattr(RealmStore, "integrity_report", inspect_history)
+    root_fd = backup.open_directory_chain(root)
+    try:
+        report, _ = backup._inspect_consolidated_realm(root_fd)
+        assert report["ok"]
+    finally:
+        os.close(root_fd)
     assert snapshot(service) == before
-    assert not any(commits._history_state.values())
 
 
 @pytest.mark.parametrize("tamper,reason", [
