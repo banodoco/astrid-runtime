@@ -1031,9 +1031,11 @@ class MediaReads:
                                      "metadata": _media_metadata(generation_metadata)},
                       "variant": {"variant_type": row["variant_type"], "metadata": _media_metadata(variant_metadata)},
                       "entry": entry}
+            # The generation ID is global. Find the settlement before checking
+            # its project so a corrupt scope cannot hide a generated output.
             associations = self.store.conn.execute(
-                "SELECT association_id FROM managed_output_associations WHERE project_id=? AND generation_id=? AND object_digest=?",
-                (project_id, selection["generation_id"], row["object_digest"]),
+                "SELECT association_id FROM managed_output_associations WHERE generation_id=? AND object_digest=?",
+                (selection["generation_id"], row["object_digest"]),
             ).fetchall()
             matched = [self.store.get_managed_output(item["association_id"]) for item in associations]
             matched = [item for item in matched if self._variant_matches(item, variant_metadata)]
