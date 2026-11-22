@@ -47,7 +47,7 @@ def command(op, select, args):
 
 def test_exact_frozen_schema_and_operation_inventory_are_packaged():
     raw = (ROOT / "contract/schemas/edit-command.json").read_bytes()
-    assert hashlib.sha256(raw).hexdigest() == "1c20249fc9551da9b85c0b98f4e6ab758af50e026f3cfa918150291fa7e0f3e8"
+    assert hashlib.sha256(raw).hexdigest() == "66b2990f50c6e6b4adf6ba7d80971b5076f1f557515cdd0f77e394cdaaaa74b7"
     schema = json.loads(raw)
     assert len(schema["$defs"]) == 58
     assert len(schema["$defs"]["EditCommand"]["allOf"]) == 30
@@ -66,6 +66,21 @@ def test_all_registered_operations_keep_args_and_refuse_unknown_keys(op, select,
     value["args"]["unknown"] = None
     with pytest.raises(ValidationError):
         validate_commit_value(value, "EditCommand")
+
+
+@pytest.mark.parametrize("placement,valid", [("place", True), ("other", False), (None, False), (True, False)])
+def test_clip_set_element_optional_placement_marker(placement, valid):
+    args = {"elementRef": {"id": "element", "kind": "component", "revision": "r"}}
+    validate_commit_value(command("clip.set-element", "parent/clip:c", args), "EditCommand")
+    args["placement"] = placement
+    if valid:
+        validate_commit_value(command("clip.set-element", "parent/clip:c", args), "EditCommand")
+        args["unknown"] = None
+        with pytest.raises(ValidationError):
+            validate_commit_value(command("clip.set-element", "parent/clip:c", args), "EditCommand")
+    else:
+        with pytest.raises(ValidationError):
+            validate_commit_value(command("clip.set-element", "parent/clip:c", args), "EditCommand")
 
 
 @pytest.mark.parametrize("op", ["placement.create", "occurrence.add-media"])
