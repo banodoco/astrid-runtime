@@ -16,7 +16,7 @@ import sqlite3
 import sys
 import threading
 from collections import deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 from typing import cast
 
@@ -323,7 +323,7 @@ class _HistoryReadInputs:
 
 
 class TimelineCommitStore:
-    def __init__(self, store, *, validate_prepared, validate_event=None):
+    def __init__(self, store, *, validate_prepared, validate_event=None, snapshot_version=None):
         self.store = store
         # Validation uses the wire worker's authoritative schema, including
         # Agent-owned leaves. It must raise on invalid data, never normalize it.
@@ -335,11 +335,15 @@ class TimelineCommitStore:
         self._replay_store_version = None
         self._history_state = {}
         self._connection = self.store.conn
+        self._snapshot_version = snapshot_version
         self._reading = False
         self._read_version_pin = None
         self._acceptance_transaction = False
-        value = os.stat(self.store.db_path)
-        self._database_identity = (value.st_dev, value.st_ino)
+        if snapshot_version is None:
+            value = os.stat(self.store.db_path)
+            self._database_identity = (value.st_dev, value.st_ino)
+        else:
+            self._database_identity = snapshot_version[3][0][:2]
         self._wal_identity = None
         self.clear_replay_memo()
 
@@ -429,7 +433,14 @@ class TimelineCommitStore:
             self._replay_store_version = None
             self.clear_replay_memo()
 
-    def _store_version(self):
+    def _store_version(self, *, allow_reopen=True):
+        if self._snapshot_version is not None:
+            # The live connection samples bracket this already-pinned reader.
+            # SQLite and file counters can move outside this snapshot while it
+            # runs. Only the live final fence can authorize publication.
+            if not self.store.conn.in_transaction:
+                raise ProtocolError("timeline read snapshot is no longer pinned")
+            return self._snapshot_version
         # data_version is meaningful only on the same live connection. The
         # RealmStore mutex also serializes its use across request threads.
         files, package_owner = self._physical_version()
@@ -437,6 +448,8 @@ class TimelineCommitStore:
         database_changed = files[0] is None or files[0][:2] != self._database_identity
         wal_changed = self._wal_identity is not None and (files[1] is None or files[1][:2] != self._wal_identity)
         if connection_changed or database_changed or wal_changed:
+            if not allow_reopen:
+                raise _head_busy("isolated-read storage", "connection, database or WAL identity", _PostReadMovement)
             self._reestablish_connection()
             files, package_owner = self._physical_version()
         if files[0] is None:
@@ -488,7 +501,7 @@ class TimelineCommitStore:
                     self._reading = False
                     if owned:
                         connection.rollback()
-                    elif not self._acceptance_transaction:
+                    elif not self._acceptance_transaction and self._snapshot_version is None:
                         # An unrelated caller transaction may still roll back.
                         # Its provisional rows cannot become retained proofs.
                         self.clear_replay_memo()
@@ -1185,6 +1198,112 @@ class TimelineCommitStore:
                    "project_id": project_id, "project_seq": [row["first_project_seq"], row["last_project_seq"]],
                    "event_ids": json.loads(row["event_ids_json"]), "result": data, "created_at": row["created_at"]}
         return detached({"data": data, "receipt": receipt})
+
+    @staticmethod
+    def _public_head(connection, project_id, timeline_id):
+        row = connection.execute(
+            "SELECT revision_id, publication_id FROM parent_composition_heads "
+            "WHERE project_id=? AND timeline_id=?", (project_id, timeline_id),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def read_isolated(self, project_id, timeline_id, *, prepare, authorize, read):
+        # As with the live verifier, one movement can be reread. A failed
+        # attempt never shares its semantic or physical proofs.
+        try:
+            return self._read_isolated(project_id, timeline_id, prepare, authorize, read)
+        except _PostReadMovement:
+            pass
+        try:
+            return self._read_isolated(project_id, timeline_id, prepare, authorize, read)
+        except _PostReadMovement as exc:
+            raise HeadBusyError(*exc.args) from None
+
+    def _read_isolated(self, project_id, timeline_id, prepare, authorize, read):
+        from .store import TimelineReadSnapshot
+
+        with ExitStack() as snapshot:
+            with self.store._mutex:
+                prepare()
+                version = self._store_version()
+                live_connection = self.store.conn
+                owner = self.store._lock_file
+                if owner is None:
+                    raise ProtocolError("accepted commit storage is closed; reopen required")
+                if live_connection.in_transaction:
+                    raise HeadBusyError("timeline read requires a committed view")
+                expected = self._public_head(live_connection, project_id, timeline_id)
+                # The owned live verifier already distinguishes protection
+                # suitable for a full replay from protection suitable for
+                # sharing memo. Keep that policy for the isolated read too.
+                connection = snapshot.enter_context(self.store._read_snapshot(owner_only=False))
+                # BEGIN is deferred. This SELECT pins the committed snapshot
+                # before either the live mutex or the initial SQL fence ends.
+                observed = self._public_head(connection, project_id, timeline_id)
+                pinned_at = self._store_version(allow_reopen=False)
+                if not _same_store_version(version, pinned_at, allow_checkpoint=True) or observed != expected:
+                    raise _head_busy("isolated-read pin", _moved_components(version, pinned_at), _PostReadMovement)
+
+                if not _same_store_version(self._replay_store_version, version) or self._memo_failure(version):
+                    self.clear_replay_memo()
+                generation = self._replay_generation
+                reader = TimelineCommitStore(
+                    TimelineReadSnapshot(self.store, connection),
+                    validate_prepared=self.validate_prepared, validate_event=self.validate_event,
+                    snapshot_version=version,
+                )
+                reader._replay_store_version = version
+                reader._replay_memo = self._replay_memo.copy()
+                reader._history_state = {name: values.copy() for name, values in self._history_state.items()}
+                # Event prefix lists are the only retained values updated in
+                # place. All other cached values are read-only or replaced.
+                reader._history_state["events"] = {
+                    key: events.copy() for key, events in self._history_state["events"].items()
+                }
+
+            with reader.verification_scope(), reader.history_read_scope():
+                result = read(reader)
+            # Release the SQLite snapshot before reading the live counters.
+            snapshot.close()
+
+            with self.store._mutex:
+                if self.store.conn is not live_connection or self.store._lock_file != owner:
+                    raise _head_busy("isolated-read final", "connection or realm owner", _PostReadMovement)
+                authorize()
+                current = self._public_head(live_connection, project_id, timeline_id)
+                # Never hash under the live mutex. The isolated verifier used
+                # the usual digest checks; now require those same files to be
+                # present at the confirmed identities.
+                for object_id in reader._history_state["objects"]:
+                    # Only a proof actually observed by this reader suffices.
+                    identity = reader.store.verified_cas[object_id] if object_id in reader.store.verified_cas else None
+                    if identity is None or reader._cas().current_identity(object_id) != identity:
+                        raise _head_busy("isolated-read final", "verified CAS object")
+                actual = self._store_version(allow_reopen=False)
+                if (not _same_store_version(version, actual, allow_checkpoint=True)
+                        or current != expected or generation != self._replay_generation):
+                    raise _head_busy("isolated-read final", _moved_components(version, actual), _PostReadMovement)
+                if self._memo_failure(actual) is None:
+                    self._replay_memo = reader._replay_memo
+                    self._history_state = reader._history_state
+                    self._replay_store_version = actual
+                self.store.verified_cas.update(reader.store.verified_cas)
+                return result
+
+    def verified_head(self, project_id, timeline_id, *, verify_selections):
+        head, entry = self._head_entry(project_id, timeline_id)
+        document = self.revision_closure(project_id, timeline_id, head["revision_id"])
+        if entry["intent"] == "recorded" and document != entry["receipt"]["result"]["canonical_document"]:
+            reject("history_unavailable", "canonical film differs from accepted publication",
+                   diagnostic_reason="store_head_canonical_mismatch")
+        verify_selections(document)
+        return {"project_id": project_id, "timeline_id": timeline_id, "head": head,
+                "canonical_document": document}
+
+    def _verify_selection_object(self, digest, size, *, label):
+        actual, _ = self._history_object_value(digest)
+        if size != actual:
+            raise ConflictError(f"{label} size does not match catalog metadata")
 
     @_evaluation
     def head(self, project_id, timeline_id):

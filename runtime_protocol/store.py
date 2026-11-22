@@ -1175,7 +1175,7 @@ class RealmStore:
             os.close(descriptor)
 
     @contextmanager
-    def _read_snapshot(self):
+    def _read_snapshot(self, *, owner_only=True):
         """Read committed identity state without waiting on a busy writer."""
         primary = self.conn
         if primary is None:
@@ -1187,7 +1187,7 @@ class RealmStore:
             raise OSError("realm root is unavailable")
         if not stat.S_ISREG(self.db_path.lstat().st_mode):
             raise OSError("realm database must be an ordinary file")
-        if not platform.is_owner_only(self.db_path):
+        if owner_only and not platform.is_owner_only(self.db_path):
             raise PermissionError("realm database must retain owner-only permissions")
         connection = sqlite3.connect(sqlite_file_uri(self.db_path), uri=True, isolation_level=None)
         connection.row_factory = sqlite3.Row
@@ -7736,3 +7736,36 @@ class RealmStore:
             return {"status": "ready" if not issues else "invalid", "ok": not issues, "issues": issues, "path": str(activation_path)}
         except (OSError, StopIteration, json.JSONDecodeError):
             return {"status": "invalid", "ok": False, "issues": ["activation_missing"]}
+
+
+class _SnapshotObjectIdentities(dict):
+    """Keep exact identities consumed by this read without copying the live CAS index."""
+
+    def __init__(self, retained):
+        super().__init__()
+        self._retained = retained
+
+    def get(self, key, default=None):
+        if key not in self:
+            retained = self._retained.get(key)
+            if retained is not None:
+                self[key] = retained
+        return super().get(key, default)
+
+
+class TimelineReadSnapshot:
+    """Query-only store view for the timeline verifier and retained media reads."""
+
+    def __init__(self, live, connection):
+        self.conn = connection
+        self.db_path = live.db_path
+        self.cas_root = live.cas_root
+        self._mutex = threading.RLock()
+        self.verified_cas = _SnapshotObjectIdentities(live.verified_cas)
+
+    get_project = RealmStore.get_project
+    get_managed_output = RealmStore.get_managed_output
+    _project = RealmStore._project
+    _managed_output_value = RealmStore._managed_output_value
+    _managed_output_select = staticmethod(RealmStore._managed_output_select)
+    _generation_publish_output_key = staticmethod(RealmStore._generation_publish_output_key)

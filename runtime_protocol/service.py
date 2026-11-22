@@ -46,6 +46,7 @@ from collections.abc import Mapping
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote
 from .errors import RuntimeErrorBase, AuthorizationError, ForbiddenError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError, RetiredRouteError
 from .errors import VerificationReceiptMissingError, CandidateNotVerifiedError, VerificationDigestMismatchError
@@ -65,6 +66,7 @@ MEDIA_IMPORT_CAPABILITY = "runtime.media.import.v1"
 MEDIA_IMPORT_EXECUTOR = "runtime-host-media-import"
 MEDIA_IMPORT_CAPABILITY_DIGEST = "sha256:" + hashlib.sha256(MEDIA_IMPORT_CAPABILITY.encode()).hexdigest()
 TARGETED_EXECUTION_BINDING_CAPABILITY = "execution_binding.targeted.v1"
+VERIFIED_TIMELINE_HEAD_CAPABILITY = "timeline.verified_head.v1"
 QUALIFIED_REMOTE_CAPABILITY = "h3_av.transform"
 PLACEMENT_RECOVERY_SCHEMA_VERSION = 1
 PLACEMENT_LOSS_EVIDENCE_MAX_AGE_SECONDS = 15 * 60
@@ -1036,7 +1038,7 @@ class RuntimeService:
         excess = sorted(set(requested) - negotiated)
         if excess:
             raise AuthorizationError("credential cannot negotiate requested scopes", details={"scopes": excess})
-        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY, "rendering.render.historical_revision.v1"]}
+        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY, "rendering.render.historical_revision.v1", VERIFIED_TIMELINE_HEAD_CAPABILITY]}
 
     @staticmethod
     def _assert_executor_identity(identity, executor_id):
@@ -3192,14 +3194,16 @@ class RuntimeService:
             finally:
                 self._registering_v33_provider = False
 
-    def _verify_legacy_media_selections(self, document):
+    def _verify_legacy_media_selections(self, document, *, media_reads=None):
         """Recheck explicit retained five-field pins without rewriting them."""
         from .timeline_commit_port import MediaReads
+        media_reads = MediaReads(self) if media_reads is None else media_reads
+
         def verify(value):
             if isinstance(value, dict):
                 if set(value) == {"asset", "generation_id", "variant_id", "object_id", "catalog_digest"}:
                     try:
-                        MediaReads(self).selected(document["project_id"], value, retained=True)
+                        media_reads.selected(document["project_id"], value, retained=True)
                     except (ConflictError, ValidationError, NotFoundError) as exc:
                         raise ConflictError("Timeline is read-only because a retained media selection changed. Inspect/export the original or restore the matching backup.",
                             details={"reason": "history_unavailable", "integrity_reason": "retained_media_selection_changed", "input": value}) from exc
@@ -3451,20 +3455,44 @@ class RuntimeService:
     @_clear_replay_on_refusal
     def list_timeline_commits(self, project_id, timeline_id, *, cursor=None,
                               limit=PAGE_DEFAULT_LIMIT, authorize):
-        from .timeline_commit import CommitRejected
-        from .timeline_commit_port import public_failure
         # The public HTTP query is text, while the commit store deliberately
         # accepts only an already-validated integer.  Keep cursor validation
         # and fixed-head binding in the commit store; this call only normalizes
         # the independent public limit argument.
         limit, _ = _page_args(None, limit)
+        return self._read_timeline_commits(
+            project_id, timeline_id, authorize,
+            lambda reader: reader._read_history(project_id, timeline_id, cursor=cursor, limit=limit),
+        )
+
+    @_clear_replay_on_refusal
+    def get_timeline_verified_head(self, project_id, timeline_id, *, authorize):
+        from .timeline_commit_port import MediaReads
+
+        def read(reader):
+            media = MediaReads(SimpleNamespace(
+                store=reader.store, realm=self.realm, cas=self.cas,
+                _verify_child_object_bytes=reader._verify_selection_object,
+            ))
+            return reader.verified_head(
+                project_id, timeline_id,
+                verify_selections=lambda document: self._verify_legacy_media_selections(document, media_reads=media),
+            )
+
+        return self._read_timeline_commits(project_id, timeline_id, authorize, read)
+
+    def _read_timeline_commits(self, project_id, timeline_id, authorize, read):
+        from .timeline_commit import CommitRejected
+        from .timeline_commit_port import public_failure
+
         check = self._timeline_authorize(project_id, timeline_id, authorize, mutation=False)
         commits, _ = self._timeline_commits()
         try:
-            with commits.verification_scope(), self.store._mutex:
-                check()
-                self._ensure_timeline_commit_baseline(commits, project_id, timeline_id, check)
-                return commits._read_history(project_id, timeline_id, cursor=cursor, limit=limit)
+            return commits.read_isolated(
+                project_id, timeline_id,
+                prepare=lambda: self._ensure_timeline_commit_baseline(commits, project_id, timeline_id, check),
+                authorize=check, read=read,
+            )
         except CommitRejected as exc:
             from .timeline_commit_execution import (
                 _emit_redacted_diagnostic,
