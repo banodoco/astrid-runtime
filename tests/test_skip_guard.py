@@ -61,6 +61,41 @@ def test_skip_mark_importorskip_and_xfail_fail_the_run(sandbox):
     ])
 
 
+@pytest.mark.parametrize("fixed", [False, True])
+def test_exact_declared_xfail_fails_when_the_gap_starts_passing(sandbox, fixed):
+    result = _run(sandbox, f"""
+        from datetime import date, timedelta
+        import pytest
+        from tests import lanes
+
+        declaration = lanes.DeclaredXfail(
+            name="synthetic-gap",
+            nodeids=("check_it.py::test_gap",),
+            reason="[declared-xfail:synthetic-gap] known error",
+            raises="builtins.RuntimeError",
+            issue="https://example.invalid/issues/1",
+            owner="test-owner",
+            expires=(date.today() + timedelta(days=1)).isoformat(),
+        )
+        lanes.DECLARED_XFAILS[declaration.name] = declaration
+
+        @pytest.mark.xfail(strict=True, raises=RuntimeError, reason=declaration.reason)
+        def test_gap():
+            if not {fixed!r}:
+                raise RuntimeError("known error")
+
+        def test_control():
+            pass
+        """)
+    if fixed:
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
+        result.assert_outcomes(failed=1, passed=1)
+        assert "[XPASS(strict)] [declared-xfail:synthetic-gap] known error" in result.stdout.str()
+    else:
+        assert result.ret == pytest.ExitCode.OK
+        result.assert_outcomes(xfailed=1, passed=1)
+
+
 @pytest.mark.parametrize("variant", ["new-node", "moved-function", "new-parameter", "changed-reason", "missing-reason"])
 def test_xfail_reason_does_not_authorize_a_different_node_or_contract(sandbox, variant):
     reason = lanes.DECLARED_XFAILS["runtime-domains-update"].reason
@@ -99,11 +134,6 @@ _PINNED_XFAILS = {
         ('tests/test_runtime_domains.py::test_generated_direct_timeline_shot_reference_writers_remain_retired',),
         'tests.test_runtime_domains._RetiredTimelineUpdate',
         '[declared-xfail:runtime-domains-update] direct timeline update writer remains retired',
-    ),
-    'runtime-exact-idempotency': (
-        ('tests/test_runtime_exact_idempotency.py::test_timeline_shot_and_reference_creation_are_keyed_durable_and_non_overwriting',),
-        'astrid_runtime_client.generated.ApiError',
-        '[declared-xfail:runtime-exact-idempotency] RT02 held: direct shot writes are retired (410); the reference half is the KEPT catalog (RK01)',
     ),
     'second-client-core': (
         ('tests/test_second_client_e2e.py::test_second_client_core_journey_is_executable',),

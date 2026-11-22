@@ -857,13 +857,33 @@ class RuntimeService:
         # and CAS walk. Health is called before every editor mutation, so it is
         # one cheap liveness read on a separate committed snapshot (WAL): it
         # never waits behind a commit. Only losing admission takes the mutex.
-        # ``identity_probe`` is kept for callers; both paths read the same way.
+        # Explicit identity probes must always verify the committed path.
         try:
             with self.store._read_snapshot() as connection:
                 row = connection.execute("SELECT id FROM realm LIMIT 1").fetchone()
                 live = row is not None and row[0] == self.realm["id"]
         except (sqlite3.DatabaseError, OSError, ValueError, TypeError):
             live = False
+            # A parent of the admitted realm may have been renamed while the
+            # primary handle remains live. Ordinary health historically checks
+            # that handle; do not permanently revoke admission just because a
+            # fresh pathname-based connection cannot reach it. Identity probes
+            # still fail closed, as do failures with an accessible realm root.
+            missing_root = False
+            if not identity_probe:
+                try:
+                    self.store.root.lstat()
+                except FileNotFoundError:
+                    missing_root = True
+                except OSError:
+                    pass
+            if missing_root:
+                with self.store._mutex:
+                    try:
+                        row = self.store.conn.execute("SELECT id FROM realm LIMIT 1").fetchone()
+                        live = row is not None and row[0] == self.realm["id"]
+                    except (sqlite3.DatabaseError, OSError, ValueError, TypeError, AttributeError):
+                        live = False
         if not live:
             with self.store._mutex:
                 self._verified = False

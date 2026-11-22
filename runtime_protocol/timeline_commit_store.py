@@ -52,7 +52,6 @@ def reject(reason, message=None, *, status=409, diagnostic_reason=None, safe_det
     raise error
 
 
-_SEQUENCE_QUERY = "SELECT next_seq FROM project_sequences WHERE project_id=?"
 _VERSION_PARTS = ("connection", "total_changes", "data_version", "files", "package_owner")
 
 
@@ -332,8 +331,6 @@ class TimelineCommitStore:
         self._replay_generation = 0
         self._replay_store_version = None
         self._history_state = {}
-        # Every SQL result a retained proof consumed: (query, parameters, method) -> rows.
-        self._retained_rows = {}
         self._connection = self.store.conn
         self._reading = False
         self._read_version_pin = None
@@ -342,59 +339,13 @@ class TimelineCommitStore:
         self._database_identity = (value.st_dev, value.st_ino)
         self._wal_identity = None
         self.clear_replay_memo()
-        # The store calls this after any other committed write (see _absorb_own_write).
-        self.store._after_commit = self._absorb_own_write
 
     def clear_replay_memo(self):
         with self.store._mutex:
             self._replay_memo.clear()
             self._history_state = {key: {} for key in
                                    ("records", "entries", "closures", "heads", "chains", "chain_tails", "events", "objects")}
-            self._retained_rows = {}
             self._replay_generation += 1
-
-    def _absorb_own_write(self):
-        """Keep verified history across an unrelated write by this Runtime.
-
-        Accepted history is immutable and each proof is valid for exactly the
-        SQL results and CAS bytes it consumed. After any other committed write
-        (a media import, say) proofs survive when no other process wrote (the
-        external-write counter, file identities and ownership are as sampled)
-        and every retained SQL result still reads back identically; otherwise
-        everything is discarded, as before. A new head then costs only its own
-        verification, not a replay of each entry the caller loads next.
-        """
-        with self.store._mutex:
-            if self._acceptance_transaction or getattr(self._verification, "current", None) is not None:
-                return
-            try:
-                version, previous = self._store_version(), self._replay_store_version
-                if previous is None or version == previous:
-                    return
-                if (self._memo_failure(version) is None and version[0] == previous[0]
-                        and version[2] == previous[2] and version[4] == previous[4]
-                        and all(old is None or (new is not None and old[:2] == new[:2] and old[-2:] == new[-2:])
-                                for old, new in zip(previous[3], version[3]))
-                        and self._retained_rows_unchanged()):
-                    self._history_state["heads"].clear()
-                    self._replay_store_version = version
-                else:
-                    self.clear_replay_memo()
-            except Exception:
-                self.clear_replay_memo()
-
-    def _retained_rows_unchanged(self):
-        for (query, parameters, method), expected in list(self._retained_rows.items()):
-            value = getattr(self.store.conn.execute(query, parameters), method)()
-            rows = [value] if method == "fetchone" else value
-            live = tuple(None if row is None else tuple(row) for row in rows)
-            if query == _SEQUENCE_QUERY:
-                # A proof only needs ``project_seq < next_seq``, and the counter only grows.
-                if live[0] is None or expected[0] is None or live[0][0] < expected[0][0]:
-                    return False
-            elif live != expected:
-                return False
-        return True
 
     def _physical_version(self):
         files = []
@@ -967,10 +918,6 @@ class TimelineCommitStore:
                 self._replay_memo.update(proofs)
                 for node, (ledger, history, _) in traversal["nodes"].items():
                     self._history_state["records"][node] = (dict(ledger), dict(history))
-                for key, snapshot in traversal["inputs"].rows.items():
-                    # A key already retained with other rows stays as first seen:
-                    # the recheck then fails and discards, never absorbs.
-                    self._retained_rows.setdefault(key, snapshot)
         except (KeyError, TypeError, ValueError, IndexError, ValidationError, CommitRejected) as exc:
             raise ProtocolError("accepted commit record is corrupt") from exc
         finally:
@@ -1023,7 +970,8 @@ class TimelineCommitStore:
             # Replay verifies the accepted prefix, independent of later writes.
             prefix = self._event_prefix(edge["project_id"], edge["timeline_id"], through=seq)
             valid = valid and isinstance(ids, list) and 0 < len(ids) <= seq <= len(prefix)
-            project_seq = self.conn.execute(_SEQUENCE_QUERY, (edge["project_id"],)).fetchone()
+            project_seq = self.conn.execute("SELECT next_seq FROM project_sequences WHERE project_id=?",
+                                            (edge["project_id"],)).fetchone()
             valid = valid and project_seq is not None and 0 < edge["project_seq"] < project_seq[0]
             valid = valid and ids == [str(e["id"]) for e in prefix[seq - len(ids):seq]]
             event = self.conn.execute("SELECT * FROM timeline_events WHERE id=? AND timeline_id=?",

@@ -20,7 +20,7 @@ def open_client(world):
     from astrid.sdk.timeline.commit import RuntimeCommitService
     from astrid_runtime_client import contract_metadata
 
-    assert contract_metadata.CONTRACT_VERSION == "0.2.14"
+    assert contract_metadata.CONTRACT_VERSION == "0.2.15"
     assert contract_metadata.SCHEMA_DIGEST == SCHEMA_DIGEST
     assert type(world.daemon.service._timeline_commit_provider) is RuntimeCommitService
     assert world.daemon.service._timeline_commit_provider.contract_digest == SCHEMA_DIGEST

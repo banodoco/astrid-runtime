@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -20,6 +19,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.errors import ConflictError, NotFoundError, RetiredRouteError, RuntimeErrorBase, ValidationError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.timeline_commit_port import CommitUnavailable
+from tests.astrid_checkout import astrid_checkout
 
 
 # Direct replace_timeline_clip is retired (ledger D04; refusal asserted in
@@ -91,18 +91,11 @@ def _service_fixture(tmp_path, *, clip_type: str | None = None):
 NATIVE_OWNER = "occurrence:native-occurrence"
 NATIVE_TARGET = NATIVE_OWNER + "/clip:native-clip"
 NATIVE_PARENT_TARGET = "parent/clip:native-parent-clip"
-_PREPARED_AGENT = Path(
-    "/tmp/claude-0/-home-user-repo/7dc61be1-7066-52e0-a5d0-94f90e61430a/"
-    "scratchpad/orch/workers/rt-m2-next-ordinary-official-prep/agent-final-source"
-)
 
 
 def _native_agent_source():
-    """Use the frozen ordinary Agent source when the integration runner lacks it."""
-    configured = Path(os.environ.get("ASTRID_CHECKOUT", ""))
-    source = configured if (configured / "astrid/sdk/timeline/native_occurrence_create.py").exists() else _PREPARED_AGENT
-    if not (source / "astrid/sdk/timeline/native_occurrence_create.py").exists():
-        pytest.fail("frozen ordinary Agent source is unavailable")
+    """Use the same explicit Agent checkout as the other integration fixtures."""
+    source = astrid_checkout()
     if str(source) not in sys.path:
         sys.path.insert(0, str(source))
     return source
