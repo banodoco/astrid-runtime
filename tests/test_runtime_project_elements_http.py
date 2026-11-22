@@ -194,6 +194,35 @@ def test_list_and_element_bytes_are_served_through_the_door(world, project):
     assert head.headers["content-length"] == str(len(compiled))
 
 
+def test_http_projection_authoring_commands_scope_named_collection(world, project):
+    service = world.daemon.service
+    default_bytes = compiled_bytes("default")
+    named_bytes = compiled_bytes("named")
+    publish(service, project, [admission(service, project,
+        ingest_snapshot(service, project, default_bytes), default_bytes)], "commands-default")
+
+    collection = "special_effects"
+    named = admission(service, project, ingest_snapshot(service, project, named_bytes), named_bytes)
+    named["descriptor"]["packId"] = collection
+    document_id = "document:" + str(uuid.uuid5(
+        uuid.NAMESPACE_URL, json.dumps([project, PROJECT_PACK_KIND, collection])))
+    content = {"schema": PROJECT_PACK_SCHEMA, "pack_id": collection, "source_binding_key": "project-packs",
+               "relative_manifest": f"{service.realm['id']}/{project}/packs/{collection}/pack.yaml",
+               "admissions": [named]}
+    service.create_document(project, {"document_id": document_id, "kind": PROJECT_PACK_KIND, "content": content},
+                            idempotency_key="commands-named")
+
+    response = world.call(list_path(project))
+    assert response.status == 200
+    projected = {item["packId"]: item for item in response.json()["projects"]}
+    default = projected[owner_id(service, project)]
+    expected_prefix = "python3 -m astrid.core.element.cli project-pack"
+    for verb, key in (("init", "initCommand"), ("admit", "admitCommand"), ("inspect", "inspectCommand")):
+        assert default[key] == f"{expected_prefix} {verb} --realm {service.realm['id']} --project {project}"
+        assert projected[collection][key] == (
+            f"{expected_prefix} {verb} --realm {service.realm['id']} --project {project} --collection {collection}")
+
+
 def test_door_refuses_foreign_origins_and_non_exact_routes(world, project):
     service = world.daemon.service
     compiled = compiled_bytes("b")

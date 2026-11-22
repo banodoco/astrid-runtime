@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 from runtime_protocol import v33_lifecycle as life, upgrade
-from runtime_protocol.errors import ConflictError, ValidationError, RuntimeErrorBase
+from runtime_protocol.errors import ConflictError, NotFoundError, ValidationError, RuntimeErrorBase
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 from runtime_protocol.util import canonical_json
@@ -784,6 +784,54 @@ service.close();print(json.dumps(accepted))
             service._verify_legacy_media_selections(document)
     finally:
         service.close()
+
+
+
+def test_V33_MEDIA_DIGEST_CONFLICT_NAMES_FIELDS(captures, tmp_path, caplog):
+    """A stale pin names what cannot match (names only) and logs one INFO line; a matching pin logs nothing."""
+    import logging
+    import threading
+    from runtime_protocol.cas import ContentAddressedStore
+    from runtime_protocol.timeline_commit_port import MediaReads
+    from runtime_protocol.timeline_commit_validation import digest as dg
+    root = tmp_path / "realm"
+    _, facts = copy_capture(captures,"R0",root)
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        metadata = {"provenance":{"origin":"imported"},"params":{"duration_seconds":1,"modality":"audio","model":"fixture"}}
+        connection.execute("INSERT INTO generations(id,project_id,type,status,metadata_json,version,created_at,updated_at) VALUES (?,?,'audio','completed',?,1,'t','t')",("g1",facts["project"],canonical_json(metadata)))
+        connection.execute("INSERT INTO generation_variants(id,generation_id,object_id,variant_type,metadata_json,created_at) VALUES (?,?,?,'original','{}','t')",("g1-variant","g1",facts["audio"].removeprefix('sha256:')))
+    with life.sqlite_observation(root) as copy:
+        connection=sqlite3.connect(copy / "realm.sqlite3"); connection.row_factory=sqlite3.Row
+        store=SimpleNamespace(conn=connection,_mutex=threading.RLock(),get_project=lambda p:dict(connection.execute("SELECT * FROM projects WHERE id=?",(p,)).fetchone()))
+        source=SimpleNamespace(store=store,realm={"id":facts["realm"]},cas=ContentAddressedStore(root/'cas/sha256'),_verify_child_object_bytes=lambda *a,**k:None)
+        reads=MediaReads(source)
+        pin=reads.selection(facts["project"],asset="g1",generation_id="g1",variant_id="g1-variant")
+        record=reads._selected_project_media(facts["project"],pin)
+        base={k:record[k] for k in ("realm_id","project_id","asset","generation_id","variant_id","object_id")}
+        def stale(**omit):
+            entry={k:v for k,v in record["entry"].items() if k not in omit}
+            return {**pin,"catalog_digest":dg({**base,"variant_type":record["variant"]["variant_type"],"entry":entry})}
+        try:
+            with caplog.at_level(logging.INFO,logger="runtime_protocol.timeline_commit_port"):
+                reads._selected_project_media(facts["project"],pin)
+                assert not caplog.records
+                with pytest.raises(ConflictError,match=r"^selected media catalog digest changed \(fields: size\)$") as refusal:
+                    reads._selected_project_media(facts["project"],stale(size=0))
+                assert refusal.value.details=={"fields":["size"]}
+                lines=[r.getMessage() for r in caplog.records]
+                assert len(lines)==1 and "fields=size" in lines[0]
+                for key in ("asset","generation_id","variant_id","object_id"): assert key+"="+pin[key] in lines[0]
+                assert record["entry"]["filename"] not in lines[0] if record["entry"].get("filename") else True
+                caplog.clear()
+                with pytest.raises(ConflictError,match=r"\(fields: facts: undetermined\)") as refusal:
+                    reads._selected_project_media(facts["project"],{**pin,"catalog_digest":"sha256:"+"0"*64})
+                assert refusal.value.details=={"fields":["facts: undetermined"]}
+                caplog.clear()
+                with pytest.raises(NotFoundError):
+                    reads._selected_project_media(facts["project"],{**pin,"variant_id":"wrong-variant"})
+                assert not caplog.records
+        finally:
+            connection.close()
 
 
 _ACCEPTED_CELLS = {(30,False,False,False),(31,True,False,False),(31,False,True,False),

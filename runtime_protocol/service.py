@@ -118,8 +118,15 @@ DISCOVERY_GRANT_CEILINGS = {
 PROJECT_ELEMENTS_PREFIX = "/api/runtime/packs/project-elements"
 
 
-def _project_pack_command(verb, realm, project_id):
-    return f"python3 -m astrid.core.element.cli project-pack {verb} --realm {realm} --project {project_id}"
+def _project_pack_command(verb, realm, project_id, pack_id=None, *, is_default=True):
+    command = f"python3 -m astrid.core.element.cli project-pack {verb} --realm {realm} --project {project_id}"
+    if not is_default:
+        command += f" --collection {pack_id}"
+    return command
+
+
+def _default_project_pack_id(realm, project_id):
+    return "project_" + hashlib.sha256(f"{realm}:{project_id}:default".encode()).hexdigest()[:20]
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
 MANAGED_COVERAGE_MODES = frozenset({"interval", "clips", "cuts", "shots"})
 MANAGED_COVERAGE_REASONS = frozenset({"interval", "before_cut", "after_cut", "clip_first", "shot_midpoint"})
@@ -5978,6 +5985,7 @@ class RuntimeService:
         entries, legacy = self._project_pack_elements(project_id)
         realm = self.realm["id"]
         projects = {}
+        default_pack_id = _default_project_pack_id(realm, project_id)
         elements = []
         for entry in entries:
             descriptor = entry["descriptor"]
@@ -5989,9 +5997,12 @@ class RuntimeService:
             projects.setdefault(entry["packId"], {
                 "projectId": project_id, "packId": entry["packId"], "packRoot": entry["authoring"]["packRoot"],
                 "status": "admitted",
-                "initCommand": _project_pack_command("init", realm, project_id),
-                "admitCommand": _project_pack_command("admit", realm, project_id),
-                "inspectCommand": _project_pack_command("inspect", realm, project_id),
+                "initCommand": _project_pack_command("init", realm, project_id, entry["packId"],
+                                                     is_default=entry["packId"] == default_pack_id),
+                "admitCommand": _project_pack_command("admit", realm, project_id, entry["packId"],
+                                                      is_default=entry["packId"] == default_pack_id),
+                "inspectCommand": _project_pack_command("inspect", realm, project_id, entry["packId"],
+                                                        is_default=entry["packId"] == default_pack_id),
             })
         selection = sha256_bytes(canonical_json({"projectId": project_id, "realmId": realm, "refs": [
             [e["ref"], e["digest"]] for e in elements]}).encode("utf-8"))
