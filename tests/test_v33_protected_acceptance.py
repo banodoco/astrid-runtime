@@ -42,7 +42,13 @@ def tree(root):
 
 
 def extract_executable(ref, destination):
-    raw = subprocess.check_output(["git", "archive", ref], cwd=REPO)
+    try:
+        raw = subprocess.check_output(["git", "archive", ref], cwd=REPO)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"cannot archive required commit {ref} from {REPO}; fetch this SHA "
+            f"or full history with `git -C {REPO} fetch origin {ref}`"
+        ) from exc
     destination.mkdir()
     with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
         archive.extractall(destination, filter="data")
@@ -706,6 +712,7 @@ def test_V33_V28_V29_SNAPSHOT_ORDER_AND_REPLAY(captures, tmp_path, family):
 
 
 def test_V33_EXISTING_PINS_AFFECTED_AND_UNAFFECTED(captures, tmp_path):
+    """A pin is affected only by an identity or byte change (Release 14 N1), never by metadata the migration rewrites."""
     import threading
     from runtime_protocol.cas import ContentAddressedStore
     from runtime_protocol.timeline_commit_port import MediaReads
@@ -714,7 +721,7 @@ def test_V33_EXISTING_PINS_AFFECTED_AND_UNAFFECTED(captures, tmp_path):
     original = {}
     # Explicit imported fixture rows use retained public-API-owned audio bytes.
     with sqlite3.connect(root / "realm.sqlite3") as connection:
-        for name in ("affected","unaffected"):
+        for name in ("affected","metadata-only","unaffected"):
             metadata = {"provenance":{"origin":"imported"},"params":{"duration_seconds":1,"modality":"audio","model":"fixture"}}
             if name == "unaffected": metadata["gen"] = {"kind":"audio","model":"fixture","origin":"imported"}
             connection.execute("INSERT INTO generations(id,project_id,type,status,metadata_json,version,created_at,updated_at) VALUES (?,?,'audio','completed',?,1,'t','t')",(name,facts["project"],canonical_json(metadata)))
@@ -727,7 +734,7 @@ def test_V33_EXISTING_PINS_AFFECTED_AND_UNAFFECTED(captures, tmp_path):
             data=(root/'cas/sha256'/digest[:2]/digest[2:]).read_bytes()
             assert len(data)==size and hashlib.sha256(data).hexdigest()==digest
         source=SimpleNamespace(store=store,realm={"id":facts["realm"]},cas=ContentAddressedStore(root/'cas/sha256'),_verify_child_object_bytes=verify_bytes)
-        for name in ("affected","unaffected"):
+        for name in ("affected","metadata-only","unaffected"):
             original[name]=MediaReads(source).selection(facts["project"],asset=name,generation_id=name,variant_id=name+'-variant')
         connection.close()
     preserved=canonical_json(original)
@@ -744,6 +751,10 @@ body['dependency_manifest']={'media':[{'media_id':pin['object_id'],'content_dige
 accepted=service.publish_parent_composition(project,'main',body,idempotency_key='original-pinned-publication')
 service.close();print(json.dumps(accepted))
 """,root,facts["project"],canonical_json(original["affected"]))
+    # "affected" changes identity after the pinned publication (its variant is no longer the one pinned);
+    # "metadata-only" is rewritten by the migration in metadata only and must keep verifying.
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        connection.execute("UPDATE generation_variants SET variant_type='upscaled' WHERE id='affected-variant'")
     migrate(root)
     service=RuntimeService(root)
     try:
@@ -764,6 +775,9 @@ service.close();print(json.dumps(accepted))
         from runtime_protocol.timeline_commit_port import route_path
         assert service.commit_timeline(facts["project"],"cuts",body,idempotency_key="unaffected-new-edit",publisher="editor",invocation_path=route_path(facts["project"],"cuts"),authorize=lambda:None)["data"]["status"] == "accepted"
         assert service.get_project_verified_media(facts["project"],original["unaffected"],authorize=lambda:None)["selection"]==original["unaffected"]
+        # The migration rewrote its metadata only; the pin still reads the same bytes and verifies unchanged.
+        assert "gen" in json.loads(service.store.conn.execute("SELECT metadata_json FROM generations WHERE id='metadata-only'").fetchone()[0])
+        assert service.get_project_verified_media(facts["project"],original["metadata-only"],authorize=lambda:None)["selection"]==original["metadata-only"]
         with pytest.raises(ConflictError,match="catalog digest changed"):
             service.get_project_verified_media(facts["project"],original["affected"],authorize=lambda:None)
         fresh=service.get_project_media_selection(facts["project"],{"asset":"affected","generation_id":"affected","variant_id":"affected-variant"},authorize=lambda:None)
