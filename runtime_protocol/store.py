@@ -1497,10 +1497,7 @@ class RealmStore:
             self.conn.execute(f"PRAGMA busy_timeout={old_timeout}")
 
     def _install_replay_checkpoint(self, checkpoint):
-        from .timeline_commit_store import TimelineCommitStore, _installed_replay_checkpoint_version
-
-        if checkpoint["reused"] and _installed_replay_checkpoint_version() != checkpoint["version"]:
-            return False
+        from .timeline_commit_store import TimelineCommitStore
         try:
             with self._try_checkpoint_fence():
                 self.conn.execute("BEGIN IMMEDIATE")
@@ -1511,18 +1508,20 @@ class RealmStore:
                         self, validate_prepared=None, register_after_commit_hook=False,
                         checkpoint_proofs=checkpoint["reused"], admission_proofs=checkpoint["verified"],
                     )
+                    if verifier._checkpoint_version != checkpoint["version"]:
+                        return False
                 finally:
                     self.conn.rollback()
         except (sqlite3.Error, OSError, RuntimeErrorBase):
             return False
-        if verifier._replay_store_version is None:
+        if verifier._replay_store_version is None or not verifier._check_checkpoint_identity():
             return False
         self._startup_timeline_verifier = verifier
         verifier._register_after_commit_hook()
         return True
 
     def _prepare_replay_checkpoint(self, realm_id):
-        from .timeline_commit_store import _installed_replay_checkpoint_version, _same_store_version
+        from .timeline_commit_store import _same_store_version
 
         verifier = getattr(self, "_timeline_replay_verifier", None)
         if verifier is None or self.conn.in_transaction:
@@ -1533,9 +1532,9 @@ class RealmStore:
             if (not proofs or not _same_store_version(verifier._replay_store_version, before)
                     or verifier._memo_failure(before) is not None):
                 return None
-            version = verifier._checkpoint_version
-            if version is None or _installed_replay_checkpoint_version() != version:
+            if not verifier._check_checkpoint_identity():
                 return None
+            version = verifier._checkpoint_version
             with self._try_checkpoint_fence():
                 if self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] != 0:
                     return None
@@ -1575,7 +1574,10 @@ class RealmStore:
                 state["sqlite_components"][component.name] = None
         if (clean and replay_checkpoint is not None
                 and self._replay_checkpoint_identity(self.root) == replay_checkpoint["storage"]):
-            state["timeline_replay_checkpoint"] = replay_checkpoint
+            from .timeline_commit_store import current_replay_checkpoint_version
+
+            if current_replay_checkpoint_version() == replay_checkpoint["version"]:
+                state["timeline_replay_checkpoint"] = replay_checkpoint
         path = self.root / _ADMISSION_STATE
         fd, temporary = tempfile.mkstemp(prefix=".admission-state-", dir=self.root)
         try:

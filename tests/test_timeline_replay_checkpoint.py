@@ -22,6 +22,33 @@ from runtime_protocol.timeline_commit import CommitRejected
 from runtime_protocol.timeline_commit_store import TimelineCommitStore
 
 service = port_tests.service
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_checkpoint_installation(request, monkeypatch):
+    """Supply the installation premise for source-only storage/fence controls."""
+    if "service" not in request.fixturenames:
+        return
+    # These controls instrument verifier methods and run from a checkout. The
+    # independent installed cases below exercise the real custody/code checks.
+    import hashlib
+
+    from runtime_protocol.contract_metadata import SCHEMA_DIGEST
+    from runtime_protocol.timeline_commit_validation import digest
+
+    def fingerprint():
+        root = Path(timeline_commit_store.__file__).parent
+        paths = sorted(root.rglob("*.py")) + [root / "schemas" / "timeline-commit-bundle.json"]
+        schemas = ("attrs", "jsonschema", "jsonschema-specifications", "referencing", "rpds-py")
+        return digest([timeline_commit_store._REPLAY_CHECKPOINT_FORMAT, SCHEMA_DIGEST,
+                       list(sys.version_info), {name: timeline_commit_store.version(name) for name in schemas},
+                       {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in paths}])
+
+    timeline_commit_store.replay_checkpoint_version.cache_clear()
+    monkeypatch.setattr(timeline_commit_store, "_installed_replay_checkpoint_version", fingerprint)
+    request.addfinalizer(timeline_commit_store.replay_checkpoint_version.cache_clear)
+
 _CHECKPOINT = "timeline_replay_checkpoint"
 
 
@@ -208,6 +235,12 @@ import sys
 from runtime_protocol import platform, timeline_commit_store
 from runtime_protocol.service import RuntimeService
 
+# Mirror the parent test's synthetic installation premise in the crash child.
+import json
+from pathlib import Path
+state = json.loads((Path(sys.argv[1]) / "admission-state.json").read_text())
+timeline_commit_store._installed_replay_checkpoint_version = lambda: state["timeline_replay_checkpoint"]["version"]
+
 service = RuntimeService(sys.argv[1])
 replace = platform.durable_replace
 
@@ -291,3 +324,220 @@ def test_external_history_write_before_commit_still_refuses(service, retain):
         with pytest.raises((CommitRejected, RuntimeErrorBase), match="corrupt|history"):
             commit(reopened, request, key="must-refuse")
         assert rows(reopened) == before
+
+
+@pytest.fixture
+def installed_replay_take(tmp_path, stage1_runtime_environment):
+    """Use an offline Runtime wheel in the version/profile layout the installer selects."""
+    import shutil
+    from importlib.metadata import distribution
+
+    if sys.platform != "linux":
+        pytest.skip("checkpoint attestation currently supports the Linux installed layout")
+    take = tmp_path / "program" / "versions" / "0123456789ab"
+    prefix = take / "py"
+    shutil.copytree(stage1_runtime_environment, prefix, symlinks=True,
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    site = next(prefix.glob("lib/python*/site-packages"))
+    for package in ("attrs", "jsonschema", "jsonschema-specifications", "referencing", "rpds-py",
+                    "typing-extensions"):
+        dist = distribution(package)
+        for path in dist.files:
+            if path.parts[0] == ".." or path.suffix == ".pyc":
+                continue
+            destination = site / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(dist.locate_file(path), destination)
+    python = prefix / "bin" / "python"
+    (take / "r").mkdir()
+    (site / "astrid").mkdir()
+    (take / "manifest.json").write_text(json.dumps({"release": 77, "runtime": {"sha": "a" * 40}}))
+    profile = take / "profile.json"
+    profile.write_text(json.dumps({"runtime_environment": str(prefix), "runtime_checkout": str(take / "r"),
+                                   "source_checkout": str(site / "astrid")}))
+    (take / "version.json").write_text(json.dumps({
+        "root": str(take), "python": str(python), "profile": str(profile),
+        "identity": {"release": 77, "managed_by": None},
+    }))
+    return python
+
+
+_INSTALLED_REPLAY_PROBE = r'''
+import base64
+import csv
+import hashlib
+import json
+import sys
+from contextlib import closing
+from pathlib import Path
+
+mode, realm, project, tests, test_dependencies, source = sys.argv[1:]
+if mode == "development":
+    sys.path.insert(0, source)
+from runtime_protocol import timeline_commit_store
+from runtime_protocol.errors import RealmAdmissionError, RuntimeErrorBase
+from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
+from runtime_protocol import timeline_commit_validation
+
+runtime = Path(timeline_commit_store.__file__)
+if mode != "development":
+    assert runtime.is_relative_to(sys.prefix), runtime
+else:
+    assert runtime.is_relative_to(source), runtime
+sys.path.extend((tests, test_dependencies))
+import test_timeline_replay_checkpoint as witness
+
+calls = []
+def observe(frame, event, arg):
+    if event == "call" and frame.f_code.co_name == "_verify_accepted_replay":
+        calls.append((str(frame.f_locals["self"].store.db_path),
+                      frame.f_locals["edge"]["publication_id"]))
+
+sys.setprofile(observe)
+result = {"module": str(runtime)}
+if mode in ("seed", "before-first-sample"):
+    if mode == "before-first-sample":
+        # A same-version replacement after import and before the first store
+        # sees fresh wheel metadata and stale executing validation code.
+        path = Path(timeline_commit_validation.__file__)
+        old = path.read_text()
+        new = old.replace("    finite_json(value)\n    from jsonschema.exceptions",
+                          "    if definition == 'CommitContext':\n"
+                          "        raise ValidationError('incompatible verifier')\n"
+                          "    finite_json(value)\n    from jsonschema.exceptions")
+        assert old != new
+        path.write_text(new)
+        site = path.parent.parent
+        record, = site.glob("astrid_runtime-*.dist-info/RECORD")
+        with record.open(newline="") as stream:
+            entries = list(csv.reader(stream))
+        for entry in entries:
+            if entry[0] == path.relative_to(site).as_posix():
+                changed = path.read_bytes()
+                entry[1:] = ["sha256=" + base64.urlsafe_b64encode(hashlib.sha256(changed).digest()).rstrip(b"=").decode(),
+                             str(len(changed))]
+                break
+        else:
+            raise AssertionError("wheel did not record verifier source")
+        with record.open("w", newline="") as stream:
+            csv.writer(stream).writerows(entries)
+    RealmStore.initialize(realm).close()
+    service = RuntimeService(realm)
+    service.test_provider = witness.port_tests.PreparedProvider()
+    service.register_timeline_commit_provider(service.test_provider)
+    project = service.create_project({"slug": "checkpoint", "name": "Checkpoint"})["id"]
+    service.test_created = service.create_timeline(project, "main", idempotency_key="create-main")
+    service.test_project = project
+    from test_timeline_commit_sequential_verifier import _provider_with_capture
+    _provider_with_capture(service)
+    first = witness.commit(service, witness.body(service))["receipt"]["receipt_id"]
+    head = witness.commit(service, witness._next(service), key="edit-2")["receipt"]["receipt_id"]
+    for publication in (first, head):
+        metadata = service.store.conn.execute(
+            "SELECT metadata_json FROM timeline_commit_history WHERE publication_id=?", (publication,)
+        ).fetchone()[0]
+        assert "_sequential_execution" in json.loads(metadata)
+    history = witness._history(service, project)
+    service.close()
+    result.update(project=project, publications=[first, head], history=history)
+else:
+    if mode == "loaded-dependency":
+        from jsonschema import _keywords
+        original = _keywords.type
+        assert timeline_commit_store.replay_checkpoint_version() is not None
+        def incompatible(validator, types, instance, schema):
+            raise ValueError("incompatible schema dependency")
+        original.__code__ = incompatible.__code__
+    if mode == "identity-error":
+        try:
+            from runtime_protocol import timeline_replay_identity
+        except ImportError:
+            pass
+        else:
+            assert timeline_commit_store.replay_checkpoint_version() is not None
+            def unavailable(self):
+                raise OSError("identity computation is unavailable")
+            type(timeline_replay_identity._installation)._schema_matches = unavailable
+    try:
+        with closing(RuntimeService(realm)) as service:
+            if mode == "cached-resource":
+                # Change the resource reached by the already-compiled schema
+                # resolver after copied admission and live handoff.
+                bundle, _ = timeline_commit_validation._schema_resources()
+                validator = timeline_commit_validation._validator("CommitContext")
+                resolver = timeline_commit_validation._validator_resolver(validator).resolver
+                effective = resolver.lookup(bundle["root"]).contents
+                effective["$defs"]["CommitContext"]["required"].append("incompatible_resource")
+            result["history"] = witness._history(service, project)
+    except (RealmAdmissionError, RuntimeErrorBase) as exc:
+        result["refusal"] = type(exc).__name__
+        if isinstance(exc, RealmAdmissionError):
+            result["revisions"] = exc.details["checks"]["revisions"]
+sys.setprofile(None)
+result["calls"] = calls
+result["checkpoint"] = "timeline_replay_checkpoint" in json.loads((Path(realm) / "admission-state.json").read_text())
+print(json.dumps(result))
+'''
+
+
+def _installed_probe(python, mode, realm, project=""):
+    tests = Path(__file__).resolve().parent
+    result = subprocess.run(
+        [str(python), "-I", "-B", "-c", _INSTALLED_REPLAY_PROBE, mode, str(realm), project,
+         str(tests), str(Path(pytest.__file__).resolve().parents[1]), str(tests.parent)],
+        cwd=realm.parent, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_verified_installed_restart_hits_checkpoint(installed_replay_take, tmp_path):
+    realm = tmp_path / "realm"
+    seeded = _installed_probe(installed_replay_take, "seed", realm)
+    replayed = _installed_probe(installed_replay_take, "restart", realm, seeded["project"])
+    assert seeded["checkpoint"]
+    assert replayed["checkpoint"]
+    assert replayed["history"] == seeded["history"]
+    assert replayed["calls"] == []
+
+
+def test_wheel_replacement_after_import_cannot_relabel_replay(installed_replay_take, tmp_path):
+    realm = tmp_path / "realm"
+    seeded = _installed_probe(installed_replay_take, "before-first-sample", realm)
+    restarted = _installed_probe(installed_replay_take, "restart", realm, seeded["project"])
+    assert seeded["calls"]
+    assert not seeded["checkpoint"]
+    assert restarted["refusal"] == "RealmAdmissionError"
+    assert not restarted["revisions"]["ok"]
+    assert restarted["calls"]
+
+
+@pytest.mark.parametrize("mode", ["development", "missing-attestation", "identity-error"])
+def test_unverified_installation_replays_and_does_not_publish(installed_replay_take, tmp_path, mode):
+    realm = tmp_path / "realm"
+    seeded = _installed_probe(installed_replay_take, "seed", realm)
+    assert seeded["checkpoint"]
+    if mode == "missing-attestation":
+        (installed_replay_take.parents[2] / "profile.json").unlink()
+    restarted = _installed_probe(installed_replay_take, mode, realm, seeded["project"])
+    assert restarted["history"] == seeded["history"]
+    assert {publication for path, publication in restarted["calls"]
+            if path != str(realm / "realm.sqlite3")} == set(seeded["publications"])
+    assert not restarted["checkpoint"]
+
+
+@pytest.mark.parametrize(("mode", "refusal"), [
+    ("loaded-dependency", "RealmAdmissionError"),
+    ("cached-resource", "ProtocolError"),
+])
+def test_effective_verifier_drift_cannot_skip_semantic_refusal(installed_replay_take, tmp_path, mode, refusal):
+    realm = tmp_path / "realm"
+    seeded = _installed_probe(installed_replay_take, "seed", realm)
+    assert seeded["checkpoint"]
+    restarted = _installed_probe(installed_replay_take, mode, realm, seeded["project"])
+    assert restarted.get("refusal") == refusal
+    assert restarted["calls"]
+    if mode == "cached-resource":
+        assert all(path == str(realm / "realm.sqlite3") for path, _ in restarted["calls"])
+        assert not restarted["checkpoint"]
