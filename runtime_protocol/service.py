@@ -29,6 +29,7 @@ from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
 from .render_observer import admitted_run_id
 from .idempotency import command_result, compact_result
 import hashlib
+import io
 import json
 import sqlite3
 import base64
@@ -114,6 +115,18 @@ DISCOVERY_GRANT_CEILINGS = {
     "max_child_media_bindings": 1,
     "max_child_media_bytes": 16 * 1024 * 1024,
 }
+PROJECT_ELEMENTS_PREFIX = "/api/runtime/packs/project-elements"
+
+
+def _project_pack_command(verb, realm, project_id, pack_id=None, *, is_default=True):
+    command = f"python3 -m astrid.core.element.cli project-pack {verb} --realm {realm} --project {project_id}"
+    if not is_default:
+        command += f" --collection {pack_id}"
+    return command
+
+
+def _default_project_pack_id(realm, project_id):
+    return "project_" + hashlib.sha256(f"{realm}:{project_id}:default".encode()).hexdigest()[:20]
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
 MANAGED_COVERAGE_MODES = frozenset({"interval", "clips", "cuts", "shots"})
 MANAGED_COVERAGE_REASONS = frozenset({"interval", "before_cut", "after_cut", "clip_first", "shot_midpoint"})
@@ -543,6 +556,107 @@ def _durable_mutation(function=None, *, reap_task_lifetimes=False):
 
 def _refuse_direct_shot_write(self, *args, **kwargs):
     raise RetiredRouteError("direct shot writes are retired; use timeline commands")
+
+
+
+def _project_element_snapshot_bytes(data, project_id, entry):
+    """Verify the selected receipt binding and closure without consulting other objects."""
+    def unavailable():
+        raise ConflictError("This project element was admitted by a pre-release build. Change its component source, admit the element again, then place the new revision on the clip.",
+                            details={"reason": "project_element_binding_missing"})
+
+    def corrupt():
+        raise ConflictError("project pack compiled element bytes are missing or corrupt; re-admit the pack",
+                            details={"packId": entry["packId"], "id": entry["descriptor"]["id"]})
+
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("non-finite JSON value")
+
+    try:
+        snapshot = json.loads(data, object_pairs_hook=unique_pairs,
+                              parse_constant=reject_constant)
+        if not isinstance(snapshot, dict) or set(snapshot) != {"files", "build_receipt_base64"}:
+            corrupt()
+        files = snapshot["files"]
+        receipt = json.loads(base64.b64decode(snapshot["build_receipt_base64"], validate=True),
+                             object_pairs_hook=unique_pairs,
+                             parse_constant=reject_constant)
+    except (ValueError, TypeError, KeyError):
+        corrupt()
+    descriptor = entry["descriptor"]
+    ref = {"projectId": project_id, "packId": entry["packId"],
+           **{key: descriptor[key] for key in ("id", "kind", "revision")}}
+    if (not isinstance(receipt, dict) or receipt.get("schema") != "astrid.element-build/v1"
+            or not isinstance(receipt.get("selectionDigest"), str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt["selectionDigest"])
+            or not isinstance(receipt.get("elements"), list)
+            or sum(item == ref for item in receipt["elements"]) != 1):
+        corrupt()
+    if "compiledBindings" not in receipt:
+        unavailable()
+    if not isinstance(receipt["compiledBindings"], list):
+        corrupt()
+    try:
+        if not isinstance(files, list) or not 0 < len(files) <= 256:
+            corrupt()
+        closure = []
+        by_path = {}
+        selected_raw = None
+        total = 0
+        for item in files:
+            if not isinstance(item, dict) or set(item) != {"path", "sha256", "bytes_base64"}:
+                corrupt()
+            path, file_digest = item["path"], item["sha256"]
+            if (not isinstance(path, str) or "\\" in path or "\x00" in path
+                    or any(part in ("", ".", "..") for part in path.split("/"))
+                    or path in by_path or not isinstance(file_digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", file_digest)):
+                corrupt()
+            raw_file = base64.b64decode(item["bytes_base64"], validate=True)
+            total += len(raw_file)
+            if total > 64 * 1024 * 1024 or hashlib.sha256(raw_file).hexdigest() != file_digest:
+                corrupt()
+            by_path[path] = item
+            if path == entry["compiled"]["path"]:
+                selected_raw = raw_file
+            closure.append({"path": path, "sha256": file_digest})
+        if "pack.yaml" not in by_path or list(by_path) != sorted(by_path):
+            corrupt()
+        closure_bytes = json.dumps(closure, sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=True, allow_nan=False).encode("utf-8")
+        if hashlib.sha256(closure_bytes).hexdigest() != entry["snapshot_digest"]:
+            corrupt()
+        bindings = [item for item in receipt["compiledBindings"] if isinstance(item, dict)
+                    and all(item.get(key) == value for key, value in ref.items())]
+        if len(bindings) != 1:
+            corrupt()
+        binding = bindings[0]
+        component = binding.get("componentPath")
+        if (set(binding) != {*ref, "componentPath", "compiled"}
+                or not isinstance(component, str) or "\\" in component or "\x00" in component
+                or any(part in ("", ".", "..") for part in component.split("/"))
+                or descriptor.get("componentPath") != (f"external/{entry['packId']}/{entry['snapshot_digest']}/{component}")
+                or component not in by_path
+                or binding.get("compiled") != entry["compiled"]
+                or entry["compiled"]["path"] != "compiled/" + component + ".mjs"):
+            corrupt()
+        item = by_path.get(entry["compiled"]["path"])
+        if item is None:
+            corrupt()
+        raw = selected_raw
+        if item["sha256"] != entry["digest"] or hashlib.sha256(raw).hexdigest() != entry["digest"]:
+            corrupt()
+        return raw
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        corrupt()
 
 
 class RuntimeService:
@@ -4957,9 +5071,10 @@ class RuntimeService:
     def _validate_project_document(self, project_id, document_id, kind, content):
         self._validate_preference_document(project_id, document_id, kind, content)
         self._validate_transcript_document(project_id, document_id, kind, content)
-        from .timeline_commit_inputs import PROJECT_PACK_KIND, validate_pack_snapshot_objects
+        from .timeline_commit_inputs import PROJECT_PACK_KIND, validate_pack_compiled_listing, validate_pack_snapshot_objects
         if kind == PROJECT_PACK_KIND:
             validate_pack_snapshot_objects(self.store.conn, project_id, content)
+            validate_pack_compiled_listing(content)
 
     def _document_resource(self, row):
         content = json.loads(row["content_json"])
@@ -5948,6 +6063,109 @@ class RuntimeService:
             item["artifactManifest"] = record["artifactManifest"]
             packs.append(item)
         return {"version": 1, "revision": revision, "packs": packs}
+
+    def _project_pack_elements(self, project_id):
+        """The project's admitted elements that name compiled bytes, plus the admissions that do not, re-read now.
+
+        Returns (entries, legacy). `legacy` lists `{packId, kind, id}` for each admission recorded before
+        compiled bytes existed: it cannot be served, and the editor tells the user to re-admit it.
+
+        The project-pack Documents are the only authority. Copy the admitted
+        metadata under the store mutex, without reading any snapshot bytes.
+        A re-admit is visible on the next request; only a bytes request reads
+        and verifies the selected portable snapshot, after releasing the mutex.
+        """
+        from .timeline_commit_inputs import PROJECT_PACK_KIND, _project_pack_header, _project_pack_admission
+        entries = []
+        legacy = []
+        with self.store._mutex:
+            rows = self.store.conn.execute(
+                "SELECT id, kind, content_json FROM project_documents WHERE project_id=? AND kind=? ORDER BY id",
+                (project_id, PROJECT_PACK_KIND)).fetchall()
+            candidates = []
+            counts = {}
+            for row in rows:
+                content = json.loads(row["content_json"])
+                try:
+                    _project_pack_header(self.store.conn, project_id, row["id"], content, canonical_default=True)
+                except RuntimeErrorBase:
+                    continue
+                for admission in content["admissions"]:
+                    try:
+                        identity = _project_pack_admission(self.store.conn, project_id, content["pack_id"], admission)
+                    except RuntimeErrorBase:
+                        continue
+                    ref = (content["pack_id"], *identity)
+                    counts[ref] = counts.get(ref, 0) + 1
+                    candidates.append((ref, content["pack_id"], admission))
+            for ref, owner, admission in candidates:
+                # Never choose an arbitrary winner for an ambiguous reference.
+                if counts[ref] != 1:
+                    continue
+                compiled = admission.get("compiled")
+                if compiled is None:
+                    legacy.append({"packId": owner, "kind": admission["kind"], "id": admission["id"]})
+                    continue
+                entries.append({"packId": owner, "descriptor": admission["descriptor"],
+                                "authoring": admission["authoring"], "digest": compiled["sha256"],
+                                "compiled": compiled, "snapshot_object": admission["snapshot_object"],
+                                "snapshot_digest": admission["snapshot_digest"]})
+        return entries, legacy
+
+    def project_pack_elements(self, project_id):
+        """The project's current admitted element bundles, addressed by compiled digest."""
+        project_id = self.store.get_project(project_id)["id"]
+        entries, legacy = self._project_pack_elements(project_id)
+        realm = self.realm["id"]
+        projects = {}
+        default_pack_id = _default_project_pack_id(realm, project_id)
+        elements = []
+        for entry in entries:
+            descriptor = entry["descriptor"]
+            ref = {"packId": entry["packId"], "kind": descriptor["kind"], "id": descriptor["id"],
+                   "revision": descriptor["revision"]}
+            elements.append({"ref": ref, "digest": entry["digest"], "descriptor": descriptor,
+                             "authoring": entry["authoring"],
+                             "url": f"{PROJECT_ELEMENTS_PREFIX}/{project_id}/{entry['digest']}.js"})
+            projects.setdefault(entry["packId"], {
+                "projectId": project_id, "packId": entry["packId"], "packRoot": entry["authoring"]["packRoot"],
+                "status": "admitted",
+                "initCommand": _project_pack_command("init", realm, project_id, entry["packId"],
+                                                     is_default=entry["packId"] == default_pack_id),
+                "admitCommand": _project_pack_command("admit", realm, project_id, entry["packId"],
+                                                      is_default=entry["packId"] == default_pack_id),
+                "inspectCommand": _project_pack_command("inspect", realm, project_id, entry["packId"],
+                                                        is_default=entry["packId"] == default_pack_id),
+            })
+        selection = sha256_bytes(canonical_json({"projectId": project_id, "realmId": realm, "refs": [
+            [e["ref"], e["digest"]] for e in elements]}).encode("utf-8"))
+        return {"version": 1, "projectId": project_id, "realmId": realm, "selectionDigest": selection,
+                "projects": list(projects.values()), "elements": elements, "legacy": legacy}
+
+    def open_project_pack_element(self, project_id, digest, ref=None):
+        """Serve only compiled bytes the project's current admissions name."""
+        from .timeline_commit_inputs import read_pack_snapshot_bytes, validate_pack_snapshot_objects
+
+        project_id = self.store.get_project(project_id)["id"]
+        matches = [entry for entry in self._project_pack_elements(project_id)[0] if entry["digest"] == digest]
+        if ref is not None:
+            matches = [entry for entry in matches if sha256_bytes(json.dumps(
+                [entry["packId"], *[entry["descriptor"][key] for key in ("kind", "id", "revision")]],
+                separators=(',', ':'), ensure_ascii=False).encode("utf-8")) == ref]
+        if not matches:
+            raise NotFoundError("project pack element is not admitted for this project")
+        result = None
+        for entry in matches:
+            # A digest URL may name several admissions. Every matching admission
+            # must establish its own binding before any bytes can be returned.
+            with self.store._mutex:
+                validate_pack_snapshot_objects(
+                    self.store.conn, project_id, {"admissions": [{"snapshot_object": entry["snapshot_object"]}]})
+            data, _identity = read_pack_snapshot_bytes(
+                self.cas, entry["snapshot_object"], max_bytes=self.max_object_bytes)
+            raw = _project_element_snapshot_bytes(data, project_id, entry)
+            result = raw
+        return {"digest": digest, "size": len(result), "media_type": "text/javascript"}, io.BytesIO(result)
 
     def _prune_pack_leases(self, records):
         """Disable/uninstall revokes retention, including not-yet-imported chunks."""

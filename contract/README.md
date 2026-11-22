@@ -141,6 +141,12 @@ the 0.2.2 check proves the five explicit additive regex changes. Other rewrites
 still require review. Source snapshots and provenance live in
 `tests/fixtures/published-command-schemas/`.
 
+The unpublished 0.2.15 candidate mirrors the Agent edit-command schema at
+`f368e8fb112ab6f8bccb96a66cbdbcc5692979fe`, raw SHA256
+`66b2990f50c6e6b4adf6ba7d80971b5076f1f557515cdd0f77e394cdaaaa74b7`.
+It adds the optional `placement: "place"` marker to `clip.set-element`;
+Runtime validation remains structural and does not grant placement authority.
+
 After copying an authorized schema and updating `generators/release.json`, run
 `python generators/generate.py`, normally regenerate the independent TypeScript
 conformance client as described in the repository README, then run

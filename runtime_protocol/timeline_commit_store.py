@@ -1233,8 +1233,15 @@ class TimelineCommitStore:
 
     @_evaluation
     def history_entry(self, project_id, timeline_id, publication_id, *, allow_archived=False):
-        return detached(self._history_entry_view(project_id, timeline_id, publication_id,
-                                                 allow_archived=allow_archived))
+        entry = self._history_entry_view(project_id, timeline_id, publication_id,
+                                         allow_archived=allow_archived)
+        if (getattr(self.store, "_read_cas_object", None) is not None
+                and entry["intent"] == "recorded" and self._verification.current["traversal"] is None):
+            # A pinned reader cannot inherit live CAS proofs. Reauthenticate the
+            # selected revision even when a fresh scope has discarded its memo.
+            self.revision_closure(project_id, timeline_id, entry["revision_id"],
+                                  allow_archived=allow_archived)
+        return detached(entry)
 
     @_evaluation
     def _history_entry_view(self, project_id, timeline_id, publication_id, *, allow_archived=False):
