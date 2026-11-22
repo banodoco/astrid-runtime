@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -76,3 +77,26 @@ def test_edit_after_raw_batch_is_detected(tmp_path: Path, monkeypatch):
     with pytest.raises(source_identity.SourceIdentityError, match="changed during identity capture"):
         source_identity.capture_source_identity(runtime, agent)
     assert changed
+
+
+def test_large_parallel_hash_batches_preserve_order_and_fail_closed(tmp_path, monkeypatch):
+    runtime = _repo(tmp_path / "runtime")
+    paths = [f"file-{i:04}".encode() for i in range(1025)]
+    expected = []
+    for i, path in enumerate(paths):
+        content = str(i).encode()
+        (runtime / path.decode()).write_bytes(content)
+        expected.append(hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest().encode())
+    assert source_identity._blob_ids(runtime, paths) == expected
+
+    original = source_identity._git
+
+    def incomplete(root, *args, **kwargs):
+        output = original(root, *args, **kwargs)
+        if args[0] == "hash-object":
+            return b""
+        return output
+
+    monkeypatch.setattr(source_identity, "_git", incomplete)
+    with pytest.raises(source_identity.SourceIdentityError, match="incomplete raw blob hashes"):
+        source_identity._blob_ids(runtime, paths)

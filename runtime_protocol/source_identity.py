@@ -5,6 +5,7 @@ import hashlib
 import os
 import stat
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -95,16 +96,31 @@ def validate_checkout_root(root: Path) -> Path:
 
 
 def _blob_ids(root: Path, paths: list[bytes]) -> list[bytes]:
-    """Hash raw files in one process using Git's quoted pathname input."""
+    """Hash raw files using Git's quoted pathname input."""
     if not paths:
         return []
     # Quoting every byte makes newlines, quotes and non-UTF-8 names unambiguous
     # to Git's --stdin-paths parser. Prefix prevents option-like pathnames.
-    encoded = b"".join(
-        b'"' + b"".join(f"\\{byte:03o}".encode("ascii") for byte in b"./" + path) + b'"\n'
-        for path in paths
-    )
-    result = _git(root, "hash-object", "--no-filters", "--stdin-paths", input=encoded).splitlines()
+    quotes = [f"\\{byte:03o}".encode("ascii") for byte in range(256)]
+
+    def batch(items: list[bytes]) -> list[bytes]:
+        encoded = b"".join(
+            b'"' + b"".join(quotes[byte] for byte in b"./" + path) + b'"\n'
+            for path in items
+        )
+        result = _git(root, "hash-object", "--no-filters", "--stdin-paths", input=encoded).splitlines()
+        if len(result) != len(items):
+            raise SourceIdentityError(f"Git returned incomplete raw blob hashes at {root}")
+        return result
+
+    if len(paths) < 1024:
+        result = batch(paths)
+    else:
+        # Large source trees benefit from concurrent reads. Keep each batch in
+        # order and wait for every process before accepting an observation.
+        step = (len(paths) + 3) // 4
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            result = [oid for group in pool.map(batch, (paths[i:i + step] for i in range(0, len(paths), step))) for oid in group]
     if len(result) != len(paths):
         raise SourceIdentityError(f"Git returned incomplete raw blob hashes at {root}")
     return result
