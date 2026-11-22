@@ -28,10 +28,16 @@ class LegacyGenuineUncertified(AssertionError):
 
 
 def _archive(repo, revision, target, *paths):
-    archive = subprocess.run(
-        ["git", "-C", str(repo), "archive", revision, *paths],
-        check=True, capture_output=True,
-    )
+    try:
+        archive = subprocess.run(
+            ["git", "-C", str(repo), "archive", revision, *paths],
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"cannot archive required commit {revision} from {repo}; fetch this SHA "
+            f"or full history with `git -C {repo} fetch origin {revision}`"
+        ) from exc
     target.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as source:
         source.extractall(target, filter="data")

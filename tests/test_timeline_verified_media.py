@@ -171,8 +171,12 @@ def test_catalog_changes_refuse_original_pin_without_refresh_or_writes(media, ch
             metadata["params"]["duration_seconds"] = 3
         service.store.conn.execute("UPDATE generations SET metadata_json=? WHERE id=?", (json.dumps(metadata), selection["generation_id"]))
     before = snapshot(service)
-    with pytest.raises((ConflictError, NotFoundError, ValidationError)):
-        service.get_project_verified_media(project, selection, authorize=lambda: None)
+    if change in {"pin", "promote"}:
+        # Lifecycle operations change no selected bytes: the original pin still verifies.
+        assert service.get_project_verified_media(project, selection, authorize=lambda: None)["selection"] == original
+    else:
+        with pytest.raises((ConflictError, NotFoundError, ValidationError)):
+            service.get_project_verified_media(project, selection, authorize=lambda: None)
     if change in {"pin", "promote", "expired"}:
         with pytest.raises(ConflictError):
             service.get_project_media_selection(project, selector(output), authorize=lambda: None)

@@ -301,3 +301,46 @@ def test_selected_media_mutation_between_capture_and_accept_is_atomic(tmp_path, 
         ).fetchone()[0] == 0
     finally:
         service.close()
+
+
+def test_selection_pin_ignores_mutable_metadata_and_lifecycle_but_not_identity(tmp_path):
+    """A pin guards the object's identity and bytes; lifecycle/metadata drift (a later import, a thumbnail) is not a conflict."""
+    service, project, associations = _settled_media(tmp_path, slug="pin-identity")
+    try:
+        association = associations["first"]
+        selection = _capture(service, project, association)
+        outcome = {}
+
+        def action(context, port):
+            candidate, _ = _prepared_media_candidate(context, port, selection)
+            row = service.store.conn.execute(
+                "SELECT metadata_json FROM generations WHERE id=?", (selection["generation_id"],)).fetchone()
+            metadata = json.loads(row["metadata_json"])
+            metadata["note"] = "changed after import"
+            service.store.conn.execute("UPDATE generations SET metadata_json=? WHERE id=?",
+                                       (json.dumps(metadata, sort_keys=True), selection["generation_id"]))
+            service.store.conn.execute(
+                "UPDATE managed_output_lifecycle SET version=version+1 WHERE association_id=?",
+                (association["association_id"],))
+            service.store.conn.commit()
+            outcome["drifted"] = port.selected_media(selection)
+            service.store.conn.execute(
+                "UPDATE managed_output_associations SET variant_key=? WHERE association_id=?",
+                ("changed", association["association_id"]))
+            service.store.conn.commit()
+            with pytest.raises(ConflictError):
+                port.selected_media(selection)
+            return port.accept(candidate)
+
+        provider = PreparedProvider(action)
+        service.register_timeline_commit_provider(provider)
+        service.test_project = project
+        service.create_timeline(project, "main", idempotency_key="create-main")
+        body = request(service)
+        body["commands"][0]["op"] = "fixture.inspect"
+        body["commands"][0]["args"]["selection"] = selection
+        with pytest.raises(ConflictError):
+            commit(service, body, key="pin-identity")
+        assert outcome["drifted"] is not None
+    finally:
+        service.close()
