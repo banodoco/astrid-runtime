@@ -10,6 +10,20 @@ import math
 VERSION = 1
 DISCLOSURE_VERSION = "visual-seam/v1"
 
+# Closed R13 built-in timing inventory (App de7dd1e6). These IDs describe
+# renderer timing only; they do not execute or resolve App effect code.
+_TRANSITION_IDS = frozenset({"cross-fade", "crossfade", "fade", "wipe", "slide-push", "zoom-through"})
+_ANIMATION_DEFAULTS = {
+    "fade": 12, "fade-up": 18, "scale-in": 18, "slide-left": 18, "slide-up": 12, "type-on": 120,
+}
+_LEGACY_PHASE_IDS = {
+    "entrance": frozenset({
+        "slide-down", "slide-right", "zoom-in", "zoom-spin", "pulse", "flip", "bounce", "meteorite",
+    }),
+    "exit": frozenset({"slide-down", "zoom-out", "flip", "fade-out", "shrink", "dissolve"}),
+    "continuous": frozenset({"ken-burns", "float", "glitch", "slow-zoom", "drift"}),
+}
+
 
 def finite(value, fallback=0):
     if type(value) is int:
@@ -34,7 +48,7 @@ def nonnegative(value):
 def transition_frames(value, fps):
     ref = value if isinstance(value, dict) else {}
     identity = value if isinstance(value, str) else ref.get("id", ref.get("type"))
-    if identity not in ("cross-fade", "crossfade", "fade"):
+    if not isinstance(identity, str) or identity not in _TRANSITION_IDS:
         return None
     frames = ref.get("durationFrames", finite(ref.get("duration"), -1) * fps if "duration" in ref else 8)
     frames = positive(frames)
@@ -116,15 +130,31 @@ def boundary_report(context):
             for entry in raw if isinstance(raw, list) else [raw]:
                 ref = entry if isinstance(entry, dict) else {}
                 identity = entry if isinstance(entry, str) else ref.get("id", ref.get("type"))
-                defaults = {"fade": 12, "fade-up": 18, "scale-in": 18, "slide-left": 18, "slide-up": 12, "type-on": 120}
-                duration = ref.get("durationFrames", finite(ref.get("duration"), -1) * fps if "duration" in ref else defaults.get(identity) if isinstance(identity, str) else None)
-                if nonnegative(duration) is None or identity not in defaults:
+                if not isinstance(identity, str):
+                    report["opaque"].append(f"unsupported {phase} timing")
+                    continue
+                default = _ANIMATION_DEFAULTS.get(identity)
+                if default is None and identity in _LEGACY_PHASE_IDS[phase] and "effect" not in path:
+                    default = js_round(0.4 * fps)
+                duration = ref.get("durationFrames", finite(ref.get("duration"), -1) * fps
+                                   if "duration" in ref else default)
+                if default is None or nonnegative(duration) is None:
                     report["opaque"].append(f"unsupported {phase} timing")
                     continue
                 if duration > 0:
                     cue(1 if phase == "entrance" else max(0, end - origin - js_round(duration) + 1), "motion-start", phase)
         if "continuous" in clip:
-            report["opaque"].append("unsupported continuous timing")
+            raw = clip["continuous"]
+            ref = raw if isinstance(raw, dict) else {}
+            identity = raw if isinstance(raw, str) else ref.get("id", ref.get("type"))
+            if isinstance(identity, str) and identity in _LEGACY_PHASE_IDS["continuous"] and "effect" not in path:
+                # R13's continuous renderers receive the whole clip duration.
+                # Glitch is already active on local frame zero; the other
+                # continuous renderers first change their output on frame one.
+                if finite(ref.get("intensity"), 0.5) != 0:
+                    cue(0 if identity == "glitch" else 1, "motion-start", "continuous")
+            else:
+                report["opaque"].append("unsupported continuous timing")
         if "children" in clip or "effect" in path and "effects" in clip:
             report["opaque"].append("unsupported nested effect timing")
         if "transition" in clip and transition_frames(clip["transition"], fps) is None:
