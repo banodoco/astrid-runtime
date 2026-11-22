@@ -27,7 +27,7 @@ from runtime_protocol.timeline_commit_inputs import PROJECT_PACK_KIND, PROJECT_P
 from tests.door_helpers import HOSTED, create_realm, start_door_world
 
 TSX = "elements/reveal/component.tsx"
-COMPILED = "elements/reveal/component.js"
+COMPILED = "compiled/" + TSX + ".mjs"
 
 
 def sha(data: bytes) -> str:
@@ -46,30 +46,51 @@ def owner_id(service, project: str) -> str:
     return "project_" + hashlib.sha256(f"{service.realm['id']}:{project}:default".encode()).hexdigest()[:20]
 
 
-def ingest_snapshot(service, project: str, compiled: bytes, *, path: str = COMPILED) -> dict:
-    """The portable snapshot the Agent builds: the source file, the compiled file and a build receipt."""
-    source = b"export default function Reveal() { return null; }\n"
-    files = [
-        {"path": TSX, "sha256": sha(source), "bytes_base64": b64(source)},
-        {"path": path, "sha256": sha(compiled), "bytes_base64": b64(compiled)},
-    ]
-    data = json.dumps({"files": files, "build_receipt_base64": b64(b"receipt")},
-                      sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+def _fixture_resources(compiled: bytes, path: str = COMPILED) -> dict:
+    return {"pack.yaml": b"id: fixture\n", "elements/reveal/element.yaml": b"id: reveal\n",
+            TSX: b"export default function Reveal() { return null; }\n", path: compiled}
+
+
+def _fixture_closure(compiled: bytes, path: str = COMPILED) -> str:
+    files = [{"path": name, "sha256": sha(raw)} for name, raw in sorted(_fixture_resources(compiled, path).items())]
+    # Agent _closure_digest, including ASCII escaping.
+    return sha(json.dumps(files, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode())
+
+
+def ingest_snapshot(service, project: str, compiled: bytes, *, path: str = COMPILED,
+                    pack_id: str | None = None, revision: str = "1", ref_id: str = "reveal",
+                    include_binding: bool = True) -> dict:
+    """Vendor Agent's _portable_snapshot and _build_receipt output shapes."""
+    ref = {"projectId": project, "packId": pack_id or owner_id(service, project),
+           "id": ref_id, "kind": "effect", "revision": "sha256:" + revision * 64}
+    selection = {"elements": [{"projectId": project, "descriptor": {key: ref[key] for key in ("packId", "id", "kind", "revision")}}]}
+    selection_bytes = (json.dumps(selection, indent=2, sort_keys=True) + "\n").encode()
+    receipt = {"schema": "astrid.element-build/v1", "selectionDigest": "sha256:" + sha(selection_bytes),
+               "elements": [ref], "compiledBindings": [{**ref, "componentPath": TSX,
+                                                          "compiled": {"path": path, "sha256": sha(compiled)}}]}
+    if not include_binding:
+        del receipt["compiledBindings"]
+    receipt_bytes = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode()
+    files = _fixture_resources(compiled, path)
+    value = {"files": [{"path": name, "sha256": sha(raw), "bytes_base64": b64(raw)}
+                       for name, raw in sorted(files.items())], "build_receipt_base64": b64(receipt_bytes)}
+    data = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
     actual = service.ingest(project, data, media_type="application/json",
                             idempotency_key="snapshot-" + sha(data))["data"]
     return {name: actual[name] for name in ("object_id", "digest", "size", "media_type")}
 
 
 def admission(service, project: str, descriptor_object: dict, compiled: bytes, *, revision: str = "1") -> dict:
-    """One admitted effect as the Agent records it: identity, closure digest, snapshot, compiled file, metadata."""
+    """One admitted effect in the Agent's stored shape."""
     ref_id, kind = "reveal", "effect"
     revision_text = "sha256:" + revision * 64
+    closure = _fixture_closure(compiled)
     return {
-        "id": ref_id, "kind": kind, "revision": revision_text, "snapshot_digest": "2" * 64,
+        "id": ref_id, "kind": kind, "revision": revision_text, "snapshot_digest": closure,
         "snapshot_object": descriptor_object,
         "compiled": {"path": COMPILED, "sha256": sha(compiled)},
         "descriptor": {"packId": owner_id(service, project), "id": ref_id, "kind": kind,
-                       "revision": revision_text, "label": "Reveal", "description": "", "componentPath": TSX,
+                       "revision": revision_text, "label": "Reveal", "description": "", "componentPath": f"external/{owner_id(service, project)}/{closure}/{TSX}",
                        "defaults": {}, "parameters": [],
                        "renderability": {"preview": "supported", "browserExport": "supported", "workerExport": "unknown"}},
         "authoring": {"packRoot": "/work/packs/reveal", "descriptorPath": "/work/packs/reveal/descriptor.yaml",
@@ -175,6 +196,7 @@ def test_list_and_element_bytes_are_served_through_the_door(world, project):
     expected = json.loads(FIXTURE.read_text().replace(FIXTURE_PROJECT, project)
                           .replace(FIXTURE_REALM, service.realm["id"]).replace(FIXTURE_PACK, owner_id(service, project)))
     assert expected["elements"][0]["digest"] == digest
+    expected["elements"][0]["descriptor"]["componentPath"] = f"external/{owner_id(service, project)}/{_fixture_closure(compiled)}/{TSX}"
     refs = [[element["ref"], element["digest"]] for element in expected["elements"]]
     expected["selectionDigest"] = sha(canonical_json({"projectId": project, "realmId": service.realm["id"], "refs": refs}).encode())
     assert listed.json() == expected
@@ -202,8 +224,9 @@ def test_http_projection_authoring_commands_scope_named_collection(world, projec
         ingest_snapshot(service, project, default_bytes), default_bytes)], "commands-default")
 
     collection = "special_effects"
-    named = admission(service, project, ingest_snapshot(service, project, named_bytes), named_bytes)
+    named = admission(service, project, ingest_snapshot(service, project, named_bytes, pack_id=collection), named_bytes)
     named["descriptor"]["packId"] = collection
+    named["descriptor"]["componentPath"] = f"external/{collection}/{named['snapshot_digest']}/{TSX}"
     document_id = "document:" + str(uuid.uuid5(
         uuid.NAMESPACE_URL, json.dumps([project, PROJECT_PACK_KIND, collection])))
     content = {"schema": PROJECT_PACK_SCHEMA, "pack_id": collection, "source_binding_key": "project-packs",
@@ -262,6 +285,7 @@ def test_list_reads_only_admission_metadata_without_cas_reads(service_project, m
     assert reads == []
     expected = json.loads(FIXTURE.read_text().replace(FIXTURE_PROJECT, project)
                           .replace(FIXTURE_REALM, service.realm["id"]).replace(FIXTURE_PACK, owner_id(service, project)))
+    expected["elements"][0]["descriptor"]["componentPath"] = f"external/{owner_id(service, project)}/{_fixture_closure(compiled)}/{TSX}"
     refs = [[element["ref"], element["digest"]] for element in expected["elements"]]
     expected["selectionDigest"] = sha(canonical_json({"projectId": project, "realmId": service.realm["id"], "refs": refs}).encode())
     assert canonical_json(listed) == canonical_json(expected)
@@ -274,7 +298,7 @@ def test_bytes_read_only_selected_snapshot_without_holding_store_mutex(service_p
     snapshot = ingest_snapshot(service, project, compiled)
     selected = admission(service, project, snapshot, compiled)
     other_bytes = compiled_bytes("unrelated")
-    other = admission(service, project, ingest_snapshot(service, project, other_bytes), other_bytes)
+    other = admission(service, project, ingest_snapshot(service, project, other_bytes, ref_id="other"), other_bytes)
     other["id"] = other["descriptor"]["id"] = "other"
     # An unrelated corrupt compiled file must not prevent serving the selected one.
     other["compiled"]["sha256"] = "0" * 64
@@ -355,7 +379,7 @@ def test_current_admissions_are_reread_on_every_request(world, project):
 
     second = compiled_bytes("second")
     replace_admissions(service, project,
-                       [admission(service, project, ingest_snapshot(service, project, second), second, revision="2")],
+                       [admission(service, project, ingest_snapshot(service, project, second, revision="2"), second, revision="2")],
                        "pack-second")
 
     listed = json.loads(world.call(list_path(project)).body)
@@ -539,7 +563,7 @@ def test_preview_isolates_wrong_descriptor_owner_in_same_pack(service_project):
 def test_preview_excludes_default_owner_alias_and_ambiguous_refs(service_project):
     service, project = service_project
     good_bytes, duplicate_bytes, alias_bytes = (compiled_bytes(tag) for tag in ("healthy", "duplicate", "alias"))
-    good = admission(service, project, ingest_snapshot(service, project, good_bytes), good_bytes)
+    good = admission(service, project, ingest_snapshot(service, project, good_bytes, ref_id="healthy"), good_bytes)
     good["id"] = good["descriptor"]["id"] = "healthy"
     duplicate = admission(service, project, ingest_snapshot(service, project, duplicate_bytes), duplicate_bytes)
     publish(service, project, [duplicate, dict(duplicate), good], "duplicates")
@@ -563,3 +587,64 @@ def test_commit_pack_source_rejects_compiled_descriptor_owner_mismatch(service_p
     document_id, content = pack_document(service, project, [value])
     with pytest.raises(ConflictError, match="owner does not match"):
         timeline_commit_inputs._project_pack_source(service.store.conn, project, document_id, content)
+
+
+def test_same_digest_wrong_compiled_member_is_refused(service_project):
+    service, project = service_project
+    selected = compiled_bytes("selected")
+    wrong = selected  # Identical bytes cannot authorize the wrong member.
+    component = "elements/reveal/component.tsx"
+    other_component = "elements/other/component.tsx"
+    selected_path = "compiled/" + component + ".mjs"
+    wrong_path = "compiled/" + other_component + ".mjs"
+    resources = {"pack.yaml": b"fixture manifest", component: b"selected source", other_component: b"other source",
+                 selected_path: selected, wrong_path: wrong}
+    closure = [{"path": path, "sha256": sha(raw)} for path, raw in sorted(resources.items())]
+    closure_digest = sha(json.dumps(closure, sort_keys=True, separators=(",", ":"),
+                                    ensure_ascii=True, allow_nan=False).encode())
+    ref = {"projectId": project, "packId": owner_id(service, project), "id": "reveal",
+           "kind": "effect", "revision": "sha256:" + "1" * 64}
+    binding = {**ref, "componentPath": component,
+               "compiled": {"path": selected_path, "sha256": sha(selected)}}
+    receipt = json.dumps({"schema": "astrid.element-build/v1", "selectionDigest": "sha256:" + "0" * 64,
+                          "elements": [ref], "compiledBindings": [binding]}).encode()
+    # Exact Agent _portable_snapshot serializer.
+    envelope = {"files": [{"path": path, "sha256": sha(raw), "bytes_base64": b64(raw)}
+                          for path, raw in sorted(resources.items())],
+                "build_receipt_base64": b64(receipt)}
+    data = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                      allow_nan=False).encode()
+    stored = service.ingest(project, data, media_type="application/json",
+                            idempotency_key="wrong-member-" + sha(data))["data"]
+    snapshot = {key: stored[key] for key in ("object_id", "digest", "size", "media_type")}
+    value = admission(service, project, snapshot, wrong)
+    value["snapshot_digest"] = closure_digest
+    value["descriptor"]["componentPath"] = f"external/{ref['packId']}/{closure_digest}/{component}"
+    value["compiled"] = {"path": selected_path, "sha256": sha(selected)}
+    publish(service, project, [value], "right-member")
+    assert service.open_project_pack_element(project, sha(selected))[1].read() == selected
+    value["compiled"] = {"path": wrong_path, "sha256": sha(wrong)}
+    replace_admissions(service, project, [value], "wrong-member")
+    assert service.project_pack_elements(project)["elements"][0]["digest"] == sha(wrong)
+    with pytest.raises(ConflictError, match="compiled element bytes are missing or corrupt"):
+        service.open_project_pack_element(project, sha(wrong))
+    value["compiled"] = {"path": selected_path, "sha256": sha(selected)}
+    alias = json.loads(json.dumps(value))
+    alias["id"] = alias["descriptor"]["id"] = "other"
+    replace_admissions(service, project, [value, alias], "same-digest-alias")
+    with pytest.raises(ConflictError, match="compiled element bytes are missing or corrupt"):
+        service.open_project_pack_element(project, sha(selected))
+
+
+def test_pre_release_receipt_refuses_with_recovery_reason(service_project):
+    service, project = service_project
+    compiled = compiled_bytes("old_receipt")
+    snapshot = ingest_snapshot(service, project, compiled, include_binding=False)
+    value = admission(service, project, snapshot, compiled)
+    publish(service, project, [value], "old-receipt")
+    with pytest.raises(ConflictError) as refused:
+        service.open_project_pack_element(project, sha(compiled))
+    assert str(refused.value) == ("This project element was admitted by a pre-release build. "
+                                  "Change its component source, admit the element again, "
+                                  "then place the new revision on the clip.")
+    assert refused.value.details["reason"] == "project_element_binding_missing"
