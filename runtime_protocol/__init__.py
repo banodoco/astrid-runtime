@@ -7,6 +7,10 @@ checkouts.  Clients communicate through the versioned HTTP protocol.
 from importlib import import_module
 from typing import TYPE_CHECKING
 
+from .timeline_replay_identity import capture_replay_installation as _capture_replay_installation
+
+_capture_replay_installation(__file__)
+
 from .errors import RuntimeErrorBase, AuthorizationError, ConflictError, NotFoundError
 
 if TYPE_CHECKING:

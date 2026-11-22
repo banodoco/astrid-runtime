@@ -18,7 +18,7 @@ import threading
 from collections import deque
 from contextlib import contextmanager
 from functools import cache, wraps
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import version
 from pathlib import Path
 from typing import cast
 
@@ -35,22 +35,19 @@ _PRIVATE_EXECUTION = "_sequential_execution"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _TEXT_BINDING_REF = re.compile(r"occurrence:([^/]+)/text-binding:(prompt|voiceover_script|transcript)(?::([a-z][a-z0-9-]{0,63}))?\Z")
 _LOGGER = logging.getLogger(__name__)
-_REPLAY_CHECKPOINT_FORMAT = 1
+_REPLAY_CHECKPOINT_FORMAT = 2
 
 
 def _installed_replay_checkpoint_version():
-    """Fingerprint the installed Runtime verifier and its schema engine."""
     from .contract_metadata import SCHEMA_DIGEST
+    from .timeline_replay_identity import SCHEMA_DISTRIBUTIONS, installed_identity
 
     try:
-        root = Path(__file__).resolve().parent
-        files = sorted(root.rglob("*.py")) + [root / "schemas" / "timeline-commit-bundle.json"]
-        schema_packages = ("attrs", "jsonschema", "jsonschema-specifications", "referencing", "rpds-py")
-        return digest([_REPLAY_CHECKPOINT_FORMAT, SCHEMA_DIGEST, list(sys.version_info),
-                       {name: version(name) for name in schema_packages},
-                       {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-                        for path in files}])
-    except (OSError, RuntimeError, PackageNotFoundError):
+        identity = installed_identity()
+        if identity is not None:
+            return digest([_REPLAY_CHECKPOINT_FORMAT, SCHEMA_DIGEST, sys.version, sys.flags.optimize,
+                           {name: version(name) for name in SCHEMA_DISTRIBUTIONS}, identity])
+    except Exception:
         return None
 
 
@@ -59,15 +56,21 @@ def replay_checkpoint_version():
     return _installed_replay_checkpoint_version()
 
 
+def current_replay_checkpoint_version():
+    pinned = replay_checkpoint_version()
+    if pinned is not None and _installed_replay_checkpoint_version() == pinned:
+        return pinned
+    return None
+
+
 def decode_replay_checkpoint(checkpoint, *, realm_id, storage_identity):
     if (not isinstance(checkpoint, dict) or set(checkpoint) != {"version", "realm_id", "storage", "proofs"}
             or checkpoint["realm_id"] != realm_id or storage_identity is None
             or checkpoint["storage"] != storage_identity
             or not isinstance(checkpoint["proofs"], list)):
         return set()
-    verified_version = replay_checkpoint_version()
-    if (verified_version is None or checkpoint["version"] != verified_version
-            or _installed_replay_checkpoint_version() != verified_version):
+    verified_version = current_replay_checkpoint_version()
+    if verified_version is None or checkpoint["version"] != verified_version:
         return set()
     keys = set()
     for key in checkpoint["proofs"]:
@@ -287,6 +290,11 @@ def _evaluation(method):
                 self._sync_replay_memo()
                 boundary = self._history_inputs is None
                 current = self._verification.current
+                outermost = not current["depth"]
+                if outermost:
+                    current["checkpoint_checked"] = False
+                    if self._checkpoint_proofs:
+                        self._check_checkpoint_identity()
                 current["depth"] += 1
                 try:
                     result = method(self, *args, **kwargs)
@@ -307,6 +315,11 @@ def _evaluation(method):
                         # its own dependencies.
                         self.clear_replay_memo()
                 self._check_history_version()
+                if (outermost and method.__name__ != "accept"
+                        and self._checkpoint_proofs and not self._check_checkpoint_identity()):
+                    # An installation change during the read requires a new
+                    # evaluation without any imported proofs.
+                    raise _PostReadMovement("timeline replay verifier changed during evaluation")
                 return result
         except BaseException:
             self.clear_replay_memo()
@@ -374,7 +387,7 @@ class TimelineCommitStore:
         self.validate_event = validate_event
         # Pin the interpreter's verifier identity before this instance earns
         # any proofs. A later install must never relabel earlier verification.
-        self._checkpoint_version = replay_checkpoint_version()
+        self._checkpoint_version = current_replay_checkpoint_version()
         self._verification = threading.local()
         self._replay_memo = set()
         self._checkpoint_proofs = set()
@@ -394,7 +407,7 @@ class TimelineCommitStore:
         self._database_identity = (value.st_dev, value.st_ino)
         self._wal_identity = None
         self.clear_replay_memo()
-        if checkpoint_proofs or admission_proofs:
+        if self._checkpoint_version is not None and (checkpoint_proofs or admission_proofs):
             version = self._store_version()
             if self._memo_failure(version) is None:
                 self._checkpoint_proofs.update(checkpoint_proofs)
@@ -407,6 +420,14 @@ class TimelineCommitStore:
         # The long-lived verifier tracks other committed writes on this store.
         self.store._after_commit = self._absorb_own_write
         self.store._timeline_replay_verifier = self
+
+    def _check_checkpoint_identity(self):
+        if self._checkpoint_version is not None and current_replay_checkpoint_version() == self._checkpoint_version:
+            return True
+        if self._checkpoint_proofs or self._admission_proofs:
+            self.clear_replay_memo()
+        self._checkpoint_version = None
+        return False
 
     def clear_replay_memo(self):
         with self.store._mutex:
@@ -773,6 +794,8 @@ class TimelineCommitStore:
                 before = self._replay_store_version
                 assert before is not None
                 yield
+                if self._checkpoint_proofs and not self._check_checkpoint_identity():
+                    raise HeadBusyError("timeline replay verifier changed during acceptance")
                 after = self._store_version()
                 if after[2] != before[2]:
                     raise ProtocolError("accepted commit inputs changed during acceptance")
@@ -807,7 +830,7 @@ class TimelineCommitStore:
         previous = getattr(self._verification, "current", None)
         current = {"verified": set(), "active": set(), "traversal": None, "inputs": None,
                    "generation": self._replay_generation, "accepting": False, "memo_fallback": False,
-                   "depth": 0, "physical": {}}
+                   "depth": 0, "physical": {}, "checkpoint_checked": False}
         self._verification.current = current
         try:
             yield
@@ -1010,6 +1033,10 @@ class TimelineCommitStore:
             # dependency. Re-read every consumed result, including empty SQL
             # results and physical object bytes, before using queued proofs.
             traversal["inputs"].check(final=False)
+            if (self._checkpoint_proofs and not current["checkpoint_checked"]):
+                current["checkpoint_checked"] = True
+                if not self._check_checkpoint_identity():
+                    raise _PostReadMovement("timeline replay verifier changed before proof use")
             proofs = set()
             generation = self._replay_generation
             for node in ordered:
@@ -1595,6 +1622,8 @@ class TimelineCommitStore:
                     self._verify_inputs(json.loads(ledger[0]["result_json"])["canonical_document"])
                 elif edge["records_json"] is not None or ledger[0]["command_kind"] != "parent_composition.publish":
                     raise ValueError("invented legacy provenance")
+            except _PostReadMovement:
+                raise
             except Exception as exc:
                 errors.append({"table": "timeline_commit_history", "id": edge["publication_id"], "reason": str(exc)})
         for key, expected in previous.items():
