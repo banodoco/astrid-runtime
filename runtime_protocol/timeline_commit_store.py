@@ -321,7 +321,7 @@ class _HistoryReadInputs:
 
 
 class TimelineCommitStore:
-    def __init__(self, store, *, validate_prepared, validate_event=None):
+    def __init__(self, store, *, validate_prepared, validate_event=None, register_after_commit_hook: bool = True):
         self.store = store
         # Validation uses the wire worker's authoritative schema, including
         # Agent-owned leaves. It must raise on invalid data, never normalize it.
@@ -342,8 +342,9 @@ class TimelineCommitStore:
         self._database_identity = (value.st_dev, value.st_ino)
         self._wal_identity = None
         self.clear_replay_memo()
-        # The store calls this after any other committed write (see _absorb_own_write).
-        self.store._after_commit = self._absorb_own_write
+        if register_after_commit_hook:
+            # The long-lived verifier tracks other committed writes on this store.
+            self.store._after_commit = self._absorb_own_write
 
     def clear_replay_memo(self):
         with self.store._mutex:

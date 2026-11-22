@@ -2321,7 +2321,10 @@ class RealmStore:
                     if key in params and params[key] != actual:
                         raise ConflictError(f"render {key} does not match the canonical timeline",
                                             details={"expected": params[key], "actual": actual})
-            commits = TimelineCommitStore(self, validate_prepared=lambda value: validate_commit_value(value, "PreparedCommit"))
+            commits = TimelineCommitStore(
+                self, validate_prepared=lambda value: validate_commit_value(value, "PreparedCommit"),
+                register_after_commit_hook=False,
+            )
             try:
                 entry = commits.history_entry(
                     project_id, row["id"], historical["publication_id"], allow_archived=True,
@@ -7524,7 +7527,8 @@ class RealmStore:
         identity_ok = realm_identity["ok"]
         if {"timeline_commit_history", "timeline_document_input_contents", "timeline_document_input_links"}.issubset(actual_tables):
             from .timeline_commit_store import TimelineCommitStore
-            revision_errors.extend(TimelineCommitStore(self, validate_prepared=None).integrity_errors())
+            commits = TimelineCommitStore(self, validate_prepared=None, register_after_commit_hook=False)
+            revision_errors.extend(commits.integrity_errors())
         healthy = sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and not relational_errors and not revision_errors and catalog_check["ok"] and activation_check["ok"]
         issues = []
         if not sqlite_ok: issues.append("sqlite_integrity")

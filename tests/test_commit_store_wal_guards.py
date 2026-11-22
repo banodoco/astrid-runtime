@@ -21,6 +21,17 @@ def _commit_store(root):
     return store, commits
 
 
+def test_integrity_report_preserves_live_timeline_commit_hook(tmp_path):
+    store, live = _commit_store(tmp_path / "realm")
+    try:
+        assert store._after_commit.__self__ is live
+        report = store.integrity_report()
+        assert report["ok"]
+        assert store._after_commit.__self__ is live
+    finally:
+        store.close()
+
+
 def test_external_committed_sqlite_write_changes_data_version(tmp_path):
     store, commits = _commit_store(tmp_path / "realm")
     try:
