@@ -765,9 +765,12 @@ def test_media_selection_uses_main_settlement_identity_and_rechecks_lifecycle(tm
             "operation": "pin", "expected_version": 1,
         }, idempotency_key="pin-after-accept")
         assert commit(service, body) == accepted and provider.calls == 1
+        # PR #61: a lifecycle operation changes no selected bytes, so a fresh commit re-runs the provider and the
+        # original pin still verifies; only the stale lifecycle-version selector is refused.
+        assert commit(service, body, key="after-lifecycle")["data"]["status"] == "rebased" and provider.calls == 2
         with pytest.raises(RuntimeErrorBase):
-            commit(service, body, key="stale-catalog")
-        assert service.store.conn.execute("SELECT COUNT(*) FROM timeline_commit_history WHERE intent='recorded'").fetchone()[0] == 1
+            service.get_project_media_selection(project["id"], selectors, authorize=lambda: None)
+        assert service.store.conn.execute("SELECT COUNT(*) FROM timeline_commit_history WHERE intent='recorded'").fetchone()[0] == 2
     finally:
         service.close()
 
