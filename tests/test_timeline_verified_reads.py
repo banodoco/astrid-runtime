@@ -28,7 +28,7 @@ def test_verified_head_route_returns_exact_accepted_closure_without_history(serv
     provider(service)
     accepted = commit(service, body(service))
     project = service.test_project
-    head = {"revision_id": accepted["data"]["head_revision_id"],
+    head = {"revision_id": accepted["data"]["accepted_revision_id"],
             "publication_id": accepted["receipt"]["receipt_id"]}
     commits, _ = service._timeline_commits()
     document = commits.revision_closure(project, "main", head["revision_id"])
@@ -44,7 +44,7 @@ def test_verified_head_route_returns_exact_accepted_closure_without_history(serv
     parent = document["parent_revision"]
     assert parent["revision_id"] == head["revision_id"]
     assert parent["content_digest"] == digest(parent["payload"])
-    assert classify(request.path, "GET") is not None
+    assert classify("/api/runtime" + request.path, "GET") is not None
 
 
 def test_handshake_advertises_verified_head_with_existing_core_digest(service):
