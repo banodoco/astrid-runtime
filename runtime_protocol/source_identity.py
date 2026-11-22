@@ -113,16 +113,16 @@ def _blob_ids(root: Path, paths: list[bytes]) -> list[bytes]:
             raise SourceIdentityError(f"Git returned incomplete raw blob hashes at {root}")
         return result
 
-    if len(paths) < 1024:
-        result = batch(paths)
-    else:
-        # Large source trees benefit from concurrent reads. Keep each batch in
-        # order and wait for every process before accepting an observation.
-        step = (len(paths) + 3) // 4
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            result = [oid for group in pool.map(batch, (paths[i:i + step] for i in range(0, len(paths), step))) for oid in group]
-    if len(result) != len(paths):
-        raise SourceIdentityError(f"Git returned incomplete raw blob hashes at {root}")
+    if len(paths) < 512:
+        return batch(paths)
+
+    # Hash interleaved slices concurrently, then restore path order.
+    workers = 4
+    batches = (paths[offset::workers] for offset in range(workers))
+    result = [b""] * len(paths)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for offset, hashes in enumerate(pool.map(batch, batches)):
+            result[offset::workers] = hashes
     return result
 
 
