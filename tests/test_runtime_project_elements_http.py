@@ -767,3 +767,117 @@ def test_pre_release_receipt_refuses_with_recovery_reason(service_project):
                                   "Change its component source, admit the element again, "
                                   "then place the new revision on the clip.")
     assert refused.value.details["reason"] == "project_element_binding_missing"
+
+
+def _ref_selector(value):
+    descriptor = value["descriptor"]
+    return sha(json.dumps([descriptor[k] for k in ("packId", "kind", "id", "revision")],
+                          separators=(',', ':'), ensure_ascii=False).encode('utf-8'))
+
+
+def test_scoped_same_digest_bad_alias_is_isolated_on_both_listeners(world, project, monkeypatch):
+    service = world.daemon.service
+    data = compiled_bytes("scoped_alias")
+    snapshot = ingest_snapshot(service, project, data)
+    good = admission(service, project, snapshot, data)
+    bad = json.loads(json.dumps(good))
+    bad["id"] = bad["descriptor"]["id"] = "other"
+    publish(service, project, [good, bad], "scoped-alias")
+    path = element_path(project, sha(data))
+    good_path = path + "?ref=" + _ref_selector(good)
+    bad_path = path + "?ref=" + _ref_selector(bad)
+    reads, probes = [], []
+    validate = timeline_commit_inputs.validate_pack_snapshot_objects
+    read = timeline_commit_inputs.read_pack_snapshot_bytes
+
+    def probe():
+        acquired = []
+        def take():
+            held = service.store._mutex.acquire(blocking=False)
+            acquired.append(held)
+            if held:
+                service.store._mutex.release()
+        thread = threading.Thread(target=take)
+        thread.start()
+        thread.join(timeout=2)
+        return acquired
+
+    def checked_validate(*args, **kwargs):
+        probes.append(("validate", probe()))
+        return validate(*args, **kwargs)
+
+    def checked_read(cas, descriptor, **kwargs):
+        reads.append(descriptor["object_id"])
+        probes.append(("read", probe()))
+        return read(cas, descriptor, **kwargs)
+
+    monkeypatch.setattr(timeline_commit_inputs, "validate_pack_snapshot_objects", checked_validate)
+    monkeypatch.setattr(timeline_commit_inputs, "read_pack_snapshot_bytes", checked_read)
+    for method in ("GET", "HEAD"):
+        for call in (lambda p: world.call(p, method), lambda p: world.owner(method, p)):
+            response = call(good_path)
+            status, body = (response.status, response.body) if hasattr(response, "status") else response
+            assert (status, body) == (200, data if method == "GET" else b"")
+    assert reads == [snapshot["object_id"]] * 4
+    assert all(held == ([False] if stage == "validate" else [True]) for stage, held in probes)
+    for method in ("GET", "HEAD"):
+        assert world.call(bad_path, method).status == 409
+        assert world.owner(method, bad_path)[0] == 409
+        assert world.call(path, method).status == 409
+        assert world.owner(method, path)[0] == 409
+    other = service.create_project({"slug": "other-scoped", "name": "Other"})["id"]
+    assert world.call(element_path(other, sha(data)) + "?ref=" + _ref_selector(good)).status == 404
+    for suffix in ("?ref=", "?ref=" + "A" * 64, "?ref=" + "a" * 63,
+                   "?ref=" + _ref_selector(good) + "&ref=" + _ref_selector(good),
+                   "?ref=" + _ref_selector(good) + "&extra=1", "?x=1&ref=" + _ref_selector(good),
+                   "?ref=" + "0" * 64):
+        for method in ("GET", "HEAD"):
+            assert world.call(path + suffix, method).status == 404
+            assert world.owner(method, path + suffix)[0] == 404
+
+
+def test_scoped_fresh_binding_survives_same_digest_retained_bindingless(world, project):
+    service = world.daemon.service
+    data = compiled_bytes("same_retained")
+    old = admission(service, project, ingest_snapshot(service, project, data, include_binding=False), data)
+    fresh = admission(service, project, ingest_snapshot(service, project, data, revision="2"), data, revision="2")
+    publish(service, project, [old, fresh], "scoped-retained")
+    path = element_path(project, sha(data))
+    for method in ("GET", "HEAD"):
+        for call in (lambda p: world.call(p, method), lambda p: world.owner(method, p)):
+            response = call(path + "?ref=" + _ref_selector(fresh))
+            status, body = (response.status, response.body) if hasattr(response, "status") else response
+            assert (status, body) == (200, data if method == "GET" else b"")
+            response = call(path + "?ref=" + _ref_selector(old))
+            status, body = (response.status, response.body) if hasattr(response, "status") else response
+            assert status == 409
+            if method == "GET":
+                assert b"project_element_binding_missing" in body
+            response = call(path)
+            assert (response.status if hasattr(response, "status") else response[0]) == 409
+
+
+def test_scoped_ref_excludes_noncanonical_document(world, project):
+    service = world.daemon.service
+    data = compiled_bytes("noncanonical_scoped")
+    good = admission(service, project, ingest_snapshot(service, project, data), data)
+    publish(service, project, [good], "scoped-canonical")
+    bad = admission(service, project, ingest_snapshot(service, project, data, revision="4"), data, revision="4")
+    _, content = pack_document(service, project, [bad])
+    service.create_document(project, {"document_id": "document:" + str(uuid.uuid4()),
+                                      "kind": PROJECT_PACK_KIND, "content": content},
+                            idempotency_key="scoped-noncanonical")
+    path = element_path(project, sha(data)) + "?ref=" + _ref_selector(bad)
+    for method in ("GET", "HEAD"):
+        assert world.call(path, method).status == 404
+        assert world.owner(method, path)[0] == 404
+    assert world.call(element_path(project, sha(data)) + "?ref=" + _ref_selector(good)).body == data
+
+
+def test_scoped_route_parser_requires_exact_query():
+    digest, ref = "a" * 64, "b" * 64
+    path = f"/api/runtime/packs/project-elements/proj_1/{digest}.js"
+    assert pack_http_route(path + "?ref=" + ref) == ("project-element", "proj_1", digest, ref)
+    for suffix in ("?ref=", "?ref=" + ref.upper(), "?ref=" + ref + "&ref=" + ref,
+                   "?ref=" + ref + "&x=1", "?ref=%62" + ref[1:], "?ref=" + ref + "#fragment"):
+        assert pack_http_route(path + suffix) is None
