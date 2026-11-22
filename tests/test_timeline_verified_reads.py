@@ -187,6 +187,44 @@ def test_memo_custody_loss_replays_and_does_not_retain_proof(service, monkeypatc
     assert not any(commits._history_state.values())
 
 
+def test_transient_memo_custody_loss_forces_a_fresh_replay_on_retry(service, monkeypatch):
+    provider(service)
+    commit(service, body(service))
+    project = service.test_project
+    expected = service.get_timeline_verified_head(project, "main", authorize=lambda: None)
+    publication = expected["head"]["publication_id"]
+    commits, _ = service._timeline_commits()
+    initial_generation = commits._replay_generation
+    initial_version = commits._store_version()
+    assert commits._replay_memo
+    physical_policy = TimelineCommitStore._memo_failure
+    replay = TimelineCommitStore._verify_accepted_replay
+    lost = []
+    replays = []
+
+    def custody(self, version):
+        if self is not commits and not lost:
+            lost.append(self)
+            return "simulated transient native memo permission loss"
+        return physical_policy(self, version)
+
+    def counted(self, row, edge, *args, **kwargs):
+        replays.append((self, edge["publication_id"], commits._replay_generation))
+        return replay(self, row, edge, *args, **kwargs)
+
+    monkeypatch.setattr(TimelineCommitStore, "_memo_failure", custody)
+    monkeypatch.setattr(TimelineCommitStore, "_verify_accepted_replay", counted)
+    assert service.get_timeline_verified_head(project, "main", authorize=lambda: None) == expected
+    assert commits._store_version()[:3] == initial_version[:3]
+    assert [replayed for _, replayed, _ in replays] == [publication, publication]
+    (fallback, _, fallback_generation), (retry, _, retry_generation) = replays
+    assert lost == [fallback]
+    assert fallback is not retry
+    assert fallback_generation == initial_generation < retry_generation
+    assert commits._history_state is retry._history_state
+    assert commits._replay_memo
+
+
 def test_history_and_head_read_safe_permissions_beyond_owner_only(service):
     project = service.test_project
     previous = service.store.db_path.stat().st_mode & 0o777
