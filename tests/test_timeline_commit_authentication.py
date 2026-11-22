@@ -1385,3 +1385,39 @@ def test_created_child_public_captured_transcript_advances_sequential_manifest(c
     assert canonical["dependency_manifest"]["documents"] == [pin]
     assert len(canonical["parent_revision"]["payload"]["occurrences"]) == 2
     assert publish(submitted, "captured-transcript-child") == accepted
+
+
+def _member_removal_case(*, order_before=("clip-a", "clip-b", "clip-c"), writes=True):
+    from runtime_protocol.timeline_commit_auth import step_output
+
+    rows = [{"id": name, "track": "picture", "at": at} for name, at in
+            (("clip-a", 0), ("clip-b", 2), ("clip-c", 4))]
+    payload = {"config": {"tracks": [{"id": "picture"}], "clips": copy.deepcopy(rows)},
+               "clips": copy.deepcopy(rows), "occurrences": []}
+    parent = {"revision_id": "parent", "content_digest": digest(payload), "payload": payload}
+    removed = rows[1]
+    change = {"op": "list.remove", "ref": "parent", "path": ["config", "clips"], "id": "clip-b",
+              "before": {"state": "present", "value": removed}, "order_before": list(order_before)}
+    # The Agent records a member-scoped removal: the removed row is cleared, the collection is not observed.
+    clear = {"ref": "parent/clip:clip-b", "path": [], "before": {"state": "present", "value": removed},
+             "after": {"state": "absent"}}
+    step = {"id": "remove", "command_ordinals": [0], "patch": [change]}
+    records = {"commands": [{"writes": [clear] if writes else [], "bindings": []}]}
+    kept = [rows[0], rows[2]]
+    after_payload = {"config": {"tracks": [{"id": "picture"}], "clips": copy.deepcopy(kept)},
+                     "clips": copy.deepcopy(kept), "occurrences": []}
+    after = {"parent": {"revision_id": "parent", "content_digest": digest(after_payload),
+                        "payload": after_payload}}
+    return step_output, {"parent": parent}, step, records, after
+
+
+def test_member_scoped_clip_removal_projects_the_collection_without_a_collection_observation():
+    step_output, boundary, step, records, after = _member_removal_case()
+    assert step_output(boundary, step, records, after) == after
+
+
+@pytest.mark.parametrize("case", [{"writes": False}, {"order_before": ("clip-a", "clip-c")}])
+def test_member_scoped_clip_removal_still_refuses_unproven_list_effects(case):
+    step_output, boundary, step, records, after = _member_removal_case(**case)
+    with pytest.raises(CommitRejected):
+        step_output(boundary, step, records, after)

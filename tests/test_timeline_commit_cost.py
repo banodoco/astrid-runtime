@@ -75,8 +75,7 @@ class Film:
             validate_commit_value(value, "PreparedCommit")
             return port.accept(value)
 
-        self.provider = PreparedProvider(execute)
-        self.service.register_timeline_commit_provider(self.provider)
+        self.service.register_timeline_commit_provider(PreparedProvider(execute))
 
     def edit(self, *, key=None, base=None):
         body, change = _body(self.service, self.project, self.timeline, f"note {self.next}", self.before)
