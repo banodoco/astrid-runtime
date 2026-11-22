@@ -5,6 +5,7 @@ import hashlib
 import os
 import stat
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -95,24 +96,37 @@ def validate_checkout_root(root: Path) -> Path:
 
 
 def _blob_ids(root: Path, paths: list[bytes]) -> list[bytes]:
-    """Hash regular files in bounded argv batches, without filters or object writes."""
-    result: list[bytes] = []
-    batch: list[str] = []
-    size = 0
-    for relative in paths:
-        if batch and (len(batch) == 64 or size + len(relative) > 8192):
-            result.extend(_git(root, "hash-object", "--no-filters", "--", *batch).splitlines())
-            batch, size = [], 0
-        batch.append("./" + os.fsdecode(relative))
-        size += len(relative) + 3
-    if batch:
-        result.extend(_git(root, "hash-object", "--no-filters", "--", *batch).splitlines())
-    if len(result) != len(paths):
-        raise SourceIdentityError(f"Git returned incomplete raw blob hashes at {root}")
+    """Hash raw files using Git's quoted pathname input."""
+    if not paths:
+        return []
+    # Quoting every byte makes newlines, quotes and non-UTF-8 names unambiguous
+    # to Git's --stdin-paths parser. Prefix prevents option-like pathnames.
+    quotes = [f"\\{byte:03o}".encode("ascii") for byte in range(256)]
+
+    def batch(items: list[bytes]) -> list[bytes]:
+        encoded = b"".join(
+            b'"' + b"".join(quotes[byte] for byte in b"./" + path) + b'"\n'
+            for path in items
+        )
+        result = _git(root, "hash-object", "--no-filters", "--stdin-paths", input=encoded).splitlines()
+        if len(result) != len(items):
+            raise SourceIdentityError(f"Git returned incomplete raw blob hashes at {root}")
+        return result
+
+    if len(paths) < 512:
+        return batch(paths)
+
+    # Hash interleaved slices concurrently, then restore path order.
+    workers = 4
+    batches = (paths[offset::workers] for offset in range(workers))
+    result = [b""] * len(paths)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for offset, hashes in enumerate(pool.map(batch, batches)):
+            result[offset::workers] = hashes
     return result
 
 
-def _worktree_rows(root: Path, paths: list[bytes], *, allow_directories: bool) -> list[tuple[bytes, bytes, bytes]]:
+def _worktree_rows(root: Path, paths: list[bytes], *, allow_directories: bool, object_format: str) -> list[tuple[bytes, bytes, bytes]]:
     """Frame path/type/mode metadata around Git's raw blob hashes.
 
     One metadata observation per path is enough here: capture_source_identity
@@ -134,7 +148,9 @@ def _worktree_rows(root: Path, paths: list[bytes], *, allow_directories: bool) -
             rows.append((relative, b"100755" if mode & 0o111 else b"100644", b""))
             regular.append(relative)
         elif stat.S_ISLNK(mode):
-            oid = _git(root, "hash-object", "--no-filters", "--stdin", input=os.fsencode(os.readlink(path))).strip()
+            target = os.fsencode(os.readlink(path))
+            blob = b"blob " + str(len(target)).encode("ascii") + b"\0" + target
+            oid = hashlib.new(object_format, blob).hexdigest().encode("ascii")
             rows.append((relative, b"120000", oid))
         elif stat.S_ISDIR(mode):
             if not allow_directories:
@@ -178,9 +194,10 @@ def _capture_repo(root_arg: Path) -> tuple[str, bytes, bool, tuple]:
             raise SourceIdentityError(f"submodules or unsupported tree entries are not supported: {root}")
         expected_rows.append((relative, mode, oid))
     expected_rows.sort(key=lambda item: item[0])
-    unknown = _worktree_rows(root, _untracked(root), allow_directories=False)
+    object_format = "sha1" if len(head) == 40 else "sha256"
+    unknown = _worktree_rows(root, _untracked(root), allow_directories=False, object_format=object_format)
     tracked_paths = [row.split(b"\t", 1)[1] for row in index.split(b"\0") if row]
-    tracked = _worktree_rows(root, tracked_paths, allow_directories=True)
+    tracked = _worktree_rows(root, tracked_paths, allow_directories=True, object_format=object_format)
     for _, mode, oid in tracked + unknown:
         if mode in (b"100644", b"100755", b"120000") and (
             len(oid) != len(head) or any(c not in b"0123456789abcdef" for c in oid)
