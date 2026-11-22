@@ -32,8 +32,11 @@ def _project_elements_route(target):
     if rest.startswith("?"):
         match = re.fullmatch(r"\?project=(" + PROJECT_ID_TEXT + r")", rest)
         return ("project-elements", match.group(1)) if match else None
-    match = re.fullmatch(r"/(" + PROJECT_ID_TEXT + r")/([0-9a-f]{64})\.js", rest)
-    return ("project-element", *match.groups()) if match else None
+    match = re.fullmatch(r"/(" + PROJECT_ID_TEXT + r")/([0-9a-f]{64})\.js(?:\?ref=([0-9a-f]{64}))?", rest)
+    if not match:
+        return None
+    project, digest, ref = match.groups()
+    return ("project-element", project, digest, ref) if ref else ("project-element", project, digest)
 
 
 def pack_http_route(target):
