@@ -17,7 +17,9 @@ import sys
 import threading
 from collections import deque
 from contextlib import contextmanager
-from functools import wraps
+from functools import cache, wraps
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import cast
 
 from . import platform as runtime_platform
@@ -33,6 +35,48 @@ _PRIVATE_EXECUTION = "_sequential_execution"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _TEXT_BINDING_REF = re.compile(r"occurrence:([^/]+)/text-binding:(prompt|voiceover_script|transcript)(?::([a-z][a-z0-9-]{0,63}))?\Z")
 _LOGGER = logging.getLogger(__name__)
+_REPLAY_CHECKPOINT_FORMAT = 1
+
+
+def _installed_replay_checkpoint_version():
+    """Fingerprint the installed Runtime verifier and its schema engine."""
+    from .contract_metadata import SCHEMA_DIGEST
+
+    try:
+        root = Path(__file__).resolve().parent
+        files = sorted(root.rglob("*.py")) + [root / "schemas" / "timeline-commit-bundle.json"]
+        schema_packages = ("attrs", "jsonschema", "jsonschema-specifications", "referencing", "rpds-py")
+        return digest([_REPLAY_CHECKPOINT_FORMAT, SCHEMA_DIGEST, list(sys.version_info),
+                       {name: version(name) for name in schema_packages},
+                       {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in files}])
+    except (OSError, RuntimeError, PackageNotFoundError):
+        return None
+
+
+@cache
+def replay_checkpoint_version():
+    return _installed_replay_checkpoint_version()
+
+
+def decode_replay_checkpoint(checkpoint, *, realm_id, storage_identity):
+    if (not isinstance(checkpoint, dict) or set(checkpoint) != {"version", "realm_id", "storage", "proofs"}
+            or checkpoint["realm_id"] != realm_id or storage_identity is None
+            or checkpoint["storage"] != storage_identity
+            or not isinstance(checkpoint["proofs"], list)):
+        return set()
+    verified_version = replay_checkpoint_version()
+    if (verified_version is None or checkpoint["version"] != verified_version
+            or _installed_replay_checkpoint_version() != verified_version):
+        return set()
+    keys = set()
+    for key in checkpoint["proofs"]:
+        if (not isinstance(key, list) or len(key) != 3 or type(key[0]) is not int or key[0] <= 0
+                or not isinstance(key[1], str) or not _DIGEST.fullmatch(key[1])
+                or not isinstance(key[2], str) or (key[2] != "" and not _DIGEST.fullmatch(key[2]))):
+            return set()
+        keys.add(tuple(key))
+    return keys if len(keys) == len(checkpoint["proofs"]) else set()
 
 
 def reject(reason, message=None, *, status=409, diagnostic_reason=None, safe_details=None):
@@ -321,14 +365,22 @@ class _HistoryReadInputs:
 
 
 class TimelineCommitStore:
-    def __init__(self, store, *, validate_prepared, validate_event=None, register_after_commit_hook: bool = True):
+    def __init__(self, store, *, validate_prepared, validate_event=None, register_after_commit_hook: bool = True,
+                 checkpoint_proofs=(), admission_proofs=()):
         self.store = store
         # Validation uses the wire worker's authoritative schema, including
         # Agent-owned leaves. It must raise on invalid data, never normalize it.
         self.validate_prepared = validate_prepared
         self.validate_event = validate_event
+        # Pin the interpreter's verifier identity before this instance earns
+        # any proofs. A later install must never relabel earlier verification.
+        self._checkpoint_version = replay_checkpoint_version()
         self._verification = threading.local()
         self._replay_memo = set()
+        self._checkpoint_proofs = set()
+        # Full verification in a startup copy can supply the next clean
+        # checkpoint. It cannot skip replay in this process's live reads.
+        self._admission_proofs = set()
         self._replay_generation = 0
         self._replay_store_version = None
         self._history_state = {}
@@ -342,13 +394,25 @@ class TimelineCommitStore:
         self._database_identity = (value.st_dev, value.st_ino)
         self._wal_identity = None
         self.clear_replay_memo()
+        if checkpoint_proofs or admission_proofs:
+            version = self._store_version()
+            if self._memo_failure(version) is None:
+                self._checkpoint_proofs.update(checkpoint_proofs)
+                self._admission_proofs.update(admission_proofs)
+                self._replay_store_version = version
         if register_after_commit_hook:
-            # The long-lived verifier tracks other committed writes on this store.
-            self.store._after_commit = self._absorb_own_write
+            self._register_after_commit_hook()
+
+    def _register_after_commit_hook(self):
+        # The long-lived verifier tracks other committed writes on this store.
+        self.store._after_commit = self._absorb_own_write
+        self.store._timeline_replay_verifier = self
 
     def clear_replay_memo(self):
         with self.store._mutex:
             self._replay_memo.clear()
+            self._checkpoint_proofs.clear()
+            self._admission_proofs.clear()
             self._history_state = {key: {} for key in
                                    ("records", "entries", "closures", "heads", "chains", "chain_tails", "events", "objects")}
             self._retained_rows = {}
@@ -954,7 +1018,8 @@ class TimelineCommitStore:
                     key, arguments = replay
                     self._sync_replay_memo()
                     if key not in current["verified"] and key not in self._replay_memo:
-                        self._verify_accepted_replay(*arguments)
+                        if key not in self._checkpoint_proofs:
+                            self._verify_accepted_replay(*arguments)
                         proofs.add(key)
             # Replay/capture validation can also call back into the runtime.
             # Publish no proofs or history until all inputs still match.
@@ -1103,21 +1168,26 @@ class TimelineCommitStore:
         original = self.revision_closure(edge["project_id"], edge["timeline_id"], base["revision_id"],
                                          allow_archived=allow_archived)
         realm = self.conn.execute("SELECT realm_id FROM projects WHERE id=?", (edge["project_id"],)).fetchone()
+        semantic_events = []
+        if _PRIVATE_EXECUTION in metadata:
+            for event_id in json.loads(row["event_ids_json"])[:-1]:
+                event = self.conn.execute("SELECT kind, payload_json FROM timeline_events WHERE id=? AND timeline_id=?",
+                                          (event_id, edge["timeline_id"])).fetchone()
+                semantic_events.append(dict(event) if event is not None else None)
         # Entry bytes alone do not cover mutable source rows or event prefixes.
         # Resolve those afresh before reusing the pure recorder/capture checks.
         traversal = self._verification.current["traversal"]
         key = (edge["project_seq"], digest({"ledger": dict(row), "edge": dict(edge),
                "source": source, "base": original, "continuations": {key: sorted(value) for key, value in continuations.items()}, "history": history,
-               "events": events, "realm": list(realm) if realm else None}),
+               "events": events, "realm": list(realm) if realm else None, "semantic_events": semantic_events}),
                self._history_chain(edge))
         verified = self._verification.current["verified"]
         arguments = (row, edge, data, metadata, replay_request, prepared,
-                     original, source, continuations, history)
+                     original, source, continuations, history, realm, semantic_events)
         if traversal is not None:
             traversal["replays"][traversal["current"]] = (key, arguments)
         elif key not in verified and key not in self._replay_memo:
-            self._verify_accepted_replay(row, edge, data, metadata, replay_request, prepared,
-                                         original, source, continuations, history)
+            self._verify_accepted_replay(*arguments)
             verified.add(key)
 
     def _history_chain(self, edge):
@@ -1142,13 +1212,13 @@ class TimelineCommitStore:
         return chains[(*scope, ordinal)]
 
     def _verify_accepted_replay(self, row, edge, data, metadata, replay_request, prepared,
-                                original, source, continuations, history):
+                                original, source, continuations, history, realm, semantic_events):
         from .timeline_commit_auth import validate
         sequential = None
         if _PRIVATE_EXECUTION in metadata:
             replay_request, prepared, sequential = self._historical_sequential(
                 metadata[_PRIVATE_EXECUTION], row, edge, data, prepared, original, source,
-                continuations, history,
+                continuations, history, realm, semantic_events,
             )
         else:
             from .timeline_commit_auth import sequential_proof_required
@@ -1156,7 +1226,8 @@ class TimelineCommitStore:
                 raise ValueError("historical sequential proof is missing")
         validate(replay_request, prepared, source, original, continuations, history, sequential=sequential)
 
-    def _historical_sequential(self, execution, row, edge, data, accepted, base, source, continuations, history):
+    def _historical_sequential(self, execution, row, edge, data, accepted, base, source, continuations, history,
+                               realm, semantic_events):
         from .timeline_commit_auth import validate_sequential_capture
         from .timeline_commit_port import route_path
         from .timeline_commit_validation import validate_commit_value
@@ -1168,7 +1239,6 @@ class TimelineCommitStore:
         validate_commit_value(context, "CommitContext")
         validate_commit_value(prepared, "PreparedCommit")
         request = context["request"]
-        realm = self.conn.execute("SELECT realm_id FROM projects WHERE id=?", (edge["project_id"],)).fetchone()
         if (realm is None or context["realm_id"] != realm[0]
                 or context["publisher"] != edge["publisher"]
                 or context["idempotency_key"] != row["idempotency_key"]
@@ -1190,9 +1260,7 @@ class TimelineCommitStore:
         event_ids = json.loads(row["event_ids_json"])
         if len(event_ids) != len(prepared["semantic_events"]) + 1:
             raise ValueError("historical sequential events differ from acceptance")
-        for event_id, semantic in zip(event_ids, prepared["semantic_events"]):
-            event = self.conn.execute("SELECT kind, payload_json FROM timeline_events WHERE id=? AND timeline_id=?",
-                                      (event_id, edge["timeline_id"])).fetchone()
+        for event, semantic in zip(semantic_events, prepared["semantic_events"]):
             if event is None or event["kind"] != semantic["kind"] or json.loads(event["payload_json"]) != {
                     "project_id": edge["project_id"], "timeline_id": edge["timeline_id"],
                     "publisher": edge["publisher"], **semantic}:

@@ -25,7 +25,7 @@ from urllib.parse import unquote
 
 from . import platform
 from . import cancellation
-from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
+from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, RuntimeErrorBase, ValidationError
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
 from .cas import ContentAddressedStore
 from .dirfd import remove_tree_at, open_directory_chain
@@ -1124,13 +1124,26 @@ class RealmStore:
             owner_marker_present = self.lock_path.exists() or self.lock_path.is_symlink()
             if acquire_owner and owner_marker_present:
                 self._acquire_owner()
-            self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout, allow_active_marker=False)
+            checkpoint = {} if acquire_owner and owner_marker_present else None
+            self.admission_report = self.inspect_realm(
+                self.root, timeout_seconds=admission_timeout, allow_active_marker=False,
+                _startup_checkpoint=checkpoint,
+            )
             if not self.admission_report.get("ok"):
                 raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
             if acquire_owner and not owner_marker_present:
                 self._acquire_owner()
             self._open(fresh=False)
             if acquire_owner:
+                if checkpoint and not self._install_replay_checkpoint(checkpoint):
+                    # Admission reused only a copied generation. If it moved
+                    # before the live connection was fenced, inspect again
+                    # without that proof before admitting the service.
+                    self.admission_report = self.inspect_realm(
+                        self.root, timeout_seconds=admission_timeout, allow_active_marker=False,
+                    )
+                    if not self.admission_report.get("ok"):
+                        raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
                 self._begin_admission_session()
             self._release_admission_lock()
         except Exception:
@@ -1299,7 +1312,7 @@ class RealmStore:
             os.close(source_fd)
 
     @classmethod
-    def inspect_realm(cls, root: str | Path, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS, deep: bool = False, allow_active_marker: bool = True):
+    def inspect_realm(cls, root: str | Path, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS, deep: bool = False, allow_active_marker: bool = True, _startup_checkpoint=None):
         """Inspect a WAL-aware isolated snapshot without opening the source DB.
 
         Startup calls this only after acquiring the realm owner lock, so the
@@ -1337,6 +1350,7 @@ class RealmStore:
                     raise OSError(f"realm SQLite component is not a regular file: {path.name}")
                 identities[path] = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
                 components.append(path)
+            storage = cls._replay_checkpoint_identity(root) if _startup_checkpoint is not None else None
             with tempfile.TemporaryDirectory(prefix="astrid-runtime-realm-preflight-") as temporary:
                 snapshot_root = Path(temporary)
                 for source in components:
@@ -1360,16 +1374,26 @@ class RealmStore:
                 inspector.conn = connection
                 inspector._mutex = threading.RLock()
                 admission_state = cls._read_admission_state(root, identities)
+                if storage is not None and cls._replay_checkpoint_identity(root) == storage:
+                    inspector._replay_checkpoint_identity_at_copy = storage
+                    inspector._startup_replay_checkpoint = _startup_checkpoint
                 if admission_state is not None and allow_active_marker:
                     admission_state["owner_active"] = cls._owner_is_locked(root)
                 try:
                     connection.execute("PRAGMA query_only=ON")
-                    return inspector.integrity_report(
+                    report = inspector.integrity_report(
                         catalog_path=catalog_path,
                         timeout_seconds=max(0.001, deadline - time.monotonic()),
                         deep=deep,
                         admission_state=admission_state,
                     )
+                    if _startup_checkpoint and cls._replay_checkpoint_identity(root) != storage:
+                        _startup_checkpoint.clear()
+                        return cls.inspect_realm(
+                            root, catalog_path=catalog_path, deep=deep, allow_active_marker=allow_active_marker,
+                            timeout_seconds=deadline - time.monotonic(),
+                        )
+                    return report
                 finally:
                     connection.close()
         except TimeoutError as exc:
@@ -1383,13 +1407,36 @@ class RealmStore:
     def _read_admission_state(root, identities):
         path = root / _ADMISSION_STATE
         try:
-            if not stat.S_ISREG(path.lstat().st_mode):
+            initial = path.lstat()
+            if not stat.S_ISREG(initial.st_mode):
                 return None
-            with path.open("r", encoding="utf-8") as source:
-                state = json.load(source)
-            expected = {component.name: list(identity) if identity else None for component, identity in identities.items()}
-            return state if isinstance(state, dict) and state.get("sqlite_components") == expected else None
-        except (FileNotFoundError, OSError, ValueError, UnicodeError):
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+                opened = os.fstat(source.fileno())
+                content = source.read()
+                state = json.loads(content)
+                expected = {component.name: list(identity) if identity else None for component, identity in identities.items()}
+                if not isinstance(state, dict) or state.get("sqlite_components") != expected:
+                    return None
+                if "timeline_replay_checkpoint" in state:
+                    def identity(metadata):
+                        return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns,
+                                metadata.st_ctime_ns, metadata.st_mode, metadata.st_uid, metadata.st_nlink)
+
+                    if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or identity(initial) != identity(opened)
+                            or not platform.is_owner_only(source.fileno())
+                            or identity(path.lstat()) != identity(opened)
+                            or identity(os.fstat(source.fileno())) != identity(opened)):
+                        state.pop("timeline_replay_checkpoint")
+                    else:
+                        # Duplicate keys and non-finite values cannot be replay custody.
+                        from .timeline_commit_baseline import _json
+                        try:
+                            state = _json(content)
+                        except (TypeError, ValueError, RecursionError):
+                            state.pop("timeline_replay_checkpoint")
+                return state
+        except (OSError, ValueError, RecursionError):
             return None
 
     @staticmethod
@@ -1408,7 +1455,104 @@ class RealmStore:
         finally:
             os.close(fd)
 
-    def _write_admission_state(self, *, clean, realm_id=None):
+    @staticmethod
+    def _replay_checkpoint_identity(root, *, allow_empty_wal=False):
+        """Only a protected, fully checkpointed local SQLite generation can carry proofs."""
+        try:
+            directory = root.lstat()
+            db_path = root / "realm.sqlite3"
+            db = db_path.lstat()
+            if (not stat.S_ISDIR(directory.st_mode) or not stat.S_ISREG(db.st_mode) or db.st_nlink != 1
+                    or not platform.is_owner_only(db_path)):
+                return None
+            if sys.platform == "win32":
+                if not platform.is_owner_only(root, directory=True):
+                    return None
+            elif directory.st_mode & 0o022 or not platform.is_current_user(directory):
+                return None
+            for suffix in ("-wal", "-shm", "-journal"):
+                path = root / (db_path.name + suffix)
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if (not allow_empty_wal or suffix == "-journal" or not stat.S_ISREG(info.st_mode)
+                        or not platform.is_owner_only(path) or (suffix == "-wal" and info.st_size != 0)):
+                    return None
+            return {
+                "directory": [directory.st_dev, directory.st_ino, directory.st_uid, directory.st_mode],
+                "database": [db.st_dev, db.st_ino, db.st_size, db.st_mtime_ns, db.st_ctime_ns, db.st_uid, db.st_mode],
+            }
+        except OSError:
+            return None
+
+    @contextmanager
+    def _try_checkpoint_fence(self):
+        """An optimization must not wait for a writer or another snapshot."""
+        old_timeout = self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.conn.execute("PRAGMA busy_timeout=0")
+        try:
+            yield
+        finally:
+            self.conn.execute(f"PRAGMA busy_timeout={old_timeout}")
+
+    def _install_replay_checkpoint(self, checkpoint):
+        from .timeline_commit_store import TimelineCommitStore, _installed_replay_checkpoint_version
+
+        if checkpoint["reused"] and _installed_replay_checkpoint_version() != checkpoint["version"]:
+            return False
+        try:
+            with self._try_checkpoint_fence():
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._replay_checkpoint_identity(self.root, allow_empty_wal=True) != checkpoint["storage"]:
+                        return False
+                    verifier = TimelineCommitStore(
+                        self, validate_prepared=None, register_after_commit_hook=False,
+                        checkpoint_proofs=checkpoint["reused"], admission_proofs=checkpoint["verified"],
+                    )
+                finally:
+                    self.conn.rollback()
+        except (sqlite3.Error, OSError, RuntimeErrorBase):
+            return False
+        if verifier._replay_store_version is None:
+            return False
+        self._startup_timeline_verifier = verifier
+        verifier._register_after_commit_hook()
+        return True
+
+    def _prepare_replay_checkpoint(self, realm_id):
+        from .timeline_commit_store import _installed_replay_checkpoint_version, _same_store_version
+
+        verifier = getattr(self, "_timeline_replay_verifier", None)
+        if verifier is None or self.conn.in_transaction:
+            return None
+        try:
+            before = verifier._store_version()
+            proofs = verifier._replay_memo | verifier._checkpoint_proofs | verifier._admission_proofs
+            if (not proofs or not _same_store_version(verifier._replay_store_version, before)
+                    or verifier._memo_failure(before) is not None):
+                return None
+            version = verifier._checkpoint_version
+            if version is None or _installed_replay_checkpoint_version() != version:
+                return None
+            with self._try_checkpoint_fence():
+                if self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] != 0:
+                    return None
+                # Establish the final generation under the SQLite writer fence.
+                # close() releases it; sidecar publication compares the clean
+                # component identity again before recording these proofs.
+                self.conn.execute("BEGIN IMMEDIATE")
+                after = verifier._store_version()
+                storage = self._replay_checkpoint_identity(self.root, allow_empty_wal=True)
+                if storage is not None and _same_store_version(before, after, allow_checkpoint=True):
+                    return {"version": version, "realm_id": realm_id, "storage": storage,
+                            "proofs": sorted(proofs)}
+        except (sqlite3.Error, OSError, RuntimeErrorBase):
+            return None
+        return None
+
+    def _write_admission_state(self, *, clean, realm_id=None, replay_checkpoint=None):
         # The owner lock is held. A failed clean-close replacement leaves the
         # active marker, so the next startup must run the deep tier.
         report = getattr(self, "admission_report", {})
@@ -1429,6 +1573,9 @@ class RealmStore:
                 state["sqlite_components"][component.name] = [metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns]
             except FileNotFoundError:
                 state["sqlite_components"][component.name] = None
+        if (clean and replay_checkpoint is not None
+                and self._replay_checkpoint_identity(self.root) == replay_checkpoint["storage"]):
+            state["timeline_replay_checkpoint"] = replay_checkpoint
         path = self.root / _ADMISSION_STATE
         fd, temporary = tempfile.mkstemp(prefix=".admission-state-", dir=self.root)
         try:
@@ -1527,7 +1674,8 @@ class RealmStore:
                 sqlite_file_uri(self.db_path, mode="rw"), uri=True, timeout=10,
                 isolation_level=None, check_same_thread=False,
             )
-        platform.owner_only(self.db_path)
+        if not platform.is_owner_only(self.db_path):
+            platform.owner_only(self.db_path)
         self.conn.row_factory = sqlite3.Row
         journal_mode = self.conn.execute("PRAGMA journal_mode=WAL").fetchone()
         if journal_mode is None or str(journal_mode[0]).lower() != "wal":
@@ -1695,14 +1843,16 @@ class RealmStore:
                 try:
                     if self.conn is not None:
                         clean_realm_id = None
+                        replay_checkpoint = None
                         if orderly and getattr(self, "_admission_active", False):
                             clean_realm_id = self.conn.execute("SELECT id FROM realm").fetchone()[0]
+                            replay_checkpoint = self._prepare_replay_checkpoint(clean_realm_id)
                         try:
                             self.conn.close()
                         finally:
                             self.conn = None
                         if clean_realm_id is not None:
-                            self._write_admission_state(clean=True, realm_id=clean_realm_id)
+                            self._write_admission_state(clean=True, realm_id=clean_realm_id, replay_checkpoint=replay_checkpoint)
                 finally:
                     self._release_owner()
         finally:
@@ -7525,11 +7675,29 @@ class RealmStore:
             catalog_check = {"status": "blocked", "ok": False, "issues": ["catalog_realm_unavailable"], "path": str(catalog_path)}
             activation_check = {"status": "blocked", "ok": False, "issues": ["activation_catalog_unavailable"]}
         identity_ok = realm_identity["ok"]
+        checkpoint_proofs = set()
+        checkpoint_storage = getattr(self, "_replay_checkpoint_identity_at_copy", None)
+        checkpoint_output = getattr(self, "_startup_replay_checkpoint", None)
+        verified_proofs = set()
+        checkpoint_version = None
         if {"timeline_commit_history", "timeline_document_input_contents", "timeline_document_input_links"}.issubset(actual_tables):
-            from .timeline_commit_store import TimelineCommitStore
-            commits = TimelineCommitStore(self, validate_prepared=None, register_after_commit_hook=False)
+            from .timeline_commit_store import TimelineCommitStore, decode_replay_checkpoint
+            if checkpoint_output is not None and not run_deep and previous_verification.get("clean_shutdown") is True:
+                checkpoint_proofs = decode_replay_checkpoint(
+                    previous_verification.get("timeline_replay_checkpoint"), realm_id=realm_identity["realm_id"],
+                    storage_identity=checkpoint_storage,
+                )
+            commits = TimelineCommitStore(self, validate_prepared=None, register_after_commit_hook=False,
+                                          checkpoint_proofs=checkpoint_proofs)
             revision_errors.extend(commits.integrity_errors())
+            if checkpoint_storage is not None:
+                checkpoint_version = commits._checkpoint_version
+                verified_proofs = commits._replay_memo
+                checkpoint_proofs.intersection_update(commits._checkpoint_proofs, verified_proofs)
         healthy = sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and not relational_errors and not revision_errors and catalog_check["ok"] and activation_check["ok"]
+        if healthy and verified_proofs and checkpoint_version is not None:
+            checkpoint_output.update(storage=checkpoint_storage, version=checkpoint_version,
+                                     reused=checkpoint_proofs, verified=verified_proofs - checkpoint_proofs)
         issues = []
         if not sqlite_ok: issues.append("sqlite_integrity")
         if fk: issues.append("foreign_keys")
