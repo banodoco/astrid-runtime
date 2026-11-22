@@ -6,14 +6,14 @@ from runtime_protocol.visual_boundary import boundary_report, transition_frames
 from runtime_protocol.visual_seam import evaluate_closure
 
 
-def _report(clip, *, fps=30, start=0, end=120, origin=0):
+def _report(clip, *, fps=30, start=0, end=120, origin=0, path=("clip",)):
     return boundary_report({
         "clip": {"clipType": "media", **clip},
         "fps": fps,
         "startFrame": start,
         "endFrame": end,
         "originFrame": origin,
-        "path": ["clip"],
+        "path": list(path),
         "params": {},
     })
 
@@ -86,3 +86,13 @@ def test_unknown_phase_and_continuous_ids_remain_opaque():
         assert report["opaque"] == [f"unsupported {phase} timing"]
     report = _report({"continuous": {"type": "unregistered-effect"}})
     assert report["opaque"] == ["unsupported continuous timing"]
+
+
+def test_legacy_phase_timing_uses_the_path_role_instead_of_the_clip_id():
+    clip = {"entrance": {"type": "slide-down"}, "continuous": {"type": "drift"}}
+    root = ("parent", "t", "clip", "effect")
+    assert _report(clip, path=root)["opaque"] == []
+    assert _report(clip, path=(*root, "effect", "nested"))["opaque"] == [
+        "unsupported entrance timing",
+        "unsupported continuous timing",
+    ]

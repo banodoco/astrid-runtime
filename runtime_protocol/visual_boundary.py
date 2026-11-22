@@ -116,6 +116,7 @@ def boundary_report(context):
 
     element = clip.get("elementRef")
     kind = clip.get("clipType", element.get("id") if isinstance(element, dict) else None)
+    nested_effect = len(path) >= 2 and path[-2] == "effect"
     try:
         if finite(fps, None) is None or fps <= 0 or not isinstance(start, int) or not isinstance(end, int) or end <= start:
             raise ValueError("invalid visible span")
@@ -134,7 +135,7 @@ def boundary_report(context):
                     report["opaque"].append(f"unsupported {phase} timing")
                     continue
                 default = _ANIMATION_DEFAULTS.get(identity)
-                if default is None and identity in _LEGACY_PHASE_IDS[phase] and "effect" not in path:
+                if default is None and identity in _LEGACY_PHASE_IDS[phase] and not nested_effect:
                     default = js_round(0.4 * fps)
                 duration = ref.get("durationFrames", finite(ref.get("duration"), -1) * fps
                                    if "duration" in ref else default)
@@ -147,7 +148,7 @@ def boundary_report(context):
             raw = clip["continuous"]
             ref = raw if isinstance(raw, dict) else {}
             identity = raw if isinstance(raw, str) else ref.get("id", ref.get("type"))
-            if isinstance(identity, str) and identity in _LEGACY_PHASE_IDS["continuous"] and "effect" not in path:
+            if isinstance(identity, str) and identity in _LEGACY_PHASE_IDS["continuous"] and not nested_effect:
                 # R13's continuous renderers receive the whole clip duration.
                 # Glitch is already active on local frame zero; the other
                 # continuous renderers first change their output on frame one.
