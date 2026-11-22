@@ -6142,12 +6142,16 @@ class RuntimeService:
         return {"version": 1, "projectId": project_id, "realmId": realm, "selectionDigest": selection,
                 "projects": list(projects.values()), "elements": elements, "legacy": legacy}
 
-    def open_project_pack_element(self, project_id, digest):
+    def open_project_pack_element(self, project_id, digest, ref=None):
         """Serve only compiled bytes the project's current admissions name."""
         from .timeline_commit_inputs import read_pack_snapshot_bytes, validate_pack_snapshot_objects
 
         project_id = self.store.get_project(project_id)["id"]
         matches = [entry for entry in self._project_pack_elements(project_id)[0] if entry["digest"] == digest]
+        if ref is not None:
+            matches = [entry for entry in matches if sha256_bytes(json.dumps(
+                [entry["packId"], *[entry["descriptor"][key] for key in ("kind", "id", "revision")]],
+                separators=(',', ':'), ensure_ascii=False).encode("utf-8")) == ref]
         if not matches:
             raise NotFoundError("project pack element is not admitted for this project")
         result = None
