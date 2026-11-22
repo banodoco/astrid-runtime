@@ -1274,6 +1274,13 @@ class TimelineCommitStore:
             snapshot.close()
 
             with self.store._mutex:
+                if memo_allowed and memo_fallback:
+                    # Native permissions can recover before this final sample.
+                    # Invalidate the generation that crossed the custody loss
+                    # before a retry can inherit it, even if the head moved.
+                    if generation == self._replay_generation:
+                        self.clear_replay_memo()
+                    raise _head_busy("isolated-read final", "memo custody", _PostReadMovement)
                 if self.store.conn is not live_connection or self.store._lock_file != owner:
                     raise _head_busy("isolated-read final", "connection or realm owner", _PostReadMovement)
                 authorize()
@@ -1294,7 +1301,8 @@ class TimelineCommitStore:
                         or current != expected or generation != self._replay_generation):
                     raise _head_busy("isolated-read final", _moved_components(version, actual), _PostReadMovement)
                 memo_still_allowed = self._memo_failure(actual) is None
-                if memo_allowed and (memo_fallback or not memo_still_allowed):
+                if memo_allowed and not memo_still_allowed:
+                    self.clear_replay_memo()
                     raise _head_busy("isolated-read final", "memo custody", _PostReadMovement)
                 if memo_allowed and memo_still_allowed:
                     self._replay_memo = reader._replay_memo
