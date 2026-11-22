@@ -14,8 +14,8 @@ import test_timeline_commit_port as port_tests
 from test_timeline_commit_authentication import body, provider
 from test_timeline_commit_port import commit, rows
 
-from runtime_protocol import platform
-from runtime_protocol.errors import RealmAdmissionError, RuntimeErrorBase
+from runtime_protocol import platform, timeline_commit_store
+from runtime_protocol.errors import AuthorizationError, RealmAdmissionError, RuntimeErrorBase
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 from runtime_protocol.timeline_commit import CommitRejected
@@ -154,6 +154,21 @@ def test_changed_history_has_same_startup_refusal_as_full_replay(service, monkey
     assert [published for _, published in retained_calls] == [published for _, published in calls]
 
 
+def test_installed_verifier_change_cannot_relabel_earlier_proofs(service, monkeypatch):
+    original = timeline_commit_store.version
+    timeline_commit_store.replay_checkpoint_version.cache_clear()
+    try:
+        provider(service)
+        commit(service, body(service))
+        _history(service, service.test_project)
+        monkeypatch.setattr(timeline_commit_store, "version",
+                            lambda name: "changed" if name == "jsonschema" else original(name))
+        service.close()
+        assert _CHECKPOINT not in json.loads(_state(service.store.root).read_text())
+    finally:
+        timeline_commit_store.replay_checkpoint_version.cache_clear()
+
+
 def test_interrupted_replacement_leaves_no_usable_checkpoint(service, monkeypatch):
     provider(service)
     accepted = commit(service, body(service))
@@ -190,7 +205,7 @@ def test_process_crash_after_sync_never_admits_temporary_proof(service, monkeypa
     code = """
 import os
 import sys
-from runtime_protocol import platform
+from runtime_protocol import platform, timeline_commit_store
 from runtime_protocol.service import RuntimeService
 
 service = RuntimeService(sys.argv[1])
@@ -229,6 +244,21 @@ def test_writer_between_copied_admission_and_live_open_forces_new_admission(serv
     with pytest.raises(RealmAdmissionError) as refused:
         RuntimeService(root)
     assert not refused.value.details["checks"]["revisions"]["ok"]
+
+
+def test_first_refused_read_clears_live_checkpoint(service, monkeypatch):
+    root, project, _, head, expected = _seed(service)
+    calls = _replays(monkeypatch)
+
+    def denied():
+        raise AuthorizationError("read denied")
+
+    with closing(RuntimeService(root)) as reopened:
+        assert calls == []
+        with pytest.raises(AuthorizationError, match="read denied"):
+            reopened.list_timeline_commits(project, "main", limit=1, authorize=denied)
+        assert _history(reopened, project) == expected
+    assert (root / "realm.sqlite3", head) in calls
 
 
 def test_external_unrelated_writer_also_clears_live_checkpoint(service, monkeypatch):

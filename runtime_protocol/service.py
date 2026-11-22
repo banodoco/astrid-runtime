@@ -607,6 +607,10 @@ class RuntimeService:
                     "realm failed startup admission",
                     details=self.store.admission_report,
                 )
+            if getattr(self.store, "_startup_timeline_verifier", None) is not None:
+                # Make the admitted verifier visible to the service's refusal
+                # boundary even before the first timeline request.
+                self._timeline_commits()
             self.cas = ContentAddressedStore(self.store.cas_root)
             self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
             self.runtime_session_id = new_id()

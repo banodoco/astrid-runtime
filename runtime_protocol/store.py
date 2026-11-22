@@ -1497,8 +1497,10 @@ class RealmStore:
             self.conn.execute(f"PRAGMA busy_timeout={old_timeout}")
 
     def _install_replay_checkpoint(self, checkpoint):
-        from .timeline_commit_store import TimelineCommitStore
+        from .timeline_commit_store import TimelineCommitStore, _installed_replay_checkpoint_version
 
+        if checkpoint["reused"] and _installed_replay_checkpoint_version() != checkpoint["version"]:
+            return False
         try:
             with self._try_checkpoint_fence():
                 self.conn.execute("BEGIN IMMEDIATE")
@@ -1520,7 +1522,7 @@ class RealmStore:
         return True
 
     def _prepare_replay_checkpoint(self, realm_id):
-        from .timeline_commit_store import _same_store_version, replay_checkpoint_version
+        from .timeline_commit_store import _installed_replay_checkpoint_version, _same_store_version
 
         verifier = getattr(self, "_timeline_replay_verifier", None)
         if verifier is None or self.conn.in_transaction:
@@ -1531,8 +1533,8 @@ class RealmStore:
             if (not proofs or not _same_store_version(verifier._replay_store_version, before)
                     or verifier._memo_failure(before) is not None):
                 return None
-            version = replay_checkpoint_version()
-            if version is None:
+            version = verifier._checkpoint_version
+            if version is None or _installed_replay_checkpoint_version() != version:
                 return None
             with self._try_checkpoint_fence():
                 if self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] != 0:
@@ -7677,6 +7679,7 @@ class RealmStore:
         checkpoint_storage = getattr(self, "_replay_checkpoint_identity_at_copy", None)
         checkpoint_output = getattr(self, "_startup_replay_checkpoint", None)
         verified_proofs = set()
+        checkpoint_version = None
         if {"timeline_commit_history", "timeline_document_input_contents", "timeline_document_input_links"}.issubset(actual_tables):
             from .timeline_commit_store import TimelineCommitStore, decode_replay_checkpoint
             if checkpoint_output is not None and not run_deep and previous_verification.get("clean_shutdown") is True:
@@ -7688,12 +7691,13 @@ class RealmStore:
                                           checkpoint_proofs=checkpoint_proofs)
             revision_errors.extend(commits.integrity_errors())
             if checkpoint_storage is not None:
+                checkpoint_version = commits._checkpoint_version
                 verified_proofs = commits._replay_memo
                 checkpoint_proofs.intersection_update(commits._checkpoint_proofs, verified_proofs)
         healthy = sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and not relational_errors and not revision_errors and catalog_check["ok"] and activation_check["ok"]
-        if healthy and verified_proofs:
-            checkpoint_output.update(storage=checkpoint_storage, reused=checkpoint_proofs,
-                                     verified=verified_proofs - checkpoint_proofs)
+        if healthy and verified_proofs and checkpoint_version is not None:
+            checkpoint_output.update(storage=checkpoint_storage, version=checkpoint_version,
+                                     reused=checkpoint_proofs, verified=verified_proofs - checkpoint_proofs)
         issues = []
         if not sqlite_ok: issues.append("sqlite_integrity")
         if fk: issues.append("foreign_keys")

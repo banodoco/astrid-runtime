@@ -38,9 +38,8 @@ _LOGGER = logging.getLogger(__name__)
 _REPLAY_CHECKPOINT_FORMAT = 1
 
 
-@cache
-def replay_checkpoint_version():
-    """Bind a proof to the installed Runtime verifier and its schema engine."""
+def _installed_replay_checkpoint_version():
+    """Fingerprint the installed Runtime verifier and its schema engine."""
     from .contract_metadata import SCHEMA_DIGEST
 
     try:
@@ -55,12 +54,20 @@ def replay_checkpoint_version():
         return None
 
 
+@cache
+def replay_checkpoint_version():
+    return _installed_replay_checkpoint_version()
+
+
 def decode_replay_checkpoint(checkpoint, *, realm_id, storage_identity):
     if (not isinstance(checkpoint, dict) or set(checkpoint) != {"version", "realm_id", "storage", "proofs"}
             or checkpoint["realm_id"] != realm_id or storage_identity is None
-            or checkpoint["storage"] != storage_identity or replay_checkpoint_version() is None
-            or checkpoint["version"] != replay_checkpoint_version()
+            or checkpoint["storage"] != storage_identity
             or not isinstance(checkpoint["proofs"], list)):
+        return set()
+    verified_version = replay_checkpoint_version()
+    if (verified_version is None or checkpoint["version"] != verified_version
+            or _installed_replay_checkpoint_version() != verified_version):
         return set()
     keys = set()
     for key in checkpoint["proofs"]:
@@ -365,6 +372,9 @@ class TimelineCommitStore:
         # Agent-owned leaves. It must raise on invalid data, never normalize it.
         self.validate_prepared = validate_prepared
         self.validate_event = validate_event
+        # Pin the interpreter's verifier identity before this instance earns
+        # any proofs. A later install must never relabel earlier verification.
+        self._checkpoint_version = replay_checkpoint_version()
         self._verification = threading.local()
         self._replay_memo = set()
         self._checkpoint_proofs = set()
