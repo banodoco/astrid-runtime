@@ -3143,9 +3143,14 @@ class RuntimeService:
         from .timeline_commit_store import TimelineCommitStore
         with self.store._mutex:
             if self._timeline_commit_store is None:
-                self._timeline_commit_store = TimelineCommitStore(
-                    self.store, validate_prepared=lambda value: validate_commit_value(value, "PreparedCommit"),
-                )
+                validate_prepared = lambda value: validate_commit_value(value, "PreparedCommit")
+                admitted = getattr(self.store, "_startup_timeline_verifier", None)
+                if admitted is not None:
+                    admitted.validate_prepared = validate_prepared
+                    self._timeline_commit_store = admitted
+                    del self.store._startup_timeline_verifier
+                else:
+                    self._timeline_commit_store = TimelineCommitStore(self.store, validate_prepared=validate_prepared)
                 self._timeline_commit_coordinator = CommitExecutionCoordinator(self._timeline_commit_store)
             return self._timeline_commit_store, self._timeline_commit_coordinator
 
