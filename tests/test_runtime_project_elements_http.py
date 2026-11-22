@@ -494,3 +494,72 @@ def test_route_parser_accepts_only_the_exact_shapes():
         f"/api/runtime/packs/project-elements/proj_1/{digest[:-1]}G.js",
     ):
         assert pack_http_route(target) is None, target
+
+
+@pytest.mark.parametrize("damage", ["document_id", "source_binding_key", "relative_manifest"])
+def test_preview_excludes_noncanonical_pack_and_preserves_healthy_pack(service_project, damage):
+    service, project = service_project
+    good_bytes, bad_bytes = compiled_bytes("good"), compiled_bytes("bad")
+    good = admission(service, project, ingest_snapshot(service, project, good_bytes), good_bytes)
+    publish(service, project, [good], "canonical-good")
+    bad = admission(service, project, ingest_snapshot(service, project, bad_bytes), bad_bytes, revision="4")
+    bad["descriptor"]["packId"] = "other_pack"
+    document_id, content = pack_document(service, project, [bad])
+    content["pack_id"] = "other_pack"
+    content["relative_manifest"] = f"{service.realm['id']}/{project}/packs/other_pack/pack.yaml"
+    document_id = "document:" + str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([project, PROJECT_PACK_KIND, "other_pack"])))
+    if damage == "document_id":
+        document_id = "document:" + str(uuid.uuid4())
+    else:
+        content[damage] = "wrong"
+    service.create_document(project, {"document_id": document_id, "kind": PROJECT_PACK_KIND,
+                                      "content": content}, idempotency_key="noncanonical")
+    listed = service.project_pack_elements(project)
+    assert [item["digest"] for item in listed["elements"]] == [sha(good_bytes)]
+    with pytest.raises(NotFoundError):
+        service.open_project_pack_element(project, sha(bad_bytes))
+    assert service.open_project_pack_element(project, sha(good_bytes))[1].read() == good_bytes
+
+
+def test_preview_isolates_wrong_descriptor_owner_in_same_pack(service_project):
+    service, project = service_project
+    good_bytes, bad_bytes = compiled_bytes("good"), compiled_bytes("wrong_owner")
+    good = admission(service, project, ingest_snapshot(service, project, good_bytes), good_bytes)
+    bad = admission(service, project, ingest_snapshot(service, project, bad_bytes), bad_bytes, revision="4")
+    bad["descriptor"]["packId"] = "other_pack"
+    publish(service, project, [bad, good, legacy_admission(service, project)], "mixed-owner")
+    listed = service.project_pack_elements(project)
+    assert [item["digest"] for item in listed["elements"]] == [sha(good_bytes)]
+    assert listed["legacy"] == [{"packId": owner_id(service, project), "kind": "transition", "id": "wipe"}]
+    with pytest.raises(NotFoundError):
+        service.open_project_pack_element(project, sha(bad_bytes))
+    assert service.open_project_pack_element(project, sha(good_bytes))[1].read() == good_bytes
+
+
+def test_preview_excludes_default_owner_alias_and_ambiguous_refs(service_project):
+    service, project = service_project
+    good_bytes, duplicate_bytes, alias_bytes = (compiled_bytes(tag) for tag in ("healthy", "duplicate", "alias"))
+    good = admission(service, project, ingest_snapshot(service, project, good_bytes), good_bytes)
+    good["id"] = good["descriptor"]["id"] = "healthy"
+    duplicate = admission(service, project, ingest_snapshot(service, project, duplicate_bytes), duplicate_bytes)
+    publish(service, project, [duplicate, dict(duplicate), good], "duplicates")
+    alias = admission(service, project, ingest_snapshot(service, project, alias_bytes), alias_bytes, revision="4")
+    alias_id = "document:" + str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([project, PROJECT_PACK_KIND, owner_id(service, project)])))
+    _, content = pack_document(service, project, [alias])
+    service.create_document(project, {"document_id": alias_id, "kind": PROJECT_PACK_KIND,
+                                      "content": content}, idempotency_key="owner-alias")
+    assert [item["digest"] for item in service.project_pack_elements(project)["elements"]] == [sha(good_bytes)]
+    for data in (duplicate_bytes, alias_bytes):
+        with pytest.raises(NotFoundError):
+            service.open_project_pack_element(project, sha(data))
+    assert service.open_project_pack_element(project, sha(good_bytes))[1].read() == good_bytes
+
+
+def test_commit_pack_source_rejects_compiled_descriptor_owner_mismatch(service_project):
+    service, project = service_project
+    data = compiled_bytes("wrong_owner_commit")
+    value = admission(service, project, ingest_snapshot(service, project, data), data)
+    value["descriptor"]["packId"] = "other_pack"
+    document_id, content = pack_document(service, project, [value])
+    with pytest.raises(ConflictError, match="owner does not match"):
+        timeline_commit_inputs._project_pack_source(service.store.conn, project, document_id, content)

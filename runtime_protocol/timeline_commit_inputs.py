@@ -200,8 +200,8 @@ def _document_source(content: Any, *, project_id: str, document_id: str, kind: s
     return None, None
 
 
-def _project_pack_source(connection: sqlite3.Connection, project_id: str,
-                         document_id: str, content: Any) -> None:
+def _project_pack_header(connection: sqlite3.Connection, project_id: str,
+                         document_id: str, content: Any, *, canonical_default: bool = False) -> None:
     if not isinstance(content, dict) or set(content) != {
         "schema", "pack_id", "source_binding_key", "relative_manifest", "admissions",
     } or content.get("schema") != PROJECT_PACK_SCHEMA or content.get("source_binding_key") != "project-packs":
@@ -213,7 +213,9 @@ def _project_pack_source(connection: sqlite3.Connection, project_id: str,
     if project is None:
         raise ConflictError("project pack project binding is missing")
     default_owner = "project_" + hashlib.sha256(f"{project['realm_id']}:{project_id}:default".encode()).hexdigest()[:20]
-    collections = [owner, "default"] if owner == default_owner else [owner]
+    # Render resolves the default owner through the stable default collection.
+    # Retained historical inputs also accept the older owner-named alias.
+    collections = (["default"] if canonical_default else [owner, "default"]) if owner == default_owner else [owner]
     identities = {
         "document:" + str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([project_id, PROJECT_PACK_KIND, collection])))
         for collection in collections
@@ -225,23 +227,35 @@ def _project_pack_source(connection: sqlite3.Connection, project_id: str,
     admissions = content["admissions"]
     if not isinstance(admissions, list):
         raise ConflictError("project pack admissions are invalid")
+
+
+def _project_pack_admission(connection: sqlite3.Connection, project_id: str,
+                            owner: str, admission: Any) -> tuple[str, str, str]:
+    if (not isinstance(admission, dict) or not {"id", "kind", "revision", "snapshot_digest"} <= set(admission)
+            or set(admission) - {"id", "kind", "revision", "snapshot_digest", "snapshot_object", "compiled", "descriptor", "authoring"}
+            or not isinstance(admission["id"], str) or not admission["id"]
+            or not isinstance(admission["kind"], str) or admission["kind"] not in {"effect", "animation", "transition"}
+            or not isinstance(admission["revision"], str) or not _DIGEST_RE.fullmatch(admission["revision"])
+            or not isinstance(admission["snapshot_digest"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", admission["snapshot_digest"])):
+        raise ConflictError("project pack admission identity/digest is invalid")
+    if "compiled" in admission:
+        _compiled_descriptor(admission)
+        if admission["descriptor"]["packId"] != owner:
+            raise ConflictError("project pack listed element owner does not match its pack")
+    validate_pack_snapshot_objects(connection, project_id, {"admissions": [admission]})
+    return admission["id"], admission["kind"], admission["revision"]
+
+
+def _project_pack_source(connection: sqlite3.Connection, project_id: str,
+                         document_id: str, content: Any) -> None:
+    _project_pack_header(connection, project_id, document_id, content)
     seen = set()
-    for admission in admissions:
-        if (not isinstance(admission, dict) or not {"id", "kind", "revision", "snapshot_digest"} <= set(admission)
-                or set(admission) - {"id", "kind", "revision", "snapshot_digest", "snapshot_object", "compiled", "descriptor", "authoring"}
-                or not isinstance(admission["id"], str) or not admission["id"]
-                or not isinstance(admission["kind"], str) or admission["kind"] not in {"effect", "animation", "transition"}
-                or not isinstance(admission["revision"], str) or not _DIGEST_RE.fullmatch(admission["revision"])
-                or not isinstance(admission["snapshot_digest"], str)
-                or not re.fullmatch(r"[0-9a-f]{64}", admission["snapshot_digest"])):
-            raise ConflictError("project pack admission identity/digest is invalid")
-        if "compiled" in admission:
-            _compiled_descriptor(admission)
-        identity = admission["id"], admission["kind"], admission["revision"]
+    for admission in content["admissions"]:
+        identity = _project_pack_admission(connection, project_id, content["pack_id"], admission)
         if identity in seen:
             raise ConflictError("project pack admission identity is ambiguous")
         seen.add(identity)
-    validate_pack_snapshot_objects(connection, project_id, content)
 
 
 _RENDERABILITY = {"supported", "blocked", "unknown"}

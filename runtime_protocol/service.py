@@ -5974,29 +5974,40 @@ class RuntimeService:
         A re-admit is visible on the next request; only a bytes request reads
         and verifies the selected portable snapshot, after releasing the mutex.
         """
-        from .timeline_commit_inputs import PROJECT_PACK_KIND
+        from .timeline_commit_inputs import PROJECT_PACK_KIND, _project_pack_header, _project_pack_admission
         entries = []
         legacy = []
         with self.store._mutex:
             rows = self.store.conn.execute(
                 "SELECT id, kind, content_json FROM project_documents WHERE project_id=? AND kind=? ORDER BY id",
                 (project_id, PROJECT_PACK_KIND)).fetchall()
-            refs = set()
+            candidates = []
+            counts = {}
             for row in rows:
                 content = json.loads(row["content_json"])
-                self._validate_project_document(project_id, row["id"], row["kind"], content)
+                try:
+                    _project_pack_header(self.store.conn, project_id, row["id"], content, canonical_default=True)
+                except RuntimeErrorBase:
+                    continue
                 for admission in content["admissions"]:
-                    compiled = admission.get("compiled")
-                    if compiled is None:
-                        legacy.append({"packId": content["pack_id"], "kind": admission["kind"], "id": admission["id"]})
+                    try:
+                        identity = _project_pack_admission(self.store.conn, project_id, content["pack_id"], admission)
+                    except RuntimeErrorBase:
                         continue
-                    ref = (content["pack_id"], admission["kind"], admission["id"], admission["revision"])
-                    if ref in refs:
-                        raise ConflictError("project pack admitted element identity is ambiguous")
-                    refs.add(ref)
-                    entries.append({"packId": content["pack_id"], "descriptor": admission["descriptor"],
-                                    "authoring": admission["authoring"], "digest": compiled["sha256"],
-                                    "compiled": compiled, "snapshot_object": admission["snapshot_object"]})
+                    ref = (content["pack_id"], *identity)
+                    counts[ref] = counts.get(ref, 0) + 1
+                    candidates.append((ref, content["pack_id"], admission))
+            for ref, owner, admission in candidates:
+                # Never choose an arbitrary winner for an ambiguous reference.
+                if counts[ref] != 1:
+                    continue
+                compiled = admission.get("compiled")
+                if compiled is None:
+                    legacy.append({"packId": owner, "kind": admission["kind"], "id": admission["id"]})
+                    continue
+                entries.append({"packId": owner, "descriptor": admission["descriptor"],
+                                "authoring": admission["authoring"], "digest": compiled["sha256"],
+                                "compiled": compiled, "snapshot_object": admission["snapshot_object"]})
         return entries, legacy
 
     def project_pack_elements(self, project_id):
