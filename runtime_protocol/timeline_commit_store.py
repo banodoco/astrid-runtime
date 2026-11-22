@@ -2012,56 +2012,74 @@ class TimelineCommitStore:
         reservations = set(claims) | {("shot", "shot:" + shot) for shot in fresh - authorized}
         reservations.update(("item", identity) for identity in fresh_items - restored_items)
         if reservations:
-            # Traverse each history record's created refs once, then match them
-            # against a bounded-parameter list in the original reservation order.
-            # The history order matches the existing project/timeline/sequence
-            # index scan, including when several corrupt witnesses could match.
             ordered_reservations = list(reservations)
-            try:
-                rows = self.conn.execute(
-                    "SELECT DISTINCT reservation.key AS reservation_index, h.* "
-                    "FROM timeline_commit_history h "
-                    "CROSS JOIN json_each(h.records_json, '$.commands') r "
-                    "CROSS JOIN json_each(r.value, '$.created') i "
-                    "CROSS JOIN json_each(?) reservation "
-                    "WHERE json_extract(i.value, '$.kind')=json_extract(reservation.value, '$[0]') "
-                    "AND (json_extract(i.value, '$.ref')=json_extract(reservation.value, '$[1]') "
-                    "OR json_extract(reservation.value, '$[0]')='item') "
-                    "AND (h.project_id=? OR json_extract(reservation.value, '$[0]')='item') "
-                    "AND (h.timeline_id=? OR json_extract(reservation.value, '$[0]') IN ('shot', 'item')) "
-                    "ORDER BY reservation.key, h.project_id, h.timeline_id, h.project_seq",
-                    (json.dumps(ordered_reservations), project, timeline)).fetchall()
-            except sqlite3.OperationalError as error:
-                if str(error) != "malformed JSON":
-                    raise
-                # A malformed nested JSON value outside an earlier reservation's
-                # scope must not preempt its original lookup and refusal.
-                def candidates():
-                    for kind, ref in ordered_reservations:
-                        for entry in self.conn.execute(
-                                "SELECT DISTINCT h.* FROM timeline_commit_history h, "
-                                "json_each(h.records_json, '$.commands') r, json_each(r.value, '$.created') i "
-                                "WHERE json_extract(i.value, '$.kind')=? AND (json_extract(i.value, '$.ref')=? OR ?='item') "
-                                "AND (h.project_id=? OR ?='item') AND (h.timeline_id=? OR ? IN ('shot', 'item'))",
-                                (kind, ref, kind, project, kind, timeline, kind)).fetchall():
-                            yield kind, ref, entry
-            else:
-                def candidates():
-                    for row in rows:
-                        kind, ref = ordered_reservations[row["reservation_index"]]
-                        # Do not expose the query index as a history field to the verifier.
-                        entry = {key: row[key] for key in row.keys() if key != "reservation_index"}
-                        yield kind, ref, entry
-            for kind, ref, entry in candidates():
-                if kind == "item" and not any(i["kind"] == "item" and self._reservation_identity("item", i["ref"]) == ref
-                        for r in json.loads(entry["records_json"])["commands"]
-                        if r["command"]["op"] != "timeline.inverse" for i in r["created"]):
-                    continue
-                ledger = self.conn.execute("SELECT * FROM command_idempotency WHERE txn_id=?", (entry["publication_id"],)).fetchone()
-                if ledger is None:
+            refs_by_kind = {}
+            for kind, ref in ordered_reservations:
+                refs_by_kind.setdefault(kind, []).append(ref)
+            candidates_by_kind, item_records = {}, {}
+            for kind, ref in ordered_reservations:
+                if kind not in candidates_by_kind:
+                    refs = refs_by_kind[kind]
+                    if kind == "item" or len(refs) == 1:
+                        # Item lookups deliberately retrieve all item births: old
+                        # refs may need Python identity normalization. For a single
+                        # ref retain the original lookup and its query plan.
+                        rows = self.conn.execute(
+                            "SELECT DISTINCT h.* FROM timeline_commit_history h, "
+                            "json_each(h.records_json, '$.commands') r, json_each(r.value, '$.created') i "
+                            "WHERE json_extract(i.value, '$.kind')=? AND (json_extract(i.value, '$.ref')=? OR ?='item') "
+                            "AND (h.project_id=? OR ?='item') AND (h.timeline_id=? OR ? IN ('shot', 'item'))",
+                            (kind, ref, kind, project, kind, timeline, kind)).fetchall()
+                        candidates_by_kind[kind] = rows if kind == "item" else {ref: rows}
+                    else:
+                        try:
+                            rows = self.conn.execute(
+                                "SELECT DISTINCT json_extract(i.value, '$.ref') AS reservation_ref, h.* "
+                                "FROM timeline_commit_history h, json_each(h.records_json, '$.commands') r, "
+                                "json_each(r.value, '$.created') i "
+                                "WHERE json_extract(i.value, '$.kind')=? "
+                                "AND json_extract(i.value, '$.ref') IN (SELECT value FROM json_each(?)) "
+                                "AND h.project_id=? AND (h.timeline_id=? OR ?='shot') "
+                                "ORDER BY h.project_id, h.timeline_id, h.project_seq",
+                                (kind, json.dumps(refs), project, timeline, kind)).fetchall()
+                        except sqlite3.OperationalError as error:
+                            if str(error) != "malformed JSON":
+                                raise
+                            # Retry in original reservation order so corruption in
+                            # a later lookup cannot preempt an earlier refusal.
+                            rows = None
+                        if rows is None:
+                            candidates_by_kind[kind] = None
+                        else:
+                            by_ref = {value: [] for value in refs}
+                            for row in rows:
+                                entry = {key: row[key] for key in row.keys() if key != "reservation_ref"}
+                                by_ref[row["reservation_ref"]].append(entry)
+                            candidates_by_kind[kind] = by_ref
+                candidates = candidates_by_kind[kind]
+                if candidates is None:
+                    rows = self.conn.execute(
+                        "SELECT DISTINCT h.* FROM timeline_commit_history h, "
+                        "json_each(h.records_json, '$.commands') r, json_each(r.value, '$.created') i "
+                        "WHERE json_extract(i.value, '$.kind')=? AND (json_extract(i.value, '$.ref')=? OR ?='item') "
+                        "AND (h.project_id=? OR ?='item') AND (h.timeline_id=? OR ? IN ('shot', 'item'))",
+                        (kind, ref, kind, project, kind, timeline, kind)).fetchall()
+                else:
+                    rows = candidates if kind == "item" else candidates[ref]
+                for entry in rows:
+                    if kind == "item":
+                        publication = entry["publication_id"]
+                        if publication not in item_records:
+                            item_records[publication] = json.loads(entry["records_json"])
+                        if not any(i["kind"] == "item" and self._reservation_identity("item", i["ref"]) == ref
+                                for r in item_records[publication]["commands"]
+                                if r["command"]["op"] != "timeline.inverse" for i in r["created"]):
+                            continue
+                    ledger = self.conn.execute("SELECT * FROM command_idempotency WHERE txn_id=?", (entry["publication_id"],)).fetchone()
+                    if ledger is None:
+                        reject("identity_collision")
+                    self._verify_accepted(ledger, entry)
                     reject("identity_collision")
-                self._verify_accepted(ledger, entry)
-                reject("identity_collision")
 
     @staticmethod
     def _reservation_identity(kind, ref):
