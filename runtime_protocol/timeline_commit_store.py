@@ -21,7 +21,7 @@ from functools import wraps
 from typing import cast
 
 from . import platform as runtime_platform
-from .errors import ConflictError, HeadBusyError, ProtocolError, ValidationError
+from .errors import ConflictError, HeadBusyError, NotFoundError, ProtocolError, ValidationError
 from .idempotency import command_result
 from .timeline_commit_validation import detached, digest
 from .timeline_materialization import has_materialization, item_identity, materialization_join, root_identity
@@ -66,10 +66,40 @@ def _moved_components(before, after):
     return ", ".join(moved) or "none"
 
 
-def _head_busy(site, moved):
+def _same_store_version(before, after, *, allow_checkpoint=False):
+    """Compare logical inputs while allowing SQLite checkpoint file movement."""
+    if before is None or after is None:
+        return before is after
+    if before[:3] != after[:3] or before[4] != after[4]:
+        return False
+    for index, (old, new) in enumerate(zip(before[3], after[3])):
+        if old is None or new is None:
+            if old is not new:
+                return False
+            continue
+        # Device/inode and owner/mode remain trust boundaries. SQLite may
+        # rewrite DB bytes while checkpointing, and WAL can be reset in place.
+        if old[:2] != new[:2] or old[-2:] != new[-2:]:
+            return False
+        if index < 2 and old[2] != new[2] and (
+                not allow_checkpoint
+                or (index == 0 and new[2] < old[2])
+                or (index == 1 and new[2] > old[2])):
+            # During a read, SQLite may grow the DB by backfilling pages or
+            # truncate the WAL. Appended WAL frames can hide a committed write
+            # while data_version still reflects the read snapshot.
+            return False
+    return True
+
+
+def _head_busy(site, moved, error=HeadBusyError):
     """The retryable refusal for inputs that moved while a request verified them."""
     _LOGGER.warning("accepted commit inputs changed during verification at %s: moved %s", site, moved)
-    return HeadBusyError("accepted commit inputs changed during verification")
+    return error("accepted commit inputs changed during verification")
+
+
+class _PostReadMovement(HeadBusyError):
+    """Counters moved after a read-owned snapshot was released."""
 
 
 def request_identity(context):
@@ -199,10 +229,18 @@ def _evaluation(method):
                     with self.verification_scope():
                         return evaluate(self, *args, **kwargs)
                 if method.__name__ != "accept" and not self._reading:
-                    with self._read_transaction():
-                        return evaluate(self, *args, **kwargs)
+                    try:
+                        with self._read_transaction():
+                            return evaluate(self, *args, **kwargs)
+                    except _PostReadMovement:
+                        # Never return the first result or reuse its proofs.
+                        self._discard_read_attempt()
+                    try:
+                        with self._read_transaction():
+                            return evaluate(self, *args, **kwargs)
+                    except _PostReadMovement as exc:
+                        raise HeadBusyError(*exc.args) from None
                 self._sync_replay_memo()
-                version = self._replay_store_version
                 boundary = self._history_inputs is None
                 current = self._verification.current
                 current["depth"] += 1
@@ -214,10 +252,17 @@ def _evaluation(method):
                     # Nested boundaries reuse bytes this request already
                     # confirmed; the outermost one re-reads every object
                     # before any result or proof leaves the request.
-                    self._check_history_objects(final=not current["depth"])
+                    try:
+                        self._check_history_objects(final=not current["depth"])
+                    except (ConflictError, NotFoundError):
+                        # Match by name because a new-key lookup drops stale CAS proofs.
+                        if method.__name__ != "lookup" or result is not None:
+                            raise
+                        # A ledger miss consumed no historical objects.
+                        # Drop stale proofs and let the new request validate
+                        # its own dependencies.
+                        self.clear_replay_memo()
                 self._check_history_version()
-                if method.__name__ != "accept" and version != self._replay_store_version:
-                    raise _head_busy("evaluate", _moved_components(version, self._replay_store_version))
                 return result
         except BaseException:
             self.clear_replay_memo()
@@ -291,6 +336,7 @@ class TimelineCommitStore:
         self._retained_rows = {}
         self._connection = self.store.conn
         self._reading = False
+        self._read_version_pin = None
         self._acceptance_transaction = False
         value = os.stat(self.store.db_path)
         self._database_identity = (value.st_dev, value.st_ino)
@@ -478,8 +524,10 @@ class TimelineCommitStore:
                     connection.execute("BEGIN")
                 self._reading = True
                 try:
-                    # Compare after entering the snapshot, before any cache hit.
+                    # Anchor to the snapshot before consulting any retained
+                    # proof. Nested evaluations may only check this baseline.
                     self._sync_replay_memo()
+                    self._read_version_pin = self._replay_store_version
                     yield
                     self._check_history_version()
                 finally:
@@ -491,15 +539,39 @@ class TimelineCommitStore:
                         # Its provisional rows cannot become retained proofs.
                         self.clear_replay_memo()
                 # data_version can stay at the snapshot's value until it ends.
-                self._check_history_version()
+                self._check_history_version(after_read=owned)
             except BaseException:
                 self.clear_replay_memo()
                 raise
+            finally:
+                self._read_version_pin = None
 
-    def _check_history_version(self):
-        version = self._store_version()
-        if version != self._replay_store_version:
-            raise _head_busy("version-check", _moved_components(self._replay_store_version, version))
+    def _discard_read_attempt(self):
+        """Drop every proof and confirmation from the refused snapshot."""
+        self.clear_replay_memo()
+        current = self._verification.current
+        current["verified"].clear()
+        current["physical"].clear()
+
+    def _check_history_version(self, *, version=None, after_read=False):
+        before = self._read_version_pin or self._replay_store_version
+        after = self._store_version() if version is None else version
+        if not _same_store_version(before, after, allow_checkpoint=True):
+            # Only counter movement can trigger a fresh read. The unchanged
+            # identity and file bounds still guard against replacement or DB
+            # shrink; WAL shrink is permitted only for a complete TRUNCATE.
+            old_wal = before[3][1] if before is not None else None
+            new_wal = after[3][1]
+            counters_only = (before is not None and before[1:3] != after[1:3]
+                             and _same_store_version(before, (after[0], *before[1:3], *after[3:]),
+                                                     allow_checkpoint=True)
+                             and (old_wal is None or new_wal is None
+                                  or new_wal[2] >= old_wal[2] or new_wal[2] == 0))
+            raise _head_busy("post-read" if after_read else "version-check",
+                             _moved_components(before, after),
+                             _PostReadMovement if after_read and counters_only else HeadBusyError)
+        if after_read:
+            self._replay_store_version = after
 
     def _check_history_objects(self, *, final=True):
         # CAS is outside SQLite's change boundary. Keep the existing physical
@@ -598,6 +670,8 @@ class TimelineCommitStore:
     def _sync_replay_memo(self):
         version = self._store_version()
         current = self._verification.current
+        if self._read_version_pin is not None:
+            self._check_history_version(version=version)
         failure = self._memo_failure(version)
         if failure is not None and not current["memo_fallback"]:
             # Keep request-local verification, but never inherit proofs from a
@@ -605,7 +679,7 @@ class TimelineCommitStore:
             self.clear_replay_memo()
             current["memo_fallback"] = True
             _LOGGER.warning("timeline history memo disabled; full verification for this request: %s", failure)
-        if version != self._replay_store_version:
+        if self._read_version_pin is None and version != self._replay_store_version:
             previous = self._replay_store_version
             if (current["accepting"] and self.store.conn.in_transaction and previous is not None
                     and version[0] == previous[0] and version[2] == previous[2] and version[4] == previous[4]
@@ -699,14 +773,11 @@ class TimelineCommitStore:
         current["inputs"] = inputs
         try:
             self._sync_replay_memo()
-            version = self._replay_store_version
             self._check_history_objects()
             yield
             inputs.check()
             self._check_history_objects()
-            after = self._store_version()
-            if after != version:
-                raise _head_busy("read-scope-exit", _moved_components(version, after))
+            self._check_history_version()
         except BaseException:
             self.clear_replay_memo()
             raise
