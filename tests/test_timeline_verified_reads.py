@@ -44,7 +44,7 @@ def test_verified_head_route_returns_exact_accepted_closure_without_history(serv
     parent = document["parent_revision"]
     assert parent["revision_id"] == head["revision_id"]
     assert parent["content_digest"] == digest(parent["payload"])
-    assert classify("GET", request.path) is not None
+    assert classify(request.path, "GET") is not None
 
 
 def test_handshake_advertises_verified_head_with_existing_core_digest(service):
