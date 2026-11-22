@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import shutil
+import sqlite3
 import subprocess
 import sys
 
@@ -138,6 +141,7 @@ def test_doctor_distinguishes_missing_cas_from_missing_dependency_pointer(closur
     missing = [bare] if fault == "missing-cas" else []
     assert report["checks"]["cas_missing"] == missing
     assert report["checks"]["reachable_cas"]["missing"] == missing
+
     assert report["checks"]["reachable_cas"]["ok"] is (fault != "missing-cas")
     if fault == "missing-pointer":
         assert "dependency_graph_mismatch" in {
@@ -151,6 +155,128 @@ def test_doctor_distinguishes_missing_cas_from_missing_dependency_pointer(closur
     observed = json.loads(completed.stdout)
     assert observed["ok"] == report["ok"]
     assert observed["checks"]["cas_missing"] == missing
+    assert snapshot(service) == before
+
+
+def test_unchanged_evaluations_reuse_history_objects_and_records(closure, monkeypatch):
+    service, commits, project, _, _, accepted = closure
+    publication = accepted["receipt"]["receipt_id"]
+    commits.clear_replay_memo()
+    reads, records = [], []
+    read_object, verify = commits._read_object, commits._verify_accepted_record
+
+    def counted_read(object_id):
+        reads.append(object_id)
+        return read_object(object_id)
+
+    def counted_record(*args, **kwargs):
+        records.append(True)
+        return verify(*args, **kwargs)
+
+    monkeypatch.setattr(commits, "_read_object", counted_read)
+    monkeypatch.setattr(commits, "_verify_accepted_record", counted_record)
+    expected = commits.history_entry(project, "main", publication)
+    head = commits.head(project, "main")
+    document = commits.revision_closure(project, "main", head["revision_id"])
+    assert commits._history_state["objects"] and records, "the initial evaluation must verify real media and history"
+    reads.clear()
+    records.clear()
+    for _ in range(3):
+        assert commits.history_entry(project, "main", publication) == expected
+        assert commits.head(project, "main") == head
+        assert commits.revision_closure(project, "main", head["revision_id"]) == document
+        with commits.history_read_scope():
+            assert commits.head(project, "main") == head
+    assert reads == []
+    assert records == []
+
+    # A write to history must discard the retained results even if it keeps
+    # the same head and bytes. Existing corruption tests cover forged values.
+    service.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=metadata_json WHERE publication_id=?",
+                               (publication,))
+    assert commits.history_entry(project, "main", publication) == expected
+    assert commits.revision_closure(project, "main", head["revision_id"]) == document
+    assert commits._history_state["objects"] and records
+
+
+@pytest.mark.parametrize("mutation", ["rewrite", "replace", "missing"])
+def test_warm_history_still_rejects_changed_cas(closure, tmp_path, mutation):
+    service, commits, project, _, item, accepted = closure
+    from runtime_protocol.errors import RuntimeErrorBase
+
+    publication = accepted["receipt"]["receipt_id"]
+    commits.history_entry(project, "main", publication)
+    path = service.cas.path_for(item["media_id"].removeprefix("sha256:"))
+    if mutation == "missing":
+        path.unlink()
+    else:
+        damaged = bytes([path.read_bytes()[0] ^ 1]) + path.read_bytes()[1:]
+        if mutation == "replace":
+            replacement = tmp_path / "replacement"
+            replacement.write_bytes(damaged)
+            replacement.replace(path)
+        else:
+            path.write_bytes(damaged)
+    before = snapshot(service)
+    with pytest.raises(RuntimeErrorBase):
+        commits.history_entry(project, "main", publication)
+    assert snapshot(service) == before
+    assert not any(commits._history_state.values())
+
+
+def test_descriptor_reader_does_not_inherit_live_cas_proofs(closure, monkeypatch, tmp_path):
+    from runtime_protocol import backup
+    from runtime_protocol.cas import ContentAddressedStore
+    from runtime_protocol.errors import ConflictError
+    from runtime_protocol.store import RealmStore
+    from runtime_protocol.timeline_commit_store import TimelineCommitStore
+
+    service, commits, project, _, item, accepted = closure
+    publication = accepted["receipt"]["receipt_id"]
+    expected = commits.history_entry(project, "main", publication)
+    expected_closure = commits.revision_closure(project, "main", "parent-v1")
+    before = snapshot(service)
+    object_id = item["media_id"].removeprefix("sha256:")
+    root = tmp_path / "consolidated"
+    root.mkdir()
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        service.store.conn.backup(connection)
+    shutil.copytree(service.store.cas_root, root / "cas" / "sha256")
+    path = root / "cas" / "sha256" / object_id[:2] / object_id[2:]
+    verified = {}
+    original = ContentAddressedStore(root / "cas" / "sha256").read(object_id, verified=verified)
+    assert object_id in verified
+
+    def inspect_history(inspector, **kwargs):
+        inspector.verified_cas = verified
+        reader = inspector._read_cas_object
+        reads = []
+
+        def observed_reader(value):
+            reads.append(value)
+            return reader(value)
+
+        inspector._read_cas_object = observed_reader
+        history = TimelineCommitStore(inspector, validate_prepared=None)
+        assert history.history_entry(project, "main", publication) == expected
+        assert history.revision_closure(project, "main", "parent-v1") == expected_closure
+        assert object_id in reads  # The matching live-style proof cannot skip the pinned reader.
+        assert object_id in history._history_state["objects"]
+        changes = inspector.conn.total_changes
+        path.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        with pytest.raises(ConflictError, match="hash verification"):
+            history.history_entry(project, "main", publication)
+        assert not any(history._history_state.values())
+        assert inspector.conn.total_changes == changes
+        return {"ok": True}
+
+    monkeypatch.setattr(RealmStore, "integrity_report", inspect_history)
+    root_fd = backup.open_directory_chain(root)
+    try:
+        report, _ = backup._inspect_consolidated_realm(root_fd)
+        assert report["ok"]
+    finally:
+        os.close(root_fd)
     assert snapshot(service) == before
 
 
