@@ -48,7 +48,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
-from .errors import RuntimeErrorBase, AuthorizationError, ForbiddenError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError, RetiredRouteError
+from .errors import RuntimeErrorBase, AuthorizationError, ForbiddenError, ConflictError, HeadBusyError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError, RetiredRouteError
 from .errors import VerificationReceiptMissingError, CandidateNotVerifiedError, VerificationDigestMismatchError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
@@ -3452,9 +3452,20 @@ class RuntimeService:
             if row is None or row["publication_id"] is None:
                 commits.head(project_id, timeline_id)
 
-    @_clear_replay_on_refusal
     def list_timeline_commits(self, project_id, timeline_id, *, cursor=None,
                               limit=PAGE_DEFAULT_LIMIT, authorize):
+        return self._timeline_commit_history(
+            project_id, timeline_id, cursor=cursor, limit=limit, authorize=authorize, isolated=False,
+        )
+
+    def list_timeline_commits_isolated(self, project_id, timeline_id, *, cursor=None,
+                                       limit=PAGE_DEFAULT_LIMIT, authorize):
+        return self._timeline_commit_history(
+            project_id, timeline_id, cursor=cursor, limit=limit, authorize=authorize, isolated=True,
+        )
+
+    @_clear_replay_on_refusal
+    def _timeline_commit_history(self, project_id, timeline_id, *, cursor, limit, authorize, isolated):
         # The public HTTP query is text, while the commit store deliberately
         # accepts only an already-validated integer.  Keep cursor validation
         # and fixed-head binding in the commit store; this call only normalizes
@@ -3463,35 +3474,56 @@ class RuntimeService:
         return self._read_timeline_commits(
             project_id, timeline_id, authorize,
             lambda reader: reader._read_history(project_id, timeline_id, cursor=cursor, limit=limit),
+            isolated=isolated,
         )
 
     @_clear_replay_on_refusal
     def get_timeline_verified_head(self, project_id, timeline_id, *, authorize):
         from .timeline_commit_port import MediaReads
 
+        selections = {}
+
+        def verify_object(digest, size, *, label):
+            identity = self._verify_child_object_bytes(digest, size, label=label, capture_custody=True)
+            if selections.setdefault(digest, identity) != identity:
+                raise HeadBusyError("retained media selection changed during verification")
+
         def read(reader):
+            selections.clear()
             media = MediaReads(SimpleNamespace(
                 store=reader.store, realm=self.realm, cas=self.cas,
-                _verify_child_object_bytes=reader._verify_selection_object,
+                _verify_child_object_bytes=verify_object,
             ))
             return reader.verified_head(
                 project_id, timeline_id,
                 verify_selections=lambda document: self._verify_legacy_media_selections(document, media_reads=media),
             )
 
-        return self._read_timeline_commits(project_id, timeline_id, authorize, read)
+        def confirm():
+            for digest, identity in selections.items():
+                if self._selection_custody(digest) != identity:
+                    raise HeadBusyError("retained media selection changed during verification")
 
-    def _read_timeline_commits(self, project_id, timeline_id, authorize, read):
+        return self._read_timeline_commits(project_id, timeline_id, authorize, read, confirm=confirm)
+
+    def _read_timeline_commits(self, project_id, timeline_id, authorize, read, *, confirm=None, isolated=True):
         from .timeline_commit import CommitRejected
         from .timeline_commit_port import public_failure
 
         check = self._timeline_authorize(project_id, timeline_id, authorize, mutation=False)
         commits, _ = self._timeline_commits()
         try:
+            if not isolated:
+                # In-process callers retain the synchronous live-verifier
+                # boundary. HTTP dispatch opts into the independent reader.
+                with commits.verification_scope(), self.store._mutex:
+                    check()
+                    self._ensure_timeline_commit_baseline(commits, project_id, timeline_id, check)
+                    return read(commits)
             return commits.read_isolated(
                 project_id, timeline_id,
                 prepare=lambda: self._ensure_timeline_commit_baseline(commits, project_id, timeline_id, check),
-                authorize=check, read=read,
+                authorize=check, read=read, confirm=confirm,
             )
         except CommitRejected as exc:
             from .timeline_commit_execution import (
@@ -6877,16 +6909,39 @@ class RuntimeService:
             raise ConflictError("derived input object metadata or project association changed")
         self._verify_child_object_bytes(digest, ref["size"], label="derived input CAS object")
 
-    def _verify_child_object_bytes(self, digest, size, *, label):
+    def _verify_child_object_bytes(self, digest, size, *, label, capture_custody=False):
         try:
             root_fd, prefix_fd = self._cas_prefix_fds(digest, create=False)
         except OSError as exc:
             raise ConflictError(f"{label} is unavailable") from exc
         try:
-            self._verify_file_at(prefix_fd, digest[2:], digest, size, label=label)
+            seen = self._verify_file_at(prefix_fd, digest[2:], digest, size, label=label)
+            if capture_custody:
+                return self._selection_identity(root_fd, prefix_fd, seen)
         finally:
             os.close(prefix_fd)
             os.close(root_fd)
+
+    @staticmethod
+    def _selection_identity(root_fd, prefix_fd, file_stat):
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None
+        directories = [os.fstat(fd) for fd in (root_fd, prefix_fd)]
+        return (file_identity(file_stat), tuple(
+            (value.st_dev, value.st_ino, value.st_uid, value.st_mode) for value in directories
+        ))
+
+    def _selection_custody(self, digest):
+        try:
+            root_fd, prefix_fd = self._cas_prefix_fds(digest, create=False)
+            try:
+                seen = os.stat(digest[2:], dir_fd=prefix_fd, follow_symlinks=False)
+                return self._selection_identity(root_fd, prefix_fd, seen)
+            finally:
+                os.close(prefix_fd)
+                os.close(root_fd)
+        except (OSError, ConflictError):
+            return None
 
     def _register_derived_inputs(self, inputs, attempt, parent, project, policy, lease):
         limits = policy["limits"]
@@ -9771,7 +9826,7 @@ class RuntimeService:
         except OSError as exc:
             raise ConflictError(f"{label} is unavailable") from exc
         try:
-            RuntimeService._verify_open_file(file_fd, digest, expected_size, label=label)
+            return RuntimeService._verify_open_file(file_fd, digest, expected_size, label=label)
         finally:
             os.close(file_fd)
 

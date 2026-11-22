@@ -621,7 +621,8 @@ class TimelineCommitStore:
                     raise ProtocolError("accepted commit object changed during verification")
                 inputs.objects[object_id] = retained
             return retained
-        trusted = (self._verified_cas() or {}).get(object_id)
+        verified_cas = self._verified_cas()
+        trusted = verified_cas.get(object_id) if verified_cas is not None else None
         if trusted is not None and self._cas().current_identity(object_id) == trusted:
             # Immutable and unchanged since it was hashed: the pin needs only
             # (size, sha256), so the file is not opened or read.
@@ -1207,19 +1208,19 @@ class TimelineCommitStore:
         ).fetchone()
         return dict(row) if row is not None else None
 
-    def read_isolated(self, project_id, timeline_id, *, prepare, authorize, read):
+    def read_isolated(self, project_id, timeline_id, *, prepare, authorize, read, confirm=None):
         # As with the live verifier, one movement can be reread. A failed
         # attempt never shares its semantic or physical proofs.
         try:
-            return self._read_isolated(project_id, timeline_id, prepare, authorize, read)
+            return self._read_isolated(project_id, timeline_id, prepare, authorize, read, confirm)
         except _PostReadMovement:
             pass
         try:
-            return self._read_isolated(project_id, timeline_id, prepare, authorize, read)
+            return self._read_isolated(project_id, timeline_id, prepare, authorize, read, confirm)
         except _PostReadMovement as exc:
             raise HeadBusyError(*exc.args) from None
 
-    def _read_isolated(self, project_id, timeline_id, prepare, authorize, read):
+    def _read_isolated(self, project_id, timeline_id, prepare, authorize, read, confirm):
         from .store import TimelineReadSnapshot
 
         with ExitStack() as snapshot:
@@ -1244,7 +1245,11 @@ class TimelineCommitStore:
                 if not _same_store_version(version, pinned_at, allow_checkpoint=True) or observed != expected:
                     raise _head_busy("isolated-read pin", _moved_components(version, pinned_at), _PostReadMovement)
 
-                if not _same_store_version(self._replay_store_version, version) or self._memo_failure(version):
+                memo_allowed = self._memo_failure(version) is None
+                if not _same_store_version(self._replay_store_version, version):
+                    self.clear_replay_memo()
+                    self._replay_store_version = version
+                elif not memo_allowed and (self._replay_memo or any(self._history_state.values())):
                     self.clear_replay_memo()
                 generation = self._replay_generation
                 reader = TimelineCommitStore(
@@ -1261,8 +1266,10 @@ class TimelineCommitStore:
                     key: events.copy() for key, events in self._history_state["events"].items()
                 }
 
-            with reader.verification_scope(), reader.history_read_scope():
-                result = read(reader)
+            with reader.verification_scope():
+                with reader.history_read_scope():
+                    result = read(reader)
+                memo_fallback = reader._verification.current["memo_fallback"]
             # Release the SQLite snapshot before reading the live counters.
             snapshot.close()
 
@@ -1275,15 +1282,21 @@ class TimelineCommitStore:
                 # the usual digest checks; now require those same files to be
                 # present at the confirmed identities.
                 for object_id in reader._history_state["objects"]:
-                    # Only a proof actually observed by this reader suffices.
-                    identity = reader.store.verified_cas[object_id] if object_id in reader.store.verified_cas else None
+                    # Bypass the live index. Only this reader's observed
+                    # identity can confirm the object it actually validated.
+                    identity = dict.get(reader.store.verified_cas, object_id)
                     if identity is None or reader._cas().current_identity(object_id) != identity:
                         raise _head_busy("isolated-read final", "verified CAS object")
+                if confirm is not None:
+                    confirm()
                 actual = self._store_version(allow_reopen=False)
                 if (not _same_store_version(version, actual, allow_checkpoint=True)
                         or current != expected or generation != self._replay_generation):
                     raise _head_busy("isolated-read final", _moved_components(version, actual), _PostReadMovement)
-                if self._memo_failure(actual) is None:
+                memo_still_allowed = self._memo_failure(actual) is None
+                if memo_allowed and (memo_fallback or not memo_still_allowed):
+                    raise _head_busy("isolated-read final", "memo custody", _PostReadMovement)
+                if memo_allowed and memo_still_allowed:
                     self._replay_memo = reader._replay_memo
                     self._history_state = reader._history_state
                     self._replay_store_version = actual
@@ -1293,17 +1306,12 @@ class TimelineCommitStore:
     def verified_head(self, project_id, timeline_id, *, verify_selections):
         head, entry = self._head_entry(project_id, timeline_id)
         document = self.revision_closure(project_id, timeline_id, head["revision_id"])
-        if entry["intent"] == "recorded" and document != entry["receipt"]["result"]["canonical_document"]:
+        if entry["intent"] == "recorded" and digest(document) != entry["receipt"]["result"]["document_digest"]:
             reject("history_unavailable", "canonical film differs from accepted publication",
                    diagnostic_reason="store_head_canonical_mismatch")
         verify_selections(document)
         return {"project_id": project_id, "timeline_id": timeline_id, "head": head,
                 "canonical_document": document}
-
-    def _verify_selection_object(self, digest, size, *, label):
-        actual, _ = self._history_object_value(digest)
-        if size != actual:
-            raise ConflictError(f"{label} size does not match catalog metadata")
 
     @_evaluation
     def head(self, project_id, timeline_id):

@@ -977,7 +977,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     path[2], path[4], authorize=authorize,
                 ))
             query = parse_qs(raw_query, keep_blank_values=True)
-            return self._send(200, self.runtime.list_timeline_commits(
+            read_history = getattr(self.runtime, "list_timeline_commits_isolated", None)
+            if not callable(read_history):
+                read_history = self.runtime.list_timeline_commits
+            return self._send(200, read_history(
                 path[2], path[4], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0],
                 authorize=authorize,
             ))
@@ -1636,7 +1639,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     # Support diagnostics performs independent owner-boundary
                     # probes; it must not hold the serialized SQLite section.
                     self._route()
-                elif self._is_timeline_history_read():
+                elif self._is_timeline_history_read() and callable(
+                        getattr(self.runtime, "list_timeline_commits_isolated", None)):
                     # These readers own their live admission and finalization.
                     # Verification and response assembly run on a pinned reader.
                     self._route()
