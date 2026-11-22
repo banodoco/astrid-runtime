@@ -17,7 +17,9 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import NamedTuple
+from urllib.parse import urlparse
 
 import pytest
 
@@ -41,7 +43,8 @@ LANE_MARKERS = {
 # is false. Test modules never call pytest's skip APIs (tests/test_skip_policy.py);
 # they use the ``requires_*`` marks below. The guard further down fails the run
 # on any skip whose reason does not carry a registered ``[declared:NAME]`` tag,
-# on any xfail, and prints every skip by test name.
+# on any xfail that does not match an exact strict declaration, and prints every
+# skip by test name.
 #
 # ``skip_when`` is executable: a Python expression over ``sys_platform`` and
 # ``os_name`` that is true on the hosts where the test is skipped. The mark is
@@ -56,9 +59,9 @@ LANE_MARKERS = {
 # ``no_ci`` is the one exception to "some CI job runs it": a plain reason, for an
 # entry that no CI job runs. The checker accepts the reason in place of a job,
 # and the run summary prints those skips under "NOT RUN BY ANY CI JOB".
-# Today every entry is blocking: the Windows ``unit`` matrix leg is continue-on-error,
-# but each Windows entry is also run by ``portability-lifecycle`` (or
-# ``windows-worker-handoff``), which fails CI.
+# Windows coverage is the targeted ``windows-realm-publication`` job. The broad
+# Windows jobs were removed in aa6c5b0; entries it does not cover must say no_ci,
+# rather than naming the removed jobs. This metadata does not select or skip tests.
 
 HOSTS = {
     "linux": Host("linux", "posix"),
@@ -101,6 +104,10 @@ class DeclaredSkip:
 
 
 SKIP_REGISTRY: dict[str, DeclaredSkip] = {}
+NO_WINDOWS_CI = (
+    "The Windows unit/portability matrix and worker-handoff job were removed in aa6c5b0; "
+    "windows-realm-publication does not select these tests"
+)
 
 
 @dataclass(frozen=True)
@@ -118,36 +125,43 @@ class DeclaredXfail:
     reason: str
     raises: str
     strict: bool = True
+    issue: str | None = None
+    owner: str | None = None
+    expires: str | None = None
 
 
 def _xfail_reason(name: str, reason: str) -> str:
     return f"[declared-xfail:{name}] {reason}"
 
 
+# Renew at Release 15 freeze per Lead 7067409632.
 DECLARED_XFAILS = {
     "runtime-domains-publication": DeclaredXfail(
         "runtime-domains-publication",
         ("tests/test_runtime_domains.py::test_generated_python_client_timeline_publication_is_retired_pending_commit_replacement",),
         _xfail_reason("runtime-domains-publication", "RT02/D04 held: legacy timeline publication (update_timeline) is retired (410); restored by the /v1 commit replacement"),
         "tests.test_runtime_domains._RetiredTimelinePublication",
+        issue="https://github.com/banodoco/astrid-dev/issues/805",
+        owner="R14 Lead",
+        expires="2026-12-01",
     ),
     "runtime-domains-update": DeclaredXfail(
         "runtime-domains-update",
         ("tests/test_runtime_domains.py::test_generated_direct_timeline_shot_reference_writers_remain_retired",),
         _xfail_reason("runtime-domains-update", "direct timeline update writer remains retired"),
         "tests.test_runtime_domains._RetiredTimelineUpdate",
-    ),
-    "runtime-exact-idempotency": DeclaredXfail(
-        "runtime-exact-idempotency",
-        ("tests/test_runtime_exact_idempotency.py::test_timeline_shot_and_reference_creation_are_keyed_durable_and_non_overwriting",),
-        _xfail_reason("runtime-exact-idempotency", "RT02 held: direct shot writes are retired (410); the reference half is the KEPT catalog (RK01)"),
-        "astrid_runtime_client.generated.ApiError",
+        issue="https://github.com/banodoco/astrid-dev/issues/805",
+        owner="R14 Lead",
+        expires="2026-12-01",
     ),
     "second-client-core": DeclaredXfail(
         "second-client-core",
         ("tests/test_second_client_e2e.py::test_second_client_core_journey_is_executable",),
         _xfail_reason("second-client-core", "RT02/D04 held: direct shot writes and legacy timeline publication are retired (410); the actor is ported with their replacements"),
         "subprocess.CalledProcessError",
+        issue="https://github.com/banodoco/astrid-dev/issues/805",
+        owner="R14 Lead",
+        expires="2026-12-01",
     ),
     "snapshot-legacy-certification": DeclaredXfail(
         "snapshot-legacy-certification",
@@ -157,12 +171,18 @@ DECLARED_XFAILS = {
         ),
         _xfail_reason("snapshot-legacy-certification", "ledger: no row id yet (PLAN 2026-10-20 capture certification); valid legacy capture is not re-certified until Agent project_capture lands"),
         "tests.test_snapshot_legacy_certification.LegacyGenuineUncertified",
+        issue="https://github.com/banodoco/astrid-dev/issues/806",
+        owner="R14 Lead",
+        expires="2026-12-01",
     ),
     "stage1-runtime-contract": DeclaredXfail(
         "stage1-runtime-contract",
         ("tests/test_stage1_runtime_contract_completion.py::test_timeline_update_archive_recover_replay_the_same_committed_receipt",),
         _xfail_reason("stage1-runtime-contract", "ledger D04: direct timeline writes retired; awaiting commit-path replacement"),
         "runtime_protocol.errors.RetiredRouteError",
+        issue="https://github.com/banodoco/astrid-dev/issues/805",
+        owner="R14 Lead",
+        expires="2026-12-01",
     ),
     "timeline-clip-replacement": DeclaredXfail(
         "timeline-clip-replacement",
@@ -180,6 +200,9 @@ DECLARED_XFAILS = {
         ),
         _xfail_reason("timeline-clip-replacement", "ledger D04: direct clip replacement retired; awaiting commit-path replacement"),
         "runtime_protocol.errors.RetiredRouteError",
+        issue="https://github.com/banodoco/astrid-dev/issues/805",
+        owner="R14 Lead",
+        expires="2026-12-01",
     ),
     "timeline-public-s2-historical-audio": DeclaredXfail(
         "timeline-public-s2-historical-audio",
@@ -189,6 +212,9 @@ DECLARED_XFAILS = {
                       "refused before POST ('clip.trim applies to media clips'); held until the CLI captures the "
                       "original audio film before POST"),
         "tests.test_timeline_public_s2_mixed_cli_journey.HistoricalAudioCaptureGap",
+        issue="https://github.com/banodoco/astrid-dev/issues/807",
+        owner="R14 Lead",
+        expires="2026-12-01",
     ),
     "installed-pair-source-closure": DeclaredXfail(
         "installed-pair-source-closure",
@@ -199,14 +225,79 @@ DECLARED_XFAILS = {
                       "42602337622 (darwin-native job 129109610936 at 49a062c raised KnownSourceClosureMismatch "
                       "under the strict xfail); fixed by astrid-dev Plan 38"),
         "tests.test_installed_pack_custody_spawn.KnownSourceClosureMismatch",
+        issue="https://github.com/banodoco/astrid-dev/issues/808",
+        owner="R14 Lead",
+        expires="2026-12-01",
     ),
     "p1-top-level-text-hook": DeclaredXfail(
         "p1-top-level-text-hook",
         ("tests/test_timeline_visual_fields.py::test_supported_top_level_type_on_retains_original_roundtrip_expectations",),
         _xfail_reason("p1-top-level-text-hook", "P1 top-level text-hook restoration requirement"),
         "runtime_protocol.errors.RuntimeErrorBase",
+        issue="https://github.com/banodoco/astrid-dev/issues/809",
+        owner="R14 Lead",
+        expires="2026-12-01",
     ),
 }
+
+# Release 14 quarantine ceiling. Lower it as quarantines are retired.
+MAX_DECLARED_XFAIL_TESTS = 20
+MAX_XFAIL_DAYS = 14
+
+
+def declared_xfail_errors(
+    declarations: dict[str, DeclaredXfail] | None = None, *, today: date | None = None
+) -> list[str]:
+    """Return policy violations without changing the registry or blocking collection."""
+    entries = DECLARED_XFAILS if declarations is None else declarations
+    today = date.today() if today is None else today
+    errors: list[str] = []
+    quarantined_count = sum(len(entry.nodeids) for entry in entries.values())
+    if quarantined_count > MAX_DECLARED_XFAIL_TESTS:
+        errors.append(
+            f"{quarantined_count} quarantined test node IDs exceed the limit of {MAX_DECLARED_XFAIL_TESTS}"
+        )
+
+    seen: set[str] = set()
+    for name, entry in entries.items():
+        prefix = f"{name}: "
+        if not entry.nodeids:
+            errors.append(f"{prefix}missing exact test node ID")
+        for nodeid in entry.nodeids:
+            if "::" not in nodeid or not nodeid.strip():
+                errors.append(f"{prefix}invalid exact test node ID {nodeid!r}")
+            if nodeid in seen:
+                errors.append(f"{prefix}duplicate test node ID {nodeid!r}")
+            seen.add(nodeid)
+        if not entry.reason.strip():
+            errors.append(f"{prefix}missing reason")
+        if not entry.raises.strip():
+            errors.append(f"{prefix}missing exception contract")
+        if entry.strict is not True:
+            errors.append(f"{prefix}strict must be true")
+
+        if not isinstance(entry.issue, str) or not entry.issue.strip():
+            errors.append(f"{prefix}missing issue URL")
+        else:
+            parsed_issue = urlparse(entry.issue)
+            if (
+                parsed_issue.scheme != "https"
+                or not parsed_issue.netloc
+                or not re.search(r"/issues/\d+/?$", parsed_issue.path)
+            ):
+                errors.append(f"{prefix}invalid issue URL")
+        if not isinstance(entry.owner, str) or not entry.owner.strip():
+            errors.append(f"{prefix}missing owner")
+        if not isinstance(entry.expires, str) or not entry.expires.strip():
+            errors.append(f"{prefix}missing expiry")
+        else:
+            try:
+                expiry = date.fromisoformat(entry.expires)
+            except ValueError:
+                expiry = None
+            if expiry is None or expiry <= today or expiry > today + timedelta(days=MAX_XFAIL_DAYS):
+                errors.append(f"{prefix}expiry must be a future ISO date within {MAX_XFAIL_DAYS} days")
+    return errors
 
 
 def _exception_name(exception_type) -> str | None:
@@ -241,7 +332,7 @@ def _declare(name: str, skip_when: str, reason: str, ci: tuple[str, ...], **extr
 
 requires_windows_security = _declare(
     "windows-security", "sys_platform != 'win32'",
-    "native Windows socket exclusivity and file DACL APIs", ("unit", "portability-lifecycle", "windows-realm-publication"),
+    "native Windows socket exclusivity and file DACL APIs", ("windows-realm-publication",),
 ).mark()
 requires_windows_runtime_venv = _declare(
     "windows-runtime-venv", "sys_platform != 'win32'",
@@ -273,7 +364,7 @@ requires_posix_private_modes = _declare(
 ).mark()
 requires_windows_token_process_times = _declare(
     "windows-token-process-times", "sys_platform != 'win32'",
-    "Windows token and process-time APIs", ("unit", "portability-lifecycle"),
+    "Windows token and process-time APIs", (), no_ci=NO_WINDOWS_CI,
 ).mark()
 requires_posix_process_groups = _declare(
     "posix-process-groups", "sys_platform == 'win32'",
@@ -285,19 +376,19 @@ requires_windows_job_object = _declare(
 ).mark()
 requires_windows_dirfd_adapter = _declare(
     "windows-dirfd-adapter", "os_name != 'nt'",
-    "exercises the native Windows dir-fd adapter", ("unit", "portability-lifecycle"),
+    "exercises the native Windows dir-fd adapter", (), no_ci=NO_WINDOWS_CI,
 ).mark()
 requires_windows_reparse_point_rejection = _declare(
     "windows-reparse-point-rejection", "os_name != 'nt'",
-    "exercises Windows reparse-point rejection", ("unit", "portability-lifecycle"),
+    "exercises Windows reparse-point rejection", (), no_ci=NO_WINDOWS_CI,
 ).mark()
 requires_windows_sqlite_backup = _declare(
     "windows-sqlite-backup", "os_name != 'nt'",
-    "exercises Windows SQLite backup snapshots", ("unit", "portability-lifecycle"),
+    "exercises Windows SQLite backup snapshots", (), no_ci=NO_WINDOWS_CI,
 ).mark()
 requires_windows_process_and_lock_apis = _declare(
     "windows-process-and-lock-apis", "os_name != 'nt'",
-    "native Windows process and lock APIs", ("portability-lifecycle", "windows-worker-handoff"),
+    "native Windows process and lock APIs", (), no_ci=NO_WINDOWS_CI,
 ).mark()
 requires_posix_owner_only_permissions = _declare(
     "posix-owner-only-permissions", "os_name == 'nt'",
@@ -320,7 +411,7 @@ requires_linux_o_path = _declare(
 # only fire on Windows, and only for WinError 1314 (no symlink privilege).
 _WINDOWS_SYMLINKS = _declare(
     "windows-symlink-creation", "os_name == 'nt'",
-    "symlink creation is unavailable for this Windows account", ("unit", "portability-lifecycle"),
+    "symlink creation is unavailable for this Windows account", ("unit",),
     only_error=lambda error: getattr(error, "winerror", None) == 1314,
 )
 # Applied to every ``darwin_native`` test below; the lane is deselected by default

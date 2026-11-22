@@ -3,6 +3,8 @@ name: Nightly
 on:
   schedule:
     - cron: "0 3 * * *"
+  push:
+    branches: ["release/14/plan-39"]
   workflow_dispatch:
     inputs:
       agent_sha:
@@ -17,6 +19,8 @@ jobs:
       ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Restore pip cache (C-08)
         id: c08-runtime-nightly-1
         uses: actions/cache/restore@v4
@@ -44,19 +48,80 @@ jobs:
           repository: banodoco/astrid-agent
           ref: ${{ steps.astrid-pin.outputs.sha }}
           path: astrid-agent
+          fetch-depth: 0
+      - name: Check historical Agent archive input
+        shell: bash
+        env:
+          HISTORICAL_AGENT_SHA: 321cef4b8c89a4a938cb9ede41ba6a5444cf1b62
+        run: |
+          if git -C "$ASTRID_CHECKOUT" fetch --no-tags origin "$HISTORICAL_AGENT_SHA"; then
+            if git -C "$ASTRID_CHECKOUT" cat-file -e "$HISTORICAL_AGENT_SHA^{commit}"; then
+              echo "Agent archive commit available: $HISTORICAL_AGENT_SHA"
+              printf 'Agent archive commit available: `%s`\n' "$HISTORICAL_AGENT_SHA" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::Agent archive commit unavailable after fetch: $HISTORICAL_AGENT_SHA"
+              printf 'Agent archive commit unavailable after fetch: `%s`\n' "$HISTORICAL_AGENT_SHA" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "::warning::Agent archive commit is not fetchable from the pinned public history: $HISTORICAL_AGENT_SHA"
+            printf 'Agent archive commit not fetchable from the pinned public history: `%s`\n' "$HISTORICAL_AGENT_SHA" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Record effective checkouts
         shell: bash
+        env:
+          AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
         run: |
           runtime_sha=$(git rev-parse HEAD)
           agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
+          test "$agent_sha" = "$AGENT_SHA"
           echo "Runtime: $runtime_sha"
           echo "Agent: $agent_sha"
           printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+        working-directory: packages/typescript
+      - name: Add locked TypeScript compiler to PATH
+        run: echo "$GITHUB_WORKSPACE/packages/typescript/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Install system media tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: python -m pip install -e '.[test]'
       - run: python -m pip install -e "$ASTRID_CHECKOUT"
-      - run: python -m pytest -q -m integration
+      - name: Run nightly integration tests
+        shell: bash
+        run: mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/nightly-integration.xml" -m integration
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-nightly-all-${{ runner.os }}
+      - name: Summarize test result XML
+        if: always()
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-nightly-all-${{ runner.os }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
+          if not files:
+              print('JUnit: no XML files; no test result available')
+              raise SystemExit(1)
+          root = ET.parse(files[0]).getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
+          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
+          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
+          print(line)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(line + '\n')
+          PY
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-nightly-integration-all-${{ runner.os }}
+          path: ${{ runner.temp }}/test-results-nightly-all-${{ runner.os }}/*.xml
+          retention-days: 90
+          if-no-files-found: warn
       - name: Save pip cache on main or int branches (C-08)
         if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-nightly-1.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
