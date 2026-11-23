@@ -178,12 +178,10 @@ class CommitTiming:
         key_hash = _idempotency_key_hash(current_idempotency_key())
         if key_hash is not None:
             payload["idempotency_key_sha256"] = key_hash
-        # Keep per-commit timing out of normal INFO logs. An explicit INFO
-        # override on this logger is an opt-in for timing consumers.
+        # Route bounded per-commit timing records to the Runtime's INFO sink.
         line = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         if len((line + "\n").encode("utf-8")) <= _MAX_DIAGNOSTIC_BYTES:
-            level = logging.INFO if _LOGGER.level == logging.INFO else logging.DEBUG
-            _LOGGER.log(level, "runtime.timeline_commit.timing %s", line)
+            _LOGGER.info("runtime.timeline_commit.timing %s", line)
 
 
 def current_commit_timing():

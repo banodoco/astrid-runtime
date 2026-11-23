@@ -2747,13 +2747,35 @@ class RuntimeService:
         )
         return result if found else None
 
+    def _session_replay_write(self, operation, parameters):
+        # total_changes includes TEMP writes even if their transaction rolls
+        # back. Credit only direct rows from these specific replay statements;
+        # trigger side effects and failed statements remain in the fence.
+        if operation == "insert":
+            sql = ("INSERT INTO temp.session_command_replay(command_kind,aggregate_id,idempotency_key,request_hash,result_json,created_at) "
+                   "VALUES (?, ?, ?, ?, ?, ?)")
+        elif operation == "expire":
+            sql = ("UPDATE temp.session_command_replay SET result_json=?, is_expired=1 "
+                   "WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?")
+        else:
+            raise ValueError("unknown session replay operation")
+        with self.store._mutex:
+            connection = self.store.conn
+            owner, credited = getattr(self.store, "_session_replay_changes", (None, 0))
+            if owner is not connection:
+                credited = 0
+                self.store._session_replay_changes = (connection, 0)
+            cursor = connection.execute(sql, parameters)
+            if cursor.rowcount >= 0:
+                self.store._session_replay_changes = (connection, credited + cursor.rowcount)
+            return cursor
+
     def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, with_receipt=True, created_at=None):
         if idempotency_key is not None:
             validate_idempotency_key(idempotency_key)
             if kind in {"task.claim", "task.claim_delegated_child", "executor.register"}:
-                self.store.conn.execute(
-                    "INSERT INTO session_command_replay(command_kind,aggregate_id,idempotency_key,request_hash,result_json,created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                self._session_replay_write(
+                    "insert",
                     (kind, aggregate_id, idempotency_key, request_hash, canonical_json(result), now()),
                 )
                 cutoff = (datetime.now(timezone.utc) - timedelta(seconds=SESSION_IDEMPOTENCY_WINDOW_SECONDS)).isoformat(timespec="milliseconds")
@@ -2763,9 +2785,8 @@ class RuntimeService:
                     (cutoff,),
                 ).fetchall()
                 for old in rows:
-                    self.store.conn.execute(
-                        "UPDATE session_command_replay SET result_json=?, is_expired=1 "
-                        "WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
+                    self._session_replay_write(
+                        "expire",
                         (expired_command_result(old["result_json"]), old["command_kind"], old["aggregate_id"], old["idempotency_key"]),
                     )
                 return result
