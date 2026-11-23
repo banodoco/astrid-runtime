@@ -115,13 +115,22 @@ class CommitTiming:
 
     request_id: str | None = None
     stages: dict = field(default_factory=dict)
+    spans: dict = field(default_factory=dict)
     _started: dict = field(default_factory=dict)
+    _origin_ns: int = field(default_factory=time.monotonic_ns)
     outcome: str = "unknown"
     emitted: bool = False
+    sizes_bytes: dict = field(default_factory=dict)
 
     def set_request_id(self, request_id):
         if request_id is not None:
             self.request_id = _validated_request_id(request_id)
+
+    def set_size(self, name, value):
+        """Record a bounded byte count for commit diagnostics only."""
+        if (type(name) is str and re.fullmatch(r"[a-z][a-z0-9_]{0,47}", name)
+                and type(value) is int and 0 <= value <= 2**63 - 1):
+            self.sizes_bytes[name] = value
 
     def begin(self, name):
         if name in _TIMING_FIELDS:
@@ -131,8 +140,14 @@ class CommitTiming:
         started = self._started.pop(name, None)
         if started is None:
             return
-        elapsed = max(0, time.monotonic_ns() - started)
+        ended = time.monotonic_ns()
+        elapsed = max(0, ended - started)
         self.stages[name] = min(_MAX_TIMING_MS, int(round(elapsed / 1_000_000)))
+        self.spans[name] = {
+            "start_ms": min(_MAX_TIMING_MS, max(0, int(round((started - self._origin_ns) / 1_000_000)))),
+            "end_ms": min(_MAX_TIMING_MS, max(0, int(round((ended - self._origin_ns) / 1_000_000)))),
+            "duration_ms": self.stages[name],
+        }
 
     @contextmanager
     def stage(self, name):
@@ -171,6 +186,8 @@ class CommitTiming:
             "request_id": _validated_request_id(self.request_id),
             "outcome": self.outcome,
             "timings_ms": self.finish(),
+            "stage_spans_ms": dict(sorted(self.spans.items())),
+            "sizes_bytes": dict(sorted(self.sizes_bytes.items())),
         }
         public_hash = _public_request_id_hash(current_public_request_id())
         if public_hash is not None:
