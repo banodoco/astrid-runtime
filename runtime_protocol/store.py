@@ -4487,6 +4487,27 @@ class RealmStore:
             keys = list(dict.fromkeys(resource_keys or []))
             if any(not isinstance(key, str) or not key for key in keys):
                 raise ValidationError("resource keys must be non-empty strings")
+            stored_capabilities = capability_values
+            if normalized_facts is not None:
+                stored_capabilities = []
+                for value in capability_values:
+                    if isinstance(value, str):
+                        stored_capabilities.append({"capability_id": value, "verified_facts": normalized_facts})
+                    else:
+                        stored_capabilities.append({**value, "verified_facts": normalized_facts})
+            reason = None if readiness == "ready" else (readiness_reason or "executor_not_ready")
+            row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+            expected = {
+                "max_concurrency": max_concurrency, "resource_keys_json": canonical_json(keys),
+                "capabilities_json": canonical_json(stored_capabilities), "protocol": protocol,
+                "readiness": readiness, "readiness_reason": reason, "runtime_epoch": epoch,
+                "source_digest": source_digest, "dependency_digest": dependency_digest,
+                "source_epoch": source_epoch,
+            }
+            if (row and all(row[key] == value for key, value in expected.items())
+                    and self._executor_registration_fresh(row)
+                    and self._executor_capabilities_unchanged(capability_ids, descriptors)):
+                return self._executor_result(row)
             # All input validation follows the epoch check, and descriptor
             # registration only happens after the complete request shape is
             # known to be valid.
@@ -4504,18 +4525,51 @@ class RealmStore:
             for capability_id in capability_ids:
                 if not self.conn.execute("SELECT 1 FROM capabilities WHERE id=?", (capability_id,)).fetchone():
                     self.register_capability(capability_id, "sha256:" + hashlib.sha256(str(capability_id).encode()).hexdigest(), required_resource_keys=[])
-            stored_capabilities = capability_values
-            if normalized_facts is not None:
-                stored_capabilities = []
-                for value in capability_values:
-                    if isinstance(value, str):
-                        stored_capabilities.append({"capability_id": value, "verified_facts": normalized_facts})
-                    else:
-                        stored_capabilities.append({**value, "verified_facts": normalized_facts})
             timestamp = now()
             self.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch, readiness, readiness_reason, last_seen_at, source_digest, dependency_digest, source_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, protocol=excluded.protocol, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, last_seen_at=excluded.last_seen_at, runtime_epoch=excluded.runtime_epoch, source_digest=excluded.source_digest, dependency_digest=excluded.dependency_digest, source_epoch=excluded.source_epoch", (executor_id, max_concurrency, canonical_json(keys), canonical_json(stored_capabilities), protocol, timestamp, epoch, readiness, None if readiness == "ready" else (readiness_reason or "executor_not_ready"), timestamp, source_digest, dependency_digest, source_epoch))
             row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
             return self._executor_result(row)
+
+    @staticmethod
+    def _executor_registration_fresh(row):
+        try:
+            seen = datetime.fromisoformat(row["last_seen_at"])
+            current = datetime.now(timezone.utc)
+            return current - timedelta(seconds=EXECUTOR_LIVENESS_SECONDS / 2) < seen <= current
+        except (TypeError, ValueError):
+            return False
+
+    def _executor_capabilities_unchanged(self, capability_ids, descriptors):
+        # Capability rows are shared by executors and may have changed since
+        # this executor registered. Check every advertised ID and every
+        # descriptor, including duplicates, before skipping any upsert.
+        for capability_id in capability_ids:
+            if not isinstance(capability_id, str) or not capability_id:
+                return False
+            if not self.conn.execute("SELECT 1 FROM capabilities WHERE id=?", (capability_id,)).fetchone():
+                return False
+        for capability_id, value in descriptors:
+            try:
+                status = value.get("status", "ready")
+                keys = list(dict.fromkeys(value.get("required_resource_keys") or []))
+                scratch = int(value.get("estimated_scratch_bytes", 0))
+                output = int(value.get("estimated_output_bytes", 0))
+                if (status not in {"ready", "unavailable", "unsupported", "retired"}
+                        or any(not isinstance(key, str) or not key for key in keys)
+                        or scratch < 0 or output < 0):
+                    return False
+                expected = (value["definition_digest"], status, canonical_json(keys),
+                            scratch, output, value.get("unavailable_reason"))
+            except (TypeError, ValueError, KeyError):
+                return False
+            row = self.conn.execute(
+                "SELECT definition_digest, status, required_resource_keys_json, "
+                "estimated_scratch_bytes, estimated_output_bytes, unavailable_reason "
+                "FROM capabilities WHERE id=?", (capability_id,),
+            ).fetchone()
+            if row is None or tuple(row) != expected:
+                return False
+        return True
 
     @staticmethod
     def _settlement_effect_kind(effect):
