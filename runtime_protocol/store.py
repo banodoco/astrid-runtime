@@ -971,6 +971,8 @@ class RealmStore:
         store._lock_file = None
         store._admission_lock_file = None
         store._mutex = threading.RLock()
+        store._executor_seen = {}
+        store._executor_seen_pending = None
         store.conn = None
         store._admission_active = False
         store._last_idempotency_prune = time.monotonic()
@@ -1089,6 +1091,8 @@ class RealmStore:
         self._lock_file = None
         self._admission_lock_file = None
         self._mutex = threading.RLock()
+        self._executor_seen = {}
+        self._executor_seen_pending = None
         self.conn = None
         self._admission_active = False
         self._last_idempotency_prune = time.monotonic()
@@ -1210,6 +1214,8 @@ class RealmStore:
             savepoint = f"runtime_nested_{id(self)}_{threading.get_ident()}"
             pending = getattr(self, "_idempotency_prune_pending", None)
             previous = pending.copy() if pending is not None else {}
+            seen_pending = self._executor_seen_pending
+            previous_seen = seen_pending.copy() if seen_pending is not None else None
             self.conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 yield
@@ -1218,12 +1224,16 @@ class RealmStore:
                 if pending is not None:
                     pending.clear()
                     pending.update(previous)
+                if seen_pending is not None:
+                    seen_pending.clear()
+                    seen_pending.update(previous_seen)
                 self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 raise
             return
         self.conn.execute("BEGIN IMMEDIATE")
         self._idempotency_prune_pending = {}
+        self._executor_seen_pending = {}
         try:
             yield
             self.conn.commit()
@@ -1231,11 +1241,13 @@ class RealmStore:
             self.conn.rollback()
             raise
         else:
+            self._executor_seen.update(self._executor_seen_pending)
             if self._idempotency_prune_pending:
                 self._idempotency_prune_clocks.update(self._idempotency_prune_pending)
                 self._last_idempotency_prune = max(self._idempotency_prune_pending.values())
         finally:
             self._idempotency_prune_pending = None
+            self._executor_seen_pending = None
 
     def _acquire_owner(self):
         if not self.root.exists() or not self.root.is_dir() or self.root.is_symlink():
@@ -4205,7 +4217,9 @@ class RealmStore:
             epoch = self._validate_runtime_epoch(runtime_epoch, identity="executor", identity_id=executor_id, required=True)
             if not self.conn.execute("SELECT 1 FROM executors WHERE id=?", (executor_id,)).fetchone():
                 raise NotFoundError("executor not found")
-            self.conn.execute("UPDATE executors SET readiness=?, readiness_reason=?, last_seen_at=?, runtime_epoch=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "executor_not_ready"), now(), epoch, executor_id))
+            timestamp = now()
+            self.conn.execute("UPDATE executors SET readiness=?, readiness_reason=?, last_seen_at=?, runtime_epoch=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "executor_not_ready"), timestamp, epoch, executor_id))
+            self._record_executor_seen(executor_id, timestamp, epoch)
             row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
             return self._executor_result(row)
 
@@ -4221,11 +4235,14 @@ class RealmStore:
                 if not isinstance(ready, bool):
                     raise ValidationError("ready must be a boolean")
                 self.conn.execute("UPDATE executors SET readiness=?, readiness_reason=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "executor_not_ready"), executor_id))
-            self.conn.execute("UPDATE executors SET last_seen_at=?, runtime_epoch=? WHERE id=?", (now(), epoch, executor_id))
+            timestamp = now()
+            self.conn.execute("UPDATE executors SET last_seen_at=?, runtime_epoch=? WHERE id=?", (timestamp, epoch, executor_id))
+            self._record_executor_seen(executor_id, timestamp, epoch)
             return self._executor_result(self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone())
 
     def _executor_result(self, row):
         result = dict(row)
+        result["last_seen_at"] = self._executor_last_seen(row)
         stored_capabilities = json.loads(result.pop("capabilities_json"))
         verified_facts = None
         capabilities = []
@@ -4277,12 +4294,35 @@ class RealmStore:
                 return value
         return None
 
-    @staticmethod
-    def _executor_live(row):
-        if not row or not row["last_seen_at"]:
-            return False
+    def _record_executor_seen(self, executor_id, timestamp, epoch, *, persisted=None, registration=False):
+        # Only publish a refresh after its enclosing transaction commits.
+        if not registration:
+            pending = self._executor_seen_pending if self.conn.in_transaction else None
+            previous = (pending or {}).get(executor_id, self._executor_seen.get(executor_id))
+            if not previous or previous[1] != epoch:
+                return
+        value = (timestamp, epoch, timestamp if persisted is None else persisted)
+        if self.conn.in_transaction:
+            if self._executor_seen_pending is not None:
+                self._executor_seen_pending[executor_id] = value
+        else:
+            self._executor_seen[executor_id] = value
+
+    def _executor_last_seen(self, row):
+        if not row:
+            return None
+        pending = self._executor_seen_pending if self.conn.in_transaction else None
+        value = (pending or {}).get(row["id"], self._executor_seen.get(row["id"]))
+        if not value or value[1] != row["runtime_epoch"] or value[1] != self._current_runtime_epoch():
+            return row["last_seen_at"]
+        # An independent durable change invalidates the overlay. This also
+        # handles a genuine write in an open transaction without publishing
+        # that transaction's pending timestamp before commit.
+        return value[0] if value[2] == row["last_seen_at"] else row["last_seen_at"]
+
+    def _executor_live(self, row):
         try:
-            seen = datetime.fromisoformat(row["last_seen_at"])
+            seen = datetime.fromisoformat(self._executor_last_seen(row))
         except (TypeError, ValueError):
             return False
         return seen > datetime.now(timezone.utc) - timedelta(seconds=EXECUTOR_LIVENESS_SECONDS)
@@ -4455,6 +4495,7 @@ class RealmStore:
                     self.conn.execute("UPDATE runs SET spec_digest=? WHERE id=?", (stamped, task["run_id"]))
                 self.conn.execute("UPDATE runs SET status='running', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE executors SET runtime_epoch=?, last_seen_at=? WHERE id=?", (epoch, timestamp, executor_id))
+                self._record_executor_seen(executor_id, timestamp, epoch)
                 for key in self._required_resource_keys(task["capability"]):
                     self.conn.execute("INSERT INTO reservations(task_id, resource_key, lease_token, created_at, released_at, executor_id, fence, lease_expires_at, runtime_epoch) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?) ON CONFLICT(task_id, resource_key) DO UPDATE SET lease_token=excluded.lease_token, created_at=excluded.created_at, released_at=NULL, executor_id=excluded.executor_id, fence=excluded.fence, lease_expires_at=excluded.lease_expires_at, runtime_epoch=excluded.runtime_epoch", (task_id, key, lease_token, timestamp, executor_id, fence, deadline, epoch))
                 self._append_event(task["run_id"], task_id, "task.claimed", {"executor_id": executor_id, "attempt": task["attempt"] + 1, "fence": fence, "resource_keys": self._required_resource_keys(task["capability"])})
@@ -4504,9 +4545,12 @@ class RealmStore:
                 "source_digest": source_digest, "dependency_digest": dependency_digest,
                 "source_epoch": source_epoch,
             }
-            if (row and all(row[key] == value for key, value in expected.items())
-                    and self._executor_registration_fresh(row)
+            pending = self._executor_seen_pending if self.conn.in_transaction else None
+            owned = (pending or {}).get(executor_id, self._executor_seen.get(executor_id))
+            if (row and owned and owned[1] == epoch and owned[2] == row["last_seen_at"]
+                    and all(row[key] == value for key, value in expected.items())
                     and self._executor_capabilities_unchanged(capability_ids, descriptors)):
+                self._record_executor_seen(executor_id, now(), epoch, persisted=row["last_seen_at"], registration=True)
                 return self._executor_result(row)
             # All input validation follows the epoch check, and descriptor
             # registration only happens after the complete request shape is
@@ -4528,16 +4572,8 @@ class RealmStore:
             timestamp = now()
             self.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch, readiness, readiness_reason, last_seen_at, source_digest, dependency_digest, source_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, protocol=excluded.protocol, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, last_seen_at=excluded.last_seen_at, runtime_epoch=excluded.runtime_epoch, source_digest=excluded.source_digest, dependency_digest=excluded.dependency_digest, source_epoch=excluded.source_epoch", (executor_id, max_concurrency, canonical_json(keys), canonical_json(stored_capabilities), protocol, timestamp, epoch, readiness, None if readiness == "ready" else (readiness_reason or "executor_not_ready"), timestamp, source_digest, dependency_digest, source_epoch))
             row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+            self._record_executor_seen(executor_id, timestamp, epoch, registration=True)
             return self._executor_result(row)
-
-    @staticmethod
-    def _executor_registration_fresh(row):
-        try:
-            seen = datetime.fromisoformat(row["last_seen_at"])
-            current = datetime.now(timezone.utc)
-            return current - timedelta(seconds=EXECUTOR_LIVENESS_SECONDS / 2) < seen <= current
-        except (TypeError, ValueError):
-            return False
 
     def _executor_capabilities_unchanged(self, capability_ids, descriptors):
         # Capability rows are shared by executors and may have changed since
@@ -6371,7 +6407,9 @@ class RealmStore:
             with self._transaction():
                 self.conn.execute("UPDATE tasks SET lease_expires_at=?, updated_at=? WHERE id=?", (deadline, now(), task_id))
                 self.conn.execute("UPDATE reservations SET lease_expires_at=? WHERE task_id=? AND lease_token=? AND released_at IS NULL", (deadline, task_id, lease_token))
-                self.conn.execute("UPDATE executors SET last_seen_at=? WHERE id=?", (now(), task["executor_id"]))
+                timestamp = now()
+                self.conn.execute("UPDATE executors SET last_seen_at=? WHERE id=?", (timestamp, task["executor_id"]))
+                self._record_executor_seen(task["executor_id"], timestamp, task["runtime_epoch"])
                 value = self.get_task(task_id)
                 if record is not None:
                     record(value)
