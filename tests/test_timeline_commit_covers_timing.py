@@ -8,6 +8,7 @@ import pytest
 from runtime_protocol import timeline_commit_auth as auth
 from runtime_protocol import timeline_commit_execution as execution
 from runtime_protocol.timeline_commit_producer import value_equal
+from runtime_protocol.timeline_commit_auth import _CoversIndex
 
 
 def _capture_timing(callback):
@@ -39,6 +40,7 @@ def test_covers_and_value_equal_counts_are_request_local_and_emitted():
         try:
             assert auth.covers([{"kind": "field", "ref": "x", "path": ["a"]}],
                                {"kind": "field", "ref": "x", "path": ["a"]})
+            # Equality outside covers is intentionally not part of this counter.
             assert value_equal({"a": [1]}, {"a": [1]})
         finally:
             execution.finish_commit_timing(timing, token)
@@ -47,7 +49,7 @@ def test_covers_and_value_equal_counts_are_request_local_and_emitted():
     second = _capture_timing(request)["covers"]
     assert first["calls"] == 1
     assert first["elapsed_ns"] >= 0
-    assert first["value_equal_calls"] == 8
+    assert first["value_equal_calls"] == 5
     assert second["calls"] == first["calls"]
     assert second["elapsed_ns"] >= 0
     assert second["value_equal_calls"] == first["value_equal_calls"]
@@ -69,3 +71,34 @@ def test_off_commit_counts_are_noops():
     assert execution.current_commit_timing() is None
     assert auth.covers([], {"kind": "field", "ref": "x", "path": []}) is False
     assert value_equal(1, 1)
+
+
+def test_indexed_covers_emits_scoped_counters_and_preserves_result_and_exception():
+    read = {"kind": "field", "ref": "x", "path": ["a"]}
+    dependencies = [dict(read)]
+    assert _CoversIndex(dependencies).covers(read) == auth.covers(dependencies, read) is True
+
+    def indexed_request():
+        timing, token = execution.start_commit_timing()
+        try:
+            _CoversIndex(dependencies).covers(read)
+            # This unrelated comparison must not pollute covers' equality count.
+            value_equal([1], [1])
+        finally:
+            execution.finish_commit_timing(timing, token)
+
+    metrics = _capture_timing(indexed_request)["covers"]
+    assert metrics["calls"] == 1
+    assert metrics["elapsed_ns"] >= 0
+    assert metrics["value_equal_calls"] == 5
+
+    malformed = [{}]
+    indexed = _CoversIndex(malformed)
+    def exception_outcome(function):
+        try:
+            return ("return", function())
+        except Exception as error:
+            return ("raise", type(error), str(error))
+    assert exception_outcome(lambda: indexed.covers(read)) == exception_outcome(
+        lambda: auth.covers(malformed, read)
+    )

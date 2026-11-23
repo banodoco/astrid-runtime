@@ -32,6 +32,7 @@ _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
 _PUBLIC_REQUEST_ID = ContextVar("timeline_public_request_id", default=None)
 _IDEMPOTENCY_KEY = ContextVar("timeline_idempotency_key", default=None)
 _COMMIT_TIMING = ContextVar("timeline_commit_timing", default=None)
+_COVERS_DEPTH = ContextVar("timeline_commit_covers_depth", default=0)
 _LOGGER = logging.getLogger(__name__)
 _TIMING_FIELDS = (
     "handler",
@@ -284,17 +285,17 @@ def current_commit_timing():
 def measure_covers():
     """Shared instrumentation seam for outer covers implementations."""
     timing = current_commit_timing()
-    if timing is None:
-        yield
-    else:
-        with timing.covers_call():
+    depth = _COVERS_DEPTH.get()
+    token = _COVERS_DEPTH.set(depth + 1)
+    try:
+        if depth == 0 and timing is not None:
+            from .timeline_commit_producer import count_value_equal_with
+            with timing.covers_call(), count_value_equal_with(timing.count_value_equal):
+                yield
+        else:
             yield
-
-
-def count_value_equal():
-    timing = current_commit_timing()
-    if timing is not None:
-        timing.count_value_equal()
+    finally:
+        _COVERS_DEPTH.reset(token)
 
 
 def start_commit_timing(request_id=None):

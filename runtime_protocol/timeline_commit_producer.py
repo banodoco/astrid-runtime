@@ -6,11 +6,25 @@ import hashlib
 import json
 import math
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TypedDict
 
 from .cas import IO_CHUNK_BYTES
 from .errors import RuntimeErrorBase, ValidationError
 from .timeline_commit_port import command_leaves, refused
+
+_VALUE_EQUAL_COUNTER = ContextVar("timeline_value_equal_counter", default=None)
+
+
+@contextmanager
+def count_value_equal_with(counter):
+    """Scope recursive equality-call counting to one outer covers operation."""
+    token = _VALUE_EQUAL_COUNTER.set(counter)
+    try:
+        yield
+    finally:
+        _VALUE_EQUAL_COUNTER.reset(token)
 
 
 class ProducerAdmittedTarget(TypedDict):
@@ -59,8 +73,9 @@ def validate_pin(pin):
 
 def value_equal(left, right):
     """JSON recipe equality: numeric value, distinct booleans, exact structure."""
-    from .timeline_commit_execution import count_value_equal
-    count_value_equal()
+    counter = _VALUE_EQUAL_COUNTER.get()
+    if counter is not None:
+        counter()
     if type(left) in (int, float) and type(right) in (int, float):
         return (type(left) is int or math.isfinite(left)) and (type(right) is int or math.isfinite(right)) and left == right
     if type(left) is not type(right):
