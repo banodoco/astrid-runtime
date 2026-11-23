@@ -181,6 +181,43 @@ def test_unavailable_inspector_identity_stays_observer(selection, monkeypatch, c
         assert read_operation(paths.runtime_support) is None
 
 
+@pytest.mark.skipif(platform.sys.platform != "linux", reason="Linux procfs namespace binding")
+def test_startup_reservation_refuses_pid_identity_mismatched_with_proc_self(
+    selection, monkeypatch,
+):
+    paths, _, config = selection
+    scope = workspace._startup_selection(paths, None, None, config)[3]
+    current_birth, current_uid = startup_attempt._process_birth(os.getpid())
+    assert current_birth.startswith("proc-start-ticks:")
+    assert current_uid == platform.current_user()
+    original_readlink = startup_attempt.Path.readlink
+
+    def misbound_readlink(path, *args, **kwargs):
+        if path == startup_attempt.Path("/proc/self"):
+            return startup_attempt.Path(f"/proc/{os.getpid() + 1}")
+        return original_readlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as procfs:
+        procfs.setattr(startup_attempt.Path, "readlink", misbound_readlink)
+        rejected = False
+        with _bootstrap_mutex(paths):
+            try:
+                startup_attempt.StartupAttempt.begin_locked(
+                    paths.runtime_support.resolve(), scope,
+                    inspecting=True, retry_attempt_id=None,
+                )
+            except startup_attempt.StartupAttemptError:
+                rejected = True
+        attempt = startup_attempt.read_attempt(paths.runtime_support.resolve())
+
+    assert rejected and attempt is None, (
+        "launcher reservation published despite /proc/self naming a different PID: "
+        f"rejected={rejected}, attempt="
+        f"{None if attempt is None else attempt.as_observation()!r}"
+    )
+    assert read_operation(paths.runtime_support) is None
+
+
 def test_windows_creator_pid_requires_an_older_launcher_and_a_current_record(selection, monkeypatch):
     paths, _, config = selection
     support = paths.runtime_support.resolve()
