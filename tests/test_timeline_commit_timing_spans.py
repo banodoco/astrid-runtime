@@ -2,6 +2,7 @@
 import io
 import json
 import logging
+import time
 
 from runtime_protocol import timeline_commit_execution as execution
 
@@ -67,3 +68,35 @@ def test_exclusive_partition_assigns_nested_stages_once_and_accounts_for_gaps():
         "unattributed": 1,
     }
     assert sum(exclusive.values()) == 10
+
+
+def test_normal_finish_emits_nonzero_runtime_wall_and_exclusive_stages():
+    root = logging.getLogger()
+    logger = execution._LOGGER
+    previous_handlers = root.handlers[:]
+    previous_root_level = root.level
+    previous_logger_level = logger.level
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    try:
+        root.handlers[:] = [handler]
+        root.setLevel(logging.INFO)
+        logger.setLevel(logging.NOTSET)
+        timing, token = execution.start_commit_timing()
+        timing.begin("handler")
+        time.sleep(0.003)
+        timing.end("handler")
+        execution.finish_commit_timing(timing, token)
+
+        line = stream.getvalue().strip()
+        payload = json.loads(line.split(" ", 1)[1])
+        assert payload["timings_ms"]["total"] > 0
+        assert payload["stage_spans_ms"]["total"]["duration_ms"] > 0
+        assert payload["exclusive_timings_ms"]["handler"] > 0
+        assert payload["runtime_wall_ms"] > 0
+        assert sum(payload["exclusive_timings_ms"].values()) == payload["runtime_wall_ms"]
+    finally:
+        root.handlers[:] = previous_handlers
+        root.setLevel(previous_root_level)
+        logger.setLevel(previous_logger_level)
+        handler.close()

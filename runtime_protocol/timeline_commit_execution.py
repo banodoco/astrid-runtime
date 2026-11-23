@@ -230,12 +230,13 @@ class CommitTiming:
         if self.emitted:
             return
         self.emitted = True
+        timings = self.finish()
         exclusive = self._exclusive_timings()
         payload = {
             "event": "timeline_commit_timing",
             "request_id": _validated_request_id(self.request_id),
             "outcome": self.outcome,
-            "timings_ms": self.finish(),
+            "timings_ms": timings,
             "stage_spans_ms": dict(sorted(self.spans.items())),
             "exclusive_timings_ms": exclusive,
             "runtime_wall_ms": sum(exclusive.values()),
