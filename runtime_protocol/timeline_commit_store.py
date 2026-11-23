@@ -489,7 +489,11 @@ class TimelineCommitStore:
         if self._wal_identity is None and files[1] is not None:
             self._wal_identity = files[1][:2]
         connection = cast(sqlite3.Connection, self._connection)
-        return (id(connection), connection.total_changes,
+        owner, credited = getattr(self.store, "_session_replay_changes", (None, 0))
+        if owner is not connection:
+            credited = 0
+            self.store._session_replay_changes = (connection, 0)
+        return (id(connection), connection.total_changes - credited,
                 connection.execute("PRAGMA data_version").fetchone()[0], tuple(files), package_owner)
 
     def _memo_failure(self, version):
@@ -1279,7 +1283,7 @@ class TimelineCommitStore:
                 prepare()
                 version = self._store_version()
                 if receipt is not None:
-                    receipt.setdefault("live_total_changes_before", version[1])
+                    receipt.setdefault("live_total_changes_before", self.store.conn.total_changes)
                 live_connection = self.store.conn
                 owner = self.store._lock_file
                 if owner is None:
@@ -1351,7 +1355,7 @@ class TimelineCommitStore:
                     confirm()
                 actual = self._store_version(allow_reopen=False)
                 if receipt is not None:
-                    receipt["live_total_changes_after"] = actual[1]
+                    receipt["live_total_changes_after"] = self.store.conn.total_changes
                 if (not _same_store_version(version, actual, allow_checkpoint=True)
                         or current != expected or generation != self._replay_generation):
                     raise _head_busy("isolated-read final", _moved_components(version, actual), _PostReadMovement)
