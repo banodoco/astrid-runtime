@@ -183,7 +183,7 @@ def test_rolled_back_replay_write_remains_attributed(service):
     assert calls == [True]
 
 
-def test_replay_trigger_main_write_still_forces_retry(service):
+def test_replay_trigger_main_write_serves_without_retaining_proof(service):
     provider(service)
     commit(service, body(service))
     commits, _ = service._timeline_commits()
@@ -192,6 +192,9 @@ def test_replay_trigger_main_write_still_forces_retry(service):
             "CREATE TEMP TRIGGER replay_main_write AFTER INSERT ON session_command_replay "
             "BEGIN UPDATE timelines SET name=COALESCE(name, '') || ' trigger'; END"
         )
+    service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
+    assert commits._replay_memo
+    before = commits._store_version()
     calls = []
 
     def read(reader):
@@ -202,14 +205,20 @@ def test_replay_trigger_main_write_still_forces_retry(service):
 
     assert commits.read_isolated(service.test_project, "main", prepare=lambda: None,
                                  authorize=lambda: None, read=read) == "ok"
-    assert len(calls) == 2
+    assert len(calls) == 1
+    assert commits._store_version()[:3] != before[:3]
+    assert not commits._replay_memo
+    assert not any(commits._history_state.values())
 
 
-def test_unaccounted_temp_write_still_forces_retry(service):
+def test_unaccounted_temp_write_serves_without_retaining_proof(service):
     provider(service)
     commit(service, body(service))
     commits, _ = service._timeline_commits()
     service.store.conn.execute("CREATE TEMP TABLE unaccounted (n INTEGER)")
+    service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
+    assert commits._replay_memo
+    before = commits._store_version()
     calls = []
 
     def read(reader):
@@ -221,7 +230,10 @@ def test_unaccounted_temp_write_still_forces_retry(service):
 
     assert commits.read_isolated(service.test_project, "main", prepare=lambda: None,
                                  authorize=lambda: None, read=read) == "ok"
-    assert len(calls) == 2
+    assert len(calls) == 1
+    assert commits._store_version()[:3] != before[:3]
+    assert not commits._replay_memo
+    assert not any(commits._history_state.values())
 
 
 def test_history_then_verified_head_survives_idle_claims(service, monkeypatch):
@@ -257,10 +269,13 @@ def test_history_then_verified_head_survives_idle_claims(service, monkeypatch):
     assert commits._replay_generation == generation
 
 
-def test_same_connection_durable_write_with_replay_still_forces_retry(service):
+def test_same_connection_durable_write_with_replay_serves_without_retaining_proof(service):
     provider(service)
     commit(service, body(service))
     commits, _ = service._timeline_commits()
+    service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
+    assert commits._replay_memo
+    before = commits._store_version()
     calls = []
 
     def read(reader):
@@ -276,13 +291,19 @@ def test_same_connection_durable_write_with_replay_still_forces_retry(service):
 
     assert commits.read_isolated(service.test_project, "main", prepare=lambda: None,
                                  authorize=lambda: None, read=read) == "ok"
-    assert len(calls) == 2
+    assert len(calls) == 1
+    assert commits._store_version()[:3] != before[:3]
+    assert not commits._replay_memo
+    assert not any(commits._history_state.values())
 
 
-def test_external_write_during_isolated_read_forces_retry(service):
+def test_external_write_during_isolated_read_serves_without_retaining_proof(service):
     provider(service)
     commit(service, body(service))
     commits, _ = service._timeline_commits()
+    service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
+    assert commits._replay_memo
+    before = commits._store_version()
     calls = []
 
     def read(reader):
@@ -295,7 +316,10 @@ def test_external_write_during_isolated_read_forces_retry(service):
 
     assert commits.read_isolated(service.test_project, "main", prepare=lambda: None,
                                  authorize=lambda: None, read=read) == "ok"
-    assert len(calls) == 2
+    assert len(calls) == 1
+    assert commits._store_version()[:3] != before[:3]
+    assert not commits._replay_memo
+    assert not any(commits._history_state.values())
 
 
 def test_replay_credit_is_not_transferred_between_connections(service):
@@ -329,7 +353,7 @@ def test_replay_credit_is_not_transferred_between_connections(service):
             other.close()
 
 
-def test_failed_replay_trigger_with_main_side_effect_forces_retry(service):
+def test_failed_replay_trigger_with_main_side_effect_serves_without_retaining_proof(service):
     provider(service)
     commit(service, body(service))
     commits, _ = service._timeline_commits()
@@ -339,6 +363,9 @@ def test_failed_replay_trigger_with_main_side_effect_forces_retry(service):
             "BEGIN UPDATE timelines SET name=COALESCE(name, '') || ' failed trigger'; "
             "SELECT RAISE(FAIL, 'replay failure'); END"
         )
+    service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
+    assert commits._replay_memo
+    before = commits._store_version()
     calls = []
 
     def read(reader):
@@ -350,18 +377,22 @@ def test_failed_replay_trigger_with_main_side_effect_forces_retry(service):
 
     assert commits.read_isolated(service.test_project, "main", prepare=lambda: None,
                                  authorize=lambda: None, read=read) == "ok"
-    assert len(calls) == 2
+    assert len(calls) == 1
+    assert commits._store_version()[:3] != before[:3]
+    assert not commits._replay_memo
+    assert not any(commits._history_state.values())
     assert service.store.conn.execute(
         "SELECT name FROM timelines WHERE project_id=?", (service.test_project,)
     ).fetchone()[0].endswith(" failed trigger")
 
 
-def test_history_row_mutation_during_both_verifications_refuses_result(service, monkeypatch):
-    from runtime_protocol.errors import HeadBusyError
+def test_history_row_mutation_serves_snapshot_but_next_save_refuses(service, monkeypatch):
+    from runtime_protocol.errors import ProtocolError
 
     provider(service)
     accepted = commit(service, body(service))
     publication = accepted["receipt"]["receipt_id"]
+    followup = next_request(service)
     commits, _ = service._timeline_commits()
     commits.clear_replay_memo()
     original = TimelineCommitStore.verified_head
@@ -373,16 +404,23 @@ def test_history_row_mutation_during_both_verifications_refuses_result(service, 
         with service.store._mutex:
             _record_idle_claim(service, f"mutation-claim-{len(calls)}")
             changed = service.store.conn.execute(
-                "UPDATE timeline_commit_history SET metadata_json=metadata_json || ' ' WHERE publication_id=?",
+                "UPDATE timeline_commit_history SET records_json='{}' WHERE publication_id=?",
                 (publication,),
             )
             assert changed.rowcount == 1
         return result
 
     monkeypatch.setattr(TimelineCommitStore, "verified_head", mutate_after_verification)
-    with pytest.raises(HeadBusyError):
-        service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
-    assert len(calls) == 2
+    result = service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
+    assert result["head"]["publication_id"] == publication
+    assert len(calls) == 1
+    assert not commits._replay_memo
+    assert not any(commits._history_state.values())
+    monkeypatch.setattr(TimelineCommitStore, "verified_head", original)
+    with pytest.raises(ProtocolError, match="accepted commit record is corrupt"):
+        commit(service, followup, key="after-tamper")
+    head = commits._public_head(service.store.conn, service.test_project, "main")
+    assert head["publication_id"] == publication
 
 
 def test_replay_write_helper_rejects_arbitrary_main_sql(service):
@@ -390,3 +428,68 @@ def test_replay_write_helper_rejects_arbitrary_main_sql(service):
     with pytest.raises(ValueError):
         service._session_replay_write("UPDATE main.timelines SET name='tampered'", ())
     assert service.store.conn.total_changes == before
+
+
+def test_head_row_mutation_with_fixed_revision_during_both_reads_refuses(service):
+    from runtime_protocol.errors import HeadBusyError
+
+    provider(service)
+    commit(service, body(service))
+    commits, _ = service._timeline_commits()
+    head = commits._public_head(service.store.conn, service.test_project, "main")
+    calls = []
+
+    def mutate(reader):
+        calls.append(True)
+        with service.store._mutex:
+            changed = service.store.conn.execute(
+                "UPDATE parent_composition_heads SET updated_at=updated_at || ' changed' "
+                "WHERE project_id=? AND timeline_id=?", (service.test_project, "main"),
+            )
+            assert changed.rowcount == 1
+        return "ok"
+
+    with pytest.raises(HeadBusyError):
+        commits.read_isolated(service.test_project, "main", prepare=lambda: None,
+                              authorize=lambda: None, read=mutate)
+    assert len(calls) == 2
+    current = commits._public_head(service.store.conn, service.test_project, "main")
+    assert current["revision_id"] == head["revision_id"]
+    assert current["publication_id"] == head["publication_id"]
+    assert not commits._replay_memo
+    assert not any(commits._history_state.values())
+
+
+def test_head_row_mutation_between_final_head_read_and_version_sample_refuses(service, monkeypatch):
+    from runtime_protocol.errors import HeadBusyError
+
+    provider(service)
+    commit(service, body(service))
+    commits, _ = service._timeline_commits()
+    original = TimelineCommitStore._public_head
+    attempts = []
+    pending = []
+
+    def mutate_after_final_head(connection, project_id, timeline_id):
+        result = original(connection, project_id, timeline_id)
+        if connection is service.store.conn and pending:
+            pending.pop()
+            changed = connection.execute(
+                "UPDATE parent_composition_heads SET updated_at=updated_at || ' raced' "
+                "WHERE project_id=? AND timeline_id=?", (project_id, timeline_id),
+            )
+            assert changed.rowcount == 1
+        return result
+
+    def read(reader):
+        attempts.append(True)
+        pending.append(True)
+        return "ok"
+
+    monkeypatch.setattr(TimelineCommitStore, "_public_head", staticmethod(mutate_after_final_head))
+    with pytest.raises(HeadBusyError):
+        commits.read_isolated(service.test_project, "main", prepare=lambda: None,
+                              authorize=lambda: None, read=read)
+    assert len(attempts) == 2
+    assert not commits._replay_memo
+    assert not any(commits._history_state.values())

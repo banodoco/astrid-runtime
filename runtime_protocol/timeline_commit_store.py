@@ -99,6 +99,19 @@ def _same_store_version(before, after, *, allow_checkpoint=False):
     return True
 
 
+def _same_store_identity(before, after):
+    """Compare custody of the live store without treating file growth as replacement."""
+    if before is None or after is None or before[0] != after[0] or before[4] != after[4]:
+        return False
+    for old, new in zip(before[3], after[3]):
+        if old is None or new is None:
+            if old is not new:
+                return False
+        elif old[:2] != new[:2] or old[-2:] != new[-2:]:
+            return False
+    return True
+
+
 def _head_busy(site, moved, error=HeadBusyError):
     """The retryable refusal for inputs that moved while a request verified them."""
     _LOGGER.warning("accepted commit inputs changed during verification at %s: moved %s", site, moved)
@@ -1255,7 +1268,7 @@ class TimelineCommitStore:
     @staticmethod
     def _public_head(connection, project_id, timeline_id):
         row = connection.execute(
-            "SELECT revision_id, publication_id FROM parent_composition_heads "
+            "SELECT * FROM parent_composition_heads "
             "WHERE project_id=? AND timeline_id=?", (project_id, timeline_id),
         ).fetchone()
         return dict(row) if row is not None else None
@@ -1340,7 +1353,12 @@ class TimelineCommitStore:
                     raise _head_busy("isolated-read final", "memo custody", _PostReadMovement)
                 if self.store.conn is not live_connection or self.store._lock_file != owner:
                     raise _head_busy("isolated-read final", "connection or realm owner", _PostReadMovement)
+                if live_connection.in_transaction:
+                    raise _head_busy("isolated-read final", "live transaction", _PostReadMovement)
                 authorize()
+                # A write between the head query and the final sample could
+                # otherwise conceal a moved head. Fence the whole final check.
+                final_start = self._store_version(allow_reopen=False)
                 current = self._public_head(live_connection, project_id, timeline_id)
                 # Never hash under the live mutex. The isolated verifier used
                 # the usual digest checks; now require those same files to be
@@ -1356,13 +1374,22 @@ class TimelineCommitStore:
                 actual = self._store_version(allow_reopen=False)
                 if receipt is not None:
                     receipt["live_total_changes_after"] = self.store.conn.total_changes
-                if (not _same_store_version(version, actual, allow_checkpoint=True)
-                        or current != expected or generation != self._replay_generation):
+                if (final_start != actual or not _same_store_identity(version, actual)
+                        or current != expected or generation != self._replay_generation
+                        or live_connection.in_transaction):
                     raise _head_busy("isolated-read final", _moved_components(version, actual), _PostReadMovement)
                 memo_still_allowed = self._memo_failure(actual) is None
                 if memo_allowed and not memo_still_allowed:
                     self.clear_replay_memo()
                     raise _head_busy("isolated-read final", "memo custody", _PostReadMovement)
+                if (version[:3] != actual[:3]
+                        or any(old is not None and new is not None and old[2] != new[2]
+                               for old, new in zip(version[3], actual[3]))):
+                    # The result belongs to the pinned snapshot. Its proof,
+                    # including inherited state for other timelines, cannot
+                    # be published under the new live version.
+                    self.clear_replay_memo()
+                    return result
                 if memo_allowed and memo_still_allowed:
                     self._replay_memo = reader._replay_memo
                     self._history_state = reader._history_state
