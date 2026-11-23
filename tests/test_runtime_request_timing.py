@@ -1,4 +1,5 @@
 """Runtime request timing logs stay compact and off the response contract."""
+import hashlib
 import json
 import logging
 import threading
@@ -23,6 +24,7 @@ def test_dispatch_logs_request_over_one_second_as_bounded_json(monkeypatch, capl
     handler.headers = {}
     handler.command = "GET"
     handler.path = "/v1/projects/example"
+    handler._runtime_request_id = "request-for-test"
 
     with caplog.at_level(logging.INFO, logger=runtime_server.__name__):
         handler._dispatch()
@@ -35,7 +37,19 @@ def test_dispatch_logs_request_over_one_second_as_bounded_json(monkeypatch, capl
         "event": "request_slow",
         "method": "GET",
         "path": "/v1/projects/example",
+        "request_id_sha256": hashlib.sha256(b"request-for-test").hexdigest(),
         "store_lock_wait_ms": 0,
         "total_ms": 1000,
     }
     assert len(encoded.encode("utf-8")) < 2048
+
+
+def test_slow_request_diagnostic_ignores_malformed_path():
+    handler = object.__new__(RuntimeHandler)
+    handler.path = "//[malformed"
+    handler.command = "GET"
+    handler._runtime_request_id = "request-for-test"
+
+    # urlsplit rejects this network-path reference's malformed IPv6 authority.
+    # Diagnostic parsing must never become a request-processing failure.
+    handler._log_slow_request(1_000_000_001, 0)
