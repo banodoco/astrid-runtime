@@ -647,6 +647,17 @@ class LocalRuntimeBoundary:
                     f"Runtime daemon exited during startup: {cause} (see {self._log_path(support_root)})." if cause
                     else f"Runtime daemon exited during startup (see {self._log_path(support_root)})."
                 )
+            discovery = self._read_discovery(support_root)
+            # Never adopt an incumbent's endpoint while this child starts.
+            try:
+                advertised_pid = int(discovery.get("pid", 0))
+            except (TypeError, ValueError):
+                advertised_pid = 0
+            if (advertised_pid == process.pid or (operation is None and not advertised_pid)):
+                endpoint = str(discovery.get("endpoint", ""))
+                if endpoint and self._http_health(endpoint):
+                    cancellation.check()
+                    return endpoint
             if expired:
                 try:
                     observed = operation.snapshot(fresh=False)
@@ -660,21 +671,17 @@ class LocalRuntimeBoundary:
                         "Runtime startup observation ended before the owner could be confirmed; support state retained.",
                         controller=self,
                     )
+                if observed.state == "pending" and observed.phase == "verifying_identity":
+                    if process.poll() is not None:
+                        continue
+                    raise StartupObservationLost(
+                        "Runtime startup has not acquired realm admission; support state retained.",
+                        controller=self,
+                    )
                 ended = observed.state == "ended"
-                # The existing handoff margin bounds a terminal status. During
-                # admission a fresh heartbeat is not proof of live custody.
+                # The existing handoff margin bounds a terminal status. A
+                # phase reached inside admission can wait on exact live birth.
                 deadline = time.monotonic() + STARTUP_WAIT_MARGIN_SECONDS
-            discovery = self._read_discovery(support_root)
-            # Never adopt an incumbent's endpoint while this child starts.
-            try:
-                advertised_pid = int(discovery.get("pid", 0))
-            except (TypeError, ValueError):
-                advertised_pid = 0
-            if (advertised_pid == process.pid or (operation is None and not advertised_pid)):
-                endpoint = str(discovery.get("endpoint", ""))
-                if endpoint and self._http_health(endpoint):
-                    cancellation.check()
-                    return endpoint
             cancellation.pause(0.05) if cancellation.active() else time.sleep(0.05)
 
     @staticmethod

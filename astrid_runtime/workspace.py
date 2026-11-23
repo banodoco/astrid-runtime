@@ -10,21 +10,28 @@ from typing import Any, Mapping
 from .bootstrap import (
     BootstrapConfig,
     BootstrapError,
+    BootstrapLockBusy,
     RuntimeBoundary,
     _bootstrap_mutex,
-    _pending_startup,
-    _realm_owner_present,
-    _startup_scope,
+    _capture_requested_identity,
     _commit_source_profile_metadata,
     _has_symlink_component,
     _new_realm_id,
+    _owner_record_matches,
+    _pending_startup,
     _read_catalog,
+    _read_support_json,
+    _realm_owner_present,
+    _recorded_owner_identity,
     _selected_realm,
+    _startup_scope,
     _validate_source_profile,
+    _validate_stop_endpoint,
     _validate_support_paths,
+    _validated_matching_owner_identity,
 )
 from .paths import RuntimePaths
-from runtime_protocol import process_control as process_control_setting, startup_operation
+from runtime_protocol import platform, process_control as process_control_setting, startup_operation
 
 
 def _root(value: str | Path, *, must_exist: bool, empty: bool = False) -> Path:
@@ -86,9 +93,49 @@ def _live_owner_inspection(paths: RuntimePaths, boundary: RuntimeBoundary, root:
     if (str(discovery.get("active_realm") or "") != expected
             or Path(str(discovery.get("realm_root") or "")) != root):
         return None
+    return _live_report(discovery, expected)
+
+
+def _live_report(discovery, expected):
     return {"ok": True, "state": "live", "source": "live_owner",
             "runtime_instance_id": discovery.get("runtime_instance_id"),
             "checks": {"realm_identity": {"ok": True, "realm_id": expected}}}
+
+
+def _startup_live_owner_inspection(paths, boundary, root, expected, requested_identity):
+    """Verify the same live owner through its lock, kernel birth and endpoint."""
+    discovery = _read_support_json(paths.discovery_path)
+    marker = _read_support_json(paths.instance_lock_path)
+    if (not discovery or not marker or marker.get("state") is not None
+            or not platform.is_owner_only(paths.discovery_path)
+            or not platform.is_owner_only(paths.instance_lock_path)):
+        return None
+
+    def observed_birth(pid):
+        identity = platform.process_identity(pid)
+        if identity is not None and identity.get("uid") == platform.current_user():
+            return identity.get("birth_id")
+        return None
+
+    try:
+        owner = _recorded_owner_identity(discovery, realm_id=expected, realm_root=root)
+        pid, birth, instance_id, _ = owner
+        if not _owner_record_matches(
+            marker, pid=pid, instance_id=instance_id, process_birth_id=birth,
+            realm_id=expected, realm_root=root,
+        ) or platform.process_birth_matches(birth, observed_birth(pid) or "") is not True:
+            return None
+        metadata = _validate_stop_endpoint(paths, boundary, owner=owner, realm_id=expected, realm_root=root)
+        if (metadata.get("status") != "ok" or "identity" not in metadata
+                or _read_support_json(paths.discovery_path) != discovery
+                or _read_support_json(paths.instance_lock_path) != marker
+                or not _realm_owner_present(root)
+                or platform.process_birth_matches(birth, observed_birth(pid) or "") is not True):
+            return None
+    except (BootstrapError, OSError, ValueError):
+        return None
+    _validated_matching_owner_identity(metadata, instance_id=instance_id, requested_identity=requested_identity)
+    return _live_report(discovery, expected)
 
 
 def inspect_workspace(
@@ -151,10 +198,11 @@ def _startup_selection(paths, realm_root, expected_realm_id, config):
     config = config or BootstrapConfig()
     source = config.resolve_source_profile(paths)
     _validate_source_profile(source, expected_profile=config.profile)
-    scope = _startup_scope(source, expected, root)
+    requested_identity = _capture_requested_identity(source)
+    scope = _startup_scope(source, expected, root, requested_identity=requested_identity)
     if scope is None:
         raise BootstrapError("Runtime startup operations require the selected installed Runtime environment.")
-    return configured, root, expected, scope
+    return configured, root, expected, scope, requested_identity
 
 
 def _startup_observation(paths, scope, operation_id=None):
@@ -167,7 +215,7 @@ def startup_status(paths, *, realm_root=None, expected_realm_id=None, config=Non
     """Read status for the selected identity without opening the realm or listener."""
     selection = _startup_selection(paths, realm_root, expected_realm_id, config)
     if selection is not None:
-        _, root, expected, scope = selection
+        _, root, expected, scope, _ = selection
         observed = _startup_observation(paths, scope, operation_id)
         if observed is not None and scope == startup_operation.OperationScope.from_selection(
             expected, root, scope.generation,
@@ -192,31 +240,38 @@ def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, c
     selection = _startup_selection(paths, realm_root, expected_realm_id, config)
     if selection is None:
         return {"ok": False, "state": "workspace_missing", "effects": ["observe"]}
-    _, _, _, scope = selection
+    _, _, _, scope, _ = selection
     pending = _pending_inspection(paths, scope)
     if pending is not None:
         return pending
-    with _bootstrap_mutex(paths):
-        current = _startup_selection(paths, realm_root, expected_realm_id, config)
-        if current is None or current[3] != scope:
-            raise BootstrapError("Workspace selection changed during startup inspection.")
-        configured, root, expected, _ = current
+    try:
+        with _bootstrap_mutex(paths, blocking=False):
+            current = _startup_selection(paths, realm_root, expected_realm_id, config)
+            if current is None or current[3] != scope:
+                raise BootstrapError("Workspace selection changed during startup inspection.")
+            configured, root, expected, _, requested_identity = current
+            pending = _pending_inspection(paths, scope)
+            if pending is not None:
+                return pending
+            report = _startup_live_owner_inspection(paths, boundary, root, expected, requested_identity)
+            if report is None:
+                try:
+                    with realm_admission_fence(root, blocking=False):
+                        if _realm_owner_present(root):
+                            raise BootstrapError("A different Runtime owner is active for this realm.")
+                        operation = startup_operation.StartupOperation.assign(paths.runtime_support.resolve(), scope)
+                        with operation.produce():
+                            observed, report = _inspect(boundary, root, startup=True)
+                            if observed != expected:
+                                raise BootstrapError(f"workspace identity mismatch: expected {expected}, observed {observed}")
+                            report["state"] = "verified_offline"
+                except BlockingIOError as exc:
+                    raise BootstrapError("A Runtime owner is inspecting this realm.") from exc
+    except BootstrapLockBusy:
+        # A request can lose before the winner publishes any operation. It
+        # must return to the caller without queuing another full inspection.
         pending = _pending_inspection(paths, scope)
-        if pending is not None:
-            return pending
-        report = _live_owner_inspection(paths, boundary, root, expected)
-        if report is None:
-            try:
-                with realm_admission_fence(root, blocking=False):
-                    if _realm_owner_present(root):
-                        raise BootstrapError("A different Runtime owner is active for this realm.")
-                    operation = startup_operation.StartupOperation.assign(paths.runtime_support.resolve(), scope)
-                    with operation.produce():
-                        observed, report = _inspect(boundary, root, startup=True)
-                        if observed != expected:
-                            raise BootstrapError(f"workspace identity mismatch: expected {expected}, observed {observed}")
-            except BlockingIOError as exc:
-                raise BootstrapError("A Runtime owner is inspecting this realm.") from exc
+        return pending if pending is not None else {"ok": False, "state": "startup_busy"}
     return {
         "ok": True,
         "state": "configured" if configured is not None else "inspectable",
