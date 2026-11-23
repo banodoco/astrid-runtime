@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import shutil
@@ -12,9 +13,11 @@ from .bootstrap import (
     BootstrapError,
     BootstrapLockBusy,
     RuntimeBoundary,
+    RuntimeStartAttempt,
     _bootstrap_mutex,
     _capture_requested_identity,
     _commit_source_profile_metadata,
+    _finish_start_attempt,
     _has_symlink_component,
     _new_realm_id,
     _owner_record_matches,
@@ -31,7 +34,7 @@ from .bootstrap import (
     _validated_matching_owner_identity,
 )
 from .paths import RuntimePaths
-from runtime_protocol import platform, process_control as process_control_setting, startup_operation
+from runtime_protocol import platform, process_control as process_control_setting, startup_attempt, startup_operation
 
 
 def _root(value: str | Path, *, must_exist: bool, empty: bool = False) -> Path:
@@ -205,10 +208,35 @@ def _startup_selection(paths, realm_root, expected_realm_id, config):
     return configured, root, expected, scope, requested_identity
 
 
-def _startup_observation(paths, scope, operation_id=None):
+def _startup_observation(paths, scope, operation_id=None, *, fresh=True):
     return startup_operation.read_operation(
-        paths.runtime_support.resolve(), scope=scope, operation_id=operation_id,
+        paths.runtime_support.resolve(), scope=scope, operation_id=operation_id, fresh=fresh,
     )
+
+
+@contextmanager
+def begin_startup_attempt(paths, *, realm_root=None, expected_realm_id=None, config=None, retry_attempt_id=None):
+    """Reserve a scoped start attempt around an independently verified inspection and launch."""
+    config = config or BootstrapConfig()
+    _validate_support_paths(paths)
+    with _bootstrap_mutex(paths):
+        selection = _startup_selection(paths, realm_root, expected_realm_id, config)
+        if selection is None:
+            raise BootstrapError("No workspace is configured for the Runtime start attempt.")
+        _, _, _, scope, _ = selection
+        if _pending_startup(paths) is not None:
+            raise BootstrapError("A Runtime startup operation already owns this installation.")
+        record = startup_attempt.StartupAttempt.begin_locked(
+            paths.runtime_support.resolve(), scope,
+            inspecting=True, retry_attempt_id=retry_attempt_id,
+        )
+    succeeded = False
+    try:
+        yield RuntimeStartAttempt(paths, record)
+        succeeded = True
+    finally:
+        with _bootstrap_mutex(paths):
+            _finish_start_attempt(record, failed=not succeeded)
 
 
 def startup_status(paths, *, realm_root=None, expected_realm_id=None, config=None, operation_id=None):
@@ -217,9 +245,27 @@ def startup_status(paths, *, realm_root=None, expected_realm_id=None, config=Non
     if selection is not None:
         _, root, expected, scope, _ = selection
         observed = _startup_observation(paths, scope, operation_id)
-        if observed is not None and scope == startup_operation.OperationScope.from_selection(
-            expected, root, scope.generation,
-        ):
+        if scope != startup_operation.OperationScope.from_selection(expected, root, scope.generation):
+            return {"state": "unavailable"}
+        if observed is not None and (operation_id is not None or observed.state == "pending"):
+            return observed.as_observation()
+        if operation_id is None:
+            launcher = startup_attempt.read_attempt(paths.runtime_support.resolve())
+            if launcher is not None and launcher.state != "finished":
+                if launcher.scope != scope:
+                    return {"state": "unavailable"}
+                # Assignment can race this lock-free read. An independent
+                # active operation takes priority over the launcher's record.
+                active = _startup_observation(paths, scope, fresh=False)
+                if active is not None and active.state == "pending":
+                    fresh = _startup_observation(paths, scope, active.operation_id)
+                    if fresh is None or fresh.state != "pending":
+                        return {"state": "unavailable"}
+                    return fresh.as_observation()
+                if scope == startup_operation.OperationScope.from_selection(expected, root, scope.generation):
+                    return launcher.as_observation()
+                return {"state": "unavailable"}
+        if observed is not None:
             return observed.as_observation()
     return {"state": "unavailable"}
 
