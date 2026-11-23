@@ -309,11 +309,15 @@ def test_replay_credit_is_not_transferred_between_connections(service):
         assert before[1] < original.total_changes
         other = sqlite3.connect(":memory:", isolation_level=None)
         try:
-            other.execute("CREATE TEMP TABLE session_command_replay (n INTEGER)")
-            service.store.conn = other
-            service._session_replay_write(
-                "INSERT INTO temp.session_command_replay VALUES (?)", (1,)
+            other.execute(
+                "CREATE TEMP TABLE session_command_replay ("
+                "command_kind TEXT NOT NULL, aggregate_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, "
+                "request_hash TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL, "
+                "is_expired INTEGER NOT NULL DEFAULT 0, "
+                "PRIMARY KEY(command_kind, aggregate_id, idempotency_key))"
             )
+            service.store.conn = other
+            _record_idle_claim(service, "replacement-credit")
             # A credit established on a different connection must not reduce
             # the fence when the original connection returns.
             service.store.conn = original
@@ -350,3 +354,39 @@ def test_failed_replay_trigger_with_main_side_effect_forces_retry(service):
     assert service.store.conn.execute(
         "SELECT name FROM timelines WHERE project_id=?", (service.test_project,)
     ).fetchone()[0].endswith(" failed trigger")
+
+
+def test_history_row_mutation_during_both_verifications_refuses_result(service, monkeypatch):
+    from runtime_protocol.errors import HeadBusyError
+
+    provider(service)
+    accepted = commit(service, body(service))
+    publication = accepted["receipt"]["receipt_id"]
+    commits, _ = service._timeline_commits()
+    commits.clear_replay_memo()
+    original = TimelineCommitStore.verified_head
+    calls = []
+
+    def mutate_after_verification(reader, *args, **kwargs):
+        result = original(reader, *args, **kwargs)
+        calls.append(True)
+        with service.store._mutex:
+            _record_idle_claim(service, f"mutation-claim-{len(calls)}")
+            changed = service.store.conn.execute(
+                "UPDATE timeline_commit_history SET metadata_json=metadata_json || ' ' WHERE publication_id=?",
+                (publication,),
+            )
+            assert changed.rowcount == 1
+        return result
+
+    monkeypatch.setattr(TimelineCommitStore, "verified_head", mutate_after_verification)
+    with pytest.raises(HeadBusyError):
+        service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
+    assert len(calls) == 2
+
+
+def test_replay_write_helper_rejects_arbitrary_main_sql(service):
+    before = service.store.conn.total_changes
+    with pytest.raises(ValueError):
+        service._session_replay_write("UPDATE main.timelines SET name='tampered'", ())
+    assert service.store.conn.total_changes == before
