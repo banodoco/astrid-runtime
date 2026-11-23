@@ -1631,6 +1631,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             commits = getattr(self.runtime, "_timeline_commit_store", None)
             memo_trace = getattr(commits, "_memo_trace", None)
             trace_request_id = memo_trace.request_started(self) if memo_trace is not None else None
+            if memo_trace is not None:
+                memo_trace.flush()
             self._pending_response = None
             self._pending_file_response = None
             self._prefetched_body = None
