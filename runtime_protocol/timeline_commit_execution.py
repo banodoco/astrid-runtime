@@ -32,6 +32,7 @@ _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
 _PUBLIC_REQUEST_ID = ContextVar("timeline_public_request_id", default=None)
 _IDEMPOTENCY_KEY = ContextVar("timeline_idempotency_key", default=None)
 _COMMIT_TIMING = ContextVar("timeline_commit_timing", default=None)
+_COVERS_DEPTH = ContextVar("timeline_commit_covers_depth", default=0)
 _LOGGER = logging.getLogger(__name__)
 _TIMING_FIELDS = (
     "handler",
@@ -115,24 +116,104 @@ class CommitTiming:
 
     request_id: str | None = None
     stages: dict = field(default_factory=dict)
+    spans: dict = field(default_factory=dict)
+    _span_ns: dict = field(default_factory=dict)
     _started: dict = field(default_factory=dict)
+    _origin_ns: int | None = None
+    _ended_ns: int | None = None
     outcome: str = "unknown"
     emitted: bool = False
+    sizes_bytes: dict = field(default_factory=dict)
+    covers_calls: int = 0
+    covers_elapsed_ns: int = 0
+    value_equal_calls: int = 0
 
     def set_request_id(self, request_id):
         if request_id is not None:
             self.request_id = _validated_request_id(request_id)
 
+    def set_size(self, name, value):
+        """Record a bounded byte count for commit diagnostics only."""
+        if (type(name) is str and re.fullmatch(r"[a-z][a-z0-9_]{0,47}", name)
+                and type(value) is int and 0 <= value <= 2**63 - 1):
+            self.sizes_bytes[name] = value
+
+    @contextmanager
+    def covers_call(self):
+        """Measure one outer dependency coverage check, even when it raises."""
+        self.covers_calls += 1
+        started = time.monotonic_ns()
+        try:
+            yield
+        finally:
+            self.covers_elapsed_ns += max(0, time.monotonic_ns() - started)
+
+    def count_value_equal(self):
+        self.value_equal_calls += 1
+
     def begin(self, name):
         if name in _TIMING_FIELDS:
-            self._started[name] = time.monotonic_ns()
+            started = time.monotonic_ns()
+            if self._origin_ns is None:
+                self._origin_ns = started
+            self._started[name] = started
 
     def end(self, name):
         started = self._started.pop(name, None)
         if started is None:
             return
-        elapsed = max(0, time.monotonic_ns() - started)
+        ended = time.monotonic_ns()
+        elapsed = max(0, ended - started)
+        self._span_ns[name] = (started, ended)
+        if name == "total":
+            self._ended_ns = ended
         self.stages[name] = min(_MAX_TIMING_MS, int(round(elapsed / 1_000_000)))
+        self.spans[name] = {
+            "start_ms": min(_MAX_TIMING_MS, max(0, int(round((started - self._origin_ns) / 1_000_000)))),
+            "end_ms": min(_MAX_TIMING_MS, max(0, int(round((ended - self._origin_ns) / 1_000_000)))),
+            "duration_ms": self.stages[name],
+        }
+
+    def _exclusive_timings(self):
+        """Partition total wall time once, preferring the narrowest active stage."""
+        if self._origin_ns is None or self._ended_ns is None:
+            return {"unattributed": 0}
+        origin, end = self._origin_ns, self._ended_ns
+        priority = (
+            "port_store_accept", "close", "durable_reconciliation",
+            "initial_replay_lookup", "provider_commit", "service_admission",
+            "wire_response", "handler",
+        )
+        boundaries = {origin, end}
+        intervals = {}
+        for name, (start, stop) in self._span_ns.items():
+            if name == "total":
+                continue
+            start, stop = max(origin, start), min(end, stop)
+            if start < stop:
+                intervals[name] = (start, stop)
+                boundaries.update((start, stop))
+        totals_ns = {name: 0 for name in (*priority, "unattributed")}
+        points = sorted(boundaries)
+        for left, right in zip(points, points[1:]):
+            active = [name for name in priority
+                      if name in intervals and intervals[name][0] <= left
+                      and intervals[name][1] >= right]
+            totals_ns[active[0] if active else "unattributed"] += right - left
+
+        wall_ns = max(0, end - origin)
+        wall_ms = min(_MAX_TIMING_MS, int(round(wall_ns / 1_000_000)))
+        exact_ms = {name: value / 1_000_000 for name, value in totals_ns.items()}
+        result = {name: int(value) for name, value in exact_ms.items()}
+        remainder = wall_ms - sum(result.values())
+        for name in sorted(result, key=lambda key: exact_ms[key] - result[key], reverse=True):
+            if remainder <= 0:
+                break
+            result[name] += 1
+            remainder -= 1
+        if remainder:
+            result["unattributed"] += remainder
+        return {name: value for name, value in result.items() if value or name == "unattributed"}
 
     @contextmanager
     def stage(self, name):
@@ -166,11 +247,17 @@ class CommitTiming:
         if self.emitted:
             return
         self.emitted = True
+        timings = self.finish()
+        exclusive = self._exclusive_timings()
         payload = {
             "event": "timeline_commit_timing",
             "request_id": _validated_request_id(self.request_id),
             "outcome": self.outcome,
-            "timings_ms": self.finish(),
+            "timings_ms": timings,
+            "stage_spans_ms": dict(sorted(self.spans.items())),
+            "exclusive_timings_ms": exclusive,
+            "runtime_wall_ms": sum(exclusive.values()),
+            "sizes_bytes": dict(sorted(self.sizes_bytes.items())),
         }
         public_hash = _public_request_id_hash(current_public_request_id())
         if public_hash is not None:
@@ -178,16 +265,37 @@ class CommitTiming:
         key_hash = _idempotency_key_hash(current_idempotency_key())
         if key_hash is not None:
             payload["idempotency_key_sha256"] = key_hash
-        # Keep per-commit timing out of normal INFO logs. An explicit INFO
-        # override on this logger is an opt-in for timing consumers.
+        if self.covers_calls or self.covers_elapsed_ns or self.value_equal_calls:
+            payload["covers"] = {
+                "calls": self.covers_calls,
+                "elapsed_ns": min(2**63 - 1, max(0, self.covers_elapsed_ns)),
+                "value_equal_calls": self.value_equal_calls,
+            }
+        # Route bounded per-commit timing records to the Runtime's INFO sink.
         line = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         if len((line + "\n").encode("utf-8")) <= _MAX_DIAGNOSTIC_BYTES:
-            level = logging.INFO if _LOGGER.level == logging.INFO else logging.DEBUG
-            _LOGGER.log(level, "runtime.timeline_commit.timing %s", line)
+            _LOGGER.info("runtime.timeline_commit.timing %s", line)
 
 
 def current_commit_timing():
     return _COMMIT_TIMING.get()
+
+
+@contextmanager
+def measure_covers():
+    """Shared instrumentation seam for outer covers implementations."""
+    timing = current_commit_timing()
+    depth = _COVERS_DEPTH.get()
+    token = _COVERS_DEPTH.set(depth + 1)
+    try:
+        if depth == 0 and timing is not None:
+            from .timeline_commit_producer import count_value_equal_with
+            with timing.covers_call(), count_value_equal_with(timing.count_value_equal):
+                yield
+        else:
+            yield
+    finally:
+        _COVERS_DEPTH.reset(token)
 
 
 def start_commit_timing(request_id=None):
