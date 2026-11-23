@@ -161,10 +161,104 @@ jobs:
       - run: python -m pip install -e '.[test]'
       - run: python -m pip install -e "$ASTRID_CHECKOUT"
       - name: Run unit tests
+        if: runner.os == 'Linux'
         shell: bash
         run: mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/unit.xml" -n 2
         env:
           TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
+      - name: Run macOS unit tests and Plan 77 watchdog diagnostics
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
+          WATCHDOG_DIAGNOSTICS_DIR: ${{ runner.temp }}/p77-watchdog-unit-${{ matrix.os }}
+        run: |
+          mkdir -p "$TEST_RESULTS_DIR" "$WATCHDOG_DIAGNOSTICS_DIR"
+          plugin_dir=$(mktemp -d "$RUNNER_TEMP/p77-watchdog-plugin.XXXXXX")
+          trap 'rm -rf "$plugin_dir"' EXIT
+          cat > "$plugin_dir/p77_watchdog_timeline.py" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from time import monotonic_ns
+
+          import pytest
+
+
+          class WorkerTimeline:
+              def __init__(self, worker):
+                  self.worker = worker
+                  self.path = Path(os.environ["ASTRID_P77_TIMELINE_DIR"]) / f"{worker}.jsonl"
+                  self.events = []
+
+              def record(self, nodeid, event, **fields):
+                  self.events.append({
+                      "monotonic_ns": monotonic_ns(),
+                      "worker": self.worker,
+                      "nodeid": nodeid,
+                      "event": event,
+                      **fields,
+                  })
+
+              @pytest.hookimpl(wrapper=True, tryfirst=True)
+              def pytest_runtest_protocol(self, item):
+                  self.record(item.nodeid, "protocol_start")
+                  try:
+                      return (yield)
+                  finally:
+                      self.record(item.nodeid, "protocol_finish")
+                      # Flush completed intervals outside the measured protocol.
+                      with self.path.open("a", encoding="utf-8") as timeline:
+                          timeline.writelines(json.dumps(event) + "\n" for event in self.events)
+                      self.events.clear()
+
+              @pytest.hookimpl(wrapper=True, tryfirst=True)
+              def pytest_runtest_call(self, item):
+                  self.record(item.nodeid, "call_start")
+                  try:
+                      return (yield)
+                  finally:
+                      self.record(item.nodeid, "call_finish")
+
+              def pytest_runtest_logreport(self, report):
+                  self.record(report.nodeid, "report", phase=report.when, outcome=report.outcome)
+
+
+          def pytest_configure(config):
+              if hasattr(config, "workerinput"):
+                  timeline = WorkerTimeline(config.workerinput["workerid"])
+                  config.pluginmanager.register(timeline)
+          PY
+
+          printf 'run\texit_code\n' > "$WATCHDOG_DIAGNOSTICS_DIR/exit-codes.tsv"
+          capture_pytest() {
+            local run="$1"
+            local output_dir="$WATCHDOG_DIAGNOSTICS_DIR/$run"
+            shift
+            mkdir -p "$output_dir"
+            pytest_status=0
+            python -m pytest "$@" > "$output_dir/stdout.log" 2> "$output_dir/stderr.log" || pytest_status=$?
+            printf '%s\t%s\n' "$run" "$pytest_status" >> "$WATCHDOG_DIAGNOSTICS_DIR/exit-codes.tsv"
+            printf 'Pytest %s exited with %s\n' "$run" "$pytest_status"
+          }
+
+          watchdog_test=tests/test_p2_commit_phase_capture.py::test_live_watchdog_uses_real_handler_and_private_faulthandler_output
+          for ((number = 1; number <= 20; number++)); do
+            printf -v attempt '%02d' "$number"
+            capture_pytest "A/$attempt" -q -rA -n 0 \
+              --junitxml="$WATCHDOG_DIAGNOSTICS_DIR/A/$attempt/junit.xml" "$watchdog_test"
+          done
+
+          PYTHONPATH="$plugin_dir${PYTHONPATH:+:$PYTHONPATH}" \
+            ASTRID_P77_TIMELINE_DIR="$WATCHDOG_DIAGNOSTICS_DIR/B" \
+            capture_pytest B -v -rA -n 2 --durations=50 -p p77_watchdog_timeline \
+              --junitxml="$TEST_RESULTS_DIR/unit.xml"
+          two_worker_status=$pytest_status
+
+          capture_pytest C -v -rA -n 1 --durations=50 \
+            --junitxml="$WATCHDOG_DIAGNOSTICS_DIR/C/junit.xml"
+          # The regular two-worker result still determines the CI step's status.
+          exit "$two_worker_status"
       - name: Summarize test result XML
         if: always()
         env:
@@ -192,6 +286,14 @@ jobs:
         with:
           name: test-results-unit-all-${{ matrix.os }}
           path: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}/*.xml
+          retention-days: 90
+          if-no-files-found: warn
+      - name: Upload macOS watchdog diagnostics
+        if: ${{ always() && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: p77-watchdog-unit-${{ matrix.os }}
+          path: ${{ runner.temp }}/p77-watchdog-unit-${{ matrix.os }}
           retention-days: 90
           if-no-files-found: warn
 
