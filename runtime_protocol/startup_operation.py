@@ -147,9 +147,8 @@ def _owner_birth(pid, *, expected_birth=None):
             return None
         return f'darwin-creation:{actual["start_sec"]}:{actual["start_usec"]}'
     actual = platform.process_identity(pid)
-    if not actual or actual.get("pid") != pid or actual.get("uid") != platform.current_user():
-        if (actual is None and expected_birth is not None
-                and platform.sys.platform.startswith("linux")):
+    if actual is None:
+        if expected_birth is not None and platform.sys.platform.startswith("linux"):
             # A hidden /proc entry proves absence only when this observer can
             # compare the recorded owner's boot and PID-namespace coordinates.
             local = platform.process_identity(os.getpid())
@@ -157,7 +156,17 @@ def _owner_birth(pid, *, expected_birth=None):
                     or platform.process_birth_matches(expected_birth, local["birth_id"]) is None):
                 raise StartupOperationError("Runtime startup process identity could not be verified.")
         return None
-    return actual.get("birth_id")
+    if not isinstance(actual, dict) or actual.get("pid") != pid:
+        raise StartupOperationError("Runtime startup process identity could not be verified.")
+    birth = actual.get("birth_id")
+    if not isinstance(birth, str) or not birth:
+        raise StartupOperationError("Runtime startup process identity could not be verified.")
+    if actual.get("uid") != platform.current_user():
+        if (expected_birth is not None and platform.sys.platform.startswith("linux")
+                and platform.process_birth_matches(expected_birth, birth) is False):
+            return None
+        raise StartupOperationError("Runtime startup process identity could not be verified.")
+    return birth
 
 
 def read_operation(support_root, *, scope=None, operation_id=None, fresh=True):

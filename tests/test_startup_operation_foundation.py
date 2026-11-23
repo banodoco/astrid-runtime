@@ -363,3 +363,49 @@ def test_invisible_native_owner_requires_comparable_process_namespace(tmp_path, 
         None if pid == native_pid else local_identity
     ))
     assert startup_operation.read_operation(support, fresh=False) is None
+
+
+@pytest.mark.skipif(not platform.sys.platform.startswith("linux"), reason="Linux PID namespace visibility")
+def test_visible_foreign_uid_owner_requires_definitive_birth_mismatch(tmp_path, monkeypatch):
+    """A visible foreign UID is not proof of absence without comparable, different birth."""
+    from dataclasses import replace
+
+    support = tmp_path / "support"
+    support.mkdir()
+    platform.owner_only(support)
+    operation = startup_operation.StartupOperation.assign(
+        support, startup_operation.OperationScope("d" * 64, "e" * 64, "f" * 64),
+    )
+    current = platform.process_identity(os.getpid())
+    assert current is not None
+    expected = current["birth_id"]
+    boot, namespace = [part.split(":", 1)[1] for part in expected.split(";")[1:]]
+    native_pid = 2**31 - 1
+    replacement = replace(operation.status, owner_pid=native_pid, owner_birth=expected)
+    startup_operation.StartupOperation(support, replacement)._publish()
+
+    foreign_namespace = f"proc-start-ticks:10;boot:{boot};pidns:{int(namespace) + 1}"
+    different_birth = f"proc-start-ticks:10;boot:{boot};pidns:{namespace}"
+    visible = {"pid": native_pid, "uid": platform.current_user() + 1, "birth_id": foreign_namespace}
+    monkeypatch.setattr(platform, "process_identity", lambda pid: (
+        visible if pid == native_pid else current
+    ))
+    with pytest.raises(startup_operation.StartupOperationError, match="identity"):
+        startup_operation.read_operation(support, fresh=False)
+
+    # Same recorded birth with a different UID is also indeterminate.
+    visible["birth_id"] = expected
+    with pytest.raises(startup_operation.StartupOperationError, match="identity"):
+        startup_operation.read_operation(support, fresh=False)
+
+    # An invalid/empty kernel birth is unknown, never terminal absence.
+    visible["uid"] = platform.current_user()
+    visible["birth_id"] = ""
+    with pytest.raises(startup_operation.StartupOperationError, match="identity"):
+        startup_operation.read_operation(support, fresh=False)
+
+    # A valid different birth in the same boot and PID namespace proves the
+    # recorded owner PID has been recycled, so this operation is terminal.
+    visible["uid"] = platform.current_user() + 1
+    visible["birth_id"] = different_birth
+    assert startup_operation.read_operation(support, fresh=False) is None
