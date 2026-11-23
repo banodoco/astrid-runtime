@@ -275,11 +275,13 @@ class ProducerReads:
                 raise _mismatch()
             continuation = self._continuation(task, spec, request["project_id"])
             run = self.conn.execute("SELECT * FROM runs WHERE id=?", (task["run_id"],)).fetchone()
-            return copy.deepcopy({"pin": pin, "proposal": proposal, "render_intent": publication.get("render"),
+            # Proposal, output, spec and associations were freshly decoded or
+            # read above. Only pin and identity can contain caller-owned values.
+            return {"pin": copy.deepcopy(pin), "proposal": proposal, "render_intent": publication.get("render"),
                 "artifact": {"descriptor": output, "association": association},
-                "identity": {**{key: context[key] for key in ("realm_id", "publisher", "idempotency_key", "request_hash")},
-                             "project_id": request["project_id"], "timeline_id": request["timeline_id"]},
+                "identity": copy.deepcopy({**{key: context[key] for key in ("realm_id", "publisher", "idempotency_key", "request_hash")},
+                             "project_id": request["project_id"], "timeline_id": request["timeline_id"]}),
                 "authority": {"task": dict(task), "attempt": dict(attempt), "run": dict(run), "spec": stored,
-                              "continuation": continuation}})
+                              "continuation": continuation}}
         except (KeyError, TypeError, ValueError, UnicodeError, OSError, RecursionError, RuntimeErrorBase) as exc:
             raise _unavailable() from exc
