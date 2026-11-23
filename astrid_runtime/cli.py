@@ -223,7 +223,7 @@ def _workspace_selection_args(command: argparse.ArgumentParser) -> None:
     command.add_argument("--realm-root", type=Path)
     command.add_argument("--expected-realm-id")
     command.add_argument("--require-configured-selection", action="store_true",
-                         help="require the explicit realm root and expected ID to match the current selection")
+                         help="require the current selection; when specifying a realm, pass both its root and expected ID")
 
 
 def _attempt_args(command: argparse.ArgumentParser) -> None:

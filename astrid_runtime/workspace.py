@@ -152,27 +152,41 @@ def inspect_workspace(
     config: BootstrapConfig | None = None,
 ) -> dict[str, Any]:
     """Inspect canonical identity, optionally owning a managed startup scan."""
+    required_selection = (
+        _pin_workspace_selection(paths, realm_root, expected_realm_id)
+        if require_configured_selection else None
+    )
     if startup_operation:
         result = _inspect_startup_workspace(
             paths, boundary, realm_root, expected_realm_id, config,
-            require_configured_selection=require_configured_selection,
+            required_selection=required_selection,
         )
     else:
-        configured = _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection)
+        configured = _configured_workspace(paths, required_selection=required_selection)
         result = _inspect_workspace(paths, boundary, realm_root, expected_realm_id, configured)
-    if require_configured_selection:
-        _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection)
+    if required_selection is not None:
+        _configured_workspace(paths, required_selection=required_selection)
     return result
 
 
-def _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection):
-    _validate_support_paths(paths)
-    configured = _selected_realm(_read_catalog(paths))
-    if require_configured_selection:
-        if realm_root is None or expected_realm_id is None:
-            raise BootstrapError("Requiring the configured workspace needs an explicit realm root and expected realm ID.")
+def _pin_workspace_selection(paths, realm_root, expected_realm_id):
+    if realm_root is None and expected_realm_id is None:
+        configured = _configured_workspace(paths)
         if configured is None:
             raise BootstrapError("No workspace is configured for this Runtime installation.")
+        return configured["data_root"], configured["realm_id"]
+    if realm_root is None or expected_realm_id is None:
+        raise BootstrapError("Specify both the realm root and expected realm ID to require a particular workspace.")
+    return realm_root, expected_realm_id
+
+
+def _configured_workspace(paths, *, required_selection=None):
+    _validate_support_paths(paths)
+    configured = _selected_realm(_read_catalog(paths))
+    if required_selection is not None:
+        if configured is None:
+            raise BootstrapError("No workspace is configured for this Runtime installation.")
+        realm_root, expected_realm_id = required_selection
         if (expected_realm_id != configured["realm_id"]
                 or _root(realm_root, must_exist=True) != Path(configured["data_root"])):
             raise BootstrapError("Candidate conflicts with the configured workspace.")
@@ -212,8 +226,8 @@ def _inspect_workspace(paths, boundary, realm_root, expected_realm_id, configure
     }
 
 
-def _startup_selection(paths, realm_root, expected_realm_id, config, *, require_configured_selection=False):
-    configured = _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection)
+def _startup_selection(paths, realm_root, expected_realm_id, config, *, required_selection=None):
+    configured = _configured_workspace(paths, required_selection=required_selection)
     if realm_root is None and configured is None:
         return None
     root = _root(realm_root if realm_root is not None else configured["data_root"], must_exist=True)
@@ -266,13 +280,16 @@ def begin_startup_attempt(paths, *, realm_root=None, expected_realm_id=None, con
 def startup_status(paths, *, realm_root=None, expected_realm_id=None, config=None, operation_id=None,
                    require_configured_selection=False):
     """Read status for the selected identity without opening the realm or listener."""
+    required_selection = (
+        _pin_workspace_selection(paths, realm_root, expected_realm_id)
+        if require_configured_selection else None
+    )
     selection = _startup_selection(
-        paths, realm_root, expected_realm_id, config,
-        require_configured_selection=require_configured_selection,
+        paths, realm_root, expected_realm_id, config, required_selection=required_selection,
     )
     result = _startup_status(paths, selection, operation_id)
-    if require_configured_selection:
-        _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection)
+    if required_selection is not None:
+        _configured_workspace(paths, required_selection=required_selection)
     return result
 
 
@@ -345,12 +362,11 @@ def _launcher_inspection(paths, scope, *, allow_verifier=False):
     return {"ok": False, "state": state, "startup_attempt": launcher.as_observation()}
 
 
-def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, config, *, require_configured_selection):
+def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, config, *, required_selection):
     from runtime_protocol.store import realm_admission_fence
 
     selection = _startup_selection(
-        paths, realm_root, expected_realm_id, config,
-        require_configured_selection=require_configured_selection,
+        paths, realm_root, expected_realm_id, config, required_selection=required_selection,
     )
     if selection is None:
         return {"ok": False, "state": "workspace_missing", "effects": ["observe"]}
@@ -361,8 +377,7 @@ def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, c
     try:
         with _bootstrap_mutex(paths, blocking=False):
             current = _startup_selection(
-                paths, realm_root, expected_realm_id, config,
-                require_configured_selection=require_configured_selection,
+                paths, realm_root, expected_realm_id, config, required_selection=required_selection,
             )
             if current is None or current[3] != scope:
                 raise BootstrapError("Workspace selection changed during startup inspection.")
