@@ -3,6 +3,7 @@ from contextlib import closing
 import sqlite3
 
 from runtime_protocol.timeline_commit_store import TimelineCommitStore
+from runtime_protocol.service import RuntimeService
 from test_timeline_commit_authentication import body, provider
 from test_timeline_commit_port import commit, service
 from test_timeline_verified_reads import next_request
@@ -53,3 +54,28 @@ def test_external_committed_write_forces_verified_head_reverification(service, m
     assert service.store.conn.execute("PRAGMA data_version").fetchone()[0] != initial_version
     assert service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None) == head
     assert first["receipt"]["receipt_id"] in replayed
+
+
+def test_reopened_service_reverifies_persisted_verified_head(service, monkeypatch):
+    provider(service)
+    first = commit(service, body(service))
+    project = service.test_project
+    root = service.store.root
+    expected = service.get_timeline_verified_head(project, "main", authorize=lambda: None)
+    service.close()
+
+    reopened = RuntimeService(root)
+    replayed = []
+    replay = TimelineCommitStore._verify_accepted_replay
+
+    def observe(self, row, edge, *args, **kwargs):
+        replayed.append(edge["publication_id"])
+        return replay(self, row, edge, *args, **kwargs)
+
+    monkeypatch.setattr(TimelineCommitStore, "_verify_accepted_replay", observe)
+    try:
+        actual = reopened.get_timeline_verified_head(project, "main", authorize=lambda: None)
+        assert actual == expected
+        assert first["receipt"]["receipt_id"] in replayed
+    finally:
+        reopened.close()
