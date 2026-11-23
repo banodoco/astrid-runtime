@@ -73,6 +73,33 @@ class AttemptObservation:
     def as_observation(self) -> dict:
         return {"state": self.state, "attempt_id": self.attempt_id}
 
+    def authorizes_inspection_locked(self, support_root: Path) -> bool:
+        """Check kernel custody while the caller holds the bootstrap mutex."""
+        if self.state != _INSPECTING:
+            return False
+        pid = os.getpid()
+        owner = self._record
+        try:
+            caller = _process_identity(pid)
+            if caller is None or caller.get("uid") != platform.current_user():
+                return False
+            birth = caller["birth_id"]
+            if birth.startswith("proc-start-ticks:"):
+                # Numeric procfs paths use the mount's PID namespace. Bind
+                # this lookup to the actual caller before comparing any PIDs.
+                proc_self = Path("/proc/self")
+                if (proc_self.readlink() != Path(str(pid))
+                        or not birth.endswith(f";pidns:{(proc_self / 'ns/pid').stat().st_ino}")):
+                    return False
+            if pid == owner.owner_pid:
+                matches = platform.process_birth_matches(owner.owner_birth, birth) is True
+            else:
+                matches = (caller.get("parent_pid") == owner.owner_pid
+                           and _possible_child_birth(owner.owner_birth, birth))
+        except (OSError, StartupAttemptError):
+            return False
+        return matches and read_attempt(support_root) == self
+
 
 def _read_record(directory) -> _Record | None:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
@@ -108,19 +135,40 @@ def _read_record(directory) -> _Record | None:
         raise StartupAttemptError("Runtime start attempt record is invalid.") from exc
 
 
-def _process_birth(pid: int) -> tuple[str, object] | None:
+def _process_identity(pid: int) -> dict | None:
     if platform.sys.platform == "darwin":
         info = platform._read_darwin_process_info(pid, include_exit=True)
         if info is None or info["status"] == 5:  # SZOMB
             return None
-        return f'darwin-creation:{info["start_sec"]}:{info["start_usec"]}', info["uid"]
-    info = platform.process_identity(pid)
+        info["birth_id"] = f'darwin-creation:{info["start_sec"]}:{info["start_usec"]}'
+    else:
+        info = platform.process_identity(pid)
     if info is None:
         return None
     birth = info.get("birth_id")
     if info.get("pid") != pid or not isinstance(birth, str) or not _BIRTH.fullmatch(birth):
         raise StartupAttemptError("Runtime launcher birth identity is invalid.")
-    return birth, info.get("uid")
+    return info
+
+
+def _process_birth(pid: int) -> tuple[str, object] | None:
+    info = _process_identity(pid)
+    return (info["birth_id"], info.get("uid")) if info is not None else None
+
+
+def _possible_child_birth(parent: str, child: str) -> bool:
+    """Compare canonical kernel birth coordinates for an observed parent PID."""
+    parent_stamp, _, parent_scope = parent.partition(";")
+    child_stamp, _, child_scope = child.partition(";")
+    parent_kind, _, parent_time = parent_stamp.partition(":")
+    child_kind, _, child_time = child_stamp.partition(":")
+    if parent_kind != child_kind or parent_scope != child_scope:
+        return False
+    if parent_kind == "proc-start-ticks":
+        return int(parent_time) <= int(child_time)  # /proc can round both to one tick.
+    # Windows keeps the creator's PID after exit, so a matching numeric PID
+    # grants no custody if its current process was born after the caller.
+    return tuple(map(int, parent_time.split(":"))) < tuple(map(int, child_time.split(":")))
 
 
 def _launcher_is_live(record: _Record) -> bool:

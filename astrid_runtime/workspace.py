@@ -147,14 +147,39 @@ def inspect_workspace(
     *,
     realm_root: str | Path | None = None,
     expected_realm_id: str | None = None,
+    require_configured_selection: bool = False,
     startup_operation: bool = False,
     config: BootstrapConfig | None = None,
 ) -> dict[str, Any]:
     """Inspect canonical identity, optionally owning a managed startup scan."""
     if startup_operation:
-        return _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, config)
+        result = _inspect_startup_workspace(
+            paths, boundary, realm_root, expected_realm_id, config,
+            require_configured_selection=require_configured_selection,
+        )
+    else:
+        configured = _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection)
+        result = _inspect_workspace(paths, boundary, realm_root, expected_realm_id, configured)
+    if require_configured_selection:
+        _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection)
+    return result
+
+
+def _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection):
     _validate_support_paths(paths)
     configured = _selected_realm(_read_catalog(paths))
+    if require_configured_selection:
+        if realm_root is None or expected_realm_id is None:
+            raise BootstrapError("Requiring the configured workspace needs an explicit realm root and expected realm ID.")
+        if configured is None:
+            raise BootstrapError("No workspace is configured for this Runtime installation.")
+        if (expected_realm_id != configured["realm_id"]
+                or _root(realm_root, must_exist=True) != Path(configured["data_root"])):
+            raise BootstrapError("Candidate conflicts with the configured workspace.")
+    return configured
+
+
+def _inspect_workspace(paths, boundary, realm_root, expected_realm_id, configured):
     if realm_root is None:
         if configured is None:
             return {"ok": False, "state": "workspace_missing", "effects": ["observe"]}
@@ -187,9 +212,8 @@ def inspect_workspace(
     }
 
 
-def _startup_selection(paths, realm_root, expected_realm_id, config):
-    _validate_support_paths(paths)
-    configured = _selected_realm(_read_catalog(paths))
+def _startup_selection(paths, realm_root, expected_realm_id, config, *, require_configured_selection=False):
+    configured = _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection)
     if realm_root is None and configured is None:
         return None
     root = _root(realm_root if realm_root is not None else configured["data_root"], must_exist=True)
@@ -239,9 +263,20 @@ def begin_startup_attempt(paths, *, realm_root=None, expected_realm_id=None, con
             _finish_start_attempt(record, failed=not succeeded)
 
 
-def startup_status(paths, *, realm_root=None, expected_realm_id=None, config=None, operation_id=None):
+def startup_status(paths, *, realm_root=None, expected_realm_id=None, config=None, operation_id=None,
+                   require_configured_selection=False):
     """Read status for the selected identity without opening the realm or listener."""
-    selection = _startup_selection(paths, realm_root, expected_realm_id, config)
+    selection = _startup_selection(
+        paths, realm_root, expected_realm_id, config,
+        require_configured_selection=require_configured_selection,
+    )
+    result = _startup_status(paths, selection, operation_id)
+    if require_configured_selection:
+        _configured_workspace(paths, realm_root, expected_realm_id, require_configured_selection)
+    return result
+
+
+def _startup_status(paths, selection, operation_id):
     if selection is not None:
         _, root, expected, scope, _ = selection
         observed = _startup_observation(paths, scope, operation_id)
@@ -280,10 +315,14 @@ def _pending_inspection(paths, scope):
     return {"ok": False, "state": "startup_pending", "startup_operation": observed.as_observation()}
 
 
-def _launcher_inspection(paths, scope):
+def _launcher_inspection(paths, scope, *, allow_verifier=False):
     """Return the exact launcher receipt when this call is only an observer."""
+    support_root = paths.runtime_support.resolve()
     try:
-        launcher = startup_attempt.read_attempt(paths.runtime_support.resolve())
+        launcher = startup_attempt.read_attempt(support_root)
+        if (allow_verifier and launcher is not None and launcher.scope == scope
+                and launcher.authorizes_inspection_locked(support_root)):
+            return None
     except startup_attempt.StartupAttemptError as exc:
         raise BootstrapError("Runtime launcher ownership could not be verified.") from exc
     if launcher is None:
@@ -294,53 +333,44 @@ def _launcher_inspection(paths, scope):
         if launcher.abandoned:
             return {"ok": False, "state": "unavailable"}
         return None
-    if launcher.state == "starting_service":
-        pending = _pending_inspection(paths, scope)
-        if pending is not None:
-            return pending
-        return {
-            "ok": False,
-            "state": "starting_service",
-            "startup_attempt": launcher.as_observation(),
-        }
-    if launcher.state == "failed" and launcher.abandoned:
-        pending = _pending_inspection(paths, scope)
-        if pending is not None:
-            return pending
-        return {
-            "ok": False,
-            "state": "startup_attempt_failed",
-            "startup_attempt": launcher.as_observation(),
-        }
-    # The first authorized verifier runs while the launcher is still in
-    # inspecting_workspace. A pending native operation, checked by the caller
-    # first, takes precedence over either launcher stage.
-    return None
+    if launcher.live:
+        state = launcher.state
+    elif launcher.abandoned:
+        state = "startup_attempt_failed"
+    else:
+        return None
+    pending = _pending_inspection(paths, scope)
+    if pending is not None:
+        return pending
+    return {"ok": False, "state": state, "startup_attempt": launcher.as_observation()}
 
 
-def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, config):
+def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, config, *, require_configured_selection):
     from runtime_protocol.store import realm_admission_fence
 
-    selection = _startup_selection(paths, realm_root, expected_realm_id, config)
+    selection = _startup_selection(
+        paths, realm_root, expected_realm_id, config,
+        require_configured_selection=require_configured_selection,
+    )
     if selection is None:
         return {"ok": False, "state": "workspace_missing", "effects": ["observe"]}
     _, _, _, scope, _ = selection
     pending = _pending_inspection(paths, scope)
     if pending is not None:
         return pending
-    launcher = _launcher_inspection(paths, scope)
-    if launcher is not None:
-        return launcher
     try:
         with _bootstrap_mutex(paths, blocking=False):
-            current = _startup_selection(paths, realm_root, expected_realm_id, config)
+            current = _startup_selection(
+                paths, realm_root, expected_realm_id, config,
+                require_configured_selection=require_configured_selection,
+            )
             if current is None or current[3] != scope:
                 raise BootstrapError("Workspace selection changed during startup inspection.")
             configured, root, expected, _, requested_identity = current
             pending = _pending_inspection(paths, scope)
             if pending is not None:
                 return pending
-            launcher = _launcher_inspection(paths, scope)
+            launcher = _launcher_inspection(paths, scope, allow_verifier=True)
             if launcher is not None:
                 return launcher
             report = _startup_live_owner_inspection(paths, boundary, root, expected, requested_identity)
@@ -361,7 +391,10 @@ def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, c
         # A request can lose before the winner publishes any operation. It
         # must return to the caller without queuing another full inspection.
         pending = _pending_inspection(paths, scope)
-        return pending if pending is not None else {"ok": False, "state": "startup_busy"}
+        if pending is not None:
+            return pending
+        launcher = _launcher_inspection(paths, scope)
+        return launcher if launcher is not None else {"ok": False, "state": "startup_busy"}
     return {
         "ok": True,
         "state": "configured" if configured is not None else "inspectable",

@@ -81,8 +81,7 @@ def parser() -> argparse.ArgumentParser:
     _read_args(status)
     startup = sub.add_parser("startup-status", help="observe the selected Runtime startup operation")
     _read_args(startup)
-    startup.add_argument("--realm-root", type=Path)
-    startup.add_argument("--expected-realm-id")
+    _workspace_selection_args(startup)
     startup.add_argument("--source-manifest", type=Path)
     startup.add_argument("--operation-id")
     restart_cmd = sub.add_parser("restart", help="restart the selected runtime owner")
@@ -106,8 +105,7 @@ def parser() -> argparse.ArgumentParser:
     workspace_sub = workspace.add_subparsers(dest="workspace_command", required=True)
     workspace_inspect = workspace_sub.add_parser("inspect", help="read-only canonical workspace inspection")
     _read_args(workspace_inspect)
-    workspace_inspect.add_argument("--realm-root", type=Path)
-    workspace_inspect.add_argument("--expected-realm-id")
+    _workspace_selection_args(workspace_inspect)
     workspace_inspect.add_argument("--startup-operation", action="store_true", help="coordinate an installed startup inspection")
     workspace_inspect.add_argument("--source-manifest", type=Path)
     workspace_create = workspace_sub.add_parser("create", help="create and select a fresh canonical workspace")
@@ -219,6 +217,13 @@ def _read_args(command: argparse.ArgumentParser) -> None:
     command.add_argument("--json", action="store_true")
     command.add_argument("--home", type=Path, help="override the support home (mainly for disposable roots)")
     command.add_argument("--data-root", type=Path, help=f"explicit support root (or {DATA_ROOT_ENV})")
+
+
+def _workspace_selection_args(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--realm-root", type=Path)
+    command.add_argument("--expected-realm-id")
+    command.add_argument("--require-configured-selection", action="store_true",
+                         help="require the explicit realm root and expected ID to match the current selection")
 
 
 def _attempt_args(command: argparse.ArgumentParser) -> None:
@@ -585,7 +590,8 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
     if args.command == "startup-status":
         try:
             result = startup_status(paths, realm_root=args.realm_root, expected_realm_id=args.expected_realm_id,
-                                    config=_config(args, paths), operation_id=args.operation_id)
+                                    config=_config(args, paths), operation_id=args.operation_id,
+                                    require_configured_selection=args.require_configured_selection)
         except (BootstrapError, OSError, ValueError,
                 startup_operation.StartupOperationError, startup_attempt.StartupAttemptError):
             result = {"state": "unavailable"}
@@ -600,6 +606,7 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
                     boundary,
                     realm_root=args.realm_root,
                     expected_realm_id=args.expected_realm_id,
+                    require_configured_selection=args.require_configured_selection,
                     startup_operation=args.startup_operation,
                     config=_config(args, paths) if args.startup_operation else None,
                 )
