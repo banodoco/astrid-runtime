@@ -26,7 +26,7 @@ import uuid
 
 from .io import atomic_write_json, owner_only, read_json, remove_file
 from runtime_protocol import platform as runtime_platform
-from runtime_protocol import cancellation, startup_operation
+from runtime_protocol import cancellation, startup_attempt, startup_operation
 from runtime_protocol import process_control
 from runtime_protocol.errors import ConflictError
 from .paths import INSTALL_RECORD_OWNER, RuntimePaths, _install_record_path
@@ -921,10 +921,31 @@ def _reattest_aborted_launch_stop(
         return False
 
 
+@dataclass(frozen=True)
+class RuntimeStartAttempt:
+    """The local launcher's scoped, in-process start-attempt handle."""
+
+    _paths: RuntimePaths
+    _record: startup_attempt.StartupAttempt
+
+    @property
+    def attempt_id(self) -> str:
+        return self._record.attempt_id
+
+    def starting_service(self) -> None:
+        """Record that the launcher has finished its offline inspection."""
+        with _bootstrap_mutex(self._paths):
+            self._record.starting_service_locked()
+
+
 def bootstrap(
     paths: RuntimePaths,
     boundary: RuntimeBoundary,
     config: BootstrapConfig | None = None,
+    *,
+    attempt: RuntimeStartAttempt | None = None,
+    retry_attempt_id: str | None = None,
+    _managed_service: bool = False,
 ) -> BootstrapResult:
     """Perform ``astrid-runtime up`` for the one current-Mac realm."""
     config = config or BootstrapConfig()
@@ -947,8 +968,14 @@ def bootstrap(
         )
     source = config.resolve_source_profile(paths)
     _require_startup_available(paths, realm, source)
+    launcher = _read_start_attempt(paths.runtime_support.resolve())
+    if launcher is not None and launcher.live:
+        scope = _startup_scope(source, str(realm["realm_id"]), _canonical_realm_root(str(realm["data_root"])))
+        _require_launcher_available(paths, launcher, _launcher_attempt_scope(source, scope),
+                                    attempt, managed_service=_managed_service)
     with _bootstrap_mutex(paths):
-        return _bootstrap_locked(paths, boundary, config)
+        return _bootstrap_locked(paths, boundary, config, attempt=attempt,
+                                 retry_attempt_id=retry_attempt_id, managed_service=_managed_service)
 
 
 def _commit_bootstrap_metadata(paths: RuntimePaths, source: SourceProfile, catalog: Mapping[str, Any], discovery: Mapping[str, Any]) -> None:
@@ -1024,6 +1051,56 @@ def _startup_scope(source: SourceProfile, realm_id: str, realm_root: Path):
     return startup_operation.OperationScope.from_selection(realm_id, realm_root, generation)
 
 
+def _launcher_attempt_scope(source, scope, identity=None):
+    if scope is None:
+        return None
+    return startup_attempt.attempt_scope(scope, identity if identity is not None else _capture_requested_identity(source))
+
+
+def _read_start_attempt(support_root):
+    try:
+        return startup_attempt.read_attempt(support_root)
+    except startup_attempt.StartupAttemptError as exc:
+        raise BootstrapError("Runtime launcher ownership could not be verified.") from exc
+
+
+def _require_launcher_available(paths, current, scope, attempt=None, *, managed_service=False):
+    if attempt is not None:
+        if (current is not None and scope == current.scope
+                and attempt._record.matches(paths.runtime_support.resolve(), current)):
+            return
+        raise BootstrapError("The selected Runtime start attempt no longer belongs to this launcher.")
+    if current is not None and current.live:
+        if current.scope == scope:
+            # The existing managed service entry already validates its
+            # installation. It may start its independent native operation
+            # during the parent's gap without owning or editing the attempt.
+            if managed_service and current.awaiting_service:
+                return
+            raise BootstrapError(
+                "Runtime startup is already in progress; observe it with astrid-runtime startup-status.",
+                details={"code": "startup_pending", **current.as_observation()},
+            )
+        raise DuplicateOwnerError("A Runtime launcher already owns this installation's start attempt.")
+
+
+def _startup_attempt_retry_required(launcher):
+    return BootstrapError(
+        "Retry requires the exact failed Runtime start attempt ID.",
+        details={"code": "startup_attempt_failed", **launcher.as_observation()},
+    )
+
+
+def _finish_start_attempt(record, *, failed):
+    if record is not None:
+        try:
+            record.finish_locked(failed=failed)
+        except startup_attempt.StartupAttemptError:
+            # An observation write cannot change the native owner's custody
+            # or replace its admission result.
+            pass
+
+
 def _pending_startup(paths: RuntimePaths):
     try:
         observed = startup_operation.read_operation(paths.runtime_support.resolve(), fresh=False)
@@ -1067,7 +1144,11 @@ def _validated_matching_owner_identity(
     return observed
 
 
-def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig) -> BootstrapResult:
+def _bootstrap_locked(
+    paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig, *,
+    attempt: RuntimeStartAttempt | None = None, retry_attempt_id: str | None = None,
+    managed_service: bool = False, restarting_verified_owner: bool = False,
+) -> BootstrapResult:
     upgrade_journal = _read_support_json(paths.runtime_support / "upgrade-journal.json")
     if (upgrade_journal and upgrade_journal.get("operation") == "astrid-runtime-upgrade/v1"
             and upgrade_journal.get("state") not in {"complete", "rolled_back", "failed"}
@@ -1087,6 +1168,24 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     if realm is None:
         raise BootstrapError("No workspace is configured; explicit create or attach is required before up.")
     _require_startup_available(paths, realm, source)
+    realm_id = str(realm["realm_id"])
+    realm_root = _canonical_realm_root(str(realm["data_root"]))
+    scope = _startup_scope(source, realm_id, realm_root)
+    attempt_scope = _launcher_attempt_scope(source, scope, requested_identity)
+    support_root = paths.runtime_support.resolve()
+    launcher = _read_start_attempt(support_root)
+    _require_launcher_available(paths, launcher, attempt_scope, attempt, managed_service=managed_service)
+    abandoned = launcher is not None and launcher.abandoned and launcher.scope == attempt_scope
+    if restarting_verified_owner and abandoned:
+        retry_attempt_id = launcher.attempt_id
+    if retry_attempt_id is not None and (
+        attempt is not None or launcher is None or launcher.state != "failed"
+        or launcher.attempt_id != retry_attempt_id or launcher.scope != attempt_scope
+    ):
+        raise BootstrapError("The specified failed Runtime start attempt is no longer available to retry.")
+    if (abandoned and retry_attempt_id is None and not paths.discovery_path.exists()
+            and not paths.instance_lock_path.exists()):
+        raise _startup_attempt_retry_required(launcher)
     paths.ensure_support_dirs()
     catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
     completed_stop_before_launch = _revoke_completed_stop_before_launch(paths, boundary, realm)
@@ -1215,14 +1314,14 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             "stop it before retrying astrid-runtime up --profile astrid."
         )
 
-    realm_id = str(realm["realm_id"])
-    realm_root = _canonical_realm_root(str(realm["data_root"]))
+    if abandoned and retry_attempt_id is None:
+        raise _startup_attempt_retry_required(launcher)
     configure = getattr(boundary, "configure_source", None)
     if configure is not None:
         configure(source)
     configure_startup = getattr(boundary, "configure_startup_operation", None)
     if configure_startup is not None:
-        configure_startup(_startup_scope(source, realm_id, realm_root))
+        configure_startup(scope)
     configure_door = getattr(boundary, "configure_door", None)
     if configure_door is not None:
         # The door acts with the product credential this launcher provisions below.
@@ -1233,13 +1332,27 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     credential_before = runtime_platform.read_private_file(credential_path) if credential_path.is_file() and not credential_path.is_symlink() else None
     source_manifest_path = paths.source_profiles_dir / f"{source.profile}.json"
     source_before = source_manifest_path.read_bytes() if source_manifest_path.is_file() and not source_manifest_path.is_symlink() else None
-    try:
-        handle = boundary.start(
-            realm_id=realm_id,
-            realm_root=realm_root,
-            owner_lock=paths.instance_lock_path,
-            source_profile=source,
+    record = attempt._record if attempt is not None else None
+    if record is None and not managed_service and attempt_scope is not None and configure_startup is not None:
+        record = startup_attempt.StartupAttempt.begin_locked(
+            support_root, attempt_scope, inspecting=False, retry_attempt_id=retry_attempt_id,
         )
+    elif retry_attempt_id is not None:
+        raise BootstrapError("Runtime start-attempt retry requires native startup support.")
+    if record is not None:
+        record.assign_native_locked()
+    started = False
+    try:
+        try:
+            handle = boundary.start(
+                realm_id=realm_id,
+                realm_root=realm_root,
+                owner_lock=paths.instance_lock_path,
+                source_profile=source,
+            )
+            started = True
+        finally:
+            _finish_start_attempt(record, failed=not started)
     except StartupObservationLost:
         # The exact pending owner remains responsible for admission. A lost
         # observation does not authorize stopping or rolling back its state.
@@ -2833,8 +2946,17 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     _preflight_owner_interruption(paths)
     with _bootstrap_mutex(paths):
         _require_startup_available(paths)
-        _interrupt_owner_locked(paths, boundary)
-        result = _bootstrap_locked(paths, boundary, config)
+        launcher = _read_start_attempt(paths.runtime_support.resolve())
+        _require_launcher_available(paths, launcher, None)
+        verified_owner = False
+
+        def confirmed_owner(_owner):
+            # The existing interruption fence validated the live incumbent.
+            nonlocal verified_owner
+            verified_owner = True
+
+        _interrupt_owner_locked(paths, boundary, pre_stop_manager=confirmed_owner)
+        result = _bootstrap_locked(paths, boundary, config, restarting_verified_owner=verified_owner)
     return replace(result, status="restarted")
 
 

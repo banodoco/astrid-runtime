@@ -139,3 +139,353 @@ def test_launcher_exit_without_native_operation_is_terminal(selection, tmp_path)
     assert live["state"] == "starting_service"
     assert terminal["attempt_id"] == live["attempt_id"]
     assert _observe(selection) == terminal
+
+
+def test_live_launcher_blocks_competing_native_bootstrap(selection, tmp_path):
+    from astrid_runtime.bootstrap import BootstrapError, bootstrap
+    from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+
+    paths, _, config = selection
+    with _process_waiting_after(_ABANDON, _runtime_args(selection), tmp_path / "live"):
+        live = _observe(selection)
+        with pytest.raises(BootstrapError) as refused:
+            bootstrap(paths, LocalRuntimeBoundary(), config)
+        assert refused.value.details == {"code": "startup_pending", **live}
+        assert _observe(selection) == live
+        assert not paths.discovery_path.exists()
+        assert not paths.instance_lock_path.exists()
+
+
+def test_a_failed_predecessor_authorizes_only_one_native_retry(selection, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from astrid_runtime.bootstrap import BootstrapError, bootstrap
+    from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+
+    paths, _, config = selection
+    with _process_waiting_after(_ABANDON, _runtime_args(selection), tmp_path / "retry"):
+        predecessor = _observe(selection)["attempt_id"]
+    with pytest.raises(BootstrapError) as refused:
+        bootstrap(paths, LocalRuntimeBoundary(), config)
+    assert refused.value.details == {"code": "startup_attempt_failed", "state": "failed", "attempt_id": predecessor}
+
+    launches = []
+
+    class AdmissionRefuses(LocalRuntimeBoundary):
+        def start(self, **_kwargs):
+            launches.append(workspace.startup_status(paths, config=config)["attempt_id"])
+            raise BootstrapError("independent native admission refused")
+
+    contenders = Barrier(2)
+
+    def retry():
+        contenders.wait(timeout=10)
+        with pytest.raises(BootstrapError) as result:
+            bootstrap(paths, AdmissionRefuses(), config, retry_attempt_id=predecessor)
+        return str(result.value)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = list(pool.map(lambda _index: retry(), range(2)))
+    assert receipts.count("independent native admission refused") == 1
+    assert len(launches) == 1 and launches[0] != predecessor
+    assert workspace.startup_status(paths, config=config) == {"state": "failed", "attempt_id": launches[0]}
+    assert not paths.discovery_path.exists()
+    with pytest.raises(BootstrapError, match="no longer available to retry"):
+        bootstrap(paths, AdmissionRefuses(), config, retry_attempt_id=predecessor)
+    assert len(launches) == 1
+    # An orderly admission refusal still allows the ordinary authorized launch.
+    with pytest.raises(BootstrapError, match="independent native admission refused"):
+        bootstrap(paths, AdmissionRefuses(), config)
+    assert len(launches) == 2 and len(set(launches)) == 2
+
+
+def test_unknown_launcher_birth_is_unavailable_and_recycled_pid_is_terminal(selection, tmp_path, monkeypatch, capsys):
+    import os
+
+    from astrid_runtime.bootstrap import BootstrapError, bootstrap
+    from astrid_runtime.cli import main
+    from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+    from runtime_protocol import startup_attempt
+
+    paths, _, config = selection
+    with _process_waiting_after(_ABANDON, _runtime_args(selection), tmp_path / "identity") as launcher:
+        live = _observe(selection)
+        birth_of = startup_attempt._process_birth
+
+        def unknown(pid):
+            if pid == launcher.pid:
+                raise PermissionError("kernel identity unavailable")
+            return birth_of(pid)
+
+        monkeypatch.setattr(startup_attempt, "_process_birth", unknown)
+        assert main(["startup-status", *_runtime_args(selection)]) == 1
+        assert json.loads(capsys.readouterr().out) == {"state": "unavailable"}
+        with pytest.raises(BootstrapError, match="launcher ownership could not be verified"):
+            bootstrap(paths, LocalRuntimeBoundary(), config, retry_attempt_id=live["attempt_id"])
+        assert not paths.discovery_path.exists()
+
+        # Present an actual different birth in the same process namespace at
+        # the recorded PID, as a kernel PID reuse would.
+        monkeypatch.setattr(startup_attempt, "_process_birth",
+                            lambda pid: birth_of(os.getpid() if pid == launcher.pid else pid))
+        assert workspace.startup_status(paths, config=config) == {"state": "failed", "attempt_id": live["attempt_id"]}
+        assert launcher.poll() is None
+
+
+def test_replaced_support_realm_generation_or_unsafe_record_cannot_observe_the_gap(selection, tmp_path, monkeypatch):
+    from runtime_protocol import platform, startup_attempt
+
+    paths, root, config = selection
+    with _begin(selection) as attempt:
+        assert _observe(selection) == {"state": "inspecting_workspace", "attempt_id": attempt.attempt_id}
+        attempt.starting_service()
+        expected = {"state": "starting_service", "attempt_id": attempt.attempt_id}
+        record = paths.runtime_support / startup_attempt.RECORD_NAME
+        before = record.read_bytes()
+        assert platform.is_owner_only(record, directory=False)
+        assert _observe(selection) == expected
+        with monkeypatch.context() as changed:
+            changed.setenv("ASTRID_INSTALL_RELEASE", "43")
+            assert _observe(selection) == {"state": "unavailable"}
+        other = RuntimePaths.current(paths.home, data_root=tmp_path / "other-data")
+        other.ensure_support_dirs()
+        other.catalog_path.write_bytes(paths.catalog_path.read_bytes())
+        copied = other.runtime_support / startup_attempt.RECORD_NAME
+        copied.write_bytes(before)
+        platform.owner_only(copied)
+        assert _observe((other, root, config)) == {"state": "unavailable"}
+        displaced = root.with_name("original-realm")
+        root.rename(displaced)
+        root.mkdir()
+        try:
+            assert _observe(selection) == {"state": "unavailable"}
+        finally:
+            root.rmdir()
+            displaced.rename(root)
+        assert _observe(selection) == expected
+        assert record.read_bytes() == before
+
+    # This is the same exact path and selection. A private but unbounded
+    # receipt must be refused without being changed by the observer.
+    record.write_bytes(b"x" * (startup_attempt.MAX_RECORD_BYTES + 1))
+    assert _observe(selection) == {"state": "unavailable"}
+    assert record.stat().st_size == startup_attempt.MAX_RECORD_BYTES + 1
+
+
+_NATIVE_OWNER = """
+import pathlib, sys
+pathlib.Path(sys.argv[1]).touch()
+sys.stdin.readline()
+"""
+
+_ASSIGN_AND_ABANDON = """
+import os, pathlib, sys
+from astrid_runtime.bootstrap import _bootstrap_mutex
+from astrid_runtime.cli import _config, _paths, parser
+from astrid_runtime.workspace import _startup_selection, begin_startup_attempt
+from runtime_protocol.startup_operation import StartupOperation
+args = parser().parse_args(["startup-status", *sys.argv[3:]])
+paths = _paths(args)
+config = _config(args, paths)
+with begin_startup_attempt(paths, config=config) as attempt:
+    attempt.starting_service()
+    with _bootstrap_mutex(paths):
+        scope = _startup_selection(paths, None, None, config)[3]
+        StartupOperation.assign(paths.runtime_support, scope, pid=int(sys.argv[2]))
+    pathlib.Path(sys.argv[1]).touch()
+    sys.stdin.readline()
+    os._exit(0)
+"""
+
+
+def test_independently_owned_native_operation_wins_after_launcher_exit(selection, tmp_path, monkeypatch):
+    from astrid_runtime.bootstrap import BootstrapError, bootstrap
+    from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+    from runtime_protocol import startup_operation
+
+    paths, _, config = selection
+    with _process_waiting_after(_NATIVE_OWNER, [], tmp_path / "native-alive") as native:
+        with _process_waiting_after(
+            _ASSIGN_AND_ABANDON, [str(native.pid), *_runtime_args(selection)], tmp_path / "assigned",
+        ) as launcher:
+            active = read_operation(paths.runtime_support)
+            assert active.owner_pid == native.pid != launcher.pid
+            assert _observe(selection) == active.as_observation()
+        assert launcher.returncode == 0
+        assert _observe(selection) == active.as_observation()
+        assert not paths.discovery_path.exists()
+        assert native.poll() is None
+        with monkeypatch.context() as elapsed:
+            elapsed.setattr(startup_operation.time, "monotonic_ns",
+                            lambda: active.updated_ns + (startup_operation.MAX_AGE_SECONDS + 1) * 10**9)
+            assert workspace.startup_status(paths, config=config) == {"state": "unavailable"}
+            with pytest.raises(BootstrapError, match="already owns this installation"):
+                bootstrap(paths, LocalRuntimeBoundary(), config)
+    terminal = _observe(selection)
+    assert terminal["state"] == "failed"
+    assert terminal["attempt_id"] != active.operation_id
+
+
+_MANAGED_NATIVE = """
+import json, pathlib, signal, sys, threading, time
+from astrid_runtime import cli
+from runtime_protocol.startup_operation import current_verification
+from runtime_protocol.store import RealmStore
+receipt, resume = map(pathlib.Path, sys.argv[1:3])
+args = sys.argv[3:]
+original = RealmStore.inspect_realm
+original_emit = cli._emit_ready
+
+def emit_ready(result, **kwargs):
+    original_emit(result, **kwargs)
+    receipt.with_suffix(".ready").touch()
+
+cli._emit_ready = emit_ready
+
+def inspect(root, **kwargs):
+    report = original(root, **kwargs)
+    status = current_verification(pathlib.Path(root)).snapshot()
+    checked = {
+        "allow_active_marker": kwargs.get("allow_active_marker"),
+        "operation_id": status.operation_id,
+        "ok": report["ok"],
+        "realm": report["checks"]["realm_identity"]["realm_id"],
+    }
+    pending = receipt.with_suffix(".pending")
+    pending.write_text(json.dumps(checked))
+    pending.replace(receipt)
+    deadline = time.monotonic() + 20
+    while not resume.exists() and time.monotonic() < deadline:
+        time.sleep(.02)
+    assert resume.exists()
+    return report
+
+RealmStore.inspect_realm = staticmethod(inspect)
+
+def stop_on_stdin():
+    sys.stdin.readline()
+    signal.raise_signal(signal.SIGINT)
+
+threading.Thread(target=stop_on_stdin, daemon=True).start()
+expected = {"data_root": args[args.index("--data-root") + 1],
+            "profile": args[args.index("--source-manifest") + 1]}
+sys.exit(cli.main(["run", *args], managed_launch=expected))
+"""
+
+
+@pytest.mark.integration
+def test_existing_managed_service_entry_runs_independent_admission(selection, tmp_path, monkeypatch, astrid_importable):
+    import os
+
+    from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+
+    paths, _, config = selection
+    paths.home.mkdir()
+    for variable in ("ASTRID_RUNTIME_HOME", "HOME", "USERPROFILE", "XDG_STATE_HOME", "XDG_DATA_HOME", "LOCALAPPDATA"):
+        monkeypatch.setenv(variable, str(paths.home))
+    runtime_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(map(str, (runtime_root, runtime_root / "packages" / "python", astrid_importable))))
+    version_source = tmp_path / "versions" / "42" / "agent"
+    version_source.mkdir(parents=True)
+    profile = json.loads(config.source_manifest.read_text())
+    profile["source_checkout"] = str(version_source)
+    config.source_manifest.write_text(json.dumps(profile))
+    run_args = ["--data-root", str(paths.app_support), "--source-manifest", str(config.source_manifest),
+                "--hosted-origin", "off", "--json"]
+    receipt = tmp_path / "native-verified"
+    resume = tmp_path / "publish-service"
+    with _begin(selection) as attempt:
+        with _process_waiting_after(_INSPECT, _runtime_args(selection), tmp_path / "offline-verified") as verifier:
+            offline = read_operation(paths.runtime_support)
+            assert offline.owner_pid == verifier.pid
+            assert offline.state == "ended"
+            attempt.starting_service()
+        attempt_file = paths.runtime_support / "startup-attempt.json"
+        gap_bytes = attempt_file.read_bytes()
+        unapproved = subprocess.run(
+            [sys.executable, "-m", "astrid_runtime", "run", *run_args],
+            capture_output=True, text=True, timeout=20,
+        )
+        assert unapproved.returncode == 1
+        assert "Managed Astrid must be started by its installation service" in unapproved.stdout
+        assert _observe(selection) == {"state": "starting_service", "attempt_id": attempt.attempt_id}
+
+        with _process_waiting_after(_MANAGED_NATIVE, [str(resume), *run_args], receipt) as service:
+            try:
+                native = read_operation(paths.runtime_support)
+                assert native.owner_pid == service.pid != offline.owner_pid
+                assert native.operation_id != offline.operation_id
+                assert json.loads(receipt.read_text()) == {
+                    "allow_active_marker": False, "operation_id": native.operation_id,
+                    "ok": True, "realm": REALM_ID,
+                }
+                assert _observe(selection) == native.as_observation()
+                assert not paths.discovery_path.exists()
+                assert not paths.instance_lock_path.exists()
+                assert not any(row.get("readiness") == "ready" for row in json.loads(paths.catalog_path.read_text())["realms"])
+                assert attempt_file.read_bytes() == gap_bytes
+            finally:
+                resume.touch()
+            deadline = time.monotonic() + 20
+            boundary = LocalRuntimeBoundary()
+            while time.monotonic() < deadline and service.poll() is None:
+                discovery = boundary._read_discovery(paths.runtime_support)
+                if (receipt.with_suffix(".ready").exists() and discovery.get("pid") == service.pid
+                        and boundary._http_health(discovery.get("endpoint", ""))):
+                    break
+                time.sleep(.02)
+            else:
+                pytest.fail("Managed Runtime did not complete independently verified native startup.")
+            assert attempt_file.read_bytes() == gap_bytes
+        assert service.returncode == 0
+
+
+def test_source_edit_cannot_observe_the_previous_generation(selection, tmp_path, monkeypatch):
+    from tests.test_real_bootstrap import _git_checkout
+
+    _, _, config = selection
+    runtime_source, product_source = tmp_path / "runtime-source", tmp_path / "product-source"
+    _git_checkout(runtime_source)
+    _git_checkout(product_source)
+    profile = json.loads(config.source_manifest.read_text())
+    profile.update(runtime_checkout=str(runtime_source), source_checkout=str(product_source))
+    config.source_manifest.write_text(json.dumps(profile))
+    monkeypatch.delenv("ASTRID_INSTALL_RELEASE")
+    monkeypatch.delenv("ASTRID_INSTALL_MANAGED_BY")
+    with _begin(selection) as attempt:
+        attempt.starting_service()
+        assert _observe(selection) == {"state": "starting_service", "attempt_id": attempt.attempt_id}
+        tracked = product_source / "tracked.txt"
+        tracked.write_text("different source generation", encoding="utf-8")
+        assert _observe(selection) == {"state": "unavailable"}
+
+
+@pytest.mark.integration
+def test_restart_of_verified_incumbent_does_not_stop_at_an_older_abandoned_attempt(
+    selection, tmp_path, monkeypatch, astrid_importable, owned_process_groups,
+):
+    import os
+
+    from astrid_runtime.bootstrap import bootstrap, restart
+    from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
+
+    paths, _, config = selection
+    paths.home.mkdir()
+    for variable in ("ASTRID_RUNTIME_HOME", "HOME", "USERPROFILE", "XDG_STATE_HOME", "XDG_DATA_HOME", "LOCALAPPDATA"):
+        monkeypatch.setenv(variable, str(paths.home))
+    monkeypatch.setenv("ASTRID_INSTALL_MANAGED_BY", "")
+    runtime_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(map(str, (runtime_root, runtime_root / "packages" / "python", astrid_importable))))
+
+    boundary = LocalRuntimeBoundary()
+    owned_process_groups.add_cleanup(boundary.stop)
+    first = bootstrap(paths, boundary, config)
+    assert first.ready
+    with _process_waiting_after(_ABANDON, _runtime_args(selection), tmp_path / "orphaned"):
+        abandoned = _observe(selection)["attempt_id"]
+    assert _observe(selection) == {"state": "failed", "attempt_id": abandoned}
+    replacement = restart(paths, boundary, config)
+    assert replacement.ready
+    assert replacement.runtime_instance_id != first.runtime_instance_id
+    assert boundary._http_health(replacement.endpoint)

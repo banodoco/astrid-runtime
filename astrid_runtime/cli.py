@@ -35,7 +35,7 @@ from .bootstrap import (
 )
 from .io import read_json
 from .loopback_http import urlopen_loopback
-from runtime_protocol import cancellation, startup_operation
+from runtime_protocol import cancellation, startup_attempt, startup_operation
 from .paths import DATA_ROOT_ENV, RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary, ForegroundRuntimeBoundary
 from runtime_protocol import platform
@@ -72,6 +72,7 @@ def parser() -> argparse.ArgumentParser:
     up = sub.add_parser("up", help="start or reconnect the selected runtime")
     _profile_args(up)
     up.add_argument("--wait", action="store_true", help="return only after this Runtime’s browser door is ready")
+    up.add_argument("--retry-attempt-id", help="authorize one retry of the observed failed Runtime start attempt")
     run = sub.add_parser("run", help="run the daemon and browser door in the foreground for a service manager")
     _profile_args(run)
     connect_cmd = sub.add_parser("connect", help="connect to the selected live runtime without starting one")
@@ -504,7 +505,9 @@ def _foreground_logging(stream):
         handler.close()
 
 
-def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: bool) -> int:
+def _run_foreground(
+    paths: RuntimePaths, config: BootstrapConfig, *, json_mode: bool, managed_service: bool = False,
+) -> int:
     from runtime_protocol.logs import RotatingLog
     # In-flight handlers may outlive this call; retain the production error
     # policy for the lifetime of the foreground process.
@@ -526,7 +529,10 @@ def _run_foreground(paths: RuntimePaths, config: BootstrapConfig, *, json_mode: 
             with _foreground_logging(safe_stderr), contextlib.redirect_stdout(log), contextlib.redirect_stderr(safe_stderr):
                 try:
                     with cancellation.startup_scope(stopped):
-                        result = bootstrap(paths, boundary, config)
+                        if managed_service:
+                            result = bootstrap(paths, boundary, config, _managed_service=True)
+                        else:
+                            result = bootstrap(paths, boundary, config)
                         cancellation.check()
                         boundary.check_running()
                         if config.door is not None or result.door_endpoint or result.door_origin:
@@ -580,7 +586,8 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
         try:
             result = startup_status(paths, realm_root=args.realm_root, expected_realm_id=args.expected_realm_id,
                                     config=_config(args, paths), operation_id=args.operation_id)
-        except (BootstrapError, OSError, ValueError, startup_operation.StartupOperationError):
+        except (BootstrapError, OSError, ValueError,
+                startup_operation.StartupOperationError, startup_attempt.StartupAttemptError):
             result = {"state": "unavailable"}
         _emit(result, json_mode=args.json)
         return 0 if result["state"] != "unavailable" else 1
@@ -637,19 +644,22 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
     if args.command == "run":
         config = _config(args, paths)
         try:
-            if _managed_source(paths, config) is not None:
+            managed_service = _managed_source(paths, config) is not None
+            if managed_service:
                 # Only the canonical service launcher enters in-process after
                 # installation admission. This is not a public CLI flag.
                 expected = {"data_root": str(paths.app_support), "profile": str(config.source_manifest)}
                 if managed_launch != expected:
                     raise BootstrapError("Managed Astrid must be started by its installation service")
-            return _run_foreground(paths, config, json_mode=args.json)
+            return _run_foreground(paths, config, json_mode=args.json, managed_service=managed_service)
         except Exception as exc:
             _emit({"ok": False, "error": str(exc), "log": str(platform.log_dir(paths.home) / "runtime.log")}, json_mode=True)
             return 1
     if args.command == "up":
         config = _config(args, paths)
         try:
+            if args.retry_attempt_id is not None and _managed_source(paths, config) is not None:
+                raise BootstrapError("Managed Astrid must be started by its installation service")
             managed = _managed_lifecycle(paths, config, "up", wait=args.wait)
             if managed is not None:
                 _emit(managed, json_mode=args.json)
@@ -657,7 +667,10 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
             if args.wait and config.door is None:
                 raise BootstrapError("up --wait requires the browser door; enable --hosted-origin")
             boundary = LocalRuntimeBoundary()
-            result = bootstrap(paths, boundary, config)
+            if args.retry_attempt_id is not None:
+                result = bootstrap(paths, boundary, config, retry_attempt_id=args.retry_attempt_id)
+            else:
+                result = bootstrap(paths, boundary, config)
             if args.wait:
                 _wait_for_door(paths, result, boundary)
         except Exception as exc:
@@ -666,7 +679,7 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
             # one structured error with no traceback.  KeyboardInterrupt is a
             # BaseException and intentionally remains interruptible.
             details = getattr(exc, "details", None)
-            if isinstance(details, dict) and details.get("code") == "startup_pending":
+            if isinstance(details, dict) and details.get("code") in {"startup_pending", "startup_attempt_failed"}:
                 _emit({"ok": False, **details}, json_mode=True)
             else:
                 _emit({"ok": False, "error": str(exc)}, json_mode=True)
