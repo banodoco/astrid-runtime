@@ -123,6 +123,9 @@ class CommitTiming:
     outcome: str = "unknown"
     emitted: bool = False
     sizes_bytes: dict = field(default_factory=dict)
+    covers_calls: int = 0
+    covers_elapsed_ns: int = 0
+    value_equal_calls: int = 0
 
     def set_request_id(self, request_id):
         if request_id is not None:
@@ -133,6 +136,19 @@ class CommitTiming:
         if (type(name) is str and re.fullmatch(r"[a-z][a-z0-9_]{0,47}", name)
                 and type(value) is int and 0 <= value <= 2**63 - 1):
             self.sizes_bytes[name] = value
+
+    @contextmanager
+    def covers_call(self):
+        """Measure one outer dependency coverage check, even when it raises."""
+        self.covers_calls += 1
+        started = time.monotonic_ns()
+        try:
+            yield
+        finally:
+            self.covers_elapsed_ns += max(0, time.monotonic_ns() - started)
+
+    def count_value_equal(self):
+        self.value_equal_calls += 1
 
     def begin(self, name):
         if name in _TIMING_FIELDS:
@@ -248,6 +264,12 @@ class CommitTiming:
         key_hash = _idempotency_key_hash(current_idempotency_key())
         if key_hash is not None:
             payload["idempotency_key_sha256"] = key_hash
+        if self.covers_calls or self.covers_elapsed_ns or self.value_equal_calls:
+            payload["covers"] = {
+                "calls": self.covers_calls,
+                "elapsed_ns": min(2**63 - 1, max(0, self.covers_elapsed_ns)),
+                "value_equal_calls": self.value_equal_calls,
+            }
         # Route bounded per-commit timing records to the Runtime's INFO sink.
         line = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         if len((line + "\n").encode("utf-8")) <= _MAX_DIAGNOSTIC_BYTES:
@@ -256,6 +278,23 @@ class CommitTiming:
 
 def current_commit_timing():
     return _COMMIT_TIMING.get()
+
+
+@contextmanager
+def measure_covers():
+    """Shared instrumentation seam for outer covers implementations."""
+    timing = current_commit_timing()
+    if timing is None:
+        yield
+    else:
+        with timing.covers_call():
+            yield
+
+
+def count_value_equal():
+    timing = current_commit_timing()
+    if timing is not None:
+        timing.count_value_equal()
 
 
 def start_commit_timing(request_id=None):

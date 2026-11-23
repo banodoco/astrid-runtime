@@ -59,6 +59,8 @@ def validate_pin(pin):
 
 def value_equal(left, right):
     """JSON recipe equality: numeric value, distinct booleans, exact structure."""
+    from .timeline_commit_execution import count_value_equal
+    count_value_equal()
     if type(left) in (int, float) and type(right) in (int, float):
         return (type(left) is int or math.isfinite(left)) and (type(right) is int or math.isfinite(right)) and left == right
     if type(left) is not type(right):
