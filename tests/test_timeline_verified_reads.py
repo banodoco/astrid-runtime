@@ -1,9 +1,10 @@
 """Exercise public timeline head and history through the Runtime request dispatcher."""
 import copy
+import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, redirect_stderr
 from urllib.parse import quote
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from runtime_protocol.contract_metadata import SCHEMA_DIGEST
 from runtime_protocol.door import classify
 from runtime_protocol.errors import AuthorizationError, HeadBusyError, RuntimeErrorBase
+from runtime_protocol.logs import RotatingLog
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.timeline_commit_port import digest
 from runtime_protocol.timeline_commit_store import TimelineCommitStore
@@ -84,6 +86,230 @@ def next_request(runtime):
     change["value"] = {"org.example.timeline": {"note": "second"}}
     request["steps"][0]["patch"] = [copy.deepcopy(change)]
     return request
+
+
+def verified_head_counts(stderr):
+    prefix = "runtime.timeline_commit.verified_head "
+    return [json.loads(line.removeprefix(prefix))["counts"]
+            for line in stderr.splitlines() if line.startswith(prefix)]
+
+
+def test_verified_head_emits_only_opt_in_fixed_counts_to_rotating_log(service, monkeypatch, tmp_path):
+    provider(service)
+    commit(service, body(service))
+    commits, _ = service._timeline_commits()
+    commits.clear_replay_memo()
+    log_path = tmp_path / "runtime.log"
+    monkeypatch.delenv("ASTRID_RUNTIME_TIMELINE_DIAGNOSTICS", raising=False)
+    requests = []
+    with RotatingLog(log_path) as log, redirect_stderr(log):
+        for enabled in (None, "0", "1", "1", "1"):
+            if enabled is not None:
+                monkeypatch.setenv("ASTRID_RUNTIME_TIMELINE_DIAGNOSTICS", enabled)
+            if enabled == "0":
+                commits.clear_replay_memo()
+            if len(requests) == 2:
+                assert not log_path.read_text()
+                commits.clear_replay_memo()
+            if len(requests) == 4:
+                # Keep the semantic key while forcing the record verifier to consult it.
+                commits._history_state["records"].clear()
+            request = handler(service, "verified-head")
+            request._dispatch()
+            requests.append(request)
+    assert all(request.reply == requests[0].reply for request in requests)
+    assert requests[0].reply[0] == 200
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 3
+    prefix = "runtime.timeline_commit.verified_head "
+    assert all(line.startswith(prefix) for line in lines)
+    receipts = [json.loads(line.removeprefix(prefix)) for line in lines]
+    assert all(set(receipt) == {"counts"} for receipt in receipts)
+    cold, warm, retained_replay = (receipt["counts"] for receipt in receipts)
+    assert set(cold) == set(warm) == set(retained_replay) == {
+        "document_schema_cache_hits", "document_schema_cache_misses", "document_schema_cache_evictions",
+        "selected_record_cache_hits", "selected_record_verification_attempts",
+        "selected_replay_key_hits", "selected_record_replay_attempts", "isolated_read_retries",
+        "snapshot_prefix_history_queries", "snapshot_prefix_history_rows_read",
+        "snapshot_prefix_receipt_queries", "snapshot_prefix_receipt_rows_read",
+    }
+    assert all(type(value) is int and value >= 0 for receipt in receipts for value in receipt["counts"].values())
+    assert cold["selected_record_verification_attempts"] == cold["selected_record_replay_attempts"] == 1
+    assert cold["selected_record_cache_hits"] == cold["selected_replay_key_hits"] == 0
+    assert warm["selected_record_cache_hits"] == 1
+    assert all(warm[name] == 0 for name in warm if name != "selected_record_cache_hits")
+    assert retained_replay["selected_record_verification_attempts"] == retained_replay["selected_replay_key_hits"] == 1
+    assert retained_replay["selected_record_cache_hits"] == retained_replay["selected_record_replay_attempts"] == 0
+
+
+@pytest.mark.parametrize("append_during_replay", [False, True], ids=["stable", "retry"])
+def test_verified_head_materializes_each_snapshot_prefix_once(service, monkeypatch, capsys, append_during_replay):
+    monkeypatch.setenv("ASTRID_RUNTIME_TIMELINE_DIAGNOSTICS", "1")
+    provider(service)
+    accepted = commit(service, body(service))
+    followup = next_request(service)
+    commits, _ = service._timeline_commits()
+    commits.clear_replay_memo()
+    open_snapshot = service.store._read_snapshot
+    replay = TimelineCommitStore._verify_accepted_replay
+    snapshots = []
+    appended = []
+
+    @contextmanager
+    def trace_snapshot(**kwargs):
+        with open_snapshot(**kwargs) as connection:
+            assert connection is not service.store.conn
+            assert connection.in_transaction
+            assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+            queries = []
+            connection.set_trace_callback(queries.append)
+            snapshots.append((connection, queries))
+            yield connection
+
+    def append(reader, *args, **kwargs):
+        if reader is not commits and append_during_replay and not appended:
+            appended.append(commit(service, followup, key="append-during-replay"))
+            # Exercise a cold retry against the newly committed prefix.
+            commits.clear_replay_memo()
+        return replay(reader, *args, **kwargs)
+
+    monkeypatch.setattr(service.store, "_read_snapshot", trace_snapshot)
+    monkeypatch.setattr(TimelineCommitStore, "_verify_accepted_replay", append)
+    request = handler(service, "verified-head")
+    request._dispatch()
+
+    assert request.reply[0] == 200, request.error
+    assert len(appended) == int(append_during_replay)
+    latest = appended[0] if append_during_replay else accepted
+    assert request.reply[1]["head"]["publication_id"] == latest["receipt"]["receipt_id"]
+    assert len({connection for connection, _ in snapshots}) == len(snapshots) == 1 + int(append_during_replay)
+    bounds = []
+    for _, queries in snapshots:
+        history_ranges = [query for query in queries if query.startswith(
+            "SELECT * FROM timeline_commit_history WHERE project_id=") and "AND project_seq>" in query]
+        receipt_ranges = [query for query in queries if query.startswith(
+            "SELECT * FROM command_idempotency WHERE txn_id IN (SELECT publication_id FROM timeline_commit_history")]
+        assert len(history_ranges) == len(receipt_ranges) == 1
+        history_where = history_ranges[0].split(" WHERE ")[1].split(" ORDER BY ")[0]
+        assert receipt_ranges[0].endswith(f" WHERE {history_where})")
+        bounds.append(history_where)
+        assert sum(query.startswith("SELECT * FROM command_idempotency WHERE txn_id=") for query in queries) > 1
+        assert sum(query.startswith("SELECT * FROM timeline_commit_history WHERE publication_id=") for query in queries) > 1
+
+    assert len(set(bounds)) == len(snapshots)
+    counts, = verified_head_counts(capsys.readouterr().err)
+    assert counts["selected_record_verification_attempts"] == len(snapshots)
+    assert counts["selected_record_replay_attempts"] == len(snapshots)
+    assert counts["isolated_read_retries"] == int(append_during_replay)
+    for name in ("history", "receipt"):
+        assert counts[f"snapshot_prefix_{name}_queries"] == len(snapshots)
+        # Baseline plus the first commit, followed by three rows on retry.
+        assert counts[f"snapshot_prefix_{name}_rows_read"] == 2 + 3 * int(append_during_replay)
+
+
+def test_verified_head_rechecks_prefix_after_snapshot_transaction_reentry(service, monkeypatch, caplog):
+    provider(service)
+    first = commit(service, body(service))
+    commit(service, next_request(service), key="second")
+    commits, _ = service._timeline_commits()
+    commits.clear_replay_memo()
+    replay = TimelineCommitStore._verify_accepted_replay
+    reentered = []
+
+    def change_prefix(reader, *args, **kwargs):
+        assert reader is not commits and reader.store.conn.in_transaction
+        reader.store.conn.rollback()
+        with closing(sqlite3.connect(service.store.db_path, isolation_level=None)) as writer:
+            writer.execute("UPDATE command_idempotency SET created_at=created_at || ' changed' WHERE txn_id=?",
+                           (first["receipt"]["receipt_id"],))
+        reader.store.conn.execute("BEGIN")
+        assert reader.store.conn.in_transaction
+        reentered.append(reader)
+        return replay(reader, *args, **kwargs)
+
+    monkeypatch.setattr(TimelineCommitStore, "_verify_accepted_replay", change_prefix)
+    with pytest.raises(HeadBusyError, match="changed during verification"):
+        service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
+    assert len(reentered) == 1
+    assert any("row-recheck" in message and "command_idempotency WHERE txn_id IN" in message
+               for message in caplog.messages)
+    assert not any(commits._history_state.values())
+
+
+@pytest.mark.parametrize("mode", ["text-persistent", "text-restored", "row-restored"])
+def test_verified_head_rechecks_prefix_after_result_factory_changes(service, monkeypatch, caplog, mode):
+    provider(service)
+    older_key = "old-receipt-only"
+    commit(service, body(service), key=older_key)
+    commit(service, next_request(service), key="second")
+    commits, _ = service._timeline_commits()
+    commits.clear_replay_memo()
+    version = commits._store_version()
+    converted = []
+    history_reads = []
+
+    def change_text(raw, *, restore=None):
+        value = raw.decode()
+        if value == older_key:
+            converted.append(value)
+            if restore is not None:
+                restore.text_factory = str
+            return value + "-converted"
+        return value
+
+    if mode == "text-persistent":
+        replay = TimelineCommitStore._verify_accepted_replay
+
+        def replace_decoder(reader, *args, **kwargs):
+            assert reader is not commits and reader.store.conn.in_transaction
+            reader.store.conn.text_factory = change_text
+            return replay(reader, *args, **kwargs)
+
+        monkeypatch.setattr(TimelineCommitStore, "_verify_accepted_replay", replace_decoder)
+    else:
+        open_snapshot = service.store._read_snapshot
+
+        @contextmanager
+        def trace_snapshot(**kwargs):
+            with open_snapshot(**kwargs) as connection:
+                installed = False
+
+                def change_row(cursor, row):
+                    if older_key in row:
+                        converted.append(older_key)
+                        connection.row_factory = sqlite3.Row
+                        row = tuple(value + "-converted" if value == older_key else value for value in row)
+                    return sqlite3.Row(cursor, row)
+
+                def install_before_receipts(query):
+                    nonlocal installed
+                    # The history range runs after tracking starts and before
+                    # SQLite creates the cursor that fetches the receipt range.
+                    if (query.startswith("SELECT * FROM timeline_commit_history WHERE project_id=")
+                            and "AND project_seq>" in query):
+                        history_reads.append(query)
+                        if installed:
+                            return
+                        installed = True
+                        if mode == "text-restored":
+                            connection.text_factory = lambda raw: change_text(raw, restore=connection)
+                        else:
+                            connection.row_factory = change_row
+
+                connection.set_trace_callback(install_before_receipts)
+                yield connection
+
+        monkeypatch.setattr(service.store, "_read_snapshot", trace_snapshot)
+
+    with pytest.raises(HeadBusyError, match="changed during verification"):
+        service.get_timeline_verified_head(service.test_project, "main", authorize=lambda: None)
+    assert converted == [older_key]
+    assert commits._store_version()[:3] == version[:3]
+    if mode != "text-persistent":
+        assert len(history_reads) == 2 and history_reads[0] == history_reads[1]
+    assert any("row-recheck" in message and "command_idempotency WHERE txn_id IN" in message
+               for message in caplog.messages)
+    assert not any(commits._history_state.values())
 
 
 @pytest.mark.parametrize("route", ["commits?limit=1", "verified-head"])
