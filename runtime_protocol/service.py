@@ -42,6 +42,7 @@ import subprocess
 import uuid
 import stat
 import math
+import os as system_os
 from collections.abc import Mapping
 from functools import wraps
 from datetime import datetime, timedelta, timezone
@@ -3250,6 +3251,7 @@ class RuntimeService:
             if self._timeline_commit_store is None:
                 self._timeline_commit_store = TimelineCommitStore(
                     self.store, validate_prepared=lambda value: validate_commit_value(value, "PreparedCommit"),
+                    memo_trace_path=system_os.environ.get("ASTRID_TIMELINE_MEMO_TRACE"),
                 )
                 self._timeline_commit_coordinator = CommitExecutionCoordinator(self._timeline_commit_store)
             return self._timeline_commit_store, self._timeline_commit_coordinator

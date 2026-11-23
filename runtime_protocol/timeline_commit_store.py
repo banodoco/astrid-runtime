@@ -356,7 +356,8 @@ class _HistoryReadInputs:
 
 
 class TimelineCommitStore:
-    def __init__(self, store, *, validate_prepared, validate_event=None, snapshot_version=None):
+    def __init__(self, store, *, validate_prepared, validate_event=None, snapshot_version=None,
+                 memo_trace_path=None):
         self.store = store
         # Validation uses the wire worker's authoritative schema, including
         # Agent-owned leaves. It must raise on invalid data, never normalize it.
@@ -373,9 +374,9 @@ class TimelineCommitStore:
         self._read_version_pin = None
         self._acceptance_transaction = False
         self._memo_trace = None
-        trace_path = os.environ.get("ASTRID_TIMELINE_MEMO_TRACE")
-        if trace_path and snapshot_version is None:
-            self._memo_trace = TimelineMemoTrace(self.store.conn, trace_path)
+        if memo_trace_path and snapshot_version is None:
+            self._memo_trace = TimelineMemoTrace(self.store.conn, memo_trace_path)
+            self.store._timeline_memo_trace = self._memo_trace
         if snapshot_version is None:
             value = os.stat(self.store.db_path)
             self._database_identity = (value.st_dev, value.st_ino)
@@ -479,6 +480,8 @@ class TimelineCommitStore:
                     raise ProtocolError("accepted commit database is missing; reopen required") from exc
 
             self._connection = self.store.conn
+            if self._memo_trace is not None:
+                self._memo_trace.rebind_connection(self._connection)
             files, _ = self._physical_version()
             if files[0] is None:
                 raise ProtocolError("accepted commit database is missing; reopen required")
@@ -730,8 +733,11 @@ class TimelineCommitStore:
         trace = self._memo_trace
         had_outer_transaction = bool(self.store.conn.in_transaction)
         transaction_completed = False
+        transaction_id = None
         try:
             with self.store._transaction():
+                if trace is not None:
+                    transaction_id = trace.current_transaction_id
                 # BEGIN IMMEDIATE excludes other SQLite writers. A change
                 # before that fence must invalidate all earlier proofs.
                 self._acceptance_transaction = True
@@ -742,8 +748,6 @@ class TimelineCommitStore:
                 after = self._store_version()
                 if after[2] != before[2]:
                     raise ProtocolError("accepted commit inputs changed during acceptance")
-            if trace is not None:
-                trace.transaction_outcome("savepoint_released" if had_outer_transaction else "committed")
             transaction_completed = True
             # Sample once after COMMIT and retain that exact sample. Comparing
             # its external-write counter prevents absorbing a writer that won
@@ -752,11 +756,14 @@ class TimelineCommitStore:
             committed = self._store_version()
             if committed[2] != after[2]:
                 raise ProtocolError("accepted commit inputs changed during acceptance")
+            if trace is not None:
+                trace.acceptance_transaction_outcome(
+                    transaction_id, "savepoint_released" if had_outer_transaction else "committed")
         except BaseException as exc:
             if trace is not None:
                 outcome = ("savepoint_released_then_postcheck_failed" if had_outer_transaction else "committed_then_postcheck_failed") if transaction_completed else ("savepoint_rolled_back" if had_outer_transaction else "rolled_back")
-                trace.transaction_outcome(outcome,
-                                          exception_class=type(exc).__name__)
+                trace.acceptance_transaction_outcome(transaction_id, outcome,
+                                                     exception_class=type(exc).__name__)
             self.clear_replay_memo()
             raise
         else:

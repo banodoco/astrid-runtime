@@ -1611,6 +1611,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         writes happen afterwards: an unread client must not hold the database
         lock and stall every other request, including health checks.
         """
+        commits = getattr(self.runtime, "_timeline_commit_store", None)
+        memo_trace = getattr(commits, "_memo_trace", None)
+        trace_request_id = memo_trace.request_started(self) if memo_trace is not None else None
         timing = token = None
         wire_started = False
         if self._is_timeline_commit():
@@ -1706,6 +1709,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if pending is not None:
                 pending[1].close()
                 self._pending_file_response = None
+            if memo_trace is not None:
+                memo_trace.request_finished(trace_request_id)
             if timing is not None:
                 if wire_started:
                     timing.end("wire_response")

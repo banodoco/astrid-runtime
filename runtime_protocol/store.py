@@ -1206,31 +1206,70 @@ class RealmStore:
         # command transaction).  SQLite has no nested ``BEGIN``; use a
         # savepoint so an inner failure still rolls back with the outer
         # mutation while preserving the single commit boundary.
+        trace = getattr(self, "_timeline_memo_trace", None)
         if self.conn.in_transaction:
             savepoint = f"runtime_nested_{id(self)}_{threading.get_ident()}"
             pending = getattr(self, "_idempotency_prune_pending", None)
             previous = pending.copy() if pending is not None else {}
-            self.conn.execute(f"SAVEPOINT {savepoint}")
+            transaction_id = trace.transaction_started("savepoint") if trace is not None else None
+            savepoint_started = False
             try:
+                self.conn.execute(f"SAVEPOINT {savepoint}")
+                savepoint_started = True
                 yield
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            except BaseException:
+            except BaseException as exc:
                 if pending is not None:
                     pending.clear()
                     pending.update(previous)
-                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                outcome = "begin_failed"
+                if savepoint_started:
+                    try:
+                        self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        outcome = "savepoint_rolled_back"
+                    except BaseException:
+                        outcome = "savepoint_rollback_failed"
+                        raise
+                    finally:
+                        if trace is not None:
+                            trace.transaction_finished(transaction_id, outcome,
+                                                       exception_class=type(exc).__name__)
+                elif trace is not None:
+                    trace.transaction_finished(transaction_id, outcome,
+                                               exception_class=type(exc).__name__)
                 raise
+            else:
+                if trace is not None:
+                    trace.transaction_finished(transaction_id, "savepoint_released")
             return
-        self.conn.execute("BEGIN IMMEDIATE")
+        transaction_id = trace.transaction_started("transaction") if trace is not None else None
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+        except BaseException as exc:
+            if trace is not None:
+                trace.transaction_finished(transaction_id, "begin_failed",
+                                           exception_class=type(exc).__name__)
+            raise
         self._idempotency_prune_pending = {}
         try:
             yield
             self.conn.commit()
-        except BaseException:
-            self.conn.rollback()
+        except BaseException as exc:
+            try:
+                self.conn.rollback()
+                outcome = "rolled_back"
+            except BaseException:
+                outcome = "rollback_failed"
+                raise
+            finally:
+                if trace is not None:
+                    trace.transaction_finished(transaction_id, outcome,
+                                               exception_class=type(exc).__name__)
             raise
         else:
+            if trace is not None:
+                trace.transaction_finished(transaction_id, "committed")
             if self._idempotency_prune_pending:
                 self._idempotency_prune_clocks.update(self._idempotency_prune_pending)
                 self._last_idempotency_prune = max(self._idempotency_prune_pending.values())
@@ -1704,6 +1743,9 @@ class RealmStore:
                 finally:
                     self._release_owner()
         finally:
+            trace = getattr(self, "_timeline_memo_trace", None)
+            if trace is not None:
+                trace.close()
             self._release_admission_lock()
 
     def __enter__(self):

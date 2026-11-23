@@ -63,6 +63,11 @@ class TimelineMemoTrace:
         self.unknown_seen = False
         self.bytes_written = 0
         self.disabled = False
+        self.closed = False
+        self.connection_replaced = False
+        self.transaction_sequence = 0
+        self.transaction_local = threading.local()
+        self.request_sequence = 0
         # Exclusive creation avoids appending to stale evidence or following a
         # symlink. Operators must choose a fresh evidence path for each run.
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -87,6 +92,65 @@ class TimelineMemoTrace:
             event = {"seq": self.sequence, "monotonic_ns": time.monotonic_ns(), **event}
             self.events.append(event)
 
+    @property
+    def current_transaction_id(self):
+        stack = getattr(self.transaction_local, "stack", ())
+        return stack[-1]["id"] if stack else None
+
+    def transaction_started(self, kind):
+        with self.lock:
+            self.transaction_sequence += 1
+            transaction_id = self.transaction_sequence
+        stack = list(getattr(self.transaction_local, "stack", ()))
+        parent_id = stack[-1]["id"] if stack else None
+        stack.append({"id": transaction_id, "parent_id": parent_id})
+        self.transaction_local.stack = stack
+        self._append({"kind": "transaction_scope_started", "transaction_id": transaction_id,
+                      "parent_transaction_id": parent_id, "scope": kind})
+        return transaction_id
+
+    @property
+    def current_request_id(self):
+        return getattr(self.transaction_local, "request_id", None)
+
+    def request_started(self, handler):
+        with self.lock:
+            self.request_sequence += 1
+            request_id = self.request_sequence
+        self.transaction_local.request_id = request_id
+        self._append({"kind": "request_scope_started", "request_id": request_id,
+                      "route": _route(handler)})
+        return request_id
+
+    def request_finished(self, request_id):
+        self._append({"kind": "request_scope_finished", "request_id": request_id})
+        if self.current_request_id == request_id:
+            self.transaction_local.request_id = None
+
+    def transaction_finished(self, transaction_id, outcome, *, exception_class=None):
+        stack = list(getattr(self.transaction_local, "stack", ()))
+        if not stack or stack[-1]["id"] != transaction_id:
+            self.unknown_seen = True
+            self._append({"kind": "transaction_scope_mismatch", "transaction_id": transaction_id,
+                          "unknown": True})
+        else:
+            stack.pop()
+            self.transaction_local.stack = stack
+        if outcome in ("rollback_failed", "savepoint_rollback_failed"):
+            self.unknown_seen = True
+        self._append({"kind": "transaction_outcome", "transaction_id": transaction_id,
+                      "outcome": outcome, "exception_class": exception_class,
+                      "connection_in_transaction": bool(self.connection.in_transaction)})
+
+    def rebind_connection(self, connection):
+        self.connection_replaced = True
+        self.unknown_seen = True
+        self.connection = connection
+        connection.set_trace_callback(self._trace)
+        self._append({"kind": "trace_connection_rebound", "coverage_gap": True,
+                      "unknown": True})
+        self.flush()
+
     def _trace(self, sql):
         # SQLite passes expanded SQL here. Parse only a fixed verb/table shape;
         # expanded text is intentionally never copied, logged, or formatted.
@@ -97,9 +161,21 @@ class TimelineMemoTrace:
                 raw_table = write.group(2).lower()
                 kind = write.group(1).split()[0].upper()
                 table = raw_table if raw_table in _KNOWN_TABLES else "other_or_unknown"
-                self._append({"kind": "sql_attempt", "verb": kind, "table": table, "caller": _caller()})
+                transaction_id = self.current_transaction_id
+                if transaction_id is None:
+                    self.unknown_seen = True
+                request_id = self.current_request_id
+                if request_id is None:
+                    self.unknown_seen = True
+                self._append({"kind": "sql_attempt", "verb": kind, "table": table,
+                              "caller": _caller(), "transaction_id": transaction_id,
+                              "request_id": request_id,
+                              "transaction_correlation": "observed" if transaction_id is not None else "unknown",
+                              "request_correlation": "observed" if request_id is not None else "unknown"})
             elif tx:
-                self._append({"kind": "transaction_statement_attempt", "verb": tx.group(1).upper(), "caller": _caller()})
+                self._append({"kind": "transaction_statement_attempt", "verb": tx.group(1).upper(),
+                              "caller": _caller(), "transaction_id": self.current_transaction_id,
+                              "request_id": self.current_request_id})
             elif re.match(r"^\s*(SELECT|PRAGMA|EXPLAIN)\b", sql, re.I):
                 return
             else:
@@ -132,10 +208,13 @@ class TimelineMemoTrace:
 
     def http_error(self, handler, exc):
         self._append({"kind": "http_error", "route": _route(handler),
+                      "request_id": self.current_request_id,
                       "exception_class": type(exc).__name__, "message_recorded": False})
 
-    def transaction_outcome(self, outcome, *, exception_class=None):
-        self._append({"kind": "acceptance_transaction_outcome", "outcome": outcome,
+    def acceptance_transaction_outcome(self, transaction_id, outcome, *, exception_class=None):
+        self._append({"kind": "acceptance_transaction_outcome", "transaction_id": transaction_id,
+                      "outcome": outcome,
+                      "request_id": self.current_request_id,
                       "exception_class": exception_class, "connection_in_transaction": bool(self.connection.in_transaction)})
         self.flush()
 
@@ -153,15 +232,43 @@ class TimelineMemoTrace:
                            "unknown": True, "events": [{"kind": "bounded_output_overflow"}]}
                 data = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
                 self.disabled = True
-            os.write(self.fd, data)
-            os.fsync(self.fd)
+            start = self.bytes_written
+            try:
+                view = memoryview(data)
+                while view:
+                    written = os.write(self.fd, view)
+                    if written <= 0:
+                        raise OSError("trace write made no progress")
+                    view = view[written:]
+                os.fsync(self.fd)
+            except OSError:
+                self.disabled = True
+                self.unknown_seen = True
+                try:
+                    os.ftruncate(self.fd, start)
+                    os.lseek(self.fd, start, os.SEEK_SET)
+                    failure = b'{"schema":"timeline-memo-provenance-v1","overflow":true,"unknown":true,"events":[{"kind":"trace_output_failure"}]}\n'
+                    os.write(self.fd, failure)
+                    os.fsync(self.fd)
+                    self.bytes_written = start + len(failure)
+                except OSError:
+                    pass
+                return
             self.bytes_written += len(data)
             if events:
                 self.flushed_sequence = events[-1]["seq"]
 
     def close(self):
+        if self.closed:
+            return
         try:
             self.flush()
         finally:
-            self.connection.set_trace_callback(None)
-            os.close(self.fd)
+            try:
+                self.connection.set_trace_callback(None)
+            except sqlite3.Error:
+                pass
+            try:
+                os.close(self.fd)
+            finally:
+                self.closed = True
