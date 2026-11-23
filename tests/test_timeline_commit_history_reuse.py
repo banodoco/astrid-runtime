@@ -6,7 +6,13 @@ from runtime_protocol.timeline_commit_store import TimelineCommitStore
 from runtime_protocol.service import RuntimeService
 from test_timeline_commit_authentication import body, provider
 from test_timeline_commit_port import commit, service
+from test_timeline_producer_guards import (
+    _execute as execute_producer,
+    _settle as settle_producer,
+    producer as producer_fixture,
+)
 from test_timeline_verified_reads import next_request
+from test_timeline_verified_reads import handler
 
 
 def test_verified_head_reuses_proof_through_first_save_without_intervening_write(service, monkeypatch):
@@ -79,3 +85,33 @@ def test_reopened_service_reverifies_persisted_verified_head(service, monkeypatc
         assert first["receipt"]["receipt_id"] in replayed
     finally:
         reopened.close()
+
+
+# Plan 78 Runtime follow-up probe; this fixture is generation-backed synthetic
+# producer coverage, not evidence of the exact Plan 78 writer path.
+def test_public_history_reuses_producer_commit_verification_for_next_commit(producer_fixture):
+    service = producer_fixture.service
+    settle_producer(producer_fixture)
+    producer_commit = execute_producer(producer_fixture)
+
+    assert producer_commit["data"]["status"] == "accepted"
+    assert producer_commit["data"]["commands"][-1]["op"] == "clip.move"
+    producer_publication = producer_commit["receipt"]["receipt_id"]
+
+    first_history = handler(service, "commits?limit=1")
+    first_history._dispatch()
+    assert first_history.reply[0] == 200, first_history.error
+    assert first_history.reply[1]["items"]
+    assert first_history.reply[1]["head"]["publication_id"] == producer_publication
+
+    # The producer fixture already registered this same prepared-provider type.
+    service.test_provider = service._timeline_commit_provider
+    provider(service)
+    annotation = commit(service, body(service), key="annotation-after-producer")
+    assert annotation["data"]["status"] == "accepted"
+
+    second_history = handler(service, "commits?limit=1")
+    second_history._dispatch()
+    assert second_history.reply[0] == 200, second_history.error
+    assert second_history.reply[1]["items"]
+    assert second_history.reply[1]["head"]["publication_id"] == annotation["receipt"]["receipt_id"]
