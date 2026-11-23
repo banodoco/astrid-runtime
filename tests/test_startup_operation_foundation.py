@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 
 from astrid_runtime.bootstrap import BootstrapConfig, SourceProfile, _startup_scope
 from astrid_runtime.identity import requested_startup_identity
@@ -123,3 +124,155 @@ def test_managed_inspection_does_not_trust_health_shaped_discovery_without_curre
     assert result["inspection"]["checks"]["realm_identity"]["realm_id"] == realm_id
     assert result["inspection"]["checks"]["sqlite_integrity"]["ok"] is True
     assert not paths.instance_lock_path.exists()
+
+
+def test_simultaneous_initial_startup_inspections_share_one_scan_and_operation(
+    tmp_path, monkeypatch,
+):
+    """Two no-record first observations must not queue duplicate full scans."""
+    import astrid_runtime.workspace as workspace_module
+
+    realm_root = tmp_path / "realm"
+    realm_id = "simultaneous-realm"
+    RealmStore.initialize(realm_root, realm_id=realm_id).close()
+    paths = RuntimePaths.current(data_root=tmp_path / "support")
+    _write_catalog(paths, realm_root, realm_id)
+    source = _source_profile()
+    config = BootstrapConfig(source_profile=source)
+    paths.bootstrap_lock_path.touch()
+    platform.owner_only(paths.bootstrap_lock_path)
+
+    initial_reads = threading.Barrier(2)
+    first_scan_started = threading.Event()
+    release_first_scan = threading.Event()
+    second_lock_contended = threading.Event()
+    permit_queued_lock = threading.Event()
+    counts_lock = threading.Lock()
+    seen_threads = set()
+    scan_count = 0
+    lock_holder = None
+    outcomes = {}
+    errors = {}
+    original_pending = workspace_module._pending_inspection
+    original_lock_file = platform.lock_file
+    original_unlock_file = platform.unlock_file
+    original_copy = RealmStore._copy_admission_file
+
+    def synchronize_initial_pending(paths_arg, scope):
+        result = original_pending(paths_arg, scope)
+        thread_name = threading.current_thread().name
+        with counts_lock:
+            first_read = thread_name not in seen_threads
+            if first_read:
+                seen_threads.add(thread_name)
+        if first_read:
+            assert result is None
+            initial_reads.wait(timeout=5)
+        return result
+
+    bootstrap_lock_stat = paths.bootstrap_lock_path.stat()
+
+    def observed_lock(fd, *, exclusive=True, blocking=True):
+        nonlocal lock_holder
+        observed = os.fstat(fd)
+        if ((observed.st_dev, observed.st_ino)
+                != (bootstrap_lock_stat.st_dev, bootstrap_lock_stat.st_ino)):
+            return original_lock_file(fd, exclusive=exclusive, blocking=blocking)
+
+        thread_name = threading.current_thread().name
+        with counts_lock:
+            if lock_holder is None:
+                lock_holder = thread_name
+                return original_lock_file(fd, exclusive=exclusive, blocking=blocking)
+            second_attempt = thread_name != lock_holder
+        if not second_attempt:
+            return original_lock_file(fd, exclusive=exclusive, blocking=blocking)
+
+        # Prove the second caller reached the same real bootstrap lock while it
+        # was held by the first. Candidate nonblocking acquisition reports this
+        # contention directly; baseline blocking acquisition waits for the
+        # test to release the first scan, then proceeds through the real lock.
+        try:
+            original_lock_file(fd, exclusive=exclusive, blocking=False)
+        except BlockingIOError:
+            second_lock_contended.set()
+            if not blocking:
+                raise
+            if not permit_queued_lock.wait(timeout=5):
+                raise TimeoutError("test did not release queued bootstrap lock")
+            return original_lock_file(fd, exclusive=exclusive, blocking=True)
+        else:
+            original_unlock_file(fd)
+            second_lock_contended.set()
+            return original_lock_file(fd, exclusive=exclusive, blocking=blocking)
+
+    monkeypatch.setattr(workspace_module, "_pending_inspection", synchronize_initial_pending)
+    monkeypatch.setattr(platform, "lock_file", observed_lock)
+
+    held_copy_threads = set()
+
+    def hold_first_real_admission_copy(source_path, destination_path, deadline):
+        original_copy(source_path, destination_path, deadline)
+        thread_name = threading.current_thread().name
+        with counts_lock:
+            hold = thread_name not in held_copy_threads
+            held_copy_threads.add(thread_name)
+        if hold:
+            first_scan_started.set()
+            if not release_first_scan.wait(timeout=5):
+                raise TimeoutError("test did not release first cold integrity copy")
+
+    monkeypatch.setattr(
+        RealmStore, "_copy_admission_file", staticmethod(hold_first_real_admission_copy),
+    )
+
+    class Boundary:
+        def inspect_startup(self, *, realm_root):
+            nonlocal scan_count
+            with counts_lock:
+                scan_count += 1
+            return RealmStore.inspect_realm(realm_root, timeout_seconds=120)
+
+    def inspect(name):
+        try:
+            outcomes[name] = inspect_workspace(
+                paths, Boundary(), startup_operation=True, config=config,
+            )
+        except BaseException as exc:
+            errors[name] = exc
+
+    threads = [
+        threading.Thread(target=inspect, args=(f"arrival-{index}",), name=f"arrival-{index}")
+        for index in (1, 2)
+    ]
+    for thread in threads:
+        thread.start()
+
+    operation_id = None
+    try:
+        assert first_scan_started.wait(timeout=5), "neither caller entered the first integrity scan"
+        assert second_lock_contended.wait(timeout=5), "second caller did not reach the bootstrap lock"
+        observed = startup_operation.read_operation(paths.runtime_support.resolve(), fresh=False)
+        assert observed is not None and observed.state == "pending"
+        operation_id = observed.operation_id
+    finally:
+        # Release the queued baseline caller and the held verifier together;
+        # all waits in workers/barriers are bounded above.
+        permit_queued_lock.set()
+        release_first_scan.set()
+        for thread in threads:
+            thread.join(timeout=6)
+
+    assert all(not thread.is_alive() for thread in threads), "inspection worker exceeded its bounded join"
+    assert not errors, errors
+    assert scan_count == 1, f"simultaneous inspection repeated the full verifier {scan_count} times"
+    assert len(outcomes) == 2
+
+    winners = [result for result in outcomes.values() if result.get("ok") is True]
+    losers = [result for result in outcomes.values() if result.get("ok") is False]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    loser = losers[0]
+    assert loser.get("state") in {"startup_busy", "startup_pending"}, loser
+    if loser["state"] == "startup_pending":
+        assert loser["startup_operation"]["operation_id"] == operation_id
