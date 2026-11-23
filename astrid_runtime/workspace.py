@@ -280,6 +280,38 @@ def _pending_inspection(paths, scope):
     return {"ok": False, "state": "startup_pending", "startup_operation": observed.as_observation()}
 
 
+def _launcher_inspection(paths, scope):
+    """Return the exact launcher receipt when this call is only an observer."""
+    try:
+        launcher = startup_attempt.read_attempt(paths.runtime_support.resolve())
+    except startup_attempt.StartupAttemptError as exc:
+        raise BootstrapError("Runtime launcher ownership could not be verified.") from exc
+    if launcher is None:
+        return None
+    if launcher.scope != scope:
+        if launcher.live:
+            raise BootstrapError("A Runtime launcher owns a different workspace startup attempt.")
+        if launcher.abandoned:
+            return {"ok": False, "state": "unavailable"}
+        return None
+    if launcher.state == "starting_service":
+        return {
+            "ok": False,
+            "state": "starting_service",
+            "startup_attempt": launcher.as_observation(),
+        }
+    if launcher.state == "failed" and launcher.abandoned:
+        return {
+            "ok": False,
+            "state": "startup_attempt_failed",
+            "startup_attempt": launcher.as_observation(),
+        }
+    # The first authorized verifier runs while the launcher is still in
+    # inspecting_workspace. A pending native operation, checked by the caller
+    # first, takes precedence over either launcher stage.
+    return None
+
+
 def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, config):
     from runtime_protocol.store import realm_admission_fence
 
@@ -290,6 +322,9 @@ def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, c
     pending = _pending_inspection(paths, scope)
     if pending is not None:
         return pending
+    launcher = _launcher_inspection(paths, scope)
+    if launcher is not None:
+        return launcher
     try:
         with _bootstrap_mutex(paths, blocking=False):
             current = _startup_selection(paths, realm_root, expected_realm_id, config)
@@ -299,6 +334,9 @@ def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, c
             pending = _pending_inspection(paths, scope)
             if pending is not None:
                 return pending
+            launcher = _launcher_inspection(paths, scope)
+            if launcher is not None:
+                return launcher
             report = _startup_live_owner_inspection(paths, boundary, root, expected, requested_identity)
             if report is None:
                 try:
