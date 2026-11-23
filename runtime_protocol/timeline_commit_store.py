@@ -55,6 +55,11 @@ def reject(reason, message=None, *, status=409, diagnostic_reason=None, safe_det
     raise error
 
 
+def _reject_canonical_head_mismatch():
+    reject("history_unavailable", "canonical film differs from accepted publication",
+           diagnostic_reason="store_head_canonical_mismatch")
+
+
 _VERSION_PARTS = ("connection", "total_changes", "data_version", "files", "package_owner")
 
 
@@ -1369,8 +1374,7 @@ class TimelineCommitStore:
             head, entry = self._head_entry(project_id, timeline_id, selected_head=True)
         document = self.revision_closure(project_id, timeline_id, head["revision_id"])
         if entry["intent"] == "recorded" and digest(document) != entry["receipt"]["result"]["document_digest"]:
-            reject("history_unavailable", "canonical film differs from accepted publication",
-                   diagnostic_reason="store_head_canonical_mismatch")
+            _reject_canonical_head_mismatch()
         verify_selections(document)
         return {"project_id": project_id, "timeline_id": timeline_id, "head": head,
                 "canonical_document": document}
@@ -1406,8 +1410,7 @@ class TimelineCommitStore:
                 if catalog:
                     document = self.revision_closure(project_id, timeline_id, row["revision_id"])
                     if entry["intent"] == "recorded" and document != entry["receipt"]["result"]["canonical_document"]:
-                        reject("history_unavailable", "canonical film differs from accepted publication",
-                               diagnostic_reason="store_head_canonical_mismatch")
+                        _reject_canonical_head_mismatch()
                     for shot in document["shot_revisions"]:
                         _shot_projection(self.conn, project_id, shot["shot_id"])
                         _text_bindings(self.conn, project_id, shot, self._read_history_object)
