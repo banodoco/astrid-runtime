@@ -295,12 +295,18 @@ def _launcher_inspection(paths, scope):
             return {"ok": False, "state": "unavailable"}
         return None
     if launcher.state == "starting_service":
+        pending = _pending_inspection(paths, scope)
+        if pending is not None:
+            return pending
         return {
             "ok": False,
             "state": "starting_service",
             "startup_attempt": launcher.as_observation(),
         }
     if launcher.state == "failed" and launcher.abandoned:
+        pending = _pending_inspection(paths, scope)
+        if pending is not None:
+            return pending
         return {
             "ok": False,
             "state": "startup_attempt_failed",

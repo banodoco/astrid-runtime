@@ -386,6 +386,91 @@ def test_independently_owned_native_operation_wins_after_launcher_exit(selection
     assert terminal["attempt_id"] != active.operation_id
 
 
+def test_native_operation_published_after_first_read_supersedes_launcher_receipt(
+    selection, tmp_path, monkeypatch,
+):
+    """A fresh exact native operation wins a launcher record read after exit."""
+    from threading import Event, Lock, Thread
+
+    paths, _, config = selection
+    first_read = Event()
+    resume_observer = Event()
+    read_lock = Lock()
+    read_count = 0
+    outcomes = {}
+    original_pending = workspace._pending_inspection
+
+    def pause_after_initial_empty_read(paths_arg, scope):
+        nonlocal read_count
+        result = original_pending(paths_arg, scope)
+        with read_lock:
+            initial = read_count == 0
+            read_count += 1
+        if initial:
+            assert result is None
+            first_read.set()
+            if not resume_observer.wait(timeout=10):
+                raise TimeoutError("observer test did not resume the pending read")
+            return result
+        return result
+
+    monkeypatch.setattr(workspace, "_pending_inspection", pause_after_initial_empty_read)
+
+    class NoScanBoundary:
+        def inspect_startup(self, *, realm_root):
+            raise AssertionError("observer must not run a second offline verifier")
+
+    def observe():
+        try:
+            outcomes["result"] = workspace.inspect_workspace(
+                paths, NoScanBoundary(), startup_operation=True, config=config,
+            )
+        except BaseException as exc:
+            outcomes["error"] = exc
+
+    with _process_waiting_after(_NATIVE_OWNER, [], tmp_path / "native-owner") as native:
+        observer = Thread(target=observe, name="startup-gap-observer")
+        observer.start()
+        try:
+            assert first_read.wait(timeout=5), "observer did not capture its initial empty read"
+            with _process_waiting_after(
+                _ASSIGN_AND_ABANDON,
+                [str(native.pid), *_runtime_args(selection)],
+                tmp_path / "assigned-then-abandoned",
+            ) as launcher:
+                from runtime_protocol import startup_attempt
+
+                active = read_operation(paths.runtime_support)
+                assert active.owner_pid == native.pid != launcher.pid
+                assert active.state == "pending"
+                observed_launcher = startup_attempt.read_attempt(paths.runtime_support.resolve())
+                launcher_live = observed_launcher.as_observation()
+                assert launcher_live["state"] == "starting_service"
+            assert launcher.returncode == 0
+            from runtime_protocol import startup_attempt
+
+            terminal_attempt = startup_attempt.read_attempt(paths.runtime_support.resolve()).as_observation()
+            assert terminal_attempt == {
+                "state": "failed", "attempt_id": launcher_live["attempt_id"],
+            }
+            resume_observer.set()
+            observer.join(timeout=10)
+            assert not observer.is_alive(), "observer exceeded its bounded join"
+        finally:
+            resume_observer.set()
+            observer.join(timeout=10)
+
+        assert "error" not in outcomes, outcomes.get("error")
+        assert outcomes.get("result") == {
+            "ok": False,
+            "state": "startup_pending",
+            "startup_operation": active.as_observation(),
+        }
+        assert read_operation(paths.runtime_support).operation_id == active.operation_id
+        assert not paths.discovery_path.exists()
+        assert not paths.instance_lock_path.exists()
+
+
 _MANAGED_NATIVE = """
 import json, pathlib, signal, sys, threading, time
 from astrid_runtime import cli
