@@ -542,7 +542,7 @@ def test_checkpoint_without_sql_change_preserves_the_pinned_head(service, monkey
     assert counts == [0]
 
 
-def test_http_history_refuses_repeated_external_writes_during_verification(service, monkeypatch, caplog):
+def test_http_history_serves_snapshot_after_external_write_but_does_not_retain_proof(service, monkeypatch):
     provider(service)
     commit(service, body(service))
     commits, _ = service._timeline_commits()
@@ -552,7 +552,7 @@ def test_http_history_refuses_repeated_external_writes_during_verification(servi
 
     def changed(reader, *args, **kwargs):
         result = verify(reader, *args, **kwargs)
-        if reader not in readers:
+        if not readers:
             assert reader.store.conn is not service.store.conn
             assert reader.store.conn.execute("PRAGMA query_only").fetchone()[0] == 1
             with closing(sqlite3.connect(service.store.db_path, isolation_level=None)) as connection:
@@ -563,11 +563,20 @@ def test_http_history_refuses_repeated_external_writes_during_verification(servi
     monkeypatch.setattr(TimelineCommitStore, "_verify_accepted", changed)
     public = handler(service, "commits")
     public._dispatch()
-    assert len(readers) == 2
-    assert public.reply[0] == 409
-    assert public.error["code"] == "conflict"
-    assert public.error["details"]["status"] == "refused"
-    assert public.error["details"]["reason"] == "head_busy"
-    assert public.error["message"] == "accepted commit inputs changed during verification"
-    assert any("moved" in record.getMessage() and "files" in record.getMessage() for record in caplog.records)
+    assert len(readers) == 1
+    assert public.reply[0] == 200, public.error
+    assert not commits._replay_memo
     assert not any(commits._history_state.values())
+    replayed = []
+    replay = TimelineCommitStore._verify_accepted_replay
+
+    def count_replay(reader, *args, **kwargs):
+        replayed.append(reader)
+        return replay(reader, *args, **kwargs)
+
+    monkeypatch.setattr(TimelineCommitStore, "_verify_accepted_replay", count_replay)
+    second = handler(service, "commits")
+    second._dispatch()
+    assert second.reply[0] == 200, second.error
+    assert replayed
+    assert commits._replay_memo
