@@ -84,13 +84,8 @@ class AttemptObservation:
             if caller is None or caller.get("uid") != platform.current_user():
                 return False
             birth = caller["birth_id"]
-            if birth.startswith("proc-start-ticks:"):
-                # Numeric procfs paths use the mount's PID namespace. Bind
-                # this lookup to the actual caller before comparing any PIDs.
-                proc_self = Path("/proc/self")
-                if (proc_self.readlink() != Path(str(pid))
-                        or not birth.endswith(f";pidns:{(proc_self / 'ns/pid').stat().st_ino}")):
-                    return False
+            if not _is_local_birth(pid, birth):
+                return False
             if pid == owner.owner_pid:
                 matches = platform.process_birth_matches(owner.owner_birth, birth) is True
             else:
@@ -154,6 +149,19 @@ def _process_identity(pid: int) -> dict | None:
 def _process_birth(pid: int) -> tuple[str, object] | None:
     info = _process_identity(pid)
     return (info["birth_id"], info.get("uid")) if info is not None else None
+
+
+def _is_local_birth(pid: int, birth: str) -> bool:
+    if not birth.startswith("proc-start-ticks:"):
+        return True
+    # Numeric procfs paths use the mount's PID namespace. Bind the lookup
+    # to the actual caller before trusting its PID and namespace.
+    proc_self = Path("/proc/self")
+    try:
+        return (proc_self.readlink() == Path(str(pid))
+                and birth.endswith(f";pidns:{(proc_self / 'ns/pid').stat().st_ino}"))
+    except OSError:
+        return False
 
 
 def _possible_child_birth(parent: str, child: str) -> bool:
@@ -264,16 +272,18 @@ class StartupAttempt:
                 raise StartupAttemptError("The specified failed Runtime start attempt is no longer available to retry.")
         elif failed_match and current.abandoned:
             raise StartupAttemptError("Retry requires the exact failed Runtime start attempt ID.")
-        process = _process_birth(os.getpid())
+        pid = os.getpid()
+        process = _process_birth(pid)
         if (process is None or not _BIRTH.fullmatch(process[0]) or process[1] != platform.current_user()
-                or platform.process_birth_matches(process[0], process[0]) is not True):
+                or platform.process_birth_matches(process[0], process[0]) is not True
+                or not _is_local_birth(pid, process[0])):
             raise StartupAttemptError("Runtime launcher birth identity is unavailable.")
         directory = open_directory_chain(support_root)
         try:
             support_id = _directory_digest(support_root, os.fstat(directory))
         finally:
             os.close(directory)
-        record = _Record(uuid.uuid4().hex, scope, support_id, os.getpid(), process[0],
+        record = _Record(uuid.uuid4().hex, scope, support_id, pid, process[0],
                          _INSPECTING if inspecting else _STARTING)
         _publish(support_root, record, current._record if current is not None else None)
         return cls(support_root, record)
