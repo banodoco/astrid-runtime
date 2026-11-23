@@ -85,6 +85,16 @@ pathlib.Path(sys.argv[1]).touch()
 sys.stdin.readline()
 """
 
+_INSPECT_RECEIPT = """
+import contextlib, io, json, pathlib, sys
+from astrid_runtime.cli import main
+output = io.StringIO()
+with contextlib.redirect_stdout(output):
+    returncode = main(["workspace", "inspect", "--startup-operation", *sys.argv[2:]])
+pathlib.Path(sys.argv[1]).write_text(json.dumps({"returncode": returncode, "stdout": output.getvalue()}))
+sys.stdin.readline()
+"""
+
 
 def _begin(selection, **kwargs):
     paths, _, config = selection
@@ -111,6 +121,55 @@ def test_observers_reattach_to_launcher_arcs_across_offline_verifier_exit(select
         assert before_exit == after_exit == {"state": "starting_service", "attempt_id": attempt.attempt_id}
         assert not paths.discovery_path.exists()
         assert not paths.instance_lock_path.exists()
+
+
+def test_coordinated_inspection_observes_live_starting_service_without_scanning(selection, tmp_path):
+    paths, _, _ = selection
+    receipt = tmp_path / "live-inspection.json"
+    with _begin(selection) as attempt:
+        attempt.starting_service()
+        expected = {
+            "ok": False,
+            "state": "starting_service",
+            "startup_attempt": {"attempt_id": attempt.attempt_id, "state": "starting_service"},
+        }
+        with _process_waiting_after(_INSPECT_RECEIPT, _runtime_args(selection), receipt) as observer:
+            operation = read_operation(paths.runtime_support)
+            assert operation is None, (
+                "coordinated observation started an offline verifier during the launcher gap: "
+                f"{None if operation is None else operation.as_observation()}"
+            )
+            envelope = json.loads(receipt.read_text())
+            assert envelope["returncode"] == 1
+            assert json.loads(envelope["stdout"]) == expected
+        assert observer.returncode == 0
+        assert not paths.discovery_path.exists()
+        assert not paths.instance_lock_path.exists()
+
+
+def test_coordinated_inspection_preserves_exact_abandoned_starting_service_attempt(selection, tmp_path):
+    paths, _, _ = selection
+    with _process_waiting_after(_ABANDON, _runtime_args(selection), tmp_path / "abandoned-inspection") as launcher:
+        live = _observe(selection)
+    assert launcher.returncode == 0
+    receipt = tmp_path / "abandoned-inspection-result.json"
+    with _process_waiting_after(_INSPECT_RECEIPT, _runtime_args(selection), receipt) as observer:
+        operation = read_operation(paths.runtime_support)
+        assert operation is None, (
+            "coordinated observation retried the abandoned offline verifier: "
+            f"{None if operation is None else operation.as_observation()}"
+        )
+        envelope = json.loads(receipt.read_text())
+        assert envelope["returncode"] == 1
+        assert json.loads(envelope["stdout"]) == {
+            "ok": False,
+            "state": "startup_attempt_failed",
+            "startup_attempt": {"attempt_id": live["attempt_id"], "state": "failed"},
+        }
+    assert observer.returncode == 0
+    assert _observe(selection) == {"state": "failed", "attempt_id": live["attempt_id"]}
+    assert not paths.discovery_path.exists()
+    assert not paths.instance_lock_path.exists()
 
 
 _ABANDON = """
