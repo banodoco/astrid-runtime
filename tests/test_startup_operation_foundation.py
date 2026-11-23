@@ -6,8 +6,17 @@ import os
 from pathlib import Path
 import sys
 import threading
+from types import SimpleNamespace
 
-from astrid_runtime.bootstrap import BootstrapConfig, SourceProfile, _startup_scope
+import pytest
+
+from astrid_runtime.bootstrap import (
+    BootstrapConfig,
+    BootstrapError,
+    SourceProfile,
+    _pending_startup,
+    _startup_scope,
+)
 from astrid_runtime.identity import requested_startup_identity
 from astrid_runtime.paths import RuntimePaths
 from astrid_runtime.workspace import inspect_workspace, startup_status
@@ -276,3 +285,127 @@ def test_simultaneous_initial_startup_inspections_share_one_scan_and_operation(
     assert loser.get("state") in {"startup_busy", "startup_pending"}, loser
     if loser["state"] == "startup_pending":
         assert loser["startup_operation"]["operation_id"] == operation_id
+
+
+@pytest.mark.skipif(not platform.sys.platform.startswith("linux"), reason="Linux PID namespace visibility")
+def test_invisible_native_owner_requires_comparable_process_namespace(tmp_path, monkeypatch, capsys):
+    """An invisible owner is terminal only when the observer shares its PID coordinates."""
+    from dataclasses import replace
+
+    import astrid_runtime.cli as cli_module
+    import astrid_runtime.workspace as workspace_module
+
+    public_data_root = tmp_path / "public-data"
+    support = public_data_root / "runtime"
+    support.mkdir(parents=True)
+    platform.owner_only(support)
+    operation = startup_operation.StartupOperation.assign(
+        support, startup_operation.OperationScope("a" * 64, "b" * 64, "c" * 64),
+    )
+    current = platform.process_identity(os.getpid())
+    assert current is not None
+    scope_parts = current["birth_id"].removeprefix("proc-start-ticks:").split(";")[1:]
+    assert scope_parts
+    native_pid = 2**31 - 1
+
+    def record(owner_birth):
+        replacement = replace(
+            operation.status, owner_pid=native_pid, owner_birth=owner_birth,
+        )
+        startup_operation.StartupOperation(support, replacement)._publish()
+
+    local_identity = dict(current)
+    local_identity["pid"] = os.getpid()
+    unknown_local = {**local_identity, "birth_id": "proc-start-ticks:2;" +
+                     ";".join(part for part in scope_parts if not part.startswith("pidns:"))}
+    monkeypatch.setattr(platform, "process_identity", lambda pid: (
+        None if pid == native_pid else local_identity
+    ))
+
+    # The first and second owner checks in read_operation must use the same
+    # namespace comparability rule: neither may turn an unscoped observation
+    # into evidence that the owner is dead.
+    for missing_check in (1, 2):
+        record("proc-start-ticks:1;" + ";".join(scope_parts))
+        calls = {"owner": 0}
+
+        def identity(pid):
+            if pid == native_pid:
+                calls["owner"] += 1
+                if calls["owner"] == missing_check:
+                    return None
+                return {**local_identity, "pid": native_pid,
+                        "birth_id": "proc-start-ticks:1;" + ";".join(scope_parts)}
+            return unknown_local
+
+        monkeypatch.setattr(platform, "process_identity", identity)
+        with pytest.raises(startup_operation.StartupOperationError, match="identity"):
+            startup_operation.read_operation(support, fresh=False)
+        assert calls["owner"] == missing_check
+        if missing_check == 1:
+            monkeypatch.setattr(
+                workspace_module, "_startup_selection",
+                lambda *_args, **_kwargs: (None, tmp_path / "realm", "realm", operation.status.scope, {}),
+            )
+            calls["owner"] = 0
+            assert cli_module.main([
+                "startup-status", "--data-root", str(public_data_root), "--json",
+            ]) == 1
+            assert json.loads(capsys.readouterr().out) == {"state": "unavailable"}
+        calls["owner"] = 0
+        with pytest.raises(BootstrapError, match="ownership could not be verified"):
+            _pending_startup(SimpleNamespace(runtime_support=support))
+
+    # With matching boot and PID namespace, absent / recycled is a definitive
+    # terminal observation and remains unavailable to retry authorization.
+    record("proc-start-ticks:1;" + ";".join(scope_parts))
+    monkeypatch.setattr(platform, "process_identity", lambda pid: (
+        None if pid == native_pid else local_identity
+    ))
+    assert startup_operation.read_operation(support, fresh=False) is None
+
+
+@pytest.mark.skipif(not platform.sys.platform.startswith("linux"), reason="Linux PID namespace visibility")
+def test_visible_foreign_uid_owner_requires_definitive_birth_mismatch(tmp_path, monkeypatch):
+    """A visible foreign UID is not proof of absence without comparable, different birth."""
+    from dataclasses import replace
+
+    support = tmp_path / "support"
+    support.mkdir()
+    platform.owner_only(support)
+    operation = startup_operation.StartupOperation.assign(
+        support, startup_operation.OperationScope("d" * 64, "e" * 64, "f" * 64),
+    )
+    current = platform.process_identity(os.getpid())
+    assert current is not None
+    expected = current["birth_id"]
+    boot, namespace = [part.split(":", 1)[1] for part in expected.split(";")[1:]]
+    native_pid = 2**31 - 1
+    replacement = replace(operation.status, owner_pid=native_pid, owner_birth=expected)
+    startup_operation.StartupOperation(support, replacement)._publish()
+
+    foreign_namespace = f"proc-start-ticks:10;boot:{boot};pidns:{int(namespace) + 1}"
+    different_birth = f"proc-start-ticks:10;boot:{boot};pidns:{namespace}"
+    visible = {"pid": native_pid, "uid": platform.current_user() + 1, "birth_id": foreign_namespace}
+    monkeypatch.setattr(platform, "process_identity", lambda pid: (
+        visible if pid == native_pid else current
+    ))
+    with pytest.raises(startup_operation.StartupOperationError, match="identity"):
+        startup_operation.read_operation(support, fresh=False)
+
+    # Same recorded birth with a different UID is also indeterminate.
+    visible["birth_id"] = expected
+    with pytest.raises(startup_operation.StartupOperationError, match="identity"):
+        startup_operation.read_operation(support, fresh=False)
+
+    # An invalid/empty kernel birth is unknown, never terminal absence.
+    visible["uid"] = platform.current_user()
+    visible["birth_id"] = ""
+    with pytest.raises(startup_operation.StartupOperationError, match="identity"):
+        startup_operation.read_operation(support, fresh=False)
+
+    # A valid different birth in the same boot and PID namespace proves the
+    # recorded owner PID has been recycled, so this operation is terminal.
+    visible["uid"] = platform.current_user() + 1
+    visible["birth_id"] = different_birth
+    assert startup_operation.read_operation(support, fresh=False) is None
