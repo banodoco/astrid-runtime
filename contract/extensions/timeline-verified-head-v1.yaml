@@ -1,0 +1,57 @@
+# Supplemental operation for workspace.v1. The workspace.v1 digest stays unchanged.
+openapi: 3.1.0
+info:
+  title: Workspace Timeline Verified Head
+  version: 1.0.0
+x-workspace-capability: timeline.verified_head.v1
+paths:
+  /v1/projects/{project_id}/timelines/{timeline_id}/verified-head:
+    get:
+      operationId: getTimelineVerifiedHead
+      summary: Read the verified current publication and its canonical document
+      security:
+        - bearerAuth: []
+      x-required-scope: projects:read
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: timeline_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Exact current head and authenticated revision closure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifiedTimelineHead"
+        default:
+          description: Workspace error, including a retryable head_busy conflict
+          content:
+            application/json:
+              schema:
+                $ref: "../schemas/common.json#/$defs/Error"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    VerifiedTimelineHead:
+      type: object
+      additionalProperties: false
+      required: [project_id, timeline_id, head, canonical_document]
+      properties:
+        project_id:
+          type: string
+        timeline_id:
+          type: string
+        head:
+          $ref: "../schemas/timeline-commit.json#/$defs/HeadPin"
+        canonical_document:
+          $ref: "../schemas/timeline-commit.json#/$defs/CanonicalDocument"

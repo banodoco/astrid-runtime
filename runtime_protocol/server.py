@@ -632,6 +632,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         )
         return commit or restore
 
+    def _is_timeline_history_read(self):
+        path = [unquote(x) for x in urlsplit(getattr(self, "path", "")).path.split("/") if x]
+        return (getattr(self, "command", None) == "GET"
+                and len(path) == 6 and path[:2] == ["v1", "projects"]
+                and path[3] == "timelines" and path[5] in ("commits", "verified-head"))
+
     def _error(self, exc):
         commits = getattr(self.runtime, "_timeline_commit_store", None)
         if commits is not None:
@@ -957,14 +963,24 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.get_project_timeline(path[2], path[4]))
             if method == "PATCH":
                 return self._send(200, self.runtime.rename_timeline(path[2], path[4], self._project_mutation_body(), idempotency_key=self._idempotency_key()))
-        if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "commits" and method == "GET":
+        if self._is_timeline_history_read():
             identity = self._identity("projects:read")
             publisher = identity["actor"]
             def authorize():
                 return self._authorize_timeline_read(publisher)
 
-            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
-            return self._send(200, self.runtime.list_timeline_commits(
+            raw_query = urlsplit(self.path).query
+            if path[5] == "verified-head":
+                if raw_query:
+                    raise ProtocolError("verified timeline head does not accept a query string")
+                return self._send(200, self.runtime.get_timeline_verified_head(
+                    path[2], path[4], authorize=authorize,
+                ))
+            query = parse_qs(raw_query, keep_blank_values=True)
+            read_history = getattr(self.runtime, "list_timeline_commits_isolated", None)
+            if not callable(read_history):
+                read_history = self.runtime.list_timeline_commits
+            return self._send(200, read_history(
                 path[2], path[4], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0],
                 authorize=authorize,
             ))
@@ -1622,6 +1638,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 elif getattr(self, "command", None) == "GET" and urlsplit(getattr(self, "path", "")).path == "/v1/diagnostics":
                     # Support diagnostics performs independent owner-boundary
                     # probes; it must not hold the serialized SQLite section.
+                    self._route()
+                elif self._is_timeline_history_read() and callable(
+                        getattr(self.runtime, "list_timeline_commits_isolated", None)):
+                    # These readers own their live admission and finalization.
+                    # Verification and response assembly run on a pinned reader.
                     self._route()
                 elif self._is_remote_credential_control() or self._is_binary_io() or self._is_timeline_commit():
                     # Both routes own short store sections. Transfer, hashing,

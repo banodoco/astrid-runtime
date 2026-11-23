@@ -16,11 +16,14 @@ import sqlite3
 import sys
 import threading
 from collections import deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import wraps
 from typing import cast
 
 from . import platform as runtime_platform
+from ._timeline_reopen_diagnostics import (
+    count_prefix_materialization, count_reopen_work, current_verified_head_receipt, verified_head_counts,
+)
 from .errors import ConflictError, HeadBusyError, NotFoundError, ProtocolError, ValidationError
 from .idempotency import command_result
 from .timeline_commit_validation import detached, digest
@@ -50,6 +53,11 @@ def reject(reason, message=None, *, status=409, diagnostic_reason=None, safe_det
     if diagnostic_reason is not None:
         error.__dict__["_diagnostic_reason"] = diagnostic_reason
     raise error
+
+
+def _reject_canonical_head_mismatch():
+    reject("history_unavailable", "canonical film differs from accepted publication",
+           diagnostic_reason="store_head_canonical_mismatch")
 
 
 _VERSION_PARTS = ("connection", "total_changes", "data_version", "files", "package_owner")
@@ -273,8 +281,12 @@ def _evaluation(method):
 
 
 class _HistoryReadCursor:
-    def __init__(self, inputs, query, parameters):
+    def __init__(self, inputs, query, parameters, *, prefix=None):
         self.inputs, self.query, self.parameters = inputs, query, parameters
+        self.prefix = prefix if inputs.snapshot_prefix_watch is not None else None
+        self.prefix_check = inputs.snapshot_prefix_watch() if self.prefix is not None else None
+        if self.prefix_check is not None and not self.prefix_check():
+            self.prefix_check = None
         self.cursor = inputs.connection.execute(query, parameters)
 
     def _read(self, method):
@@ -282,6 +294,9 @@ class _HistoryReadCursor:
         rows = [value] if method == "fetchone" else value
         snapshot = tuple(None if row is None else tuple(row) for row in rows)
         key = (self.query, self.parameters, method)
+        if self.prefix is not None:
+            count_prefix_materialization(self.prefix, rows)
+            self.inputs.snapshot_prefix_rows[key] = (self.prefix, self.prefix_check)
         if key in self.inputs.rows and self.inputs.rows[key] != snapshot:
             raise _head_busy("row-read", f"rows of {self.query[:80]!r}")
         self.inputs.rows[key] = snapshot
@@ -303,9 +318,20 @@ class _HistoryReadInputs:
         self.connection, self.read_object = connection, read_object
         self.confirm_object = confirm_object
         self.rows, self.objects = {}, {}
+        self.snapshot_prefix_watch = None
+        self.snapshot_prefix_rows = {}
 
-    def execute(self, query, parameters=()):
-        return _HistoryReadCursor(self, query, tuple(parameters))
+    def execute(self, query, parameters=(), *, prefix=None):
+        return _HistoryReadCursor(self, query, tuple(parameters), prefix=prefix)
+
+    @contextmanager
+    def snapshot_prefixes(self):
+        previous = self.snapshot_prefix_watch
+        self.snapshot_prefix_watch = getattr(self.connection, "_watch_history_prefix", None)
+        try:
+            yield
+        finally:
+            self.snapshot_prefix_watch = previous
 
     def check(self, *, final=True):
         for object_id, expected in self.objects.items():
@@ -315,15 +341,21 @@ class _HistoryReadInputs:
             data = self.read_object(object_id)
             if (len(data), hashlib.sha256(data).digest()) != expected:
                 raise ProtocolError("accepted commit object changed during verification")
-        for (query, parameters, method), expected in self.rows.items():
+        for key, expected in self.rows.items():
+            query, parameters, method = key
+            prefix, fixed = self.snapshot_prefix_rows.get(key, (None, None))
+            if fixed is not None and fixed():
+                continue
             value = getattr(self.connection.execute(query, parameters), method)()
             rows = [value] if method == "fetchone" else value
+            if prefix is not None:
+                count_prefix_materialization(prefix, rows)
             if tuple(None if row is None else tuple(row) for row in rows) != expected:
                 raise _head_busy("row-recheck", f"rows of {query[:80]!r}")
 
 
 class TimelineCommitStore:
-    def __init__(self, store, *, validate_prepared, validate_event=None):
+    def __init__(self, store, *, validate_prepared, validate_event=None, snapshot_version=None):
         self.store = store
         # Validation uses the wire worker's authoritative schema, including
         # Agent-owned leaves. It must raise on invalid data, never normalize it.
@@ -335,11 +367,15 @@ class TimelineCommitStore:
         self._replay_store_version = None
         self._history_state = {}
         self._connection = self.store.conn
+        self._snapshot_version = snapshot_version
         self._reading = False
         self._read_version_pin = None
         self._acceptance_transaction = False
-        value = os.stat(self.store.db_path)
-        self._database_identity = (value.st_dev, value.st_ino)
+        if snapshot_version is None:
+            value = os.stat(self.store.db_path)
+            self._database_identity = (value.st_dev, value.st_ino)
+        else:
+            self._database_identity = snapshot_version[3][0][:2]
         self._wal_identity = None
         self.clear_replay_memo()
 
@@ -429,7 +465,14 @@ class TimelineCommitStore:
             self._replay_store_version = None
             self.clear_replay_memo()
 
-    def _store_version(self):
+    def _store_version(self, *, allow_reopen=True):
+        if self._snapshot_version is not None:
+            # The live connection samples bracket this already-pinned reader.
+            # SQLite and file counters can move outside this snapshot while it
+            # runs. Only the live final fence can authorize publication.
+            if not self.store.conn.in_transaction:
+                raise ProtocolError("timeline read snapshot is no longer pinned")
+            return self._snapshot_version
         # data_version is meaningful only on the same live connection. The
         # RealmStore mutex also serializes its use across request threads.
         files, package_owner = self._physical_version()
@@ -437,6 +480,8 @@ class TimelineCommitStore:
         database_changed = files[0] is None or files[0][:2] != self._database_identity
         wal_changed = self._wal_identity is not None and (files[1] is None or files[1][:2] != self._wal_identity)
         if connection_changed or database_changed or wal_changed:
+            if not allow_reopen:
+                raise _head_busy("isolated-read storage", "connection, database or WAL identity", _PostReadMovement)
             self._reestablish_connection()
             files, package_owner = self._physical_version()
         if files[0] is None:
@@ -488,7 +533,7 @@ class TimelineCommitStore:
                     self._reading = False
                     if owned:
                         connection.rollback()
-                    elif not self._acceptance_transaction:
+                    elif not self._acceptance_transaction and self._snapshot_version is None:
                         # An unrelated caller transaction may still roll back.
                         # Its provisional rows cannot become retained proofs.
                         self.clear_replay_memo()
@@ -608,7 +653,8 @@ class TimelineCommitStore:
                     raise ProtocolError("accepted commit object changed during verification")
                 inputs.objects[object_id] = retained
             return retained
-        trusted = (self._verified_cas() or {}).get(object_id)
+        verified_cas = self._verified_cas()
+        trusted = verified_cas.get(object_id) if verified_cas is not None else None
         if trusted is not None and self._cas().current_identity(object_id) == trusted:
             # Immutable and unchanged since it was hashed: the pin needs only
             # (size, sha256), so the file is not opened or read.
@@ -824,7 +870,7 @@ class TimelineCommitStore:
         return self._envelope(row, edge["project_id"])
 
     @_evaluation
-    def _verify_accepted(self, row, edge, *, allow_archived=False):
+    def _verify_accepted(self, row, edge, *, allow_archived=False, selected_head=False):
         from .timeline_commit import CommitRejected
 
         self._sync_replay_memo()
@@ -832,9 +878,12 @@ class TimelineCommitStore:
         active = current["active"]
         identity = (edge["project_id"], edge["timeline_id"], edge["publication_id"])
         cached = self._history_state["records"].get(identity)
+        counts = verified_head_counts() if selected_head else None
         if cached is not None:
             if cached != (dict(row), dict(edge)):
                 raise ProtocolError("accepted commit history changed during verification")
+            if counts is not None:
+                counts["selected_record_cache_hits"] += 1
             return
         if identity in active:
             raise ProtocolError("accepted commit history contains a cycle")
@@ -871,6 +920,8 @@ class TimelineCommitStore:
                     raise ProtocolError("accepted commit history changed during verification")
                 active.add(node)
                 try:
+                    if counts is not None and node == identity:
+                        counts["selected_record_verification_attempts"] += 1
                     self._verify_accepted_record(ledger, history, allow_archived=archived)
                 finally:
                     active.remove(node)
@@ -893,7 +944,7 @@ class TimelineCommitStore:
             if len(ordered) != len(remaining):
                 raise ProtocolError("accepted commit history contains a cycle")
             # Callbacks during collection may have changed an already checked
-            # dependency. Re-read every consumed result, including empty SQL
+            # dependency. Recheck consumed results, including empty SQL
             # results and physical object bytes, before using queued proofs.
             traversal["inputs"].check(final=False)
             proofs = set()
@@ -903,9 +954,14 @@ class TimelineCommitStore:
                 if replay is not None:
                     key, arguments = replay
                     self._sync_replay_memo()
+                    measure_selected = counts is not None and node == identity
                     if key not in current["verified"] and key not in self._replay_memo:
+                        if measure_selected:
+                            counts["selected_record_replay_attempts"] += 1
                         self._verify_accepted_replay(*arguments)
                         proofs.add(key)
+                    elif measure_selected:
+                        counts["selected_replay_key_hits"] += 1
             # Replay/capture validation can also call back into the runtime.
             # Publish no proofs or history until all inputs still match.
             # Bytes already confirmed in this scope are not re-hashed here:
@@ -1067,19 +1123,25 @@ class TimelineCommitStore:
                                          original, source, continuations, history)
             verified.add(key)
 
+    def _history_prefix_rows(self, prefix, query, parameters):
+        connection = self.conn
+        if isinstance(connection, _HistoryReadInputs):
+            return connection.execute(query, parameters, prefix=prefix).fetchall()
+        return connection.execute(query, parameters).fetchall()
+
     def _history_chain(self, edge):
         chains = self._history_state["chains"]
         scope = (edge["project_id"], edge["timeline_id"])
         ordinal = edge["project_seq"]
         if (*scope, ordinal) not in chains:
             low, previous = self._history_state["chain_tails"].get(scope, (0, ""))
-            rows = self.conn.execute(
+            rows = self._history_prefix_rows("history",
                 "SELECT * FROM timeline_commit_history WHERE project_id=? AND timeline_id=? "
-                "AND project_seq>? AND project_seq<=? ORDER BY project_seq", (*scope, low, ordinal)).fetchall()
-            ledgers = {row["txn_id"]: dict(row) for row in self.conn.execute(
+                "AND project_seq>? AND project_seq<=? ORDER BY project_seq", (*scope, low, ordinal))
+            ledgers = {row["txn_id"]: dict(row) for row in self._history_prefix_rows("receipt",
                 "SELECT * FROM command_idempotency WHERE txn_id IN (SELECT publication_id "
                 "FROM timeline_commit_history WHERE project_id=? AND timeline_id=? AND project_seq>? AND project_seq<=?)",
-                (*scope, low, ordinal)).fetchall()}
+                (*scope, low, ordinal))}
             for row in rows:
                 chains[(*scope, row["project_seq"])] = previous
                 # Hash the actual stored JSON strings, including legacy rows;
@@ -1186,22 +1248,155 @@ class TimelineCommitStore:
                    "event_ids": json.loads(row["event_ids_json"]), "result": data, "created_at": row["created_at"]}
         return detached({"data": data, "receipt": receipt})
 
+    @staticmethod
+    def _public_head(connection, project_id, timeline_id):
+        row = connection.execute(
+            "SELECT revision_id, publication_id FROM parent_composition_heads "
+            "WHERE project_id=? AND timeline_id=?", (project_id, timeline_id),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def read_isolated(self, project_id, timeline_id, *, prepare, authorize, read, confirm=None):
+        # As with the live verifier, one movement can be reread. A failed
+        # attempt never shares its semantic or physical proofs.
+        try:
+            return self._read_isolated(project_id, timeline_id, prepare, authorize, read, confirm)
+        except _PostReadMovement:
+            count_reopen_work("isolated_read_retries")
+        try:
+            return self._read_isolated(project_id, timeline_id, prepare, authorize, read, confirm)
+        except _PostReadMovement as exc:
+            raise HeadBusyError(*exc.args) from None
+
+    def _read_isolated(self, project_id, timeline_id, prepare, authorize, read, confirm):
+        from .store import TimelineReadSnapshot
+
+        receipt = current_verified_head_receipt.get()
+        if receipt is not None:
+            receipt.pop("live_total_changes_after", None)
+        with ExitStack() as snapshot:
+            with self.store._mutex:
+                prepare()
+                version = self._store_version()
+                if receipt is not None:
+                    receipt.setdefault("live_total_changes_before", version[1])
+                live_connection = self.store.conn
+                owner = self.store._lock_file
+                if owner is None:
+                    raise ProtocolError("accepted commit storage is closed; reopen required")
+                if live_connection.in_transaction:
+                    raise HeadBusyError("timeline read requires a committed view")
+                expected = self._public_head(live_connection, project_id, timeline_id)
+                # The owned live verifier already distinguishes protection
+                # suitable for a full replay from protection suitable for
+                # sharing memo. Keep that policy for the isolated read too.
+                connection = snapshot.enter_context(self.store._read_snapshot(owner_only=False))
+                # BEGIN is deferred. This SELECT pins the committed snapshot
+                # before either the live mutex or the initial SQL fence ends.
+                observed = self._public_head(connection, project_id, timeline_id)
+                pinned_at = self._store_version(allow_reopen=False)
+                if not _same_store_version(version, pinned_at, allow_checkpoint=True) or observed != expected:
+                    raise _head_busy("isolated-read pin", _moved_components(version, pinned_at), _PostReadMovement)
+
+                memo_allowed = self._memo_failure(version) is None
+                if not _same_store_version(self._replay_store_version, version):
+                    self.clear_replay_memo()
+                    self._replay_store_version = version
+                elif not memo_allowed and (self._replay_memo or any(self._history_state.values())):
+                    self.clear_replay_memo()
+                generation = self._replay_generation
+                reader = TimelineCommitStore(
+                    TimelineReadSnapshot(self.store, connection),
+                    validate_prepared=self.validate_prepared, validate_event=self.validate_event,
+                    snapshot_version=version,
+                )
+                reader._replay_store_version = version
+                reader._replay_memo = self._replay_memo.copy()
+                reader._history_state = {name: values.copy() for name, values in self._history_state.items()}
+                # Event prefix lists are the only retained values updated in
+                # place. All other cached values are read-only or replaced.
+                reader._history_state["events"] = {
+                    key: events.copy() for key, events in self._history_state["events"].items()
+                }
+
+            with reader.verification_scope():
+                with reader.history_read_scope():
+                    result = read(reader)
+                memo_fallback = reader._verification.current["memo_fallback"]
+            # Release the SQLite snapshot before reading the live counters.
+            snapshot.close()
+
+            with self.store._mutex:
+                if memo_allowed and memo_fallback:
+                    # Native permissions can recover before this final sample.
+                    # Invalidate the generation that crossed the custody loss
+                    # before a retry can inherit it, even if the head moved.
+                    if generation == self._replay_generation:
+                        self.clear_replay_memo()
+                    raise _head_busy("isolated-read final", "memo custody", _PostReadMovement)
+                if self.store.conn is not live_connection or self.store._lock_file != owner:
+                    raise _head_busy("isolated-read final", "connection or realm owner", _PostReadMovement)
+                authorize()
+                current = self._public_head(live_connection, project_id, timeline_id)
+                # Never hash under the live mutex. The isolated verifier used
+                # the usual digest checks; now require those same files to be
+                # present at the confirmed identities.
+                for object_id in reader._history_state["objects"]:
+                    # Bypass the live index. Only this reader's observed
+                    # identity can confirm the object it actually validated.
+                    identity = dict.get(reader.store.verified_cas, object_id)
+                    if identity is None or reader._cas().current_identity(object_id) != identity:
+                        raise _head_busy("isolated-read final", "verified CAS object")
+                if confirm is not None:
+                    confirm()
+                actual = self._store_version(allow_reopen=False)
+                if receipt is not None:
+                    receipt["live_total_changes_after"] = actual[1]
+                if (not _same_store_version(version, actual, allow_checkpoint=True)
+                        or current != expected or generation != self._replay_generation):
+                    raise _head_busy("isolated-read final", _moved_components(version, actual), _PostReadMovement)
+                memo_still_allowed = self._memo_failure(actual) is None
+                if memo_allowed and not memo_still_allowed:
+                    self.clear_replay_memo()
+                    raise _head_busy("isolated-read final", "memo custody", _PostReadMovement)
+                if memo_allowed and memo_still_allowed:
+                    self._replay_memo = reader._replay_memo
+                    self._history_state = reader._history_state
+                    self._replay_store_version = actual
+                self.store.verified_cas.update(reader.store.verified_cas)
+                return result
+
+    def verified_head(self, project_id, timeline_id, *, verify_selections):
+        inputs = self._history_inputs
+        prefix_scope = (inputs.snapshot_prefixes()
+                        if self._snapshot_version is not None and inputs is not None else nullcontext())
+        with prefix_scope:
+            head, entry = self._head_entry(project_id, timeline_id, selected_head=True)
+        document = self.revision_closure(project_id, timeline_id, head["revision_id"])
+        if entry["intent"] == "recorded" and digest(document) != entry["receipt"]["result"]["document_digest"]:
+            _reject_canonical_head_mismatch()
+        verify_selections(document)
+        return {"project_id": project_id, "timeline_id": timeline_id, "head": head,
+                "canonical_document": document}
+
     @_evaluation
     def head(self, project_id, timeline_id):
         return self._head_entry(project_id, timeline_id)[0]
 
-    def _head_entry(self, project_id, timeline_id):
+    def _head_entry(self, project_id, timeline_id, *, selected_head=False):
         with self.store._mutex:
             self._membership(project_id, timeline_id)
             cached = self._history_state["heads"].get((project_id, timeline_id))
             if cached is not None:
-                return detached(cached), self._history_entry_view(project_id, timeline_id, cached["publication_id"])
+                return detached(cached), self._history_entry_view(
+                    project_id, timeline_id, cached["publication_id"], selected_head=selected_head,
+                )
             row = self.conn.execute("SELECT revision_id, publication_id FROM parent_composition_heads "
                                     "WHERE project_id=? AND timeline_id=?", (project_id, timeline_id)).fetchone()
             if row is None or not row["revision_id"] or not row["publication_id"]:
                 reject("history_unavailable", diagnostic_reason="store_head_missing")
             assert row is not None
-            entry = self._history_entry_view(project_id, timeline_id, row["publication_id"])
+            entry = self._history_entry_view(project_id, timeline_id, row["publication_id"], selected_head=selected_head)
             if entry["revision_id"] != row["revision_id"]:
                 reject("history_unavailable", diagnostic_reason="store_head_revision_mismatch")
             from .timeline_catalog import verify_catalog_tail
@@ -1215,8 +1410,7 @@ class TimelineCommitStore:
                 if catalog:
                     document = self.revision_closure(project_id, timeline_id, row["revision_id"])
                     if entry["intent"] == "recorded" and document != entry["receipt"]["result"]["canonical_document"]:
-                        reject("history_unavailable", "canonical film differs from accepted publication",
-                               diagnostic_reason="store_head_canonical_mismatch")
+                        _reject_canonical_head_mismatch()
                     for shot in document["shot_revisions"]:
                         _shot_projection(self.conn, project_id, shot["shot_id"])
                         _text_bindings(self.conn, project_id, shot, self._read_history_object)
@@ -1244,7 +1438,7 @@ class TimelineCommitStore:
         return detached(entry)
 
     @_evaluation
-    def _history_entry_view(self, project_id, timeline_id, publication_id, *, allow_archived=False):
+    def _history_entry_view(self, project_id, timeline_id, publication_id, *, allow_archived=False, selected_head=False):
         # Internal readers must not mutate this authenticated value. The public
         # store API and RequestCommitPort detach before handing it to a caller.
         with self.store._mutex:
@@ -1261,7 +1455,7 @@ class TimelineCommitStore:
             if cached is not None:
                 row, ledger, entry = cached
                 if row["intent"] == "recorded" or ledger["command_kind"] == "timeline.commit":
-                    self._verify_accepted(ledger, row, allow_archived=allow_archived)
+                    self._verify_accepted(ledger, row, allow_archived=allow_archived, selected_head=selected_head)
                 return entry
             row = self.conn.execute("SELECT * FROM timeline_commit_history WHERE publication_id=? "
                                     "AND project_id=? AND timeline_id=?", (publication_id, project_id, timeline_id)).fetchone()
@@ -1273,7 +1467,7 @@ class TimelineCommitStore:
                 reject("history_unavailable", diagnostic_reason="store_history_ledger_mismatch")
             assert ledger is not None
             if row["intent"] == "recorded" or ledger["command_kind"] == "timeline.commit":
-                self._verify_accepted(ledger, row, allow_archived=allow_archived)
+                self._verify_accepted(ledger, row, allow_archived=allow_archived, selected_head=selected_head)
             previous = None if row["previous_publication_id"] is None else {
                 "revision_id": row["previous_revision_id"], "publication_id": row["previous_publication_id"]}
             records = json.loads(row["records_json"]) if row["records_json"] is not None else None
