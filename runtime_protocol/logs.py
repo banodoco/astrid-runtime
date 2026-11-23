@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import io
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -73,3 +76,52 @@ class RotatingLog(io.TextIOBase):
             finally:
                 if self._file is not None:
                     self._file.close()
+
+
+class CommitStageTimingHandler(logging.Handler):
+    """Write only the structured commit timing payloads to a bounded JSONL file."""
+
+    PREFIX = "runtime.timeline_commit.timing "
+    MAX_RECORD_BYTES = 16 * 1024
+
+    def __init__(self, path):
+        super().__init__(level=logging.INFO)
+        self._log = RotatingLog(path, max_bytes=1024 * 1024, backups=3)
+
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+            if record.name != "runtime_protocol.timeline_commit_execution" or not message.startswith(self.PREFIX):
+                return
+            payload = message[len(self.PREFIX):]
+            encoded = (payload + "\n").encode("utf-8")
+            if len(encoded) > self.MAX_RECORD_BYTES:
+                return
+            # The producer emits JSON, but validate before making this a JSONL sink.
+            json.loads(payload)
+            self._log.write(payload + "\n")
+        except Exception:
+            # Diagnostics must not change the outcome of a commit.
+            return
+
+    def close(self):
+        try:
+            self._log.close()
+        finally:
+            super().close()
+
+
+@contextlib.contextmanager
+def commit_stage_timing_sink(path):
+    """Attach the JSONL sink directly so root logger configuration is irrelevant."""
+    logger = logging.getLogger("runtime_protocol.timeline_commit_execution")
+    previous_level = logger.level
+    handler = CommitStageTimingHandler(path)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+        handler.close()
