@@ -94,6 +94,10 @@ class BootstrapCustodyUncertain(BootstrapError):
         self.controller = controller
 
 
+class BootstrapLockBusy(BootstrapError):
+    """A nonblocking launch request did not acquire the bootstrap mutex."""
+
+
 class StartupObservationLost(BootstrapCustodyUncertain):
     """An assigned startup owner cannot currently be observed."""
 
@@ -738,7 +742,7 @@ def _lock_matches(
 
 
 @contextmanager
-def _bootstrap_mutex(paths: RuntimePaths):
+def _bootstrap_mutex(paths: RuntimePaths, *, blocking: bool = True):
     """Serialize launchers so two clean launches cannot both start a daemon."""
     if runtime_platform.sys.platform == "win32":
         runtime_platform.private_directory(paths.runtime_support)
@@ -752,7 +756,13 @@ def _bootstrap_mutex(paths: RuntimePaths):
             runtime_platform.owner_only(handle.fileno())
         else:
             owner_only(paths.bootstrap_lock_path)
-        runtime_platform.lock_file(handle.fileno())
+        if blocking:
+            runtime_platform.lock_file(handle.fileno())
+        else:
+            try:
+                runtime_platform.lock_file(handle.fileno(), blocking=False)
+            except BlockingIOError as exc:
+                raise BootstrapLockBusy("A Runtime launcher holds the bootstrap mutex.") from exc
         locked = True
         cancellation.check()
         yield
@@ -1007,7 +1017,7 @@ def _capture_requested_identity(source: SourceProfile) -> dict[str, Any]:
         raise BootstrapError("Requested Runtime identity could not be verified.") from exc
 
 
-def _startup_scope(source: SourceProfile, realm_id: str, realm_root: Path):
+def _startup_scope(source: SourceProfile, realm_id: str, realm_root: Path, *, requested_identity=None):
     # A custom command or a different interpreter may run a predecessor that
     # has never participated in the operation handoff. Keep those paths bounded.
     if (not source.runtime_environment or source.runtime_command
@@ -1015,12 +1025,12 @@ def _startup_scope(source: SourceProfile, realm_id: str, realm_root: Path):
         return None
     environment = Path(sys.prefix).stat()
     transport = Path(startup_operation.__file__).stat()
-    # Resolve the installed/profile generation without invoking source
-    # commands from the read-only observer.
+    if requested_identity is None:
+        requested_identity = _capture_requested_identity(source)
     generation = hashlib.sha256(json.dumps([
-        source.digest, environment.st_dev, environment.st_ino,
+        source.digest, requested_identity, environment.st_dev, environment.st_ino,
         transport.st_dev, transport.st_ino, transport.st_mtime_ns,
-    ]).encode()).hexdigest()
+    ], sort_keys=True).encode()).hexdigest()
     return startup_operation.OperationScope.from_selection(realm_id, realm_root, generation)
 
 
@@ -1032,13 +1042,13 @@ def _pending_startup(paths: RuntimePaths):
     return observed if observed is not None and observed.state == "pending" else None
 
 
-def _require_startup_available(paths: RuntimePaths, realm=None, source=None):
+def _require_startup_available(paths: RuntimePaths, realm=None, source=None, *, requested_identity=None):
     pending = _pending_startup(paths)
     if pending is None:
         return
     if realm is not None and source is not None:
         root = _canonical_realm_root(str(realm["data_root"]))
-        scope = _startup_scope(source, str(realm["realm_id"]), root)
+        scope = _startup_scope(source, str(realm["realm_id"]), root, requested_identity=requested_identity)
         if scope == pending.scope:
             observed = startup_operation.read_operation(
                 paths.runtime_support.resolve(), scope=scope, operation_id=pending.operation_id,
@@ -1086,7 +1096,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     realm = _selected_realm(catalog)
     if realm is None:
         raise BootstrapError("No workspace is configured; explicit create or attach is required before up.")
-    _require_startup_available(paths, realm, source)
+    _require_startup_available(paths, realm, source, requested_identity=requested_identity)
     paths.ensure_support_dirs()
     catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
     completed_stop_before_launch = _revoke_completed_stop_before_launch(paths, boundary, realm)
@@ -1222,7 +1232,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         configure(source)
     configure_startup = getattr(boundary, "configure_startup_operation", None)
     if configure_startup is not None:
-        configure_startup(_startup_scope(source, realm_id, realm_root))
+        configure_startup(_startup_scope(source, realm_id, realm_root, requested_identity=requested_identity))
     configure_door = getattr(boundary, "configure_door", None)
     if configure_door is not None:
         # The door acts with the product credential this launcher provisions below.

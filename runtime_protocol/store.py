@@ -1148,12 +1148,19 @@ class RealmStore:
         closing all descendant handles. The daemon's owner.lock remains the
         lifetime lock.
         """
+        coordinated = startup_operation.current_verification(self.root) is not None
         try:
             descriptor = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            platform.lock_file(descriptor)
+            if coordinated:
+                cancellation.check()
+                platform.lock_file(descriptor, blocking=False)
+            else:
+                platform.lock_file(descriptor)
         except BaseException as exc:
             if "descriptor" in locals():
                 os.close(descriptor)
+            if coordinated and isinstance(exc, BlockingIOError):
+                raise OwnerBusyError("another runtime process holds the realm admission fence") from exc
             if not isinstance(exc, OSError):
                 raise
             raise RealmAdmissionError(
