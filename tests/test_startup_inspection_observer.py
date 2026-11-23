@@ -10,6 +10,7 @@ from astrid_runtime.bootstrap import _bootstrap_mutex
 from astrid_runtime.cli import main
 from runtime_protocol import platform, startup_attempt
 from runtime_protocol.startup_operation import read_operation
+from runtime_protocol.store import RealmStore
 
 from tests.test_startup_attempt import (
     REALM_ID,
@@ -202,3 +203,78 @@ def test_windows_creator_pid_requires_an_older_launcher_and_a_current_record(sel
                 assert observed.authorizes_inspection_locked(support)
                 windows.setattr(startup_attempt, "read_attempt", lambda _support: None)
                 assert not observed.authorizes_inspection_locked(support)
+
+
+def test_strict_startup_commands_accept_implicit_configured_selection(selection, capsys):
+    paths, root, config = selection
+    args = ["--require-configured-selection", *_runtime_args(selection)]
+    with workspace.begin_startup_attempt(paths, config=config) as attempt:
+        assert main(["startup-status", *args]) == 0
+        assert json.loads(capsys.readouterr().out) == {
+            "state": "inspecting_workspace", "attempt_id": attempt.attempt_id,
+        }
+        assert main(["workspace", "inspect", "--startup-operation", *args]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert (result["state"], result["realm_id"], result["realm_root"]) == ("configured", REALM_ID, str(root))
+        assert result["inspection"]["state"] == "verified_offline"
+        operation = read_operation(paths.runtime_support)
+        assert operation.owner_pid == os.getpid() and operation.state == "ended"
+
+
+@pytest.mark.parametrize("provided", ["root", "id", "no-catalog"])
+def test_strict_startup_commands_reject_partial_selectors_or_missing_catalog(selection, capsys, provided):
+    paths, root, config = selection
+    args = ["--require-configured-selection", *_runtime_args(selection)]
+    with workspace.begin_startup_attempt(paths, config=config):
+        if provided == "root":
+            args.extend(["--realm-root", str(root)])
+        elif provided == "id":
+            args.extend(["--expected-realm-id", REALM_ID])
+        else:
+            paths.catalog_path.unlink()
+        assert main(["startup-status", *args]) == 1
+        assert json.loads(capsys.readouterr().out) == {"state": "unavailable"}
+        assert main(["workspace", "inspect", "--startup-operation", *args]) == 1
+        refusal = json.loads(capsys.readouterr().out)
+        assert set(refusal) == {"ok", "error"} and refusal["ok"] is False
+        assert read_operation(paths.runtime_support) is None
+
+
+def test_strict_implicit_selection_rejects_a_catalog_swap_during_requests(selection, capsys, monkeypatch):
+    paths, _, config = selection
+    args = ["--require-configured-selection", *_runtime_args(selection)]
+    original_catalog = paths.catalog_path.read_bytes()
+    replacement = paths.realms_dir / "replacement-realm"
+    RealmStore.initialize(replacement, realm_id=replacement.name).close()
+    swapped = json.loads(original_catalog)
+    swapped["selected_realm_id"] = replacement.name
+    swapped["realms"][0].update(realm_id=replacement.name, data_root=str(replacement))
+
+    def swap_after(read):
+        changed = False
+
+        def wrapped(*args, **kwargs):
+            nonlocal changed
+            result = read(*args, **kwargs)
+            if not changed:
+                with _bootstrap_mutex(paths, blocking=False):
+                    paths.catalog_path.write_text(json.dumps(swapped))
+                changed = True
+            return result
+        return wrapped
+
+    with workspace.begin_startup_attempt(paths, config=config):
+        with monkeypatch.context() as status:
+            status.setattr(workspace, "_startup_observation", swap_after(workspace._startup_observation))
+            assert main(["startup-status", *args]) == 1
+            assert json.loads(capsys.readouterr().out) == {"state": "unavailable"}
+            assert json.loads(paths.catalog_path.read_text()) == swapped
+    paths.catalog_path.write_bytes(original_catalog)
+
+    with monkeypatch.context() as inspect:
+        inspect.setattr(workspace, "_pending_inspection", swap_after(workspace._pending_inspection))
+        assert main(["workspace", "inspect", "--startup-operation", *args]) == 1
+        refusal = json.loads(capsys.readouterr().out)
+        assert set(refusal) == {"ok", "error"} and refusal["ok"] is False
+        assert json.loads(paths.catalog_path.read_text()) == swapped
+        assert read_operation(paths.runtime_support) is None
