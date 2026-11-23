@@ -137,7 +137,7 @@ def _read_record(directory):
         raise StartupOperationError("Runtime startup operation record is invalid.") from exc
 
 
-def _owner_birth(pid):
+def _owner_birth(pid, *, expected_birth=None):
     if platform.sys.platform == "darwin":
         # Discovery's legacy ps-lstart representation has only second
         # precision. The local operation binds the kernel's full start time.
@@ -148,6 +148,14 @@ def _owner_birth(pid):
         return f'darwin-creation:{actual["start_sec"]}:{actual["start_usec"]}'
     actual = platform.process_identity(pid)
     if not actual or actual.get("pid") != pid or actual.get("uid") != platform.current_user():
+        if (actual is None and expected_birth is not None
+                and platform.sys.platform.startswith("linux")):
+            # A hidden /proc entry proves absence only when this observer can
+            # compare the recorded owner's boot and PID-namespace coordinates.
+            local = platform.process_identity(os.getpid())
+            if (local is None or not isinstance(local.get("birth_id"), str)
+                    or platform.process_birth_matches(expected_birth, local["birth_id"]) is None):
+                raise StartupOperationError("Runtime startup process identity could not be verified.")
         return None
     return actual.get("birth_id")
 
@@ -170,7 +178,7 @@ def read_operation(support_root, *, scope=None, operation_id=None, fresh=True):
         if (status is None or (scope is not None and scope != status.scope)
                 or (operation_id is not None and operation_id != status.operation_id)):
             return None
-        actual = _owner_birth(status.owner_pid)
+        actual = _owner_birth(status.owner_pid, expected_birth=status.owner_birth)
         if actual is None:
             return None
         matches = platform.process_birth_matches(status.owner_birth, actual)
@@ -181,7 +189,7 @@ def read_operation(support_root, *, scope=None, operation_id=None, fresh=True):
         confirmed = _read_record(directory)
         if confirmed is None or confirmed.owner != status.owner:
             return None
-        actual = _owner_birth(confirmed.owner_pid)
+        actual = _owner_birth(confirmed.owner_pid, expected_birth=confirmed.owner_birth)
         if actual is None:
             return None
         matches = platform.process_birth_matches(confirmed.owner_birth, actual)
