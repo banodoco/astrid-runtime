@@ -30,6 +30,7 @@ from .timeline_commit_validation import detached, digest
 from .timeline_materialization import has_materialization, item_identity, materialization_join, root_identity
 from .timeline_commit_types import CommitFailure
 from .util import canonical_json, new_id, now
+from ._timeline_memo_trace import TimelineMemoTrace
 
 _METADATA = ("source", "label", "rationale", "group_id")
 _PRIVATE_EXECUTION = "_sequential_execution"
@@ -371,6 +372,10 @@ class TimelineCommitStore:
         self._reading = False
         self._read_version_pin = None
         self._acceptance_transaction = False
+        self._memo_trace = None
+        trace_path = os.environ.get("ASTRID_TIMELINE_MEMO_TRACE")
+        if trace_path and snapshot_version is None:
+            self._memo_trace = TimelineMemoTrace(self.store.conn, trace_path)
         if snapshot_version is None:
             value = os.stat(self.store.db_path)
             self._database_identity = (value.st_dev, value.st_ino)
@@ -380,11 +385,28 @@ class TimelineCommitStore:
         self.clear_replay_memo()
 
     def clear_replay_memo(self):
+        trace = getattr(self, "_memo_trace", None)
+        proofs_before = len(getattr(self, "_replay_memo", ())) if trace is not None else None
+        before = None
+        if trace is not None:
+            try:
+                before = self._store_version(allow_reopen=False)
+            except Exception:
+                pass
         with self.store._mutex:
             self._replay_memo.clear()
             self._history_state = {key: {} for key in
                                    ("records", "entries", "closures", "heads", "chains", "chain_tails", "events", "objects")}
             self._replay_generation += 1
+        if trace is not None:
+            try:
+                after = self._store_version(allow_reopen=False)
+            except Exception:
+                after = None
+            trace.boundary("memo_clear", before=before, after=after,
+                           generation=self._replay_generation,
+                           proofs_before=proofs_before)
+            trace.flush()
 
     def _physical_version(self):
         files = []
@@ -673,6 +695,11 @@ class TimelineCommitStore:
         if failure is not None and not current["memo_fallback"]:
             # Keep request-local verification, but never inherit proofs from a
             # previous request when the approved data/code premise fails.
+            if self._memo_trace is not None:
+                self._memo_trace.memo_invalidation(
+                    before=self._replay_store_version, after=version,
+                    reason="memo_premise_failed", generation=self._replay_generation,
+                    proofs_before=len(self._replay_memo))
             self.clear_replay_memo()
             current["memo_fallback"] = True
             _LOGGER.warning("timeline history memo disabled; full verification for this request: %s", failure)
@@ -688,6 +715,10 @@ class TimelineCommitStore:
                 # rollback or any exception discards every provisional value.
                 self._history_state["heads"].clear()
             else:
+                if self._memo_trace is not None:
+                    self._memo_trace.memo_invalidation(
+                        before=previous, after=version, reason="store_version_changed",
+                        generation=self._replay_generation, proofs_before=len(self._replay_memo))
                 self.clear_replay_memo()
             self._replay_store_version = version
         if current["generation"] != self._replay_generation:
@@ -696,6 +727,9 @@ class TimelineCommitStore:
 
     @contextmanager
     def _accepting(self):
+        trace = self._memo_trace
+        had_outer_transaction = bool(self.store.conn.in_transaction)
+        transaction_completed = False
         try:
             with self.store._transaction():
                 # BEGIN IMMEDIATE excludes other SQLite writers. A change
@@ -708,6 +742,9 @@ class TimelineCommitStore:
                 after = self._store_version()
                 if after[2] != before[2]:
                     raise ProtocolError("accepted commit inputs changed during acceptance")
+            if trace is not None:
+                trace.transaction_outcome("savepoint_released" if had_outer_transaction else "committed")
+            transaction_completed = True
             # Sample once after COMMIT and retain that exact sample. Comparing
             # its external-write counter prevents absorbing a writer that won
             # the lock immediately after our own commit. A later writer is
@@ -715,7 +752,11 @@ class TimelineCommitStore:
             committed = self._store_version()
             if committed[2] != after[2]:
                 raise ProtocolError("accepted commit inputs changed during acceptance")
-        except BaseException:
+        except BaseException as exc:
+            if trace is not None:
+                outcome = ("savepoint_released_then_postcheck_failed" if had_outer_transaction else "committed_then_postcheck_failed") if transaction_completed else ("savepoint_rolled_back" if had_outer_transaction else "rolled_back")
+                trace.transaction_outcome(outcome,
+                                          exception_class=type(exc).__name__)
             self.clear_replay_memo()
             raise
         else:

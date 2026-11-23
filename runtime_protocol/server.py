@@ -641,6 +641,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _error(self, exc):
         commits = getattr(self.runtime, "_timeline_commit_store", None)
         if commits is not None:
+            if commits._memo_trace is not None:
+                commits._memo_trace.http_error(self, exc)
+                commits._memo_trace.flush()
             commits.clear_replay_memo()
         if isinstance(exc, RuntimeErrorBase):
             payload = exc.as_dict()
