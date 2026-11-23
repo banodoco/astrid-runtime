@@ -121,6 +121,7 @@ class RequestCommitPort:
         self.__documents = {}
         self.__document_objects = {}
         self.__producers = {}
+        self.__producer_readers = {}
         self.__history_pins = []
         self.__preview = None
         self.__sequential_capture = None
@@ -211,6 +212,7 @@ class RequestCommitPort:
     def close(self):
         self.__closed = True
         self.__sequential_capture = None
+        self.__producer_readers.clear()
         self.__ancestry.clear()
         self.__ancestry_identity = None
 
@@ -485,7 +487,8 @@ class RequestCommitPort:
         def read():
             if request_pin(self.__request) != pin:
                 raise refused("producer_dependency_unavailable", "producer pin was not declared")
-            captured = ProducerReads(self.__service).capture(self.__context, pin)
+            reader = ProducerReads(self.__service)
+            captured = reader._capture_owned(self.__context, pin)
             # Exact ledger retries precede this port; a new key must refuse
             # consumption before the provider tries to replay stale edit guards.
             check_producer_consumption(self.__service.store, pin["task_id"])
@@ -493,11 +496,12 @@ class RequestCommitPort:
             if key in self.__producers and self.__producers[key] != captured:
                 raise refused("producer_attempt_mismatch", "captured producer authority changed")
             self.__producers[key] = captured
+            self.__producer_readers[key] = reader
             return {"pin": captured["pin"]}
         return self._read(read)
 
     def _producer_captures(self, prepared):
-        from .timeline_commit_producer import ProducerReads, request_pin, value_equal
+        from .timeline_commit_producer import request_pin, value_equal
         def read():
             pin = request_pin(self.__request)
             expected = [] if pin is None else [canonical_json(pin)]
@@ -520,8 +524,8 @@ class RequestCommitPort:
                                            self.__request["commands"][1:])
                         or prepared["records"]["undo_of"] or prepared["records"]["restored_from"] is not None):
                     raise refused("producer_dependency_unavailable", "producer authority requires its guard record")
-            for captured in self.__producers.values():
-                current = ProducerReads(self.__service).capture(self.__context, captured["pin"])
+            for key, captured in self.__producers.items():
+                current = self.__producer_readers[key]._capture_owned(self.__context, captured["pin"])
                 if current != captured:
                     raise refused("producer_attempt_mismatch", "captured producer authority changed")
             return list(self.__producers.values())
