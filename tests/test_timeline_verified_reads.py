@@ -88,9 +88,9 @@ def next_request(runtime):
     return request
 
 
-def verified_head_counts(stderr):
+def verified_head_receipts(stderr):
     prefix = "runtime.timeline_commit.verified_head "
-    return [json.loads(line.removeprefix(prefix))["counts"]
+    return [json.loads(line.removeprefix(prefix))
             for line in stderr.splitlines() if line.startswith(prefix)]
 
 
@@ -99,6 +99,7 @@ def test_verified_head_emits_only_opt_in_fixed_counts_to_rotating_log(service, m
     commit(service, body(service))
     commits, _ = service._timeline_commits()
     commits.clear_replay_memo()
+    live_total_changes = service.store.conn.total_changes
     log_path = tmp_path / "runtime.log"
     monkeypatch.delenv("ASTRID_RUNTIME_TIMELINE_DIAGNOSTICS", raising=False)
     requests = []
@@ -124,7 +125,10 @@ def test_verified_head_emits_only_opt_in_fixed_counts_to_rotating_log(service, m
     prefix = "runtime.timeline_commit.verified_head "
     assert all(line.startswith(prefix) for line in lines)
     receipts = [json.loads(line.removeprefix(prefix)) for line in lines]
-    assert all(set(receipt) == {"counts"} for receipt in receipts)
+    assert all(set(receipt) == {"counts", "live_total_changes_before", "live_total_changes_after"}
+               for receipt in receipts)
+    assert all(receipt["live_total_changes_before"] == receipt["live_total_changes_after"] == live_total_changes
+               for receipt in receipts)
     cold, warm, retained_replay = (receipt["counts"] for receipt in receipts)
     assert set(cold) == set(warm) == set(retained_replay) == {
         "document_schema_cache_hits", "document_schema_cache_misses", "document_schema_cache_evictions",
@@ -142,6 +146,25 @@ def test_verified_head_emits_only_opt_in_fixed_counts_to_rotating_log(service, m
     assert retained_replay["selected_record_cache_hits"] == retained_replay["selected_record_replay_attempts"] == 0
 
 
+def test_verified_head_receipt_omits_unobserved_final_live_changes(service, monkeypatch, capsys):
+    provider(service)
+    commit(service, body(service))
+    monkeypatch.setenv("ASTRID_RUNTIME_TIMELINE_DIAGNOSTICS", "1")
+    authorizations = []
+
+    def refuse_final_authorization():
+        authorizations.append(True)
+        if len(authorizations) == 3:
+            raise AuthorizationError("read revoked at final fence")
+
+    with pytest.raises(AuthorizationError, match="read revoked at final fence"):
+        service.get_timeline_verified_head(service.test_project, "main", authorize=refuse_final_authorization)
+    assert len(authorizations) == 3
+    receipt, = verified_head_receipts(capsys.readouterr().err)
+    assert receipt["live_total_changes_before"] == service.store.conn.total_changes
+    assert "live_total_changes_after" not in receipt
+
+
 @pytest.mark.parametrize("append_during_replay", [False, True], ids=["stable", "retry"])
 def test_verified_head_materializes_each_snapshot_prefix_once(service, monkeypatch, capsys, append_during_replay):
     monkeypatch.setenv("ASTRID_RUNTIME_TIMELINE_DIAGNOSTICS", "1")
@@ -150,6 +173,7 @@ def test_verified_head_materializes_each_snapshot_prefix_once(service, monkeypat
     followup = next_request(service)
     commits, _ = service._timeline_commits()
     commits.clear_replay_memo()
+    live_total_changes = service.store.conn.total_changes
     open_snapshot = service.store._read_snapshot
     replay = TimelineCommitStore._verify_accepted_replay
     snapshots = []
@@ -197,7 +221,11 @@ def test_verified_head_materializes_each_snapshot_prefix_once(service, monkeypat
         assert sum(query.startswith("SELECT * FROM timeline_commit_history WHERE publication_id=") for query in queries) > 1
 
     assert len(set(bounds)) == len(snapshots)
-    counts, = verified_head_counts(capsys.readouterr().err)
+    receipt, = verified_head_receipts(capsys.readouterr().err)
+    assert receipt["live_total_changes_before"] == live_total_changes
+    assert receipt["live_total_changes_after"] == service.store.conn.total_changes
+    assert (receipt["live_total_changes_after"] > live_total_changes) == append_during_replay
+    counts = receipt["counts"]
     assert counts["selected_record_verification_attempts"] == len(snapshots)
     assert counts["selected_record_replay_attempts"] == len(snapshots)
     assert counts["isolated_read_retries"] == int(append_during_replay)
