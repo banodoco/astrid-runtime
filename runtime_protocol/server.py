@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import math
+import os
 import re
 import select
 import socket
@@ -1611,9 +1612,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         writes happen afterwards: an unread client must not hold the database
         lock and stall every other request, including health checks.
         """
-        commits = getattr(self.runtime, "_timeline_commit_store", None)
-        memo_trace = getattr(commits, "_memo_trace", None)
-        trace_request_id = memo_trace.request_started(self) if memo_trace is not None else None
+        memo_trace = None
+        trace_request_id = None
         timing = token = None
         wire_started = False
         if self._is_timeline_commit():
@@ -1621,6 +1621,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             timing, token = start_commit_timing()
             timing.begin("handler")
         try:
+            # The timeline store is lazy. Initialize it inside the guarded
+            # request boundary so the first history/commit request is traced
+            # with the same request scope as later requests.
+            if os.environ.get("ASTRID_TIMELINE_MEMO_TRACE") and (
+                    self._is_timeline_commit() or self._is_timeline_history_read()) and callable(
+                    getattr(self.runtime, "_timeline_commits", None)):
+                self.runtime._timeline_commits()
+            commits = getattr(self.runtime, "_timeline_commit_store", None)
+            memo_trace = getattr(commits, "_memo_trace", None)
+            trace_request_id = memo_trace.request_started(self) if memo_trace is not None else None
             self._pending_response = None
             self._pending_file_response = None
             self._prefetched_body = None

@@ -1,8 +1,10 @@
 """Opt-in, bounded provenance for timeline replay-memo diagnostics.
 
 This diagnostic records SQL *attempt shapes* only. It never stores SQL text,
-parameters, exception messages, filesystem paths, or database identities. The
-acceptance wrapper supplies the actual transaction outcome separately.
+parameters, exception messages, or database identities. Its first event carries
+the opt-in process PID and Runtime module path so an isolated diagnostic can
+attest which checkout served the request. The acceptance wrapper supplies the
+actual transaction outcome separately.
 """
 from __future__ import annotations
 
@@ -10,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import traceback
@@ -80,6 +83,11 @@ class TimelineMemoTrace:
         except OSError:
             pass
         connection.set_trace_callback(self._trace)
+        runtime_module = sys.modules.get("runtime_protocol")
+        module_file = getattr(runtime_module, "__file__", None)
+        self._append({"kind": "trace_runtime_source", "pid": os.getpid(),
+                      "module_file": os.path.realpath(module_file) if module_file else None})
+        self.flush()
 
     def _append(self, event):
         with self.lock:
@@ -87,8 +95,9 @@ class TimelineMemoTrace:
                 return
             self.sequence += 1
             if len(self.events) >= _MAX_EVENTS:
-                self.events.pop(0)
-                self.overflow = True
+                dropped = self.events.pop(0)
+                if dropped["seq"] > self.flushed_sequence:
+                    self.overflow = True
             event = {"seq": self.sequence, "monotonic_ns": time.monotonic_ns(), **event}
             self.events.append(event)
 
@@ -145,6 +154,12 @@ class TimelineMemoTrace:
     def rebind_connection(self, connection):
         self.connection_replaced = True
         self.unknown_seen = True
+        previous = self.connection
+        if previous is not connection:
+            try:
+                previous.set_trace_callback(None)
+            except sqlite3.Error:
+                pass
         self.connection = connection
         connection.set_trace_callback(self._trace)
         self._append({"kind": "trace_connection_rebound", "coverage_gap": True,
@@ -173,8 +188,11 @@ class TimelineMemoTrace:
                               "transaction_correlation": "observed" if transaction_id is not None else "unknown",
                               "request_correlation": "observed" if request_id is not None else "unknown"})
             elif tx:
+                transaction_id = self.current_transaction_id
+                if transaction_id is None:
+                    self.unknown_seen = True
                 self._append({"kind": "transaction_statement_attempt", "verb": tx.group(1).upper(),
-                              "caller": _caller(), "transaction_id": self.current_transaction_id,
+                              "caller": _caller(), "transaction_id": transaction_id,
                               "request_id": self.current_request_id})
             elif re.match(r"^\s*(SELECT|PRAGMA|EXPLAIN)\b", sql, re.I):
                 return
