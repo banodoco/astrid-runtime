@@ -231,26 +231,27 @@ def covers(dependencies, read):
 
 def _covers_plain(value):
     """Conservatively admit only shallow, acyclic builtin JSON values."""
-    pending = [(value, 0, False)]
-    active = set()
+    pending = [(value, 0)]
+    seen_containers = set()
     while pending:
-        item, depth, leaving = pending.pop()
-        if leaving:
-            active.remove(id(item))
+        item, depth = pending.pop()
+        item_type = type(item)
+        if (item_type is str or item_type is int or item_type is float
+                or item_type is bool or item_type is type(None)):
             continue
-        if type(item) in (str, int, float, bool, type(None)):
-            continue
-        if type(item) not in (dict, list) or depth >= 32 or id(item) in active:
+        if item_type is not dict and item_type is not list:
             return False
-        active.add(id(item))
-        pending.append((item, depth, True))
-        if type(item) is dict:
+        identity = id(item)
+        if depth >= 32 or identity in seen_containers:
+            return False
+        seen_containers.add(identity)
+        if item_type is dict:
             if any(type(key) is not str for key in item):
                 return False
             children = item.values()
         else:
             children = item
-        pending.extend((child, depth + 1, False) for child in children)
+        pending.extend((child, depth + 1) for child in children)
     return True
 
 

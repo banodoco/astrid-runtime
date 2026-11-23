@@ -15,6 +15,47 @@ def outcome(function):
         return ("raise", type(error), str(error))
 
 
+def test_later_metaclass_equality_is_never_called_after_earlier_match():
+    calls = []
+
+    class RaisesOnTypeEquality(type):
+        def __eq__(cls, other):
+            calls.append((cls, other))
+            raise AssertionError("metaclass equality evaluated")
+
+    class Odd(metaclass=RaisesOnTypeEquality):
+        pass
+
+    read = {"kind": "field", "ref": "parent", "path": ["x"], "state": 1}
+    later = {"kind": "field", "ref": "other", "path": ["x"], "state": Odd()}
+    dependencies = [read, later]
+    assert outcome(lambda: covers(dependencies, read)) == ("return", True)
+    assert outcome(lambda: _CoversIndex(dependencies).covers(read)) == ("return", True)
+    assert calls == []
+
+
+@pytest.mark.parametrize("shared_side", ["dependency", "read"])
+def test_shared_container_dag_falls_back_and_matches_loop(shared_side):
+    read = {"kind": "field", "ref": "parent", "path": ["x"], "state": 1}
+    dependencies = [read]
+    if shared_side == "dependency":
+        shared = {"leaf": []}
+        dependencies.append({"kind": "field", "ref": "other", "path": [],
+                             "state": [shared, shared]})
+    else:
+        shared = {"leaf": []}
+        read["state"] = [shared, shared]
+        dependencies = [{"kind": "field", "ref": "parent", "path": ["x"],
+                         "state": [{"leaf": []}, {"leaf": []}]}]
+    index = _CoversIndex(dependencies)
+    if shared_side == "dependency":
+        assert not index.valid
+    else:
+        assert index.covers(read) is True
+        assert not index.valid
+    assert outcome(lambda: index.covers(read)) == outcome(lambda: covers(dependencies, read))
+
+
 @pytest.mark.parametrize("other_ref", [False, True])
 def test_earlier_nested_equality_is_not_skipped(other_ref):
     read = {"state": {"value": Explodes()}, "kind": "field", "ref": "parent", "path": ["clips"]}
