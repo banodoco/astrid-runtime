@@ -384,6 +384,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return
         try:
             self._prefetched_body = self._read_raw_body(limit)
+            if self._is_timeline_commit():
+                from .timeline_commit_execution import current_commit_timing
+                timing = current_commit_timing()
+                if timing is not None:
+                    timing.set_size("request_body", len(self._prefetched_body))
         except RuntimeErrorBase as exc:
             self._prefetched_body = exc
 
@@ -478,6 +483,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             raise ProtocolError("timeline commit does not accept a query string")
         identity = self._identity("projects:write")
         body = self._commit_body()
+        from .timeline_commit_execution import current_commit_timing
+        timing = current_commit_timing()
+        if timing is not None:
+            timing.set_size("request_json", len(json.dumps(
+                body, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")))
         if body.get("project_id") != project_id or body.get("timeline_id") != timeline_id:
             raise ConflictError("commit project/timeline identity does not match the route")
         key = self._commit_idempotency_key()
@@ -532,6 +543,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
         else:
             encoded = body
+        if self._is_timeline_commit():
+            from .timeline_commit_execution import current_commit_timing
+            timing = current_commit_timing()
+            if timing is not None:
+                timing.set_size("response_body", len(encoded))
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         if self.command != "HEAD":

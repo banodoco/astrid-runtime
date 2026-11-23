@@ -219,14 +219,16 @@ def native_site(boundary, ref, path):
 
 
 def covers(dependencies, read):
-    for dependency in dependencies:
-        if value_equal(dependency, read):
-            return True
-        if dependency["kind"] == "scope" and (
-                dependency["ref"] == "timeline" or dependency["ref"] == read["ref"]
-                and read["path"][:len(dependency["path"])] == dependency["path"]):
-            return True
-    return False
+    from .timeline_commit_execution import measure_covers
+    with measure_covers():
+        for dependency in dependencies:
+            if value_equal(dependency, read):
+                return True
+            if dependency["kind"] == "scope" and (
+                    dependency["ref"] == "timeline" or dependency["ref"] == read["ref"]
+                    and read["path"][:len(dependency["path"])] == dependency["path"]):
+                return True
+        return False
 
 
 def _covers_plain(value):
