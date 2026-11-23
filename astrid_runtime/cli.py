@@ -35,12 +35,12 @@ from .bootstrap import (
 )
 from .io import read_json
 from .loopback_http import urlopen_loopback
-from runtime_protocol import cancellation
+from runtime_protocol import cancellation, startup_operation
 from .paths import DATA_ROOT_ENV, RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary, ForegroundRuntimeBoundary
 from runtime_protocol import platform
 from runtime_protocol import process_control
-from .workspace import configure_workspace, inspect_workspace
+from .workspace import configure_workspace, inspect_workspace, startup_status
 from runtime_protocol.door import DEFAULT_DOOR_PORT, DEFAULT_HOSTED_ORIGIN, exact_https_origin
 from runtime_protocol.errors import ConflictError, RuntimeErrorBase
 from runtime_protocol.upgrade import DEFAULT_UPGRADE_TIMEOUT_SECONDS
@@ -78,6 +78,12 @@ def parser() -> argparse.ArgumentParser:
     _profile_args(connect_cmd)
     status = sub.add_parser("status", help="read runtime discovery and health")
     _read_args(status)
+    startup = sub.add_parser("startup-status", help="observe the selected Runtime startup operation")
+    _read_args(startup)
+    startup.add_argument("--realm-root", type=Path)
+    startup.add_argument("--expected-realm-id")
+    startup.add_argument("--source-manifest", type=Path)
+    startup.add_argument("--operation-id")
     restart_cmd = sub.add_parser("restart", help="restart the selected runtime owner")
     _profile_args(restart_cmd)
     down_cmd = sub.add_parser("down", help="stop the selected runtime owner after lifecycle reconciliation")
@@ -101,6 +107,8 @@ def parser() -> argparse.ArgumentParser:
     _read_args(workspace_inspect)
     workspace_inspect.add_argument("--realm-root", type=Path)
     workspace_inspect.add_argument("--expected-realm-id")
+    workspace_inspect.add_argument("--startup-operation", action="store_true", help="coordinate an installed startup inspection")
+    workspace_inspect.add_argument("--source-manifest", type=Path)
     workspace_create = workspace_sub.add_parser("create", help="create and select a fresh canonical workspace")
     _profile_args(workspace_create)
     workspace_create.add_argument("--realm-root", required=True, type=Path)
@@ -560,7 +568,7 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
             return 1
         _emit({"ok": False, "error": str(exc)}, json_mode=True)
         return 1
-    if args.command not in {"workspace", "doctor", "status", "tasks"}:
+    if args.command not in {"workspace", "doctor", "status", "startup-status", "tasks"}:
         # Any other command may stop or signal the Runtime it manages, so it
         # follows the installed process-control setting from the start.
         try:
@@ -568,6 +576,14 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
         except (ConflictError, OSError) as exc:
             _emit({"ok": False, "error": str(exc)}, json_mode=True)
             return 1
+    if args.command == "startup-status":
+        try:
+            result = startup_status(paths, realm_root=args.realm_root, expected_realm_id=args.expected_realm_id,
+                                    config=_config(args, paths), operation_id=args.operation_id)
+        except (BootstrapError, OSError, ValueError, startup_operation.StartupOperationError):
+            result = {"state": "unavailable"}
+        _emit(result, json_mode=args.json)
+        return 0 if result["state"] != "unavailable" else 1
     if args.command == "workspace":
         try:
             boundary = LocalRuntimeBoundary()
@@ -577,6 +593,8 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
                     boundary,
                     realm_root=args.realm_root,
                     expected_realm_id=args.expected_realm_id,
+                    startup_operation=args.startup_operation,
+                    config=_config(args, paths) if args.startup_operation else None,
                 )
             elif args.workspace_command == "adopt":
                 from .workspace_adopt import adopt_workspace
@@ -593,7 +611,7 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
                 )
             _emit(result, json_mode=args.json)
             return 0 if result.get("ok") else 1
-        except (BootstrapError, RuntimeErrorBase, OSError, ValueError) as exc:
+        except (BootstrapError, RuntimeErrorBase, OSError, ValueError, startup_operation.StartupOperationError) as exc:
             _emit({"ok": False, "error": str(exc)}, json_mode=True)
             return 1
     if args.command == "doctor":
@@ -647,7 +665,11 @@ def main(argv: list[str] | None = None, *, managed_launch: dict | None = None) -
             # import, protocol, filesystem, and OS failures are represented as
             # one structured error with no traceback.  KeyboardInterrupt is a
             # BaseException and intentionally remains interruptible.
-            _emit({"ok": False, "error": str(exc)}, json_mode=True)
+            details = getattr(exc, "details", None)
+            if isinstance(details, dict) and details.get("code") == "startup_pending":
+                _emit({"ok": False, **details}, json_mode=True)
+            else:
+                _emit({"ok": False, "error": str(exc)}, json_mode=True)
             return 1
         _emit_ready(result, json_mode=args.json)
         return 0

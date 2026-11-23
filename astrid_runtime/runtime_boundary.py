@@ -8,11 +8,12 @@ real loopback daemon process and a generated-client-shaped connection.
 from __future__ import annotations
 
 import errno
+from contextlib import nullcontext
 import json
 import uuid
 from runtime_protocol.dirfd import filesystem as os
 from runtime_protocol import platform
-from runtime_protocol import cancellation
+from runtime_protocol import cancellation, startup_operation
 from pathlib import Path
 import stat
 import subprocess
@@ -23,7 +24,7 @@ import urllib.request
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-from .bootstrap import BootstrapCustodyUncertain, BootstrapError, SourceProfile
+from .bootstrap import BootstrapCustodyUncertain, BootstrapError, SourceProfile, StartupObservationLost
 from .loopback_http import urlopen_loopback
 from .custody_broker import (
     ACTIVE_CAPABILITY_NAME,
@@ -184,6 +185,8 @@ class LocalRuntimeBoundary:
         self._bootstrap_credential: str | None = None
         self._detached_pid: int | None = None
         self._door: tuple[Any, Path] | None = None
+        self._operation_scope: startup_operation.OperationScope | None = None
+        self._startup_operation: startup_operation.StartupOperation | None = None
         # Where this start's own lines begin in runtime.log, so a startup failure is reported by its cause.
         self._log_offset = 0
 
@@ -234,6 +237,9 @@ class LocalRuntimeBoundary:
 
     def configure_source(self, source: SourceProfile) -> None:
         self._source = source
+
+    def configure_startup_operation(self, scope: startup_operation.OperationScope | None) -> None:
+        self._operation_scope = scope
 
     def configure_door(self, door, credential_file: Path) -> None:
         """Open the hosted page's browser door (``DoorSettings``, or None) in every daemon this boundary starts."""
@@ -406,6 +412,12 @@ class LocalRuntimeBoundary:
             raise BootstrapError("Runtime realm inspection returned invalid metadata.")
         return report
 
+    def inspect_startup(self, *, realm_root: Path) -> Mapping[str, Any]:
+        """Use the same verifier inside the caller's owned startup operation."""
+        from runtime_protocol.store import RealmStore
+
+        return RealmStore.inspect_realm(realm_root, timeout_seconds=self.admission_timeout_seconds)
+
     def _spawn_runtime(self, argv: list[str], *, support_root: Path, stdout):
         """Publish exact child custody before any admission wait can fail."""
         environment = dict(os.environ)
@@ -484,6 +496,11 @@ class LocalRuntimeBoundary:
         bootstrap_token = os.urandom(32).hex()
         token_file = self._token_file(support_root, bootstrap_token)
         argv = self._argv(source_profile, realm_id=realm_id, realm_root=realm_root, support_root=support_root, display_name=self._display_name, owner_lock=owner_lock, token_file=token_file)
+        operation_id = None
+        self._startup_operation = None
+        if self._operation_scope is not None:
+            operation_id = uuid.uuid4().hex
+            argv += ["--startup-operation", operation_id, self._operation_scope.generation]
         log_path = self._log_path(support_root)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         platform.owner_only(log_path.parent)
@@ -504,6 +521,10 @@ class LocalRuntimeBoundary:
         self._source, self._realm_root, self._support_root, self._realm_id = source_profile, realm_root, support_root, realm_id
         self._bootstrap_credential = bootstrap_token
         try:
+            if operation_id is not None:
+                self._startup_operation = startup_operation.StartupOperation.assign(
+                    support_root, self._operation_scope, operation_id=operation_id, pid=self._process.pid,
+                )
             endpoint = self._wait_endpoint(support_root, self._process)
             discovery = self._read_discovery(support_root)
             identity = default_process_identity(self._process.pid)
@@ -518,6 +539,8 @@ class LocalRuntimeBoundary:
             else:
                 broker.bind_ready_token(expected_pid=self._process.pid, expected_identity=identity)
                 publish_active_capability(support_root / ACTIVE_CAPABILITY_NAME, broker)
+        except StartupObservationLost:
+            raise
         except Exception:
             self._terminate(self._process)
             token_file.unlink(missing_ok=True)
@@ -610,7 +633,13 @@ class LocalRuntimeBoundary:
 
     def _wait_endpoint(self, support_root: Path, process: subprocess.Popen[str]) -> str:
         deadline = time.monotonic() + self.wait_seconds
-        while time.monotonic() < deadline:
+        operation = self._startup_operation
+        ended = False
+        while True:
+            expired = time.monotonic() >= deadline
+            if expired and operation is None:
+                self._terminate(process)
+                raise BootstrapError("Runtime daemon did not become healthy before the bounded startup deadline.")
             cancellation.check()
             if process.poll() is not None:
                 cause = self._startup_failure(self._log_path(support_root), self._log_offset)
@@ -618,26 +647,35 @@ class LocalRuntimeBoundary:
                     f"Runtime daemon exited during startup: {cause} (see {self._log_path(support_root)})." if cause
                     else f"Runtime daemon exited during startup (see {self._log_path(support_root)})."
                 )
+            if expired:
+                try:
+                    observed = operation.snapshot(fresh=False)
+                except startup_operation.StartupOperationError:
+                    observed = None
+                if ended or observed is None or observed.owner_pid != process.pid:
+                    if process.poll() is not None:
+                        # Preserve the daemon's exact refusal on the next iteration.
+                        continue
+                    raise StartupObservationLost(
+                        "Runtime startup observation ended before the owner could be confirmed; support state retained.",
+                        controller=self,
+                    )
+                ended = observed.state == "ended"
+                # The existing handoff margin bounds a terminal status. During
+                # admission a fresh heartbeat is not proof of live custody.
+                deadline = time.monotonic() + STARTUP_WAIT_MARGIN_SECONDS
             discovery = self._read_discovery(support_root)
-            # A support root may still advertise a healthy incumbent while a
-            # replacement candidate is starting.  Never adopt that endpoint:
-            # doing so lets the candidate's rollback clear the incumbent's
-            # discovery and owner marker.  The daemon publishes its own PID
-            # atomically only after realm admission succeeds.
+            # Never adopt an incumbent's endpoint while this child starts.
             try:
                 advertised_pid = int(discovery.get("pid", 0))
             except (TypeError, ValueError):
                 advertised_pid = 0
-            if advertised_pid and advertised_pid != process.pid:
-                cancellation.pause(0.05) if cancellation.active() else time.sleep(0.05)
-                continue
-            endpoint = str(discovery.get("endpoint", ""))
-            if endpoint and self._http_health(endpoint):
-                cancellation.check()
-                return endpoint
+            if (advertised_pid == process.pid or (operation is None and not advertised_pid)):
+                endpoint = str(discovery.get("endpoint", ""))
+                if endpoint and self._http_health(endpoint):
+                    cancellation.check()
+                    return endpoint
             cancellation.pause(0.05) if cancellation.active() else time.sleep(0.05)
-        self._terminate(process)
-        raise BootstrapError("Runtime daemon did not become healthy before the bounded startup deadline.")
 
     @staticmethod
     def _http_status(endpoint: str) -> str | None:
@@ -1241,7 +1279,10 @@ class ForegroundRuntimeBoundary(LocalRuntimeBoundary):
                 services=services, log_directory=self._log_directory, authoring_profile=authoring_profile)
             self.daemon = daemon
             cancellation.check()
-            daemon.start()
+            operation = (startup_operation.StartupOperation.assign(support, self._operation_scope)
+                         if self._operation_scope is not None else None)
+            with operation.produce() if operation is not None else nullcontext():
+                daemon.start()
             cancellation.check()
             identity = default_process_identity(os.getpid())
             if identity is None:

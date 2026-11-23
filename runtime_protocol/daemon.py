@@ -4,7 +4,7 @@ import json
 import hashlib
 from .dirfd import filesystem as os
 from . import platform
-from . import cancellation
+from . import cancellation, startup_operation
 from . import process_control
 import shutil
 import sys
@@ -319,6 +319,7 @@ class RuntimeDaemon:
             self.service = None
             raise ConflictError("migrated realm requires fresh Timeline provider registration before readiness")
         cancellation.check()
+        startup_operation.checkpoint("establishing_service")
         self.service.set_readiness_callback(self._revoke_readiness)
         self.service.set_local_claim_generation_verifier(self._verify_local_claim_generation, actor=WORKER_ACTOR)
         self.catalog.bind_owner(self._catalog_owner_valid)
