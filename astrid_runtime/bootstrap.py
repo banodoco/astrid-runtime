@@ -17,6 +17,7 @@ from pathlib import Path
 import secrets
 import shutil
 import stat
+import sys
 import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Mapping, Protocol, Sequence
@@ -25,7 +26,7 @@ import uuid
 
 from .io import atomic_write_json, owner_only, read_json, remove_file
 from runtime_protocol import platform as runtime_platform
-from runtime_protocol import cancellation
+from runtime_protocol import cancellation, startup_operation
 from runtime_protocol import process_control
 from runtime_protocol.errors import ConflictError
 from .paths import INSTALL_RECORD_OWNER, RuntimePaths, _install_record_path
@@ -91,6 +92,10 @@ class BootstrapCustodyUncertain(BootstrapError):
     def __init__(self, message: str, *, controller: object):
         super().__init__(message)
         self.controller = controller
+
+
+class StartupObservationLost(BootstrapCustodyUncertain):
+    """An assigned startup owner cannot currently be observed."""
 
 
 class LegacyRootCollisionError(BootstrapError):
@@ -935,11 +940,13 @@ def bootstrap(
     collision = _legacy_collision(paths, config.legacy_roots)
     if collision is not None:
         raise LegacyRootCollisionError(LEGACY_NEXT_ACTION.format(legacy_root=collision))
-    if _selected_realm(_read_catalog(paths)) is None:
+    realm = _selected_realm(_read_catalog(paths))
+    if realm is None:
         raise BootstrapError(
             "No workspace is configured; run astrid-runtime workspace create or workspace attach."
         )
-    config.resolve_source_profile(paths)
+    source = config.resolve_source_profile(paths)
+    _require_startup_available(paths, realm, source)
     with _bootstrap_mutex(paths):
         return _bootstrap_locked(paths, boundary, config)
 
@@ -1000,6 +1007,50 @@ def _capture_requested_identity(source: SourceProfile) -> dict[str, Any]:
         raise BootstrapError("Requested Runtime identity could not be verified.") from exc
 
 
+def _startup_scope(source: SourceProfile, realm_id: str, realm_root: Path):
+    # A custom command or a different interpreter may run a predecessor that
+    # has never participated in the operation handoff. Keep those paths bounded.
+    if (not source.runtime_environment or source.runtime_command
+            or Path(source.runtime_environment).resolve() != Path(sys.prefix).resolve()):
+        return None
+    environment = Path(sys.prefix).stat()
+    transport = Path(startup_operation.__file__).stat()
+    # Resolve the installed/profile generation without invoking source
+    # commands from the read-only observer.
+    generation = hashlib.sha256(json.dumps([
+        source.digest, environment.st_dev, environment.st_ino,
+        transport.st_dev, transport.st_ino, transport.st_mtime_ns,
+    ]).encode()).hexdigest()
+    return startup_operation.OperationScope.from_selection(realm_id, realm_root, generation)
+
+
+def _pending_startup(paths: RuntimePaths):
+    try:
+        observed = startup_operation.read_operation(paths.runtime_support.resolve(), fresh=False)
+    except (OSError, startup_operation.StartupOperationError) as exc:
+        raise BootstrapError("Runtime startup ownership could not be verified.") from exc
+    return observed if observed is not None and observed.state == "pending" else None
+
+
+def _require_startup_available(paths: RuntimePaths, realm=None, source=None):
+    pending = _pending_startup(paths)
+    if pending is None:
+        return
+    if realm is not None and source is not None:
+        root = _canonical_realm_root(str(realm["data_root"]))
+        scope = _startup_scope(source, str(realm["realm_id"]), root)
+        if scope == pending.scope:
+            observed = startup_operation.read_operation(
+                paths.runtime_support.resolve(), scope=scope, operation_id=pending.operation_id,
+            )
+            if observed is not None and observed.state == "pending":
+                raise BootstrapError(
+                    "Runtime startup is already in progress; observe it with astrid-runtime startup-status.",
+                    details={"code": "startup_pending", **observed.as_observation()},
+                )
+    raise DuplicateOwnerError("A Runtime startup operation already owns this installation.")
+
+
 def _validated_matching_owner_identity(
     owner_health: Any,
     *,
@@ -1031,12 +1082,13 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     if collision is not None:
         raise LegacyRootCollisionError(LEGACY_NEXT_ACTION.format(legacy_root=collision))
 
-    paths.ensure_support_dirs()
     catalog = _read_catalog(paths)
-    catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
     realm = _selected_realm(catalog)
     if realm is None:
         raise BootstrapError("No workspace is configured; explicit create or attach is required before up.")
+    _require_startup_available(paths, realm, source)
+    paths.ensure_support_dirs()
+    catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
     completed_stop_before_launch = _revoke_completed_stop_before_launch(paths, boundary, realm)
 
     def rollback_failed(**kwargs) -> None:
@@ -1168,6 +1220,9 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     configure = getattr(boundary, "configure_source", None)
     if configure is not None:
         configure(source)
+    configure_startup = getattr(boundary, "configure_startup_operation", None)
+    if configure_startup is not None:
+        configure_startup(_startup_scope(source, realm_id, realm_root))
     configure_door = getattr(boundary, "configure_door", None)
     if configure_door is not None:
         # The door acts with the product credential this launcher provisions below.
@@ -1185,6 +1240,10 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             owner_lock=paths.instance_lock_path,
             source_profile=source,
         )
+    except StartupObservationLost:
+        # The exact pending owner remains responsible for admission. A lost
+        # observation does not authorize stopping or rolling back its state.
+        raise
     except Exception:
         rollback_failed(realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
         raise
@@ -2567,6 +2626,7 @@ def _interrupt_owner(
     """Serialize owner validation, the lifecycle fence and manager callback."""
     _preflight_owner_interruption(paths, restore_selection=restore_selection)
     with _bootstrap_mutex(paths):
+        _require_startup_available(paths)
         return _interrupt_owner_locked(
             paths, boundary, stop_manager=stop_manager,
             pre_stop_manager=pre_stop_manager,
@@ -2772,6 +2832,7 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     _validate_support_paths(paths)
     _preflight_owner_interruption(paths)
     with _bootstrap_mutex(paths):
+        _require_startup_available(paths)
         _interrupt_owner_locked(paths, boundary)
         result = _bootstrap_locked(paths, boundary, config)
     return replace(result, status="restarted")

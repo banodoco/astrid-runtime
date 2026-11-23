@@ -12,6 +12,9 @@ from .bootstrap import (
     BootstrapError,
     RuntimeBoundary,
     _bootstrap_mutex,
+    _pending_startup,
+    _realm_owner_present,
+    _startup_scope,
     _commit_source_profile_metadata,
     _has_symlink_component,
     _new_realm_id,
@@ -21,7 +24,7 @@ from .bootstrap import (
     _validate_support_paths,
 )
 from .paths import RuntimePaths
-from runtime_protocol import process_control as process_control_setting
+from runtime_protocol import process_control as process_control_setting, startup_operation
 
 
 def _root(value: str | Path, *, must_exist: bool, empty: bool = False) -> Path:
@@ -52,8 +55,8 @@ def _opaque_realm_id(value: str | None, *, generate: bool) -> str:
     return candidate
 
 
-def _inspect(boundary: RuntimeBoundary, root: Path) -> tuple[str, dict[str, Any]]:
-    inspect = getattr(boundary, "inspect", None)
+def _inspect(boundary: RuntimeBoundary, root: Path, *, startup=False) -> tuple[str, dict[str, Any]]:
+    inspect = getattr(boundary, "inspect_startup" if startup else "inspect", None)
     if not callable(inspect):
         raise BootstrapError("runtime boundary cannot inspect a canonical realm")
     report = inspect(realm_root=root)
@@ -94,8 +97,12 @@ def inspect_workspace(
     *,
     realm_root: str | Path | None = None,
     expected_realm_id: str | None = None,
+    startup_operation: bool = False,
+    config: BootstrapConfig | None = None,
 ) -> dict[str, Any]:
-    """Observe configured or candidate identity without creating support state."""
+    """Inspect canonical identity, optionally owning a managed startup scan."""
+    if startup_operation:
+        return _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, config)
     _validate_support_paths(paths)
     configured = _selected_realm(_read_catalog(paths))
     if realm_root is None:
@@ -124,6 +131,96 @@ def inspect_workspace(
         "ok": True,
         "state": "configured" if configured is not None else "inspectable",
         "realm_id": observed,
+        "realm_root": str(root),
+        "effects": ["observe"],
+        "inspection": report,
+    }
+
+
+def _startup_selection(paths, realm_root, expected_realm_id, config):
+    _validate_support_paths(paths)
+    configured = _selected_realm(_read_catalog(paths))
+    if realm_root is None and configured is None:
+        return None
+    root = _root(realm_root if realm_root is not None else configured["data_root"], must_exist=True)
+    if expected_realm_id is None and configured is not None:
+        expected_realm_id = configured["realm_id"]
+    expected = _opaque_realm_id(expected_realm_id, generate=False)
+    if configured is not None and (expected != configured["realm_id"] or root != Path(configured["data_root"])):
+        raise BootstrapError("candidate conflicts with the configured workspace")
+    config = config or BootstrapConfig()
+    source = config.resolve_source_profile(paths)
+    _validate_source_profile(source, expected_profile=config.profile)
+    scope = _startup_scope(source, expected, root)
+    if scope is None:
+        raise BootstrapError("Runtime startup operations require the selected installed Runtime environment.")
+    return configured, root, expected, scope
+
+
+def _startup_observation(paths, scope, operation_id=None):
+    return startup_operation.read_operation(
+        paths.runtime_support.resolve(), scope=scope, operation_id=operation_id,
+    )
+
+
+def startup_status(paths, *, realm_root=None, expected_realm_id=None, config=None, operation_id=None):
+    """Read status for the selected identity without opening the realm or listener."""
+    selection = _startup_selection(paths, realm_root, expected_realm_id, config)
+    if selection is not None:
+        _, root, expected, scope = selection
+        observed = _startup_observation(paths, scope, operation_id)
+        if observed is not None and scope == startup_operation.OperationScope.from_selection(
+            expected, root, scope.generation,
+        ):
+            return observed.as_observation()
+    return {"state": "unavailable"}
+
+
+def _pending_inspection(paths, scope):
+    pending = _pending_startup(paths)
+    if pending is None:
+        return None
+    observed = _startup_observation(paths, scope, pending.operation_id)
+    if observed is None or observed.state != "pending":
+        raise BootstrapError("A Runtime startup operation already owns this installation.")
+    return {"ok": False, "state": "startup_pending", "startup_operation": observed.as_observation()}
+
+
+def _inspect_startup_workspace(paths, boundary, realm_root, expected_realm_id, config):
+    from runtime_protocol.store import realm_admission_fence
+
+    selection = _startup_selection(paths, realm_root, expected_realm_id, config)
+    if selection is None:
+        return {"ok": False, "state": "workspace_missing", "effects": ["observe"]}
+    _, _, _, scope = selection
+    pending = _pending_inspection(paths, scope)
+    if pending is not None:
+        return pending
+    with _bootstrap_mutex(paths):
+        current = _startup_selection(paths, realm_root, expected_realm_id, config)
+        if current is None or current[3] != scope:
+            raise BootstrapError("Workspace selection changed during startup inspection.")
+        configured, root, expected, _ = current
+        pending = _pending_inspection(paths, scope)
+        if pending is not None:
+            return pending
+        report = _live_owner_inspection(paths, boundary, root, expected)
+        if report is None:
+            try:
+                with realm_admission_fence(root, blocking=False):
+                    if _realm_owner_present(root):
+                        raise BootstrapError("A different Runtime owner is active for this realm.")
+                    operation = startup_operation.StartupOperation.assign(paths.runtime_support.resolve(), scope)
+                    with operation.produce():
+                        observed, report = _inspect(boundary, root, startup=True)
+                        if observed != expected:
+                            raise BootstrapError(f"workspace identity mismatch: expected {expected}, observed {observed}")
+            except BlockingIOError as exc:
+                raise BootstrapError("A Runtime owner is inspecting this realm.") from exc
+    return {
+        "ok": True,
+        "state": "configured" if configured is not None else "inspectable",
+        "realm_id": expected,
         "realm_root": str(root),
         "effects": ["observe"],
         "inspection": report,
@@ -163,6 +260,8 @@ def configure_workspace(
             raise BootstrapError(f"workspace identity mismatch: expected {requested}, observed {observed}")
 
     with _bootstrap_mutex(paths):
+        if _pending_startup(paths) is not None:
+            raise BootstrapError("A Runtime startup operation already owns this installation.")
         paths.ensure_support_dirs()
         existing = _selected_realm(_read_catalog(paths))
         if existing is not None:

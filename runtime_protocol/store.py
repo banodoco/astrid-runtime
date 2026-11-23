@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from . import platform
-from . import cancellation
+from . import cancellation, startup_operation
 from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
 from .cas import ContentAddressedStore
@@ -1287,12 +1287,13 @@ class RealmStore:
             with destination.open("wb") as target:
                 while True:
                     cancellation.check()
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError("realm inspection timed out")
                     block = os.read(source_fd, 1024 * 1024)
                     if not block:
                         break
                     target.write(block)
+                    startup_operation.checkpoint()
         finally:
             os.close(source_fd)
 
@@ -1314,7 +1315,10 @@ class RealmStore:
         db_path = root / "realm.sqlite3"
         if timeout_seconds <= 0:
             return cls._integrity_not_checked(timeout_seconds)
-        deadline = time.monotonic() + timeout_seconds
+        operation = startup_operation.current_verification(root)
+        deadline = None if operation is not None else time.monotonic() + timeout_seconds
+        if operation is not None:
+            operation.progress("checking_realm")
         candidates = [db_path, *(Path(str(db_path) + suffix) for suffix in ("-wal", "-shm", "-journal"))]
         if not db_path.exists() and not db_path.is_symlink():
             if any(path.exists() or path.is_symlink() for path in candidates[1:]):
@@ -1347,7 +1351,8 @@ class RealmStore:
                         actual = None
                     if actual != expected:
                         raise OSError(f"realm SQLite component changed during inspection: {path.name}")
-                connection = sqlite3.connect(snapshot_root / "realm.sqlite3", timeout=max(0.001, deadline - time.monotonic()))
+                remaining = timeout_seconds if deadline is None else max(0.001, deadline - time.monotonic())
+                connection = sqlite3.connect(snapshot_root / "realm.sqlite3", timeout=remaining)
                 connection.row_factory = sqlite3.Row
                 inspector = object.__new__(cls)
                 inspector.root = root
@@ -1362,9 +1367,10 @@ class RealmStore:
                     admission_state["owner_active"] = cls._owner_is_locked(root)
                 try:
                     connection.execute("PRAGMA query_only=ON")
+                    remaining = timeout_seconds if deadline is None else max(0.001, deadline - time.monotonic())
                     return inspector.integrity_report(
                         catalog_path=catalog_path,
-                        timeout_seconds=max(0.001, deadline - time.monotonic()),
+                        timeout_seconds=remaining,
                         deep=deep,
                         admission_state=admission_state,
                     )
@@ -6911,13 +6917,23 @@ class RealmStore:
         """Return a bounded report even when SQLite metadata is malformed."""
         if timeout_seconds <= 0:
             return self._integrity_not_checked(timeout_seconds)
-        deadline = time.monotonic() + timeout_seconds
+        operation = startup_operation.current_verification(self.root)
+        deadline = None if operation is not None else time.monotonic() + timeout_seconds
         timed_out = False
+        observation_error = None
 
         def progress():
-            nonlocal timed_out
-            timed_out = time.monotonic() >= deadline
-            return 1 if timed_out or cancellation.requested() else 0
+            nonlocal timed_out, observation_error
+            timed_out = deadline is not None and time.monotonic() >= deadline
+            if timed_out or cancellation.requested():
+                return 1
+            if operation is not None:
+                try:
+                    operation.progress()
+                except startup_operation.StartupOperationError as exc:
+                    observation_error = exc
+                    return 1
+            return 0
 
         with self._mutex:
             self.conn.set_progress_handler(progress, 1000)
@@ -6925,11 +6941,15 @@ class RealmStore:
                 cancellation.check()
                 result = self._integrity_report(catalog_path=catalog_path, deadline=deadline, deep=deep, admission_state=admission_state)
                 cancellation.check()
+                if observation_error is not None:
+                    raise observation_error
                 return result
             except TimeoutError as exc:
                 return self._integrity_not_checked(timeout_seconds, str(exc))
             except (sqlite3.DatabaseError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
                 cancellation.check()
+                if observation_error is not None:
+                    raise observation_error from exc
                 if timed_out:
                     return self._integrity_not_checked(timeout_seconds, str(exc))
                 return self._integrity_failure("timeout" if timed_out else "malformed", str(exc))
@@ -7022,7 +7042,9 @@ class RealmStore:
         reachable = {str(row[0]) for row in objects}
         missing = []
         corrupt = []
-        for object_row in objects if run_deep else ():
+        if run_deep:
+            startup_operation.checkpoint("checking_objects")
+        for checked, object_row in enumerate(objects if run_deep else (), 1):
             digest = str(object_row["digest"])
             try:
                 actual = self._cas_digest(digest, deadline=deadline)
@@ -7031,7 +7053,9 @@ class RealmStore:
                 raise
             except OSError:
                 missing.append(digest)
+                startup_operation.checkpoint(objects_checked=checked)
                 continue
+            startup_operation.checkpoint(objects_checked=checked)
             if actual != digest or actual_size != int(object_row["size"]):
                 corrupt.append({
                     "digest": digest,
@@ -7042,6 +7066,7 @@ class RealmStore:
                 })
         orphaned = self._cas_orphans(reachable, deadline=deadline) if run_deep else []
         cas_ok = not missing and not corrupt
+        startup_operation.checkpoint("checking_history")
         event_errors = []
         if run_deep and {"runs", "events"}.issubset(actual_tables):
             for run in self.conn.execute("SELECT id FROM runs"):
@@ -7602,6 +7627,7 @@ class RealmStore:
                     if not block:
                         return digest_value.hexdigest()
                     digest_value.update(block)
+                    startup_operation.checkpoint()
             finally:
                 os.close(fd)
 
@@ -7621,6 +7647,7 @@ class RealmStore:
                 if not block:
                     return digest_value.hexdigest()
                 digest_value.update(block)
+                startup_operation.checkpoint()
 
     def _cas_size(self, digest):
         """Read the verified CAS entry size without following a link."""
@@ -7682,6 +7709,7 @@ class RealmStore:
                         digest = prefix + name
                         if stat.S_ISREG(item.st_mode) and digest not in reachable:
                             orphaned.append(digest)
+                        startup_operation.checkpoint()
                 finally:
                     os.close(prefix_fd)
             return sorted(orphaned)
@@ -7696,6 +7724,7 @@ class RealmStore:
                     digest = path.parent.name + path.name
                     if digest not in reachable:
                         orphaned.append(digest)
+                startup_operation.checkpoint()
         return sorted(orphaned)
 
     def _catalog_check(self, path):

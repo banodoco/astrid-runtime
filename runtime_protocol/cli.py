@@ -5,7 +5,7 @@ import contextlib
 import json
 import math
 import os
-from . import platform
+from . import platform, startup_operation
 import sqlite3
 import shutil
 import time
@@ -59,6 +59,7 @@ def _parser():
     start.add_argument("--installed-pack-root", help="absolute installed pack collection; defaults to ~/Astrid/packs, where `astrid packs install` writes")
     start.add_argument("--bootstrap-token-file")
     start.add_argument("--admission-timeout", type=float, help="bounded startup integrity budget in seconds")
+    start.add_argument("--startup-operation", nargs=2, help=argparse.SUPPRESS)
     start.add_argument("--worker-profile", help="absolute installed local Worker composition profile")
     start.add_argument("--service-declaration", help="absolute profile service declaration")
     start.add_argument("--service-python", help="declaring environment's installed Python")
@@ -397,6 +398,17 @@ def _main(args):
         print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
         return 0
     try:
+        operation = None
+        if args.startup_operation is not None:
+            support = Path(args.support_root) if args.support_root else None
+            if (support is None or not support.is_absolute() or support.name != "runtime"
+                    or not args.realm_id or Path(args.owner_lock or "") != support / "instance.lock"):
+                raise startup_operation.StartupOperationError("Runtime startup operation has no canonical support binding.")
+            operation_id, generation = args.startup_operation
+            scope = startup_operation.OperationScope.from_selection(args.realm_id, Path(args.root), generation)
+            operation = startup_operation.StartupOperation.attach(
+                support, scope, operation_id, timeout=_positive_admission_seconds(args.admission_timeout),
+            )
         runtime_checkout = args.runtime_checkout
         agent_checkout = args.agent_checkout
         if agent_checkout is None and args.service_source_checkout:
@@ -450,7 +462,9 @@ def _main(args):
             agent_checkout=agent_checkout,
             authoring_profile=args.authoring_profile,
             installed_pack_root=args.installed_pack_root,
-        ).start()
+        )
+        with operation.produce() if operation is not None else contextlib.nullcontext():
+            daemon.start()
     except KeyboardInterrupt:
         raise
     except Exception as exc:
