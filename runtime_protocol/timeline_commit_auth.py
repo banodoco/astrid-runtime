@@ -229,6 +229,94 @@ def covers(dependencies, read):
     return False
 
 
+def _covers_plain(value):
+    """Conservatively admit only shallow, acyclic builtin JSON values."""
+    pending = [(value, 0, False)]
+    active = set()
+    while pending:
+        item, depth, leaving = pending.pop()
+        if leaving:
+            active.remove(id(item))
+            continue
+        if type(item) in (str, int, float, bool, type(None)):
+            continue
+        if type(item) not in (dict, list) or depth >= 32 or id(item) in active:
+            return False
+        active.add(id(item))
+        pending.append((item, depth, True))
+        if type(item) is dict:
+            if any(type(key) is not str for key in item):
+                return False
+            children = item.values()
+        else:
+            children = item
+        pending.extend((child, depth + 1, False) for child in children)
+    return True
+
+
+def _covers_key(value):
+    if (type(value) is not dict or type(value.get("kind")) is not str
+            or type(value.get("ref")) is not str or type(value.get("path")) is not list
+            or any(type(part) is not str for part in value["path"])):
+        return None
+    return value["kind"], value["ref"], tuple(value["path"])
+
+
+class _CoversIndex:
+    """Per-step filter; original equality still decides in dependency order."""
+    def __init__(self, dependencies):
+        self.dependencies = dependencies
+        self.exact = {}
+        self.scopes = {}
+        self.valid = type(dependencies) is list
+        if not self.valid:
+            return
+        for position, dependency in enumerate(dependencies):
+            if not _covers_plain(dependency):
+                self.valid = False
+                return
+            key = _covers_key(dependency)
+            if key is None:
+                self.valid = False
+                return
+            self.exact.setdefault(key, []).append(position)
+            if key[0] == "scope":
+                self.scopes.setdefault(key[1], []).append(position)
+
+    def covers(self, read):
+        if type(self.dependencies) is list and not self.dependencies:
+            return False
+        plain = _covers_plain(read)
+        if not plain:
+            self.valid = False
+        key = _covers_key(read) if plain else None
+        if not self.valid or key is None:
+            for dependency in self.dependencies:
+                if value_equal(dependency, read):
+                    return True
+                if dependency["kind"] == "scope" and (
+                        dependency["ref"] == "timeline" or dependency["ref"] == read["ref"]
+                        and read["path"][:len(dependency["path"])] == dependency["path"]):
+                    return True
+            return False
+        positions = set(self.exact.get(key, ()))
+        for position in self.scopes.get("timeline", ()):
+            positions.add(position)
+        for position in self.scopes.get(key[1], ()):
+            path = self.dependencies[position]["path"]
+            if read["path"][:len(path)] == path:
+                positions.add(position)
+        for position in sorted(positions):
+            dependency = self.dependencies[position]
+            if value_equal(dependency, read):
+                return True
+            if dependency["kind"] == "scope" and (
+                    dependency["ref"] == "timeline" or dependency["ref"] == read["ref"]
+                    and read["path"][:len(dependency["path"])] == dependency["path"]):
+                return True
+        return False
+
+
 def native_asset_reads(payload):
     """Lossless field guards for the native parent asset storage shape.
 
@@ -390,13 +478,21 @@ def validate_step(request, records, step, boundary, batch_reads, continuations, 
                   inverse_boundaries=None, created_inputs=None):
     submitted = next((item for item in request.get("steps", []) if item["id"] == step["id"]), None)
     dependencies = step["dependencies"]
+    coverage = None
+
+    def step_covers(read):
+        nonlocal coverage
+        if coverage is None:
+            coverage = _CoversIndex(dependencies)
+        return coverage.covers(read)
+
     step_reads = []
     for read in (submitted or {}).get("reads", []):
         if sequential is not None and "binding_pairs" in sequential:
             _, read = _sequential_assertion(read, step["command_ordinals"][:1], sequential, "dependency")
         step_reads.append(validate_read(boundary, read, continuations))
     for read in [*batch_reads, *step_reads]:
-        require(covers(dependencies, read), "provider dependency union omits a declared read")
+        require(step_covers(read), "provider dependency union omits a declared read")
     for ordinal in step["command_ordinals"]:
         record = records["commands"][ordinal]
         command_boundary = (command_inputs or {}).get(ordinal, boundary)
@@ -425,13 +521,13 @@ def validate_step(request, records, step, boundary, batch_reads, continuations, 
                         and restorations[0]["after"].get("value", {}).get("occurrence_id")
                         == owner.removeprefix("occurrence:"),
                         "inverse child read lacks its authenticated absent restoration owner")
-                require(covers(dependencies, {"kind": "field", "ref": "parent", "path": owner_path,
+                require(step_covers({"kind": "field", "ref": "parent", "path": owner_path,
                                               "state": {"state": "absent"}}),
                         "provider dependency union omits a restored owner's input absence")
                 continue
             if read["ref"] == "parent/collection:asset" and not read["path"]:
                 for capture in native_asset_reads(command_boundary["parent"]["payload"]):
-                    require(covers(dependencies, capture), "provider dependency union omits a captured read")
+                    require(step_covers(capture), "provider dependency union omits a captured read")
                 continue
             read_boundary = (created_boundary if created_boundary is not None
                              and created_child
@@ -441,7 +537,7 @@ def validate_step(request, records, step, boundary, batch_reads, continuations, 
                 # A same-command child has no pre-command physical image. Its
                 # root/write/link closure is staged above, while the recorder
                 # retains the exact pre-command parent scope as its dependency.
-                require(covers(dependencies, {"kind": "scope", "ref": "parent", "path": []}),
+                require(step_covers({"kind": "scope", "ref": "parent", "path": []}),
                         "provider dependency union omits a created child input parent")
                 continue
             if ref == "timeline" or not path or "/collection:" in read["ref"]:
@@ -459,10 +555,10 @@ def validate_step(request, records, step, boundary, batch_reads, continuations, 
                                    "members": sorted(members), "order": members}
             else:
                 capture = {"kind": "field", "ref": ref, "path": path, "state": read["state"]}
-            require(covers(dependencies, capture), "provider dependency union omits a captured read")
+            require(step_covers(capture), "provider dependency union omits a captured read")
         for binding in record["bindings"]:
             if "dependency" in binding:
-                require(covers(dependencies, binding["dependency"]), "provider dependency union omits a bound read")
+                require(step_covers(binding["dependency"]), "provider dependency union omits a bound read")
     assertions = (submitted or {}).get("patch", [])
     calls = [request["commands"][ordinal] for ordinal in step["command_ordinals"]]
     patches = [change for call in calls if call["op"] == "doc.patch" for change in call["args"]["changes"]]
@@ -3422,8 +3518,11 @@ def validate(request, prepared, source, base=None, continuations=None, history=N
                     continuations.setdefault(binding["physical_ref"], set()).add(binding["successor"])
         boundary = output
     for step in records["steps"]:
+        if not touched:
+            continue
+        coverage = _CoversIndex(step["dependencies"])
         for ref in touched:
-            require(covers(step["dependencies"], {"kind": "scope", "ref": ref, "path": []}),
+            require(coverage.covers({"kind": "scope", "ref": ref, "path": []}),
                     "provider atomic dependency union omits a touched scope")
     # Materialization can reuse a historical parent revision with these exact
     # bytes. Step bindings still name the projected execution image above;
