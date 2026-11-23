@@ -129,6 +129,7 @@ class ProducerReads:
         self.service = service
         self.store = service.store
         self.conn = service.store.conn
+        self.__owned_memo = None
 
     def _output(self, task, attempt, project, output, *, read_bytes=False):
         matches = [item for item in self.store.list_managed_outputs(task["id"])
@@ -222,6 +223,13 @@ class ProducerReads:
         return {"admission": dict(admission), "snapshot": snapshot, "associations": captures}
 
     def capture(self, context, pin):
+        return self._capture(context, pin, False)
+
+    def _capture_owned(self, context, pin):
+        """Capture for a port that retains the context and returned pin privately."""
+        return self._capture(context, pin, True)
+
+    def _capture(self, context, pin, owned):
         validate_pin(pin)
         request = context["request"]
         target = pin["admitted_target"]
@@ -255,33 +263,44 @@ class ProducerReads:
                 raise _unavailable()
             output = matches[0]
             raw, association = self._output(task, attempt, request["project_id"], output, read_bytes=True)
-            proposal = _strict_json(raw)
-            if (not isinstance(proposal, dict) or set(proposal) != {
-                    "schema_version", "producer", "admitted_target", "commands", "rationale", "proposal_digest"}
-                    or type(proposal["schema_version"]) is not int or proposal["schema_version"] != 1
-                    or not isinstance(proposal["producer"], dict) or set(proposal["producer"]) != _PRODUCER
-                    or not isinstance(proposal["commands"], list) or not proposal["commands"]
-                    or not isinstance(proposal["rationale"], str)):
-                raise _mismatch()
-            derived = {**proposal["producer"], "admitted_target": proposal["admitted_target"],
-                       "proposal_digest": proposal["proposal_digest"]}
-            validate_pin(derived)
-            unsigned = {key: value for key, value in proposal.items() if key != "proposal_digest"}
-            encoded = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
-            if (derived != pin or "sha256:" + hashlib.sha256(encoded).hexdigest() != pin["proposal_digest"]
-                    or request_pin(request) != pin
-                    or not value_equal(request["commands"][1:], proposal["commands"])
-                    or not value_equal(request.get("rationale"), proposal["rationale"])):
-                raise _mismatch()
+            memo = self.__owned_memo if owned else None
+            # The port owns both the context and returned pin. Exact artifact
+            # bytes allow reuse only for those same private objects; all live
+            # producer and CAS checks still run on each capture.
+            memo_hit = memo is not None and context is memo[0] and pin is memo[1] and raw == memo[2]
+            if memo_hit:
+                proposal = memo[3]
+            else:
+                proposal = _strict_json(raw)
+                if (not isinstance(proposal, dict) or set(proposal) != {
+                        "schema_version", "producer", "admitted_target", "commands", "rationale", "proposal_digest"}
+                        or type(proposal["schema_version"]) is not int or proposal["schema_version"] != 1
+                        or not isinstance(proposal["producer"], dict) or set(proposal["producer"]) != _PRODUCER
+                        or not isinstance(proposal["commands"], list) or not proposal["commands"]
+                        or not isinstance(proposal["rationale"], str)):
+                    raise _mismatch()
+                derived = {**proposal["producer"], "admitted_target": proposal["admitted_target"],
+                           "proposal_digest": proposal["proposal_digest"]}
+                validate_pin(derived)
+                unsigned = {key: value for key, value in proposal.items() if key != "proposal_digest"}
+                encoded = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+                if (derived != pin or "sha256:" + hashlib.sha256(encoded).hexdigest() != pin["proposal_digest"]
+                        or request_pin(request) != pin
+                        or not value_equal(request["commands"][1:], proposal["commands"])
+                        or not value_equal(request.get("rationale"), proposal["rationale"])):
+                    raise _mismatch()
             continuation = self._continuation(task, spec, request["project_id"])
             run = self.conn.execute("SELECT * FROM runs WHERE id=?", (task["run_id"],)).fetchone()
             # Proposal, output, spec and associations were freshly decoded or
             # read above. Only pin and identity can contain caller-owned values.
-            return {"pin": copy.deepcopy(pin), "proposal": proposal, "render_intent": publication.get("render"),
+            result = {"pin": copy.deepcopy(pin), "proposal": proposal, "render_intent": publication.get("render"),
                 "artifact": {"descriptor": output, "association": association},
                 "identity": copy.deepcopy({**{key: context[key] for key in ("realm_id", "publisher", "idempotency_key", "request_hash")},
                              "project_id": request["project_id"], "timeline_id": request["timeline_id"]}),
                 "authority": {"task": dict(task), "attempt": dict(attempt), "run": dict(run), "spec": stored,
                               "continuation": continuation}}
+            if owned and not memo_hit:
+                self.__owned_memo = (context, result["pin"], raw, proposal)
+            return result
         except (KeyError, TypeError, ValueError, UnicodeError, OSError, RecursionError, RuntimeErrorBase) as exc:
             raise _unavailable() from exc
