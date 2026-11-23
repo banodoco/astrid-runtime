@@ -19,9 +19,13 @@ def test_commit_timing_emits_stage_spans_and_byte_sizes():
         root.setLevel(logging.INFO)
         logger.setLevel(logging.NOTSET)
         timing = execution.CommitTiming()
+        timing.begin("total")
         for name in execution._TIMING_FIELDS:
+            if name == "total":
+                continue
             timing.begin(name)
             timing.end(name)
+        timing.end("total")
         timing.set_size("request_body", 1234)
         timing.set_size("response_body", 567)
         timing.emit()
@@ -35,8 +39,31 @@ def test_commit_timing_emits_stage_spans_and_byte_sizes():
             assert 0 <= span["start_ms"] <= span["end_ms"]
             assert span["duration_ms"] == payload["timings_ms"][name]
         assert payload["sizes_bytes"] == {"request_body": 1234, "response_body": 567}
+        assert sum(payload["exclusive_timings_ms"].values()) == payload["runtime_wall_ms"]
     finally:
         root.handlers[:] = previous_handlers
         root.setLevel(previous_root_level)
         logger.setLevel(previous_logger_level)
         handler.close()
+
+
+def test_exclusive_partition_assigns_nested_stages_once_and_accounts_for_gaps():
+    timing = execution.CommitTiming()
+    timing._origin_ns = 0
+    timing._ended_ns = 10_000_000
+    timing._span_ns = {
+        "handler": (0, 9_000_000),
+        "service_admission": (2_000_000, 4_000_000),
+        "provider_commit": (3_000_000, 7_000_000),
+        "port_store_accept": (4_000_000, 5_000_000),
+    }
+
+    exclusive = timing._exclusive_timings()
+    assert exclusive == {
+        "handler": 4,
+        "service_admission": 1,
+        "provider_commit": 3,
+        "port_store_accept": 1,
+        "unattributed": 1,
+    }
+    assert sum(exclusive.values()) == 10
