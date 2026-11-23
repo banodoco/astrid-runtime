@@ -9,10 +9,18 @@ import math
 from collections import OrderedDict
 from functools import cache, lru_cache
 from importlib.resources import files
+from threading import Lock
 from typing import Protocol, cast
 
+from ._timeline_reopen_diagnostics import count_reopen_work
+from .contract_metadata import SCHEMA_DIGEST
 from .errors import ValidationError
 from .util import canonical_json
+
+_CANONICAL_DOCUMENT = "CanonicalDocument"
+_DOCUMENT_MEMO_LIMIT = 256
+_document_memo = OrderedDict()
+_document_memo_lock = Lock()
 
 
 def finite_json(value) -> None:
@@ -26,7 +34,7 @@ def finite_json(value) -> None:
                 continue
             if kind is float and math.isfinite(item):
                 continue
-            if kind not in (dict, list):
+            if kind is not dict and kind is not list:
                 raise ValidationError("commit value must contain only finite JSON")
             if id(item) in active:
                 raise ValidationError("commit value must not contain cycles")
@@ -44,6 +52,39 @@ def finite_json(value) -> None:
                 return
             parent, children = parents.pop()
             active.remove(id(parent))
+
+
+def _capture_json_containers(value):
+    """Own the mutable containers while preserving raw types, aliases and cycles."""
+    if type(value) is not dict and type(value) is not list:
+        return value
+
+    captured = value.copy()
+    copies = {id(value): (value, captured)}
+    pending = [captured]
+    while pending:
+        target = pending.pop()
+        if type(target) is dict:
+            # Let finite_json refuse invalid keys without looking them up.
+            if any(type(key) is not str for key in target):
+                continue
+            keys = target
+        else:
+            keys = range(len(target))
+        for key in keys:
+            item = target[key]
+            if type(item) is not dict and type(item) is not list:
+                continue
+            retained = copies.get(id(item))
+            if retained is None:
+                child = item.copy()
+                # Keep the original alive while using its identity.
+                copies[id(item)] = (item, child)
+                pending.append(child)
+            else:
+                child = retained[1]
+            target[key] = child
+    return captured
 
 
 def detached(value):
@@ -159,18 +200,54 @@ def _reuse_schema_resolution(resolver):
     return Resolver(resolver)
 
 
+def _validate_canonical_document(value, compiled):
+    try:
+        encoded = canonical_json(value).encode()
+    except (RecursionError, TypeError, ValueError):
+        # Some finite JSON accepted by the schema cannot be encoded here.
+        count_reopen_work("document_schema_cache_misses")
+        compiled.validate(value)
+        return
+
+    key = (SCHEMA_DIGEST, _CANONICAL_DOCUMENT, id(compiled), hashlib.sha256(encoded).digest())
+    with _document_memo_lock:
+        if _document_memo.get(key) is compiled:
+            _document_memo.move_to_end(key)
+            count_reopen_work("document_schema_cache_hits")
+            return
+
+    count_reopen_work("document_schema_cache_misses")
+    compiled.validate(value)
+    with _document_memo_lock:
+        # Only successful checks enter the memo. Keep the validator alive while
+        # its identity is part of the key so Python cannot recycle that identity.
+        _document_memo[key] = compiled
+        _document_memo.move_to_end(key)
+        if len(_document_memo) > _DOCUMENT_MEMO_LIMIT:
+            _document_memo.popitem(last=False)
+            count_reopen_work("document_schema_cache_evictions")
+
+
 def validate_commit_value(value, definition: str) -> None:
     """Raise Runtime ValidationError without changing the submitted JSON value.
 
     Schema dependencies are loaded only when validation is requested; importing
     this module or the provider ABI requires only the standard library.
     """
+    if definition == _CANONICAL_DOCUMENT:
+        # Run the ordinary finite/raw guard on the same owned snapshot used
+        # for the memo key and for schema validation.
+        value = _capture_json_containers(value)
     finite_json(value)
     from jsonschema.exceptions import ValidationError as SchemaValidationError
     from referencing.exceptions import Unresolvable
 
     try:
-        _validator(definition).validate(value)
+        compiled = _validator(definition)
+        if definition == _CANONICAL_DOCUMENT:
+            _validate_canonical_document(value, compiled)
+        else:
+            compiled.validate(value)
     except SchemaValidationError as exc:
         raise ValidationError(f"invalid {definition}: {exc.message}") from exc
     except (Unresolvable, RecursionError) as exc:

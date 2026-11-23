@@ -1189,7 +1189,8 @@ class RealmStore:
             raise OSError("realm database must be an ordinary file")
         if owner_only and not platform.is_owner_only(self.db_path):
             raise PermissionError("realm database must retain owner-only permissions")
-        connection = sqlite3.connect(sqlite_file_uri(self.db_path), uri=True, isolation_level=None)
+        connection = sqlite3.connect(sqlite_file_uri(self.db_path), uri=True, isolation_level=None,
+                                     factory=_ReadSnapshotConnection)
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA query_only=ON")
@@ -7751,6 +7752,50 @@ class _SnapshotObjectIdentities(dict):
             if retained is not None:
                 self[key] = retained
         return super().get(key, default)
+
+
+class _ReadSnapshotConnection(sqlite3.Connection):
+    """Observe continuity of a query-only transaction for exact prefix reads."""
+
+    _watching_history_prefix = False
+    _history_prefix_unchanged = False
+    _custom_authorizer = False
+
+    def __setattr__(self, name, value):
+        # A changed factory can affect a fetch and restore itself before the
+        # next check. SQL's authorizer does not observe Python conversion.
+        if (name in ("row_factory", "text_factory") and self._history_prefix_unchanged
+                and value is not getattr(self, name)):
+            super().__setattr__("_history_prefix_unchanged", False)
+        super().__setattr__(name, value)
+
+    def _watch_history_prefix(self):
+        if not self._watching_history_prefix and not self._custom_authorizer:
+            self._watching_history_prefix = True
+            self._history_prefix_unchanged = self.in_transaction and self._has_default_result_factories()
+            if self._history_prefix_unchanged:
+                super().set_authorizer(self._observe_snapshot_statement)
+        return self._history_prefix_is_fixed
+
+    def set_authorizer(self, callback):
+        self._custom_authorizer = True
+        self._history_prefix_unchanged = False
+        return super().set_authorizer(callback)
+
+    def _observe_snapshot_statement(self, action, *_):
+        # A callback can end and restart BEGIN: in_transaction alone cannot
+        # distinguish the two snapshots. Also fall back if any statement
+        # could change query semantics (for example a PRAGMA or TEMP schema).
+        if action not in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
+                          sqlite3.SQLITE_RECURSIVE):
+            self._history_prefix_unchanged = False
+        return sqlite3.SQLITE_OK
+
+    def _history_prefix_is_fixed(self):
+        return self._history_prefix_unchanged and self.in_transaction and self._has_default_result_factories()
+
+    def _has_default_result_factories(self):
+        return self.row_factory is sqlite3.Row and self.text_factory is str
 
 
 class TimelineReadSnapshot:

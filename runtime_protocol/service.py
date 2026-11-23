@@ -3479,6 +3479,7 @@ class RuntimeService:
 
     @_clear_replay_on_refusal
     def get_timeline_verified_head(self, project_id, timeline_id, *, authorize):
+        from ._timeline_reopen_diagnostics import observe_verified_head
         from .timeline_commit_port import MediaReads
 
         selections = {}
@@ -3504,7 +3505,8 @@ class RuntimeService:
                 if self._selection_custody(digest) != identity:
                     raise HeadBusyError("retained media selection changed during verification")
 
-        return self._read_timeline_commits(project_id, timeline_id, authorize, read, confirm=confirm)
+        with observe_verified_head():
+            return self._read_timeline_commits(project_id, timeline_id, authorize, read, confirm=confirm)
 
     def _read_timeline_commits(self, project_id, timeline_id, authorize, read, *, confirm=None, isolated=True):
         from .timeline_commit import CommitRejected
