@@ -1175,8 +1175,8 @@ class RealmStore:
             os.close(descriptor)
 
     @contextmanager
-    def _read_snapshot(self, *, owner_only=True):
-        """Read committed identity state without waiting on a busy writer."""
+    def _read_snapshot(self, *, owner_only=True, track_history_prefix=False):
+        """Read committed state without waiting on a busy writer."""
         primary = self.conn
         if primary is None:
             raise sqlite3.ProgrammingError("realm store is closed")
@@ -1189,8 +1189,9 @@ class RealmStore:
             raise OSError("realm database must be an ordinary file")
         if owner_only and not platform.is_owner_only(self.db_path):
             raise PermissionError("realm database must retain owner-only permissions")
+        factory = _ReadSnapshotConnection if track_history_prefix else sqlite3.Connection
         connection = sqlite3.connect(sqlite_file_uri(self.db_path), uri=True, isolation_level=None,
-                                     factory=_ReadSnapshotConnection)
+                                     factory=factory)
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA query_only=ON")

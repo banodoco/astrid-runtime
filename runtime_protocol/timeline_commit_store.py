@@ -1290,7 +1290,9 @@ class TimelineCommitStore:
                 # The owned live verifier already distinguishes protection
                 # suitable for a full replay from protection suitable for
                 # sharing memo. Keep that policy for the isolated read too.
-                connection = snapshot.enter_context(self.store._read_snapshot(owner_only=False))
+                connection = snapshot.enter_context(
+                    self.store._read_snapshot(owner_only=False, track_history_prefix=True)
+                )
                 # BEGIN is deferred. This SELECT pins the committed snapshot
                 # before either the live mutex or the initial SQL fence ends.
                 observed = self._public_head(connection, project_id, timeline_id)
