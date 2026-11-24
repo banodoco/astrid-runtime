@@ -15,6 +15,9 @@ def forge_history_row(connection, statement, parameters=()):
         trigger = "timeline_history_no_delete"
     else:
         raise ValueError("history forge requires a single history UPDATE or DELETE")
+    # A test adapter that routes UPDATEs to a second connection names it here so
+    # the guard drop, the UPDATE and the restore all run on that one connection.
+    connection = getattr(connection, "forge_target", connection)
     connection.execute("SAVEPOINT forge_history_row")
     try:
         sql = connection.execute(
