@@ -80,10 +80,11 @@ class CopySites:
         thread = threading.get_ident()
         depth = 0
         inside_detached = None
+        active = True
 
         def measured_copy(x, *args, **kwargs):
             nonlocal depth
-            if threading.get_ident() != thread or depth:
+            if not active or threading.get_ident() != thread or depth:
                 return original_copy(x, *args, **kwargs)
             caller = sys._getframe(1)
             production = _production(caller.f_globals.get("__name__", ""))
@@ -105,7 +106,7 @@ class CopySites:
 
         def measured_detached(value):
             nonlocal inside_detached
-            if threading.get_ident() != thread:
+            if not active or threading.get_ident() != thread:
                 return original_detached(value)
             assert inside_detached is None, "unexpected nested detached boundary"
             site = _site(sys._getframe(1))
@@ -121,19 +122,33 @@ class CopySites:
             self.record("detached", site, value, times[0], elapsed)
             return result
 
-        with monkeypatch.context() as patch:
-            patch.setattr(copy, "deepcopy", measured_copy)
-            # Match by identity, including imported aliases. Later imports
-            # obtain the same wrappers from the patched source modules.
-            for name, module in tuple(sys.modules.items()):
-                if module is None or not _production(name):
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(copy, "deepcopy", measured_copy)
+                # Match by identity, including imported aliases. Later imports
+                # obtain the same wrappers from the patched source modules.
+                for name, module in tuple(sys.modules.items()):
+                    if module is None or not _production(name):
+                        continue
+                    for key, value in tuple(vars(module).items()):
+                        if value is original_copy:
+                            patch.setattr(module, key, measured_copy)
+                        elif value is original_detached:
+                            patch.setattr(module, key, measured_detached)
+                yield
+        finally:
+            active = False
+            # monkeypatch restores the attributes it changed. A lazy import
+            # during the observation may additionally retain a wrapper; remove
+            # only those exact aliases, including on a failed save.
+            for module in tuple(sys.modules.values()):
+                if module is None:
                     continue
                 for key, value in tuple(vars(module).items()):
-                    if value is original_copy:
-                        patch.setattr(module, key, measured_copy)
-                    elif value is original_detached:
-                        patch.setattr(module, key, measured_detached)
-            yield
+                    if value is measured_copy:
+                        setattr(module, key, original_copy)
+                    elif value is measured_detached:
+                        setattr(module, key, original_detached)
 
     def report(self):
         return [
