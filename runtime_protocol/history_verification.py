@@ -84,6 +84,7 @@ class DeferredHistoryVerification:
         self._stop = threading.Event()
         self._thread = None
         self._owner_identity = self._storage_identity()
+        self._wal_identity = None
         self._status = {"state": "pending", "message": _PENDING,
                         "history_rows_checked": 0, "history_rows_total": None,
                         "phase": "waiting_for_boot"}
@@ -149,6 +150,8 @@ class DeferredHistoryVerification:
         with self.store._mutex:
             if self._thread is not None or self._stop.is_set():
                 return
+            wal = _file_identity(self.store.db_path.with_name(self.store.db_path.name + "-wal"))
+            self._wal_identity = wal[:2] if wal is not None else None
             self._thread = threading.Thread(target=self._run, daemon=True,
                                             name="astrid-history-verification")
             self._thread.start()
@@ -179,10 +182,13 @@ class DeferredHistoryVerification:
             # Reopening a different inode under the old owner is not a retry.
             raise OSError("realm owner or database identity changed; restart required")
         connection = store.conn
+        wal = _file_identity(store.db_path.with_name(store.db_path.name + "-wal"))
+        if (wal[:2] if wal is not None else None) != self._wal_identity:
+            raise OSError("realm WAL identity changed; restart required")
         return (
             self._owner_identity,
             _file_identity(store.db_path),
-            _file_identity(store.db_path.with_name(store.db_path.name + "-wal")),
+            wal,
             connection.execute("PRAGMA data_version").fetchone()[0],
             connection.total_changes, history_boundary(connection),
         )

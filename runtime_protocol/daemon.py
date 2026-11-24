@@ -365,7 +365,8 @@ class RuntimeDaemon:
 
     def service_status(self):
         services = list(self.service_supervisor.snapshot()) if self.service_supervisor is not None else []
-        verification = self.service.store.history_verification_status() if self.service is not None else None
+        observe = getattr(getattr(self.service, "store", None), "history_verification_status", None)
+        verification = observe() if callable(observe) else None
         if verification is not None:
             state = verification["state"]
             total = verification["history_rows_total"]

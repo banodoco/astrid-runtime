@@ -321,6 +321,8 @@ def diagnostics_report(
                + (" (selected)" if root == active_root else " (not selected; old workspace copy)"))
           for root, found in runtimes),
         _row("Disk", f"{_gb(free)} free"),
+        *([_row("Realm verification", str(verification.get("reason") or verification.get("state")))]
+          if isinstance(verification, dict) else []),
         _row("Problems", "; ".join(problems) if problems else "none detected"),
         "",
         "--- Raw detail ---",
