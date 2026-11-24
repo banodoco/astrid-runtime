@@ -175,11 +175,23 @@ def _parser():
 
 def main(argv=None):
     args = _parser().parse_args(argv)
-    if args.command == "start" and args.log_file:
-        from .logs import RotatingLog
-        with RotatingLog(args.log_file) as log:
-            with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
-                return _main(args)
+    if args.command == "start":
+        from . import platform
+        from .logs import RotatingLog, commit_stage_timing_sink
+
+        # Managed daemon starts pass <data-root>/runtime as support_root. Keep
+        # timing records in that data root's own logs directory, independent of
+        # the OS-specific runtime.log location and root logger level.
+        support_root = Path(args.support_root).expanduser() if args.support_root else Path(args.root).expanduser()
+        log_directory = support_root.parent / "logs" if args.support_root else support_root / "logs"
+        platform.private_directory(log_directory)
+        timing_path = log_directory / "commit-stage-timings.jsonl"
+        with commit_stage_timing_sink(timing_path):
+            if args.log_file:
+                with RotatingLog(args.log_file) as log:
+                    with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                        return _main(args)
+            return _main(args)
     return _main(args)
 
 
