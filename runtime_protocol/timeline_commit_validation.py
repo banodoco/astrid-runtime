@@ -13,6 +13,7 @@ from functools import cache, lru_cache
 from importlib.resources import files
 from threading import Lock
 from typing import Protocol, cast
+from urllib.parse import urljoin
 
 from ._timeline_reopen_diagnostics import count_reopen_work
 from .contract_metadata import SCHEMA_DIGEST
@@ -25,16 +26,18 @@ _document_memo = OrderedDict()
 _document_memo_lock = Lock()
 
 # Only the audited installed contract has the local, annotation-independent
-# item references below. A regenerated bundle starts on the uncached path
-# until its item schema closure is reviewed again.
+# references below. A regenerated bundle starts on the uncached path until
+# its schema closure is reviewed again.
 _REVIEWED_CONTRACT = "sha256:2c6a76e17b4441398ab91e3e9d6283a719fd5b08807447db9dbf2ecc5e1339a2"
 _REVIEWED_BUNDLE = "ce5490aedf1b2932f01219c0e317468ecf397cd9c1f715152faa62d3fa0694f2"
-_SHOT_SCHEMA = "https://astrid.haus/workspace/v1/schemas/shot-composition.json"
-_ITEM_LOCATIONS = (
-    ("ParentComposition", "clips", "RawClip"),
-    ("RawTimelinePayload", "clips", "RawClip"),
-    ("RawTimelinePayload", "tracks", "RawTrack"),
+_SCHEMA_URI = "https://astrid.haus/workspace/v1/schemas/"
+_REVIEWED_TARGETS = (
+    ("edit-command.json", "JSON"),
+    ("edit-command.json", "AgentState"),
+    ("timeline-commit.json", "AgentState"),
+    ("timeline-commit.json", "CommitRead"),
 )
+_SUBTREE_MIN_BYTES = 64
 _SUBTREE_DEPTH_LIMIT = 12
 _SUBTREE_ENTRY_LIMIT = 4096
 _SUBTREE_BYTES_LIMIT = 16 * 1024 * 1024
@@ -80,8 +83,18 @@ _prepared_subtrees = _SubtreeMemo()
 
 
 def _subtree_bytes(instance):
-    # finite_json has checked this privately captured graph. Bound the local
-    # recursive schema depth before allowing a success to omit any traversal.
+    # finite_json has checked this privately captured graph. Scalar leaves
+    # have no descendants worth memoising, even when a string is long.
+    if type(instance) is not dict and type(instance) is not list:
+        return None
+    try:
+        encoded = canonical_json(instance).encode()
+    except (RecursionError, TypeError, ValueError):
+        # Encoding failure is not a schema failure (e.g. a lone surrogate).
+        return None
+    if not _SUBTREE_MIN_BYTES <= len(encoded) <= _prepared_subtrees.key_limit:
+        return None
+    # Bound the recursive schema depth before allowing a hit to omit traversal.
     pending = [(instance, 0)]
     while pending:
         item, depth = pending.pop()
@@ -91,27 +104,21 @@ def _subtree_bytes(instance):
             children = item.values() if type(item) is dict else item
             pending.extend((child, depth + 1) for child in children
                            if type(child) is dict or type(child) is list)
-    try:
-        encoded = canonical_json(instance).encode()
-    except (RecursionError, TypeError, ValueError):
-        # In particular, a lone surrogate is valid in some schema positions
-        # but cannot be encoded as strict UTF-8. Never infer a validation result.
-        return None
-    if len(encoded) > _prepared_subtrees.key_limit:
-        return None
     return encoded
 
 
 def _has_subtree_recursion_headroom():
-    # A shallow subtree can still be evaluated from a nearly exhausted stack.
-    # The three reference paths have fixed envelope depth; 512 frames is a
-    # conservative allowance for them and twelve nested metadata containers.
-    remaining = sys.getrecursionlimit()
-    frame = sys._getframe()
-    while frame is not None and remaining >= 512:
-        remaining -= 1
-        frame = frame.f_back
-    return remaining >= 512
+    # The re-aim includes recursive JSON references reached at arbitrary
+    # ancestor depths. Check current stack headroom before each eligible ref.
+    # A shallow subtree near the recursion limit must not bypass a refusal.
+    depth = sys.getrecursionlimit() - 512
+    if depth <= 0:
+        return False
+    try:
+        sys._getframe(depth)
+    except ValueError:
+        return True
+    return False
 
 
 def _reviewed_item_nodes(bundle, registry):
@@ -132,14 +139,35 @@ def _reviewed_item_nodes(bundle, registry):
     for uri, resource in bundle["resources"].items():
         if canonical_json(registry.contents(uri)) != canonical_json(resource):
             return {}
-    definitions = registry.contents(_SHOT_SCHEMA)["$defs"]
+    targets = {
+        f"{_SCHEMA_URI}{resource}#/$defs/{name}":
+        registry.contents(_SCHEMA_URI + resource)["$defs"][name]
+        for resource, name in _REVIEWED_TARGETS
+    }
     generation = object()
     nodes = {}
-    for parent, field, target in _ITEM_LOCATIONS:
-        node = definitions[parent]["properties"][field]["items"]
-        location = f"{_SHOT_SCHEMA}#/$defs/{parent}/properties/{field}/items"
-        namespace = (generation, SCHEMA_DIGEST, _REVIEWED_BUNDLE, location, target)
-        nodes[id(node)] = (node, definitions[target], namespace)
+
+    def visit(node, uri, pointer):
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            # Match only pure reference nodes to the four reviewed targets,
+            # never a sibling keyword, enclosing record or other definition.
+            if len(node) == 1 and isinstance(ref, str):
+                target = urljoin(uri, ref)
+                if target in targets:
+                    location = f"{uri}#{pointer}"
+                    namespace = (generation, SCHEMA_DIGEST, _REVIEWED_BUNDLE,
+                                 location, target)
+                    nodes[id(node)] = (node, targets[target], namespace)
+            for key, child in node.items():
+                escaped = key.replace("~", "~0").replace("/", "~1")
+                visit(child, uri, f"{pointer}/{escaped}")
+        elif isinstance(node, list):
+            for index, child in enumerate(node):
+                visit(child, uri, f"{pointer}/{index}")
+
+    for uri in bundle["resources"]:
+        visit(registry.contents(uri), uri, "")
     return nodes
 
 
@@ -147,12 +175,13 @@ def _memoized_reference(original, nodes):
     from referencing.exceptions import Unresolvable
 
     def reference(validator, ref, instance, schema):
-        if not _prepared_memo_active.get():
-            return original(validator, ref, instance, schema)
         entry = nodes.get(id(schema))
-        if entry is None or entry[0] is not schema:
+        if (entry is None or entry[0] is not schema
+                or (type(instance) is not dict and type(instance) is not list)
+                or not _prepared_memo_active.get()
+                or not _has_subtree_recursion_headroom()):
             return original(validator, ref, instance, schema)
-        # Match both the original item node and its resolved target. The
+        # Match both the original ref node and its resolved target. The
         # reviewed bundle has only static references in this closure.
         try:
             resolved = _validator_resolver(validator).lookup(ref)
