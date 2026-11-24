@@ -244,8 +244,16 @@ def test_cold_warm_four_targets_edit_insert_and_reorder(memo):
     # get the original checks; the recorder's changed/new reads are misses.
     parent = _parent(value)
     parent["clips"][0]["track"] = "changed"
+    assert _same(value)[0] == "accepted"
+    assert memo.counts["misses"] == cold["misses"]
     parent["clips"].append(_clip("new"))
+    assert _same(value)[0] == "accepted"
+    assert memo.counts["misses"] == cold["misses"]
     parent["clips"].reverse()
+    assert _same(value)[0] == "accepted"
+    internal = value["canonical_document"]["internal_timeline_revisions"][0]["payload"]
+    internal["clips"] = copy.deepcopy(parent["config"]["clips"])
+    internal["tracks"] = copy.deepcopy(parent["config"]["tracks"])
     assert _same(value)[0] == "accepted"
     assert memo.counts["misses"] == cold["misses"]
     step = _step(value)
@@ -268,12 +276,15 @@ def test_first_refusal_order_and_invalid_never_published(memo):
     parent = _parent(value)
     parent["clips"][0]["id"] = 3
     parent["config"]["tracks"][0]["kind"] = "not-a-kind"
+    before = len(memo.entries)
     first = _same(value)
     assert first[0] is ValidationError
     assert _same(value) == first
+    assert len(memo.entries) == before
     parent["clips"][0]["id"] = "same"
     second = _same(value)
     assert second[0] is ValidationError and second != first
+    assert len(memo.entries) == before
     parent["config"]["tracks"][0]["kind"] = "visual"
     assert _same(value)[0] == "accepted"
 
@@ -404,6 +415,7 @@ def test_lru_entry_and_byte_budget_and_oversize(memo, monkeypatch):
     assert _same(value)[0] == "accepted"
     assert small.size == sum(len(key[1]) for key in small.entries)
     assert 0 < small.size <= small.byte_limit
+    assert len(small.entries) < 3
     state = _record(value)["reads"][0]["state"]
     state["value"]["opaque"] = "x" * (small.key_limit + 1)
     assert validation._subtree_bytes(state) is None
@@ -528,8 +540,9 @@ def test_one_edit_prepared_schema_work(editing, count, monkeypatch):
         base_warm = _measure(_base_validate, second, memo)
         candidate_cold = _measure(_candidate, first, memo)
         candidate_warm = _measure(_candidate, second, memo)
-        assert candidate_cold["misses"] > 0
-        assert candidate_warm["hits"] > 0
+        assert candidate_cold["misses"] >= count
+        assert candidate_warm["hits"] >= count - 1
+        assert candidate_warm["misses"] > 0
         assert candidate_warm["descend_events"] < base_warm["descend_events"]
         rows.append({"base_cold": base_cold, "base_warm": base_warm,
                      "candidate_cold": candidate_cold, "candidate_warm": candidate_warm})
