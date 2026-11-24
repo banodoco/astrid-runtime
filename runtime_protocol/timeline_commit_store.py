@@ -434,6 +434,9 @@ class TimelineCommitStore:
         new physical identity baseline before verification resumes.
         """
         with self.store._mutex:
+            status = getattr(self.store, "history_verification_status", lambda: None)()
+            if status is not None and status["state"] != "complete":
+                raise ProtocolError("accepted commit storage changed during deferred verification; restart required")
             current = self.store.conn
             if current is None or getattr(self.store, "_lock_file", None) is None:
                 raise ProtocolError("accepted commit storage is closed; reopen required")

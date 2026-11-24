@@ -306,7 +306,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if method not in ("POST", "PUT", "PATCH", "DELETE"):
             return
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
-        if method == "POST" and (path == ["v1", "handshake"] or (
+        # Bootstrap-only credential provisioning writes support credentials,
+        # not the realm. It must work to enable authenticated read access.
+        if method == "POST" and (path in (["v1", "handshake"], ["v1", "credentials"]) or (
                 len(path) == 6 and path[:2] == ["v1", "projects"]
                 and path[3] == "timelines" and path[5] == "inspect")):
             return

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import sqlite3
 import stat
 import threading
@@ -15,7 +16,7 @@ from contextlib import contextmanager
 
 from . import cancellation
 from .errors import RealmAdmissionError
-from .history_guards import history_guard_manifest
+from .history_guards import HISTORY_GUARD_RECOVERY, HistoryGuardManifestError, history_guard_manifest
 
 _LOG = logging.getLogger(__name__)
 _PENDING = "verification in progress, retry in a moment"
@@ -82,6 +83,7 @@ class DeferredHistoryVerification:
         self.store = store
         self._stop = threading.Event()
         self._thread = None
+        self._owner_identity = self._storage_identity()
         self._status = {"state": "pending", "message": _PENDING,
                         "history_rows_checked": 0, "history_rows_total": None,
                         "phase": "waiting_for_boot"}
@@ -158,14 +160,27 @@ class DeferredHistoryVerification:
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=2)
 
-    def _authority(self):
+    def _storage_identity(self):
         store = self.store
         root = store.root.lstat()
-        if not stat.S_ISDIR(root.st_mode):
-            raise OSError("realm directory authority changed")
+        database = _file_identity(store.db_path)
+        lock = _file_identity(store.lock_path)
+        if (not stat.S_ISDIR(root.st_mode) or database is None or lock is None
+                or store._lock_file is None or store.conn is None):
+            raise OSError("realm owner/storage authority unavailable")
+        held = os.fstat(store._lock_file.fileno())
+        if lock[:2] != (held.st_dev, held.st_ino):
+            raise OSError("realm owner lock identity changed")
+        return (root.st_dev, root.st_ino), database[:2], lock[:2], id(store.conn)
+
+    def _authority(self):
+        store = self.store
+        if self._storage_identity() != self._owner_identity:
+            # Reopening a different inode under the old owner is not a retry.
+            raise OSError("realm owner or database identity changed; restart required")
         connection = store.conn
         return (
-            (root.st_dev, root.st_ino), id(connection),
+            self._owner_identity,
             _file_identity(store.db_path),
             _file_identity(store.db_path.with_name(store.db_path.name + "-wal")),
             connection.execute("PRAGMA data_version").fetchone()[0],
@@ -252,6 +267,13 @@ class DeferredHistoryVerification:
                             return
         except cancellation.StartupCancelled:
             return
+        except HistoryGuardManifestError as exc:
+            self._publish_failure({
+                "ok": False, "state": "unhealthy", "status": "failed",
+                "issues": ["history_guards"],
+                "checks": {"history_guards": {"ok": False, "reason": str(exc)}},
+                "recovery_action": HISTORY_GUARD_RECOVERY, "next_action": HISTORY_GUARD_RECOVERY,
+            })
         except Exception as exc:
             _LOG.exception("Deferred startup history verification failed")
             self._publish_failure(self._failure(

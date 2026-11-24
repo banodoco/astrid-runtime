@@ -917,6 +917,13 @@ class RuntimeService:
                 # is permanent for this boot, but must not clear discovery and
                 # strand independently verified reads of unaffected timelines.
                 return report
+            if (verification is not None and verification["state"] == "complete"
+                    and report.get("history_deferral_eligible") is True
+                    and report.get("issues") == []):
+                # An already completed owner does not lose its proven write
+                # admission solely because a subsequent diagnostic's history
+                # budget is shorter. A genuine reported failure still revokes.
+                return report
             if not report.get("ok"):
                 # Admission is monotonic for one service instance. Repair is
                 # verified by a fresh startup; an unhealthy process never

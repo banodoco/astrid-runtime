@@ -1422,7 +1422,12 @@ class RealmStore:
             with tempfile.TemporaryDirectory(prefix="astrid-runtime-realm-preflight-") as temporary:
                 snapshot_root = Path(temporary)
                 for source in components:
-                    cls._copy_admission_file(source, snapshot_root / source.name, deadline)
+                    try:
+                        cls._copy_admission_file(source, snapshot_root / source.name, deadline)
+                    except FileNotFoundError:
+                        if _history_progress is None:
+                            raise
+                        return cls._integrity_not_checked(timeout_seconds, "SQLite snapshot moved during inspection; retry.")
                 for path, expected in identities.items():
                     try:
                         metadata = path.lstat()
@@ -1430,6 +1435,11 @@ class RealmStore:
                     except FileNotFoundError:
                         actual = None
                     if actual != expected:
+                        if _history_progress is not None:
+                            # Read-only clients can move SHM bookkeeping. A
+                            # detached background image must be retried, never
+                            # misreported as corruption or accepted stale.
+                            return cls._integrity_not_checked(timeout_seconds, "SQLite snapshot moved during inspection; retry.")
                         raise OSError(f"realm SQLite component changed during inspection: {path.name}")
                 connection = sqlite3.connect(snapshot_root / "realm.sqlite3", timeout=max(0.001, deadline - time.monotonic()))
                 connection.row_factory = sqlite3.Row
@@ -1447,19 +1457,18 @@ class RealmStore:
                 try:
                     connection.execute("PRAGMA query_only=ON")
                     if _history_progress is not None:
-                        from .history_verification import history_boundary
                         inspector._history_progress = _history_progress
-                        # These logical facts belong to the detached SQLite
-                        # image, not to a later sample of the live connection.
-                        snapshot_authority = history_boundary(connection)
                     report = inspector.integrity_report(
                         catalog_path=catalog_path,
                         timeout_seconds=max(0.001, deadline - time.monotonic()),
                         deep=deep,
                         admission_state=admission_state,
                     )
-                    if _history_progress is not None:
-                        report["_snapshot_history_authority"] = snapshot_authority
+                    if _history_progress is not None and report.get("ok"):
+                        from .history_verification import history_boundary
+                        # The immutable, query-only image just verified owns
+                        # these facts; never sample the live DB for this value.
+                        report["_snapshot_history_authority"] = history_boundary(connection)
                     return report
                 finally:
                     connection.close()

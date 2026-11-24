@@ -298,6 +298,9 @@ def diagnostics_report(
     behind = type(installed) is int and type(latest) is int and installed < latest
     if healthy is False:
         problems.append(f"this Runtime's own checks report {state}")
+    verification = support.get("history_verification")
+    if isinstance(verification, dict) and verification.get("state") == "failed":
+        problems.append(str(verification.get("reason") or "realm history verification failed"))
     verdict = "NOT OK" if problems or behind else "OK"
     issues = [issue for issue in support.get("issues") or [] if isinstance(issue, str)] if isinstance(support.get("issues"), list) else []
     issues += [code for code in codes if code not in issues]

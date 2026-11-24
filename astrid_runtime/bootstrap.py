@@ -2849,6 +2849,13 @@ def _doctor_observation(paths: RuntimePaths, boundary: RuntimeBoundary | None = 
             elif metadata.get("status") != "ok":
                 report["healthy"] = False
                 report["issues"].append("runtime_unhealthy")
+            else:
+                # Health remains a liveness contract for a readable owner.
+                # Expose its verification service's progress separately.
+                for service in metadata.get("services", []):
+                    if isinstance(service, Mapping) and service.get("name") == "realm-history-verification":
+                        report["history_verification"] = dict(service)
+                        break
         elif report["pid_alive"] is not True:
             report["healthy"] = False
             report["issues"].append("stale_discovery")
