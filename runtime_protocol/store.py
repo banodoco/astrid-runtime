@@ -1072,7 +1072,7 @@ class RealmStore:
             if parent_fd >= 0:
                 os.close(parent_fd)
 
-    def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS, _admission_fd=None):
+    def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS, _admission_fd=None, _start_history_verification=True):
         self.root = _local_realm_root(root)
         self.admission_timeout = admission_timeout
         if create:
@@ -1131,7 +1131,10 @@ class RealmStore:
             if acquire_owner and owner_marker_present:
                 self._acquire_owner()
             self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout, allow_active_marker=False)
-            if not self.admission_report.get("ok"):
+            from .history_verification import DeferredHistoryVerification, may_defer_history
+            deferred = (acquire_owner and _admission_fd is None
+                        and may_defer_history(self.admission_report, self.root))
+            if not self.admission_report.get("ok") and not deferred:
                 issues = self.admission_report.get("issues", [])
                 guard = self.admission_report.get("checks", {}).get("history_guards", {})
                 checks = ", ".join(str(issue) for issue in issues)
@@ -1170,9 +1173,16 @@ class RealmStore:
                     details={"issues": ["history_guards"], "checks": {"history_guards": {"ok": False, "reason": str(exc)}},
                              "recovery_action": HISTORY_GUARD_RECOVERY, "next_action": HISTORY_GUARD_RECOVERY},
                 ) from exc
+            if deferred:
+                # Keep the existing guard installation above under both owner
+                # fences. Only the verified late-history timeout may reach here.
+                self._history_verification = DeferredHistoryVerification(self)
+                self.conn.execute("PRAGMA query_only=ON")
             if acquire_owner:
                 self._begin_admission_session()
             self._release_admission_lock()
+            if _start_history_verification:
+                self.start_history_verification()
         except Exception:
             self.close(orderly=False)
             raise
@@ -1239,8 +1249,34 @@ class RealmStore:
         finally:
             connection.close()
 
+    def history_verification_status(self):
+        verification = getattr(self, "_history_verification", None)
+        return verification.status if verification is not None else None
+
+    def assert_history_write_admitted(self):
+        verification = getattr(self, "_history_verification", None)
+        if verification is not None:
+            verification.assert_writable()
+
+    def start_history_verification(self):
+        verification = getattr(self, "_history_verification", None)
+        if verification is not None:
+            verification.start()
+
+    @contextmanager
+    def _verification_boot_writes(self):
+        """Only startup's lifecycle/TEMP setup may write before verification."""
+        verification = getattr(self, "_history_verification", None)
+        if verification is None:
+            yield
+        else:
+            with verification.boot_writes():
+                yield
+
     @contextmanager
     def _transaction(self):
+        if not getattr(self, "_history_boot_writes", False):
+            self.assert_history_write_admitted()
         # Service decorators and a few domain operations compose transactions
         # (for example a timeline mutation records its revision inside the
         # command transaction).  SQLite has no nested ``BEGIN``; use a
@@ -1345,7 +1381,7 @@ class RealmStore:
             os.close(source_fd)
 
     @classmethod
-    def inspect_realm(cls, root: str | Path, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS, deep: bool = False, allow_active_marker: bool = True):
+    def inspect_realm(cls, root: str | Path, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS, deep: bool = False, allow_active_marker: bool = True, _history_progress=None):
         """Inspect a WAL-aware isolated snapshot without opening the source DB.
 
         Startup calls this only after acquiring the realm owner lock, so the
@@ -1410,12 +1446,21 @@ class RealmStore:
                     admission_state["owner_active"] = cls._owner_is_locked(root)
                 try:
                     connection.execute("PRAGMA query_only=ON")
-                    return inspector.integrity_report(
+                    if _history_progress is not None:
+                        from .history_verification import history_boundary
+                        inspector._history_progress = _history_progress
+                        # These logical facts belong to the detached SQLite
+                        # image, not to a later sample of the live connection.
+                        snapshot_authority = history_boundary(connection)
+                    report = inspector.integrity_report(
                         catalog_path=catalog_path,
                         timeout_seconds=max(0.001, deadline - time.monotonic()),
                         deep=deep,
                         admission_state=admission_state,
                     )
+                    if _history_progress is not None:
+                        report["_snapshot_history_authority"] = snapshot_authority
+                    return report
                 finally:
                     connection.close()
         except TimeoutError as exc:
@@ -1736,12 +1781,16 @@ class RealmStore:
         return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
 
     def close(self, *, orderly=True):
+        verification = getattr(self, "_history_verification", None)
+        if verification is not None:
+            verification.stop()
         try:
             with self._mutex:
                 try:
                     if self.conn is not None:
                         clean_realm_id = None
-                        if orderly and getattr(self, "_admission_active", False):
+                        if (orderly and getattr(self, "_admission_active", False)
+                                and (verification is None or verification.status["state"] == "complete")):
                             clean_realm_id = self.conn.execute("SELECT id FROM realm").fetchone()[0]
                         try:
                             self.conn.close()
@@ -4138,6 +4187,10 @@ class RealmStore:
         Ordinary expiry revokes worker authority, but is not stop evidence.
         """
         with self._mutex:
+            verification = self.history_verification_status()
+            if verification is not None and verification["state"] != "complete":
+                # Task reads must remain reads while the integrity gate is held.
+                return
             if self.conn.in_transaction or not self._overdue_lease_rows():
                 return
             with self._transaction():
@@ -7033,6 +7086,9 @@ class RealmStore:
         supplied, support-state checks are included alongside the authoritative
         SQLite/CAS checks.
         """
+        verification = getattr(self, "_history_verification", None)
+        if verification is not None and verification.status["state"] != "complete":
+            return verification.doctor()
         return self.integrity_report(catalog_path=catalog_path, timeout_seconds=self.admission_timeout, deep=deep)
 
     def integrity_report(self, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS, deep=True, admission_state=None):
@@ -7658,12 +7714,23 @@ class RealmStore:
             activation_check = {"status": "blocked", "ok": False, "issues": ["activation_catalog_unavailable"]}
         identity_ok = realm_identity["ok"]
         history_incomplete = False
+        # Do not permit a deferred owner when registration would need to
+        # manufacture a baseline publication. This check precedes the budgeted
+        # traversal so an interrupt cannot masquerade as baseline eligibility.
+        legacy_baseline_pending = True
+        if schema_ok and guard_check is not None and guard_check["ok"]:
+            legacy_baseline_pending = self.conn.execute(
+                "SELECT 1 FROM parent_composition_heads WHERE revision_id IS NOT NULL "
+                "AND publication_id IS NULL LIMIT 1"
+            ).fetchone() is not None
         if {"timeline_commit_history", "timeline_document_input_contents", "timeline_document_input_links"}.issubset(actual_tables):
             from .timeline_commit_store import TimelineCommitStore
             history_errors = []
             try:
+                history_progress = getattr(self, "_history_progress", None)
                 TimelineCommitStore(self, validate_prepared=None).integrity_errors(
                     deadline=deadline, errors=history_errors,
+                    **({"progress": history_progress} if history_progress is not None else {}),
                 )
             except TimeoutError:
                 cancellation.check()
@@ -7702,7 +7769,9 @@ class RealmStore:
         return {
             "status": "not_checked" if incomplete_only else "ok" if healthy else "failed",
             "state": "not_checked" if incomplete_only else "uninitialized" if healthy and uninitialized else "ready" if healthy else "unhealthy", "ok": healthy,
-            **({"verification_incomplete": True, "message": "Verification incomplete: accepted history scan timed out."} if history_incomplete else {}),
+            **({"verification_incomplete": True,
+                "history_deferral_eligible": incomplete_only and not legacy_baseline_pending,
+                "message": "Verification incomplete: accepted history scan timed out."} if history_incomplete else {}),
             "schema_version": SCHEMA_VERSION, "issues": issues,
             "recovery_action": recovery, "next_action": recovery,
             "checks": {

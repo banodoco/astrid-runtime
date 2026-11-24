@@ -1655,7 +1655,7 @@ class TimelineCommitStore:
                 validate_pack_snapshot_objects(self.conn, document["project_id"], json.loads(row["content_json"]))
 
     @_evaluation
-    def integrity_errors(self, *, deadline=None, errors=None):
+    def integrity_errors(self, *, deadline=None, errors=None, progress=None):
         """Check accepted history, retaining known errors if the budget expires."""
         if errors is None:
             errors = []
@@ -1670,6 +1670,10 @@ class TimelineCommitStore:
 
         previous = {}
         check_deadline()
+        scanned = 0
+        total = self.conn.execute("SELECT COUNT(*) FROM timeline_commit_history").fetchone()[0] if progress is not None else None
+        if progress is not None:
+            progress(scanned, total)
         for edge in self.conn.execute("SELECT * FROM timeline_commit_history ORDER BY project_id, timeline_id, project_seq"):
             check_deadline()
             try:
@@ -1698,6 +1702,9 @@ class TimelineCommitStore:
                 errors.append({"table": "timeline_commit_history", "id": edge["publication_id"], "reason": str(exc)})
             except Exception as exc:
                 errors.append({"table": "timeline_commit_history", "id": edge["publication_id"], "reason": str(exc)})
+            scanned += 1
+            if progress is not None:
+                progress(scanned, total)
         for key, expected in previous.items():
             check_deadline()
             head = self.conn.execute("SELECT publication_id, revision_id FROM parent_composition_heads WHERE project_id=? AND timeline_id=?", key).fetchone()
