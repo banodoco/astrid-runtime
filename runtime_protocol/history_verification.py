@@ -69,14 +69,14 @@ def history_boundary(connection):
 
 
 def _file_identity(path):
+    """Stable file identity, not SQLite's mutable checkpoint metadata."""
     try:
         metadata = path.lstat()
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(metadata.st_mode):
         raise OSError("SQLite authority component is not a regular file")
-    return (metadata.st_dev, metadata.st_ino, metadata.st_size,
-            metadata.st_mtime_ns, metadata.st_ctime_ns)
+    return (metadata.st_dev, metadata.st_ino)
 
 
 class DeferredHistoryVerification:
@@ -152,7 +152,7 @@ class DeferredHistoryVerification:
             if self._thread is not None or self._stop.is_set():
                 return
             wal = _file_identity(self.store.db_path.with_name(self.store.db_path.name + "-wal"))
-            self._wal_identity = wal[:2] if wal is not None else None
+            self._wal_identity = wal
             self._thread = threading.Thread(target=self._run, daemon=True,
                                             name="astrid-history-verification")
             self._thread.start()
@@ -173,22 +173,28 @@ class DeferredHistoryVerification:
                 or store._lock_file is None or store.conn is None):
             raise OSError("realm owner/storage authority unavailable")
         held = os.fstat(store._lock_file.fileno())
-        if lock[:2] != (held.st_dev, held.st_ino):
+        if lock != (held.st_dev, held.st_ino):
             raise OSError("realm owner lock identity changed")
-        return (root.st_dev, root.st_ino), database[:2], lock[:2], id(store.conn)
+        return (root.st_dev, root.st_ino), database, lock, id(store.conn)
 
     def _authority(self):
         store = self.store
-        if self._storage_identity() != self._owner_identity:
+        storage = self._storage_identity()
+        if storage != self._owner_identity:
             # Reopening a different inode under the old owner is not a retry.
             raise OSError("realm owner or database identity changed; restart required")
         connection = store.conn
         wal = _file_identity(store.db_path.with_name(store.db_path.name + "-wal"))
-        if (wal[:2] if wal is not None else None) != self._wal_identity:
+        if wal != self._wal_identity:
             raise OSError("realm WAL identity changed; restart required")
+        # SQLite may checkpoint or touch the DB/WAL while serving reads.
+        # File size/timestamps are not commit authority. Keep pinned inode
+        # custody, and detect actual changes via this same live connection's
+        # data_version, total_changes and the logical history boundary. The
+        # final BEGIN IMMEDIATE recheck uses exactly this same authority.
         return (
-            self._owner_identity,
-            _file_identity(store.db_path),
+            storage,
+            storage[1],
             wal,
             connection.execute("PRAGMA data_version").fetchone()[0],
             connection.total_changes, history_boundary(connection),
@@ -249,7 +255,11 @@ class DeferredHistoryVerification:
                             self._publish_failure(report)
                             return
                         if source != before[1:3]:
-                            continue  # This exact detached image was not the sampled source.
+                            self._publish_failure(self._failure(
+                                "verified_snapshot_source_identity_mismatch",
+                                "Restart Runtime; the verified copy was not from the pinned DB/WAL identity.",
+                            ))
+                            return
                         if observed != before[-1] or observed[-1]["version"] != 1:
                             self._publish_failure(self._failure(
                                 "verified_snapshot_authority_mismatch",

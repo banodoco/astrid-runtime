@@ -1367,7 +1367,14 @@ class RealmStore:
                     observed = os.fstat(source_fd)
                     actual = (observed.st_dev, observed.st_ino, observed.st_size,
                               observed.st_mtime_ns, observed.st_ctime_ns)
-                    if actual != _expected_identity:
+                    if len(_expected_identity) == 2:
+                        # Deferred DB/WAL custody is inode-based. The owning
+                        # coordinator brackets the copy and scan with SQLite
+                        # commit/sequence/guard authority, including its final
+                        # writer fence; a mere timestamp touch is not a move.
+                        if actual[:2] != _expected_identity:
+                            raise OSError(f"SQLite authority component identity changed during inspection: {source.name}")
+                    elif actual != _expected_identity:
                         raise _AdmissionSnapshotMoved("SQLite snapshot moved during inspection; retry.")
 
             check_copy_identity()
@@ -1416,6 +1423,7 @@ class RealmStore:
             return cls._integrity_not_checked(timeout_seconds)
         deadline = time.monotonic() + timeout_seconds
         candidates = [db_path, *(Path(str(db_path) + suffix) for suffix in ("-wal", "-shm", "-journal"))]
+        authority_paths = (db_path, candidates[1])
         if not db_path.exists() and not db_path.is_symlink():
             if any(path.exists() or path.is_symlink() for path in candidates[1:]):
                 return cls._integrity_failure(
@@ -1436,7 +1444,14 @@ class RealmStore:
                 if not stat.S_ISREG(metadata.st_mode):
                     raise OSError(f"realm SQLite component is not a regular file: {path.name}")
                 identities[path] = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
-                background_identities[path] = (*identities[path], metadata.st_ctime_ns)
+                # Only the deferred, owner-fenced scan uses inode identity
+                # for DB and WAL. Offline/initial inspection keeps the full
+                # existing stability checks, and admission-state matching
+                # continues to use its existing metadata format.
+                background_identities[path] = (
+                    identities[path][:2] if path in authority_paths
+                    else (*identities[path], metadata.st_ctime_ns)
+                )
                 components.append(path)
             with tempfile.TemporaryDirectory(prefix="astrid-runtime-realm-preflight-") as temporary:
                 snapshot_root = Path(temporary)
@@ -1447,7 +1462,7 @@ class RealmStore:
                             **({"_expected_identity": background_identities[source]} if _history_progress is not None else {}),
                         )
                     except FileNotFoundError:
-                        if _history_progress is None:
+                        if _history_progress is None or source in authority_paths:
                             raise
                         return cls._integrity_not_checked(timeout_seconds, "SQLite snapshot moved during inspection; retry.")
                 for path, expected in identities.items():
@@ -1456,13 +1471,18 @@ class RealmStore:
                         actual = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
                     except FileNotFoundError:
                         actual = None
-                    if (actual != expected or (_history_progress is not None and actual is not None
-                            and (*actual, metadata.st_ctime_ns) != background_identities[path])):
-                        if _history_progress is not None:
-                            # Read-only clients can move SHM bookkeeping. A
-                            # detached background image must be retried, never
-                            # misreported as corruption or accepted stale.
+                    if _history_progress is not None:
+                        expected = background_identities[path]
+                        if actual is not None:
+                            actual = (actual[:2] if path in authority_paths
+                                      else (*actual, metadata.st_ctime_ns))
+                        if actual != expected:
+                            if path in authority_paths:
+                                raise OSError(f"SQLite authority component identity changed during inspection: {path.name}")
+                            # Retain the detached copy's existing stability
+                            # checks for SHM and rollback journal.
                             return cls._integrity_not_checked(timeout_seconds, "SQLite snapshot moved during inspection; retry.")
+                    elif actual != expected:
                         raise OSError(f"realm SQLite component changed during inspection: {path.name}")
                 connection = sqlite3.connect(snapshot_root / "realm.sqlite3", timeout=max(0.001, deadline - time.monotonic()))
                 connection.row_factory = sqlite3.Row
@@ -1492,8 +1512,7 @@ class RealmStore:
                         # The immutable, query-only image just verified owns
                         # these facts; never sample the live DB for this value.
                         report["_snapshot_history_authority"] = history_boundary(connection)
-                        report["_snapshot_history_source"] = (background_identities[db_path],
-                                                                 background_identities[Path(str(db_path) + "-wal")])
+                        report["_snapshot_history_source"] = tuple(background_identities[path] for path in authority_paths)
                     return report
                 finally:
                     connection.close()
