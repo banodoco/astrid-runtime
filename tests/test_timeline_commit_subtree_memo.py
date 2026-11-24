@@ -3,16 +3,20 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import sys
 import time
 from collections import Counter
 from functools import cache
+from importlib.resources import files
 from statistics import median
 
 import pytest
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as SchemaValidationError
-from referencing.exceptions import Unresolvable
+from referencing import Registry, Resource
+from referencing.exceptions import NoSuchResource, Unresolvable
+from referencing.jsonschema import DRAFT202012
 
 from runtime_protocol import timeline_commit_validation as validation
 from runtime_protocol.errors import ValidationError
@@ -21,8 +25,73 @@ from test_timeline_commit_integration import agent, editing, film  # noqa: F401
 
 
 @cache
+def _plain_validator(definition):
+    # Independent correctness oracle: read the same installed bundle, create
+    # its own offline registry and use the stock validator without wrappers.
+    bundle = json.loads(files("runtime_protocol").joinpath(
+        "schemas/timeline-commit-bundle.json").read_text(encoding="utf-8"))
+
+    def unavailable(uri):
+        raise NoSuchResource(ref=uri)
+
+    registry = Registry(retrieve=unavailable)
+    for uri, schema in bundle["resources"].items():
+        resource = Resource.from_contents(schema, default_specification=DRAFT202012)
+        registry = registry.with_resource(uri, resource)
+        if resource.id() is not None:
+            registry = registry.with_resource(resource.id(), resource)
+    return Draft202012Validator(
+        {"$ref": bundle["root"] + "#/$defs/" + definition}, registry=registry
+    )
+
+
+def _plain_finite_json(value):
+    # Independent copy of the frozen base raw guard: reverse child traversal
+    # and exact built-in types; do not share the candidate's capture or guard.
+    active = set()
+    parents = []
+    children = iter((value,))
+    while True:
+        for item in children:
+            kind = type(item)
+            if kind is str or kind is int or kind is bool or item is None:
+                continue
+            if kind is float and math.isfinite(item):
+                continue
+            if kind is not dict and kind is not list:
+                raise ValidationError("commit value must contain only finite JSON")
+            if id(item) in active:
+                raise ValidationError("commit value must not contain cycles")
+            if kind is dict and any(type(key) is not str for key in item):
+                raise ValidationError("commit JSON object keys must be strings")
+            active.add(id(item))
+            parents.append((item, children))
+            children = reversed(tuple(item.values() if kind is dict else item))
+            break
+        else:
+            if not parents:
+                return
+            parent, children = parents.pop()
+            active.remove(id(parent))
+
+
+def _plain_validate(value, definition="PreparedCommit"):
+    _plain_finite_json(value)
+    try:
+        _plain_validator(definition).validate(value)
+    except SchemaValidationError as exc:
+        raise ValidationError(f"invalid {definition}: {exc.message}") from exc
+    except (Unresolvable, RecursionError) as exc:
+        raise ValidationError(
+            f"cannot validate {definition} against the installed contract"
+        ) from exc
+
+
+@cache
 def _base_validator(definition):
-    # The exact pre-SV-L10 compiler and resolver path, with no item hook.
+    # TIMING ONLY: preserve the optimized pre-SV-L10 compiler and resolver
+    # path used for the previous 1.173 s gate; the plain oracle above is
+    # deliberately NOT the performance denominator.
     bundle, registry = validation._schema_resources()
     compiled = validation._reuse_schema_validators(Draft202012Validator)(
         {"$ref": bundle["root"] + "#/$defs/" + definition}, registry=registry
@@ -62,11 +131,12 @@ def _outcome(check, value, definition="PreparedCommit"):
         return (type(exc), str(exc), type(cause), detail)
     # Include opaque Unicode values for which the key's strict UTF-8 encoding
     # refuses; surrogatepass here is an oracle for unchanged bytes, NOT a key.
-    return ("accepted", validation.canonical_json(value).encode("utf-8", "surrogatepass"))
+    return ("accepted", json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=False).encode("utf-8", "surrogatepass"))
 
 
 def _same(value, definition="PreparedCommit"):
-    old = _outcome(_base_validate, value, definition)
+    old = _outcome(_plain_validate, value, definition)
     new = _outcome(_candidate, value, definition)
     assert new == old
     return old
@@ -105,67 +175,109 @@ def _clip(identifier="same"):
             "meta": {"vendor.test": {"nested": [1, False, None, "text"]}}}
 
 
-def _three_locations():
+def _state(identifier="same"):
+    return {"state": "present", "value": {
+        "id": identifier, "nested": [{"name": "long enough for memo eligibility",
+                                      "values": [1, False, None, "text"]}],
+    }}
+
+
+def _read(identifier="same"):
+    return {"kind": "field", "ref": "parent", "path": ["clips", "id:" + identifier],
+            "state": _state(identifier)}
+
+
+def _record(value):
+    return value["records"]["commands"][0]
+
+
+def _step(value):
+    return value["records"]["steps"][0]
+
+
+def _four_targets():
     value = prepared()
     parent = _parent(value)
-    # Same bytes at the two RawClip locations must not share a result.
     parent["clips"] = [_clip()]
     parent["config"]["clips"] = [_clip()]
     parent["config"]["tracks"] = [
         {"id": "picture", "kind": "visual", "label": "Picture",
          "role": "output", "volume": 1}
     ]
+    read = _read()
+    # AgentRead reaches the edit-command AgentState and recursive JSON;
+    # CommitRead reaches the timeline AgentState alias, which reaches the
+    # edit-command target. Equal bytes at distinct source refs stay distinct.
+    _record(value)["reads"] = [{k: copy.deepcopy(v) for k, v in read.items()
+                               if k != "kind"}]
+    value["records"]["steps"] = [{
+        "id": "step", "label": "Step", "intent": "Edit", "tags": ["proof"],
+        "command_ordinals": [0], "patch": [], "reads": [copy.deepcopy(read)],
+        "dependencies": [copy.deepcopy(read)],
+    }]
     return value
 
 
-def test_cold_warm_three_locations_edit_insert_and_reorder(memo):
-    value = _three_locations()
+def test_cold_warm_four_targets_edit_insert_and_reorder(memo):
+    value = _four_targets()
     assert _same(value)[0] == "accepted"
-    assert memo.counts["misses"] == 3
-    assert len(memo.entries) == 3
+    assert memo.counts["misses"] > 0
+    assert {key[0][-1].split("/")[-1] for key in memo.entries} == {
+        "JSON", "AgentState", "CommitRead",
+    }
+    targets = {key[0][-1] for key in memo.entries}
+    assert targets == {
+        "https://astrid.haus/workspace/v1/schemas/edit-command.json#/$defs/JSON",
+        "https://astrid.haus/workspace/v1/schemas/edit-command.json#/$defs/AgentState",
+        "https://astrid.haus/workspace/v1/schemas/timeline-commit.json#/$defs/AgentState",
+        "https://astrid.haus/workspace/v1/schemas/timeline-commit.json#/$defs/CommitRead",
+    }
+    state_keys = [key for key in memo.entries if key[1] ==
+                  validation.canonical_json(_state()).encode()]
+    assert len({key[0][-2] for key in state_keys}) > 1
+    cold = memo.counts.copy()
     assert _same(value)[0] == "accepted"
-    assert memo.counts["hits"] == 3
+    assert memo.counts["hits"] > cold["hits"]
+    assert memo.counts["misses"] == cold["misses"]
 
+    # RawClip/RawTrack locations are deliberately dropped. Clip edits still
+    # get the original checks; the recorder's changed/new reads are misses.
     parent = _parent(value)
     parent["clips"][0]["track"] = "changed"
-    assert _same(value)[0] == "accepted"
-    assert memo.counts["misses"] == 4
     parent["clips"].append(_clip("new"))
-    assert _same(value)[0] == "accepted"
-    assert memo.counts["misses"] == 5
     parent["clips"].reverse()
+    assert _same(value)[0] == "accepted"
+    assert memo.counts["misses"] == cold["misses"]
+    step = _step(value)
+    step["reads"][0]["state"]["value"]["id"] = "changed"
+    assert _same(value)[0] == "accepted"
+    assert memo.counts["misses"] > cold["misses"]
+    before = memo.counts["misses"]
+    step["reads"].append(_read("new"))
+    assert _same(value)[0] == "accepted"
+    assert memo.counts["misses"] > before
+    step["reads"].reverse()
     before = memo.counts["misses"]
     assert _same(value)[0] == "accepted"
     assert memo.counts["misses"] == before
-    # The internal-timeline payload uses the same raw item schema location.
-    internal = value["canonical_document"]["internal_timeline_revisions"][0]["payload"]
-    internal["clips"] = copy.deepcopy(parent["config"]["clips"])
-    internal["tracks"] = copy.deepcopy(parent["config"]["tracks"])
-    before = memo.counts["hits"]
-    assert _same(value)[0] == "accepted"
-    assert memo.counts["hits"] - before == 6
 
 
 def test_first_refusal_order_and_invalid_never_published(memo):
-    value = _three_locations()
+    value = _four_targets()
     assert _same(value)[0] == "accepted"
     parent = _parent(value)
     parent["clips"][0]["id"] = 3
     parent["config"]["tracks"][0]["kind"] = "not-a-kind"
-    before = len(memo.entries)
     first = _same(value)
     assert first[0] is ValidationError
     assert _same(value) == first
-    assert len(memo.entries) == before
     parent["clips"][0]["id"] = "same"
     second = _same(value)
     assert second[0] is ValidationError and second != first
-    assert len(memo.entries) == before
     parent["config"]["tracks"][0]["kind"] = "visual"
     assert _same(value)[0] == "accepted"
 
-    # An enclosing array's uniqueItems and the envelope still run when all
-    # clips are hits. The order of the first two faults remains the base order.
+    # An enclosing array's uniqueItems and the envelope still run on hits.
     value["records"]["undo_of"] = ["r", "r"]
     value["provider_version"] = ""
     assert _same(value)[0] is ValidationError
@@ -175,19 +287,51 @@ def test_first_refusal_order_and_invalid_never_published(memo):
     assert _same(value)[0] == "accepted"
 
 
+def test_invalid_nested_record_json_first_refusal_path_and_order(memo):
+    value = _four_targets()
+    assert _same(value)[0] == "accepted"
+    state = _record(value)["reads"][0]["state"]
+    # Arbitrary JSON admits every finite built-in JSON value. A malformed
+    # descendant must still fail the raw guard, even with warmed successes.
+    state["value"]["nested"][0]["invalid"] = {1: "non-string key"}
+    _step(value)["reads"][0]["path"] = [1]
+    before = memo.counts.copy()
+    first = _same(value)
+    assert first[0] is ValidationError
+    assert first[1] == "commit JSON object keys must be strings"
+    assert memo.counts == before
+    del state["value"]["nested"][0]["invalid"]
+
+    # Valid raw JSON in an invalid AgentState envelope must still fail the
+    # original oneOf. Simultaneous malformed CommitRead must be later.
+    state["unexpected"] = {"nested": ["invalid state field"]}
+    invalid_key = validation.canonical_json(state).encode()
+    first = _same(value)
+    assert first[0] is ValidationError and first[3] is not None
+    assert first[3][1] == ("records", "commands", 0, "reads", 0, "state")
+    assert _same(value) == first
+    assert all(key[1] != invalid_key for key in memo.entries)
+    del state["unexpected"]
+    second = _same(value)
+    assert second[0] is ValidationError and second != first
+    assert second[3][1] == ("records", "steps", 0, "reads", 0)
+    _step(value)["reads"][0]["path"] = ["clips", "id:same"]
+    assert _same(value)[0] == "accepted"
+
+
 def test_type_sensitive_bytes_and_mutation_after_validation(memo):
-    value = _three_locations()
-    clip = _parent(value)["clips"][0]
-    opaque = clip["meta"]["vendor.test"]
+    value = _four_targets()
+    state = _record(value)["reads"][0]["state"]
     for item in (True, 1, 1.0, -0.0, 0.0):
-        opaque["typed"] = item
+        state["value"]["typed"] = item
         before = memo.counts["misses"]
         assert _same(value)[0] == "accepted"
-        assert memo.counts["misses"] == before + (3 if before == 0 else 1)
-    # The same mutable object no longer describes the previously valid clip.
-    clip["id"] = False
+        assert memo.counts["misses"] > before
+        encoded = validation.canonical_json(state).encode()
+        assert any(key[1] == encoded for key in memo.entries)
+    state["state"] = False
     assert _same(value)[0] is ValidationError
-    clip["id"] = "same"
+    state["state"] = "present"
     assert _same(value)[0] == "accepted"
     track = _parent(value)["config"]["tracks"][0]
     track["volume"] = True
@@ -198,54 +342,55 @@ def test_type_sensitive_bytes_and_mutation_after_validation(memo):
 
 @pytest.mark.parametrize("malformed", [float("nan"), float("inf"), -float("inf")])
 def test_raw_nonfinite_refusal_before_memo(memo, malformed):
-    value = _three_locations()
+    value = _four_targets()
     assert _same(value)[0] == "accepted"
     before = memo.counts.copy()
-    _parent(value)["clips"][0]["opaque"] = malformed
+    _record(value)["reads"][0]["state"]["value"]["opaque"] = malformed
     assert _same(value)[0] is ValidationError
     assert memo.counts == before
 
 
 def test_cycle_refusal_and_encoding_fallback(memo):
-    value = _three_locations()
+    value = _four_targets()
     assert _same(value)[0] == "accepted"
-    clip = _parent(value)["clips"][0]
+    state = _record(value)["reads"][0]["state"]
     before = memo.counts.copy()
-    clip["opaque"] = clip
+    state["value"]["opaque"] = state
     assert _same(value)[0] is ValidationError
     assert memo.counts == before
-    clip["opaque"] = "\ud800"
-    before = memo.counts["misses"]
+    state["value"]["opaque"] = "\ud800"
+    assert validation._subtree_bytes(state) is None
     assert _same(value)[0] == "accepted"
     assert _same(value)[0] == "accepted"
-    assert memo.counts["misses"] == before
 
 
-def test_deep_metadata_near_recursion_limit_uncached(memo):
-    value = _three_locations()
+def test_deep_nested_json_near_recursion_limit_uncached(memo):
+    value = _four_targets()
     assert _same(value)[0] == "accepted"
-    # A recursively validated metadata value, not merely an open opaque field.
-    nested = {"leaf": 1}
+    state = _record(value)["reads"][0]["state"]
+    nested = {"leaf": "large enough to be cached in a shallow record"}
+    for _ in range(20):
+        nested = {"next": nested}
+    state["value"] = nested
+    assert validation._subtree_bytes(state) is None
+    assert _same(value)[0] == "accepted"
+    # Both validators must still refuse a deep recursive JSON value when the
+    # stack is short; no lookup may suppress that refusal.
     for _ in range(100):
         nested = {"next": nested}
-    _parent(value)["clips"][0]["meta"] = {"vendor.test": nested}
-    before = memo.counts["misses"]
-    _same(value)
-    assert memo.counts["misses"] == before
-    # Lower headroom only after both compiled validators exist.
+    state["value"] = nested
+    before = memo.counts.copy()
     limit = sys.getrecursionlimit()
     try:
         sys.setrecursionlimit(500)
-        _same(value)
+        assert _same(value)[0] is ValidationError
     finally:
         sys.setrecursionlimit(limit)
-    assert memo.counts["misses"] == before
+    assert memo.counts == before
 
 
 def test_lru_entry_and_byte_budget_and_oversize(memo, monkeypatch):
-    # Exercise actual successful item validation under small budgets, not
-    # manufactured cache entries that were never schema-checked.
-    value = _three_locations()
+    value = _four_targets()
     memo.entry_limit = 2
     assert _same(value)[0] == "accepted"
     assert len(memo.entries) == 2
@@ -253,20 +398,32 @@ def test_lru_entry_and_byte_budget_and_oversize(memo, monkeypatch):
     assert _same(value)[0] == "accepted"
     assert memo.counts["misses"] > before
 
-    key_bytes = len(validation.canonical_json(_clip()).encode())
+    key_bytes = len(validation.canonical_json(_state()).encode())
     small = _CountingMemo(entries=10, size=key_bytes + 1, key_size=key_bytes + 1)
     monkeypatch.setattr(validation, "_prepared_subtrees", small)
     assert _same(value)[0] == "accepted"
     assert small.size == sum(len(key[1]) for key in small.entries)
-    assert small.size <= small.byte_limit
-    assert len(small.entries) < 3
-    _parent(value)["clips"][0]["opaque"] = "x" * (small.key_limit + 1)
-    before = small.counts["successes"]
+    assert 0 < small.size <= small.byte_limit
+    state = _record(value)["reads"][0]["state"]
+    state["value"]["opaque"] = "x" * (small.key_limit + 1)
+    assert validation._subtree_bytes(state) is None
     assert _same(value)[0] == "accepted"
     assert all(len(key[1]) <= small.key_limit for key in small.entries)
-    # The oversized parent clip was not even a lookup/miss; other locations
-    # may have been evicted and legitimately need to validate again.
-    assert small.counts["successes"] - before <= 2
+    assert small.size == sum(len(key[1]) for key in small.entries) <= small.byte_limit
+
+
+def test_minimum_key_size_skips_scalar_and_tiny_subtrees(memo):
+    minimum = validation._SUBTREE_MIN_BYTES
+    assert minimum == 64
+    assert validation._subtree_bytes("x" * 1000) is None
+    assert validation._subtree_bytes({"state": "present", "value": 1}) is None
+    # JSON object {"x":"..."} has eight bytes of syntax overhead.
+    assert validation._subtree_bytes({"x": "a" * (minimum - 9)}) is None
+    key = validation._subtree_bytes({"x": "a" * (minimum - 8)})
+    assert key is not None and len(key) == minimum
+    assert _same(_four_targets())[0] == "accepted"
+    assert memo.entries
+    assert all(len(key[1]) >= minimum for key in memo.entries)
 
 
 def test_commit_request_has_no_item_memo(memo):
@@ -371,9 +528,8 @@ def test_one_edit_prepared_schema_work(editing, count, monkeypatch):
         base_warm = _measure(_base_validate, second, memo)
         candidate_cold = _measure(_candidate, first, memo)
         candidate_warm = _measure(_candidate, second, memo)
-        assert candidate_cold["misses"] >= count
-        assert candidate_warm["hits"] >= count - 1
-        assert candidate_warm["misses"] > 0
+        assert candidate_cold["misses"] > 0
+        assert candidate_warm["hits"] > 0
         assert candidate_warm["descend_events"] < base_warm["descend_events"]
         rows.append({"base_cold": base_cold, "base_warm": base_warm,
                      "candidate_cold": candidate_cold, "candidate_warm": candidate_warm})
@@ -383,5 +539,26 @@ def test_one_edit_prepared_schema_work(editing, count, monkeypatch):
     # the exact-head 300-clip result at 70%, including cold overhead separately.
     print("SV-L10 " + json.dumps({"clips": count, "prepared_bytes": len(
         validation.canonical_json(second).encode()), "samples": rows,
+        "min_subtree_bytes": validation._SUBTREE_MIN_BYTES,
         "base_warm_median_ns": old, "candidate_warm_median_ns": new,
         "schema_reduction": 1 - new / old}, sort_keys=True))
+
+    # Measure the cutoff on the SAME captured 300-clip pair. The default
+    # above is the sole candidate gate; controls are diagnostic, not an
+    # authorization to retune production. No additional fixture builds.
+    if count == 300:
+        controls = {}
+        for minimum in (0, 128):
+            with monkeypatch.context() as control:
+                control.setattr(validation, "_SUBTREE_MIN_BYTES", minimum)
+                control_memo = _CountingMemo()
+                control.setattr(validation, "_prepared_subtrees", control_memo)
+                validation._validator.cache_clear()
+                controls[minimum] = {
+                    "cold": _measure(_candidate, first, control_memo),
+                    "warm": _measure(_candidate, second, control_memo),
+                }
+        print("SV-L10-MIN " + json.dumps({
+            "clips": count, "candidate_min": validation._SUBTREE_MIN_BYTES,
+            "candidate_samples": rows, "controls": controls,
+        }, sort_keys=True))
