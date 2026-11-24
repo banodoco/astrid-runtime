@@ -219,14 +219,16 @@ def native_site(boundary, ref, path):
 
 
 def covers(dependencies, read):
-    for dependency in dependencies:
-        if value_equal(dependency, read):
-            return True
-        if dependency["kind"] == "scope" and (
-                dependency["ref"] == "timeline" or dependency["ref"] == read["ref"]
-                and read["path"][:len(dependency["path"])] == dependency["path"]):
-            return True
-    return False
+    from .timeline_commit_execution import measure_covers
+    with measure_covers():
+        for dependency in dependencies:
+            if value_equal(dependency, read):
+                return True
+            if dependency["kind"] == "scope" and (
+                    dependency["ref"] == "timeline" or dependency["ref"] == read["ref"]
+                    and read["path"][:len(dependency["path"])] == dependency["path"]):
+                return True
+        return False
 
 
 def _covers_plain(value):
@@ -285,14 +287,32 @@ class _CoversIndex:
                 self.scopes.setdefault(key[1], []).append(position)
 
     def covers(self, read):
-        if type(self.dependencies) is list and not self.dependencies:
-            return False
-        plain = _covers_plain(read)
-        if not plain:
-            self.valid = False
-        key = _covers_key(read) if plain else None
-        if not self.valid or key is None:
-            for dependency in self.dependencies:
+        from .timeline_commit_execution import measure_covers
+        with measure_covers():
+            if type(self.dependencies) is list and not self.dependencies:
+                return False
+            plain = _covers_plain(read)
+            if not plain:
+                self.valid = False
+            key = _covers_key(read) if plain else None
+            if not self.valid or key is None:
+                for dependency in self.dependencies:
+                    if value_equal(dependency, read):
+                        return True
+                    if dependency["kind"] == "scope" and (
+                            dependency["ref"] == "timeline" or dependency["ref"] == read["ref"]
+                            and read["path"][:len(dependency["path"])] == dependency["path"]):
+                        return True
+                return False
+            positions = set(self.exact.get(key, ()))
+            for position in self.scopes.get("timeline", ()):
+                positions.add(position)
+            for position in self.scopes.get(key[1], ()):
+                path = self.dependencies[position]["path"]
+                if read["path"][:len(path)] == path:
+                    positions.add(position)
+            for position in sorted(positions):
+                dependency = self.dependencies[position]
                 if value_equal(dependency, read):
                     return True
                 if dependency["kind"] == "scope" and (
@@ -300,22 +320,6 @@ class _CoversIndex:
                         and read["path"][:len(dependency["path"])] == dependency["path"]):
                     return True
             return False
-        positions = set(self.exact.get(key, ()))
-        for position in self.scopes.get("timeline", ()):
-            positions.add(position)
-        for position in self.scopes.get(key[1], ()):
-            path = self.dependencies[position]["path"]
-            if read["path"][:len(path)] == path:
-                positions.add(position)
-        for position in sorted(positions):
-            dependency = self.dependencies[position]
-            if value_equal(dependency, read):
-                return True
-            if dependency["kind"] == "scope" and (
-                    dependency["ref"] == "timeline" or dependency["ref"] == read["ref"]
-                    and read["path"][:len(dependency["path"])] == dependency["path"]):
-                return True
-        return False
 
 
 def native_asset_reads(payload):
