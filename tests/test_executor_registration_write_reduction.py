@@ -67,18 +67,28 @@ def test_fresh_identical_registration_has_no_durable_writes(service):
     assert service.store.matching_live_executor("render", body["capabilities"][0]["definition_digest"], include_storage=False)
 
 
-def test_half_ttl_refresh_and_liveness(service):
+def test_half_ttl_refresh_and_liveness(service, monkeypatch):
+    import runtime_protocol.store as store_module
+
     body = registration(service)
     service.register_executor(body, idempotency_key="first")
-    young = set_age(service, EXECUTOR_LIVENESS_SECONDS / 2 - 2)
-    _, writes = durable_writes(service, body, "young")
-    assert writes == []
-    assert row(service)["last_seen_at"] == young
-    old = set_age(service, EXECUTOR_LIVENESS_SECONDS / 2 + 2)
-    _, writes = durable_writes(service, body, "old")
-    assert writes
-    assert row(service)["last_seen_at"] > old
-    assert service.store.matching_live_executor("render", body["capabilities"][0]["definition_digest"], include_storage=False)
+    stored = row(service)["last_seen_at"]
+    clock = [datetime.fromisoformat(stored)]
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0] if tz else clock[0].replace(tzinfo=None)
+
+    monkeypatch.setattr(store_module, "datetime", FixedDateTime)
+    monkeypatch.setattr(store_module, "now", lambda: clock[0].isoformat())
+    for seconds in (EXECUTOR_LIVENESS_SECONDS / 2 - 2, EXECUTOR_LIVENESS_SECONDS / 2 + 2):
+        clock[0] += timedelta(seconds=seconds)
+        _, writes = durable_writes(service, body, str(seconds))
+        assert writes == []
+        assert row(service)["last_seen_at"] == stored
+        assert service.store._executor_result(row(service))["last_seen_at"] == clock[0].isoformat()
+        assert service.store.matching_live_executor("render", body["capabilities"][0]["definition_digest"], include_storage=False)
 
 
 @pytest.mark.parametrize("change", [
@@ -146,7 +156,8 @@ def test_exact_half_ttl_requires_refresh(service, monkeypatch):
 
     body = registration(service)
     service.register_executor(body, idempotency_key="first")
-    fixed = datetime.now(timezone.utc).replace(microsecond=0)
+    stored = row(service)["last_seen_at"]
+    fixed = datetime.fromisoformat(stored) + timedelta(seconds=EXECUTOR_LIVENESS_SECONDS / 2)
 
     class FixedDateTime(datetime):
         @classmethod
@@ -154,11 +165,11 @@ def test_exact_half_ttl_requires_refresh(service, monkeypatch):
             return fixed if tz else fixed.replace(tzinfo=None)
 
     monkeypatch.setattr(store_module, "datetime", FixedDateTime)
-    cutoff = (fixed - timedelta(seconds=EXECUTOR_LIVENESS_SECONDS / 2)).isoformat()
-    service.store.conn.execute("UPDATE executors SET last_seen_at=? WHERE id='worker'", (cutoff,))
+    monkeypatch.setattr(store_module, "now", lambda: fixed.isoformat())
     _, writes = durable_writes(service, body, "boundary")
-    assert writes
-    assert row(service)["last_seen_at"] != cutoff
+    assert writes == []
+    assert row(service)["last_seen_at"] == stored
+    assert service.store._executor_result(row(service))["last_seen_at"] == fixed.isoformat()
 
 
 def test_missing_string_capability_is_created(service):
