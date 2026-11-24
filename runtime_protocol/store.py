@@ -1348,7 +1348,7 @@ class RealmStore:
                 self._lock_file = None
 
     @staticmethod
-    def _copy_admission_file(source: Path, destination: Path, deadline: float) -> None:
+    def _copy_admission_file(source: Path, destination: Path, deadline: float, *, _expected_identity=None) -> None:
         """Copy one stable SQLite component without following a sidecar link."""
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         source_fd = os.open(source, flags)
@@ -1357,12 +1357,23 @@ class RealmStore:
             metadata = os.fstat(source_fd)
             if not stat.S_ISREG(metadata.st_mode):
                 raise OSError(f"realm SQLite component is not a regular file: {source.name}")
+
+            def check_copy_identity():
+                if _expected_identity is not None:
+                    observed = os.fstat(source_fd)
+                    actual = (observed.st_dev, observed.st_ino, observed.st_size,
+                              observed.st_mtime_ns, observed.st_ctime_ns)
+                    if actual != _expected_identity:
+                        raise TimeoutError("SQLite snapshot moved during inspection; retry.")
+
+            check_copy_identity()
             if sys.platform == "darwin":
                 clone = getattr(ctypes.CDLL(None, use_errno=True), "fclonefileat", None)
                 if clone is not None:
                     clone.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
                     clone.restype = ctypes.c_int
                     if clone(source_fd, getattr(os, "AT_FDCWD", -2), os.fsencode(destination), 0) == 0:
+                        check_copy_identity()
                         return
                     error = ctypes.get_errno()
                     if error not in {errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS, errno.EINVAL}:
@@ -1377,6 +1388,7 @@ class RealmStore:
                     if not block:
                         break
                     target.write(block)
+            check_copy_identity()
         finally:
             os.close(source_fd)
 
@@ -1408,22 +1420,28 @@ class RealmStore:
             return {"status": "ok", "state": "uninitialized", "ok": True, "issues": [], "checks": {}}
         try:
             identities = {}
+            background_identities = {}
             components = []
             for path in candidates:
                 try:
                     metadata = path.lstat()
                 except FileNotFoundError:
                     identities[path] = None
+                    background_identities[path] = None
                     continue
                 if not stat.S_ISREG(metadata.st_mode):
                     raise OSError(f"realm SQLite component is not a regular file: {path.name}")
                 identities[path] = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+                background_identities[path] = (*identities[path], metadata.st_ctime_ns)
                 components.append(path)
             with tempfile.TemporaryDirectory(prefix="astrid-runtime-realm-preflight-") as temporary:
                 snapshot_root = Path(temporary)
                 for source in components:
                     try:
-                        cls._copy_admission_file(source, snapshot_root / source.name, deadline)
+                        cls._copy_admission_file(
+                            source, snapshot_root / source.name, deadline,
+                            **({"_expected_identity": background_identities[source]} if _history_progress is not None else {}),
+                        )
                     except FileNotFoundError:
                         if _history_progress is None:
                             raise
@@ -1434,7 +1452,8 @@ class RealmStore:
                         actual = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
                     except FileNotFoundError:
                         actual = None
-                    if actual != expected:
+                    if (actual != expected or (_history_progress is not None and actual is not None
+                            and (*actual, metadata.st_ctime_ns) != background_identities[path])):
                         if _history_progress is not None:
                             # Read-only clients can move SHM bookkeeping. A
                             # detached background image must be retried, never
@@ -1469,6 +1488,8 @@ class RealmStore:
                         # The immutable, query-only image just verified owns
                         # these facts; never sample the live DB for this value.
                         report["_snapshot_history_authority"] = history_boundary(connection)
+                        report["_snapshot_history_source"] = (background_identities[db_path],
+                                                                 background_identities[Path(str(db_path) + "-wal")])
                     return report
                 finally:
                     connection.close()

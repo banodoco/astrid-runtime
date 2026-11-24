@@ -211,7 +211,8 @@ class DeferredHistoryVerification:
             self.store.conn.execute("PRAGMA query_only=ON")
             self.store.admission_report = report
             self._status = {**self._status, "state": "failed", "phase": "failed",
-                            "message": "realm failed " + (", ".join(report.get("issues", [])) or "history_verification") + " check"}
+                            "message": ("realm failed " + (", ".join(report.get("issues", [])) or "history_verification")
+                                        + " check. " + report.get("recovery_action", ""))}
 
     def _run(self):
         store = self.store
@@ -231,6 +232,7 @@ class DeferredHistoryVerification:
                         allow_active_marker=False, _history_progress=self._progress,
                     )
                     observed = report.pop("_snapshot_history_authority", None)
+                    source = report.pop("_snapshot_history_source", None)
                     with store._mutex:
                         cancellation.check()
                         if self._authority() != before:
@@ -241,6 +243,8 @@ class DeferredHistoryVerification:
                         if not report.get("ok"):
                             self._publish_failure(report)
                             return
+                        if source != before[1:3]:
+                            continue  # This exact detached image was not the sampled source.
                         if observed != before[-1] or observed[-1]["version"] != 1:
                             self._publish_failure(self._failure(
                                 "verified_snapshot_authority_mismatch",
@@ -261,11 +265,18 @@ class DeferredHistoryVerification:
                                 store.admission_report = report
                                 store._write_admission_state(clean=False)
                                 cancellation.check()
+                                # Publish while the writer fence is still held,
+                                # not in the gap after releasing it. Public
+                                # service writes also take the primary mutex.
+                                self._status = {**self._status, "state": "complete",
+                                                "phase": "complete", "message": "verification complete"}
                             finally:
                                 connection.rollback()
-                            cancellation.check()
-                            self._status = {**self._status, "state": "complete",
-                                            "phase": "complete", "message": "verification complete"}
+                        except BaseException:
+                            # A failed fence release is not admission success.
+                            self._status = {**self._status, "state": "pending",
+                                            "phase": "snapshot", "message": _PENDING}
+                            raise
                         finally:
                             if self._status["state"] != "complete":
                                 connection.execute("PRAGMA query_only=ON")
