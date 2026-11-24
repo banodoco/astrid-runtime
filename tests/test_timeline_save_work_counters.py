@@ -177,7 +177,7 @@ def test_one_warm_save_work_is_independent_of_accepted_history(film):
             subject.service.close()
             startup = SaveCounts()
             with startup.observe():
-                subject.service = RuntimeService(fixture.duplicate_root)
+                subject.service = RuntimeService(fixture.duplicate_root, admission_timeout=120)
                 subject.service.get_timeline_verified_head(
                     subject.project, subject.timeline, authorize=lambda: None)
             subject.service.register_timeline_commit_provider(provider)
