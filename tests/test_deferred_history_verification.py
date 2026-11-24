@@ -16,6 +16,7 @@ import pytest
 
 from astrid_runtime.bootstrap import BootstrapError
 from astrid_runtime.workspace import _inspect
+from runtime_protocol.cli import main as runtime_main
 from runtime_protocol.errors import RealmAdmissionError
 from runtime_protocol.history_guards import history_guard_manifest, remove_history_guards
 from runtime_protocol.history_verification import may_defer_history
@@ -334,3 +335,67 @@ def test_kill_mid_scan_restarts_large_history_and_enables_writes_only_after_proo
             messages.close()
             messages.join_thread()
     assert json.loads((Path(root) / "admission-state.json").read_text())["clean_shutdown"] is True
+
+
+def test_repeated_incomplete_background_scans_end_in_named_refusal(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    original = TimelineCommitStore.integrity_errors
+    background_attempts = []
+
+    def expired(self, *, deadline=None, errors=None, progress=None):
+        if progress is not None:
+            background_attempts.append(deadline)
+        # Exercise the real traversal's deadline signal, not a generic
+        # TimeoutError raised by an unrelated row or storage operation.
+        return original(self, deadline=0, errors=errors, progress=progress)
+
+    monkeypatch.setattr(TimelineCommitStore, "integrity_errors", expired)
+    runtime = RuntimeService(root, admission_timeout=120)
+    try:
+        status = _wait_state(runtime, "failed")
+        assert len(background_attempts) == 3
+        assert status["attempt"] == 3
+        report = runtime.doctor()
+        assert report["issues"] == ["history_verification"]
+        check = report["checks"]["history_verification"]
+        assert check["reason"] == "verification_retry_limit_exhausted"
+        assert check["attempts"] == 3
+        assert "rerun doctor" in report["recovery_action"]
+        assert "restore" not in report["recovery_action"].lower()
+        assert runtime.store.conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(RealmAdmissionError, match="history_verification"):
+            runtime.create_project({"slug": "blocked", "name": "Blocked"})
+    finally:
+        runtime.close()
+    assert json.loads((root / "admission-state.json").read_text())["clean_shutdown"] is False
+
+
+@pytest.mark.parametrize("command", ["backup", "export", "purge"])
+def test_offline_cli_refuses_even_eligible_incomplete_history(tmp_path, monkeypatch, command):
+    root = tmp_path / "realm"
+    destination = tmp_path / "output"
+    with RealmStore.initialize(root, realm_id="offline-strict") as store:
+        store.tombstone_realm()
+    original = TimelineCommitStore.integrity_errors
+    monkeypatch.setattr(TimelineCommitStore, "integrity_errors",
+                        _late_deadline(original, lambda *_: None))
+    report = RealmStore.inspect_realm(root, deep=True, timeout_seconds=120)
+    assert may_defer_history(report, root)
+    before = (root / "admission-state.json").read_bytes()
+
+    from runtime_protocol.history_verification import DeferredHistoryVerification
+
+    def unexpected_background(self):
+        pytest.fail("offline command attempted to start deferred verification")
+
+    monkeypatch.setattr(DeferredHistoryVerification, "start", unexpected_background)
+    arguments = ["--confirm", "PURGE offline-strict"] if command == "purge" else [
+        "--destination", str(destination)
+    ]
+    with pytest.raises(RealmAdmissionError, match="Verification incomplete") as refused:
+        runtime_main([command, "--root", str(root), *arguments])
+    assert refused.value.details["history_deferral_eligible"] is True
+    assert (root / "realm.sqlite3").is_file()
+    assert (root / "admission-state.json").read_bytes() == before
+    assert not destination.exists()

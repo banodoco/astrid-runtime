@@ -8,7 +8,7 @@ import pytest
 from astrid_runtime.bootstrap import BootstrapError
 from astrid_runtime.workspace import _inspect
 from runtime_protocol import cancellation, timeline_commit_store as history_module
-from runtime_protocol.errors import RealmAdmissionError
+from runtime_protocol.errors import IntegrityDeadlineExceeded, RealmAdmissionError
 from runtime_protocol.store import RealmStore
 from runtime_protocol.timeline_commit_store import TimelineCommitStore
 from test_timeline_commit_authentication import body, provider
@@ -71,7 +71,7 @@ def test_doctor_preserves_known_failure_on_incomplete_history(tmp_path, monkeypa
     def interrupted(self, *, deadline, errors):
         if bad_first:
             errors.append({"table": "timeline_commit_history", "id": "bad", "reason": "history receipt missing or ambiguous"})
-        raise TimeoutError("history verification incomplete")
+        raise IntegrityDeadlineExceeded("history verification incomplete")
 
     monkeypatch.setattr(history_module.TimelineCommitStore, "integrity_errors", interrupted)
     report = RealmStore.inspect_realm(root, deep=True)
@@ -170,3 +170,79 @@ def test_named_check_and_recovery_survive_startup_refusal(tmp_path, monkeypatch)
     with pytest.raises(BootstrapError, match="revisions") as workspace_refusal:
         _inspect(boundary, root)
     assert "verified backup" in str(workspace_refusal.value)
+
+
+def test_premature_row_timeout_is_a_named_revision_error(service, monkeypatch):
+    """An I/O timeout inside one row is not expiry of the scan's own budget."""
+    provider(service)
+    accepted = commit(service, body(service))
+    publication = accepted["receipt"]["receipt_id"]
+    root = service.store.root
+    service.close()
+    original = TimelineCommitStore._verify_accepted
+
+    def timed_out(self, receipt, edge, *args, **kwargs):
+        if edge["publication_id"] == publication:
+            raise TimeoutError("storage read timed out before the verification deadline")
+        return original(self, receipt, edge, *args, **kwargs)
+
+    monkeypatch.setattr(TimelineCommitStore, "_verify_accepted", timed_out)
+    report = RealmStore.inspect_realm(root, deep=True, timeout_seconds=120)
+    assert report["state"] == "unhealthy"
+    assert report["ok"] is False
+    assert report["issues"] == ["revisions"]
+    assert not report.get("history_deferral_eligible", False)
+    assert not report.get("verification_incomplete", False)
+    assert any(row["id"] == publication and "storage read timed out" in row["reason"]
+               for row in report["checks"]["revisions"]["errors"])
+    with pytest.raises(RealmAdmissionError, match="revisions"):
+        RealmStore(root, admission_timeout=120)
+
+
+def test_premature_traversal_timeout_refuses_with_named_check(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+
+    def timed_out(self, *, deadline, errors):
+        raise TimeoutError("history query I/O timed out")
+
+    monkeypatch.setattr(TimelineCommitStore, "integrity_errors", timed_out)
+    report = RealmStore.inspect_realm(root, deep=True, timeout_seconds=120)
+    assert report["state"] == "unhealthy"
+    assert report["issues"] == ["revisions"]
+    assert report["checks"]["revisions"]["errors"] == [
+        {"table": "timeline_commit_history", "reason": "history query I/O timed out"}
+    ]
+    assert not report.get("history_deferral_eligible", False)
+
+
+def test_premature_cas_timeout_names_cas_check(service, monkeypatch):
+    root = service.store.root
+    service.ingest(service.test_project, b"retained test object", media_type="application/octet-stream",
+                   idempotency_key="timeout-fixture")
+    service.close()
+
+    def timed_out(self, digest, *, deadline=None):
+        raise TimeoutError("CAS storage I/O timed out")
+
+    monkeypatch.setattr(RealmStore, "_cas_digest", timed_out)
+    report = RealmStore.inspect_realm(root, deep=True, timeout_seconds=120)
+    assert report["state"] == "unhealthy"
+    assert report["issues"] == ["reachable_cas"]
+    assert report["checks"]["reachable_cas"]["errors"][0]["reason"] == "read_timeout"
+    assert "CAS storage read timeout" in report["recovery_action"]
+    assert not report.get("history_deferral_eligible", False)
+
+
+def test_premature_snapshot_copy_timeout_is_not_deadline(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+
+    def timed_out(*args, **kwargs):
+        raise TimeoutError("source file I/O timed out")
+
+    monkeypatch.setattr(RealmStore, "_copy_admission_file", staticmethod(timed_out))
+    report = RealmStore.inspect_realm(root, timeout_seconds=120)
+    assert report["state"] == "unhealthy"
+    assert report["issues"] == ["sqlite_integrity"]
+    assert "source file I/O timed out" in report["checks"]["sqlite_integrity"]["result"]
