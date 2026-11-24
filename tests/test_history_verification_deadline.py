@@ -1,12 +1,19 @@
 """SV-L9a: timeout classification, without treating unscanned rows as corrupt."""
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
 
-from runtime_protocol import timeline_commit_store as history_module
+from astrid_runtime.bootstrap import BootstrapError
+from astrid_runtime.workspace import _inspect
+from runtime_protocol import cancellation, timeline_commit_store as history_module
+from runtime_protocol.errors import RealmAdmissionError
 from runtime_protocol.store import RealmStore
 from runtime_protocol.timeline_commit_store import TimelineCommitStore
+from test_timeline_commit_authentication import body, provider
+from test_timeline_commit_port import commit, service  # noqa: F401 (shared fixture)
+from test_timeline_verified_reads import next_request
 
 
 @pytest.mark.parametrize("bad_first", [False, True])
@@ -84,3 +91,82 @@ def test_doctor_preserves_known_failure_on_incomplete_history(tmp_path, monkeypa
         assert report["checks"]["revisions"]["errors"] == []
         assert "Verification incomplete" in report["recovery_action"]
         assert "backup" not in report["recovery_action"]
+
+
+def test_real_history_deadline_after_first_record_is_one_incomplete_report(service, monkeypatch):
+    provider(service)
+    first = commit(service, body(service))
+    second = commit(service, next_request(service), key="second")
+    root = service.store.root
+    first_id = first["receipt"]["receipt_id"]
+    second_id = second["receipt"]["receipt_id"]
+    service.close()
+    assert RealmStore.inspect_realm(root, deep=True)["ok"] is True
+
+    original = TimelineCommitStore._verify_accepted
+    expired = False
+    seen = []
+
+    def verify(self, receipt, edge, *args, **kwargs):
+        nonlocal expired
+        result = original(self, receipt, edge, *args, **kwargs)
+        seen.append(edge["publication_id"])
+        if edge["publication_id"] == first_id:
+            expired = True
+        return result
+
+    def monotonic():
+        # The doctor keeps its genuine SQLite deadline; force this traversal
+        # to observe that deadline immediately after one complete recorded row.
+        return float("inf") if expired else 0.0
+
+    monkeypatch.setattr(history_module, "time", SimpleNamespace(monotonic=monotonic))
+    monkeypatch.setattr(TimelineCommitStore, "_verify_accepted", verify)
+    report = RealmStore.inspect_realm(root, deep=True)
+    assert first_id in seen
+    assert second_id not in seen
+    assert report["ok"] is False
+    assert report["state"] == "not_checked"
+    assert report["verification_incomplete"] is True
+    assert report["issues"] == []
+    assert report["checks"]["revisions"]["errors"] == []
+    assert "Verification incomplete" in report["recovery_action"]
+    assert "backup" not in report["recovery_action"]
+
+    monkeypatch.setattr(TimelineCommitStore, "_verify_accepted", original)
+    expired = False
+    assert RealmStore.inspect_realm(root, deep=True)["ok"] is True
+
+
+def test_cancelled_scan_propagates_cancellation(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    cancelled = threading.Event()
+
+    def interrupted(self, *, deadline, errors):
+        cancelled.set()
+        cancellation.check()
+
+    monkeypatch.setattr(TimelineCommitStore, "integrity_errors", interrupted)
+    with cancellation.startup_scope(cancelled):
+        with pytest.raises(cancellation.StartupCancelled):
+            RealmStore.inspect_realm(root, deep=True)
+
+
+def test_named_check_and_recovery_survive_startup_refusal(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+
+    def damaged(self, *, deadline, errors):
+        errors.append({"table": "timeline_commit_history", "id": "bad", "reason": "history receipt missing or ambiguous"})
+        return errors
+
+    monkeypatch.setattr(TimelineCommitStore, "integrity_errors", damaged)
+    with pytest.raises(RealmAdmissionError, match="revisions") as refusal:
+        RealmStore(root)
+    assert "verified backup" in str(refusal.value)
+    assert refusal.value.details["checks"]["revisions"]["errors"][0]["id"] == "bad"
+    boundary = SimpleNamespace(inspect=lambda *, realm_root: RealmStore.inspect_realm(realm_root))
+    with pytest.raises(BootstrapError, match="revisions") as workspace_refusal:
+        _inspect(boundary, root)
+    assert "verified backup" in str(workspace_refusal.value)

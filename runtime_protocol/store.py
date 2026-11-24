@@ -7713,7 +7713,7 @@ class RealmStore:
                 "foreign_keys": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
                 "foreign_key": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
                 "revisions": {"ok": False if revision_errors else None if history_incomplete else True, "errors": revision_errors,
-                              **({"status": "not_checked", "reason": "timeout"} if history_incomplete else {})},
+                              **({"status": "failed" if revision_errors else "not_checked", "reason": "timeout"} if history_incomplete else {})},
                 "schema": {
                     "ok": schema_ok,
                     "expected_format_id": CANONICAL_FORMAT_ID,
