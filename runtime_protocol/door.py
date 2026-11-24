@@ -690,7 +690,9 @@ class DoorHandler(RuntimeHandler):
             return {"actor": "health", "scopes": ["health"]}
         if not self.server.accepting_authenticated_requests:
             raise AuthorizationError("runtime is not accepting authenticated requests")
-        return self.server.credentials.require(self._door_token, scope)
+        identity = self.server.credentials.require(self._door_token, scope)
+        self._require_history_write_admission()
+        return identity
 
     # -- responses ---------------------------------------------------------
 

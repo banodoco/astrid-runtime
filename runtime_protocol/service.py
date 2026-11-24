@@ -695,7 +695,7 @@ class RuntimeService:
             if not math.isfinite(admission_timeout) or admission_timeout <= 0:
                 raise ValidationError("admission_timeout must be a finite positive number")
             store_kwargs["admission_timeout"] = admission_timeout
-        self.store = RealmStore(root_path, **store_kwargs)
+        self.store = RealmStore(root_path, _start_history_verification=False, **store_kwargs)
         self._verified = False
         self._admission_failure = None
         self._readiness_callback = None
@@ -705,7 +705,8 @@ class RuntimeService:
         self._timeline_commit_store = None
         self._timeline_commit_coordinator = None
         try:
-            if not self.store.admission_report.get("ok"):
+            if (not self.store.admission_report.get("ok")
+                    and self.store.history_verification_status() is None):
                 raise RealmAdmissionError(
                     "realm failed startup admission",
                     details=self.store.admission_report,
@@ -714,22 +715,23 @@ class RuntimeService:
             self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
             self.runtime_session_id = new_id()
             self._child_authority_key = secrets.token_bytes(32)
-            self._runtime_state = self.store.begin_runtime_session(
-                self.runtime_session_id, epoch_floor=runtime_epoch_floor
-            )
-            # Lease and registration requests are fenced by this boot's epoch.
-            # Their replay payloads belong to the SQLite session, not the
-            # permanent command ledger copied into backups.
-            self.store.conn.execute(
-                "CREATE TEMP TABLE session_command_replay ("
-                "command_kind TEXT NOT NULL, aggregate_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, "
-                "request_hash TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL, "
-                "is_expired INTEGER NOT NULL DEFAULT 0, "
-                "PRIMARY KEY(command_kind, aggregate_id, idempotency_key))"
-            )
-            self.store.conn.execute(
-                "CREATE INDEX temp.session_replay_expiration ON session_command_replay(is_expired, created_at)"
-            )
+            with self.store._verification_boot_writes():
+                self._runtime_state = self.store.begin_runtime_session(
+                    self.runtime_session_id, epoch_floor=runtime_epoch_floor
+                )
+                # Lease and registration requests are fenced by this boot's epoch.
+                # Their replay payloads belong to the SQLite session, not the
+                # permanent command ledger copied into backups.
+                self.store.conn.execute(
+                    "CREATE TEMP TABLE session_command_replay ("
+                    "command_kind TEXT NOT NULL, aggregate_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, "
+                    "request_hash TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL, "
+                    "is_expired INTEGER NOT NULL DEFAULT 0, "
+                    "PRIMARY KEY(command_kind, aggregate_id, idempotency_key))"
+                )
+                self.store.conn.execute(
+                    "CREATE INDEX temp.session_replay_expiration ON session_command_replay(is_expired, created_at)"
+                )
             self._verified = True
         except Exception:
             self.store.close()
@@ -769,6 +771,7 @@ class RuntimeService:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+        self.store.start_history_verification()
 
     def close(self):
         for _record, fd in self._pack_leases.values():
@@ -844,6 +847,7 @@ class RuntimeService:
         from .local_execution_handoff import digest, validate_fence, write_protected
         validate_fence(held)
         with self.store._mutex:
+            self.store.assert_history_write_admitted()
             self._load_local_claim_fence()
             if self._local_claim_fence_unknown or self._local_claim_fence != held or held["state"] != "held":
                 raise ConflictError("claim fence release has no exact held generation")
@@ -885,10 +889,12 @@ class RuntimeService:
             return False
 
     def backup(self, destination, *, binding=None, destination_identity=None):
+        self.store.assert_history_write_admitted()
         key_path = (self.support_root / "backup-auth.key") if self.support_root else (self.store.root / ".operator-backup-key")
         return create_backup(self.store, destination, binding=binding, key_path=key_path, destination_identity=destination_identity)
 
     def restore(self, backup_dir, destination, *, destination_identity=None, source_identity=None):
+        self.store.assert_history_write_admitted()
         # The backup's authenticated manifest owns the key identity.  Do not
         # force this service's current support key: a destination backup
         # may have been signed by the destination realm's key while the
@@ -904,7 +910,20 @@ class RuntimeService:
 
     def doctor(self):
         with self.store._mutex:
+            verification = self.store.history_verification_status()
             report = self.store.doctor(catalog_path=(self.support_root / "catalog.json") if self.support_root else None)
+            if verification is not None and verification["state"] != "complete":
+                # Readable owner, not writable authority. A background failure
+                # is permanent for this boot, but must not clear discovery and
+                # strand independently verified reads of unaffected timelines.
+                return report
+            if (verification is not None and verification["state"] == "complete"
+                    and report.get("history_deferral_eligible") is True
+                    and report.get("issues") == []):
+                # An already completed owner does not lose its proven write
+                # admission solely because a subsequent diagnostic's history
+                # budget is shorter. A genuine reported failure still revokes.
+                return report
             if not report.get("ok"):
                 # Admission is monotonic for one service instance. Repair is
                 # verified by a fresh startup; an unhealthy process never
@@ -993,7 +1012,9 @@ class RuntimeService:
                 self._admission_failure = {"reason": "runtime_liveness_failed"}
         return {"status": "ok" if self._verified and live else "degraded", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"], "runtime_session_id": self.runtime_session_id}
 
-    def _assert_mutation_admitted(self):
+    def _assert_mutation_admitted(self, *, read_only=False):
+        if not read_only:
+            self.store.assert_history_write_admitted()
         if not getattr(self, "_registering_v33_provider", False):
             from .v33_lifecycle import require_ready, MARKER
             require_ready(self.store.root)
@@ -3193,6 +3214,20 @@ class RuntimeService:
                 "SELECT project_id, timeline_id, publication_id FROM parent_composition_heads "
                 "WHERE revision_id IS NOT NULL",
             ).fetchall()
+            verification = self.store.history_verification_status()
+            if verification is not None and verification["state"] != "complete":
+                # Deferred admission cannot create a legacy baseline or finish
+                # activation. The preflight already proved no such work is
+                # needed; check again under the live mutex. Register only the
+                # provider, not an invented "verified" inventory. Read paths
+                # still verify the selected retained closure and media pins.
+                from .v33_lifecycle import require_ready
+                require_ready(self.store.root)
+                if any(head["publication_id"] is None for head in heads):
+                    raise RealmAdmissionError("legacy baseline activation requires complete verification")
+                self._timeline_commit_provider = provider
+                self._v33_provider_registered = True
+                return
             inventory = []
             self._registering_v33_provider = True
             try:
@@ -3606,7 +3641,7 @@ class RuntimeService:
             raise
 
     def get_project_media_selection(self, project_id, selectors, *, authorize):
-        self._assert_mutation_admitted()
+        self._assert_mutation_admitted(read_only=True)
         from .timeline_commit_port import MediaReads, detached
         selectors = detached(selectors)
         if not isinstance(selectors, dict) or set(selectors) not in (
@@ -5545,6 +5580,7 @@ class RuntimeService:
     def recover_reference(self, reference_id, body, *, idempotency_key=None): return self._update_reference_state(reference_id, body, archived=False, idempotency_key=idempotency_key)
 
     def stage_object(self, chunks, *, expected_digest=None):
+        self.store.assert_history_write_admitted()
         return self.cas.stage(chunks, self.store.staging_root,
                               max_bytes=self.max_object_bytes, expected_digest=expected_digest)
 
