@@ -6,7 +6,9 @@ import copy
 import hashlib
 import json
 import math
+import sys
 from collections import OrderedDict
+from contextvars import ContextVar
 from functools import cache, lru_cache
 from importlib.resources import files
 from threading import Lock
@@ -21,6 +23,164 @@ _CANONICAL_DOCUMENT = "CanonicalDocument"
 _DOCUMENT_MEMO_LIMIT = 256
 _document_memo = OrderedDict()
 _document_memo_lock = Lock()
+
+# Only the audited installed contract has the local, annotation-independent
+# item references below. A regenerated bundle starts on the uncached path
+# until its item schema closure is reviewed again.
+_REVIEWED_CONTRACT = "sha256:2c6a76e17b4441398ab91e3e9d6283a719fd5b08807447db9dbf2ecc5e1339a2"
+_REVIEWED_BUNDLE = "ce5490aedf1b2932f01219c0e317468ecf397cd9c1f715152faa62d3fa0694f2"
+_SHOT_SCHEMA = "https://astrid.haus/workspace/v1/schemas/shot-composition.json"
+_ITEM_LOCATIONS = (
+    ("ParentComposition", "clips", "RawClip"),
+    ("RawTimelinePayload", "clips", "RawClip"),
+    ("RawTimelinePayload", "tracks", "RawTrack"),
+)
+_SUBTREE_DEPTH_LIMIT = 12
+_SUBTREE_ENTRY_LIMIT = 4096
+_SUBTREE_BYTES_LIMIT = 16 * 1024 * 1024
+_SUBTREE_KEY_LIMIT = 128 * 1024
+_prepared_memo_active = ContextVar("prepared_memo_active", default=False)
+
+
+class _SubtreeMemo:
+    """Bounded success-only LRU; no mutable instances or errors are retained."""
+
+    def __init__(self, entries=_SUBTREE_ENTRY_LIMIT, size=_SUBTREE_BYTES_LIMIT,
+                 key_size=_SUBTREE_KEY_LIMIT):
+        self.entries = OrderedDict()
+        self.size = 0
+        self.entry_limit = entries
+        self.byte_limit = size
+        self.key_limit = key_size
+        self.lock = Lock()
+
+    def contains(self, key):
+        with self.lock:
+            if key not in self.entries:
+                return False
+            self.entries.move_to_end(key)
+            return True
+
+    def remember(self, key):
+        size = len(key[1])
+        if size > self.key_limit or size > self.byte_limit or self.entry_limit < 1:
+            return
+        with self.lock:
+            if key in self.entries:
+                self.entries.move_to_end(key)
+                return
+            self.entries[key] = None
+            self.size += size
+            while len(self.entries) > self.entry_limit or self.size > self.byte_limit:
+                removed, _ = self.entries.popitem(last=False)
+                self.size -= len(removed[1])
+
+
+_prepared_subtrees = _SubtreeMemo()
+
+
+def _subtree_bytes(instance):
+    # finite_json has checked this privately captured graph. Bound the local
+    # recursive schema depth before allowing a success to omit any traversal.
+    pending = [(instance, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > _SUBTREE_DEPTH_LIMIT:
+            return None
+        if type(item) is dict or type(item) is list:
+            children = item.values() if type(item) is dict else item
+            pending.extend((child, depth + 1) for child in children
+                           if type(child) is dict or type(child) is list)
+    try:
+        encoded = canonical_json(instance).encode()
+    except (RecursionError, TypeError, ValueError):
+        # In particular, a lone surrogate is valid in some schema positions
+        # but cannot be encoded as strict UTF-8. Never infer a validation result.
+        return None
+    if len(encoded) > _prepared_subtrees.key_limit:
+        return None
+    return encoded
+
+
+def _has_subtree_recursion_headroom():
+    # A shallow subtree can still be evaluated from a nearly exhausted stack.
+    # The three reference paths have fixed envelope depth; 512 frames is a
+    # conservative allowance for them and twelve nested metadata containers.
+    remaining = sys.getrecursionlimit()
+    frame = sys._getframe()
+    while frame is not None and remaining >= 512:
+        remaining -= 1
+        frame = frame.f_back
+    return remaining >= 512
+
+
+def _reviewed_item_nodes(bundle, registry):
+    if SCHEMA_DIGEST != _REVIEWED_CONTRACT:
+        return {}
+    try:
+        raw = files("runtime_protocol").joinpath(
+            "schemas/timeline-commit-bundle.json"
+        ).read_bytes()
+    except OSError:
+        return {}
+    if hashlib.sha256(raw).hexdigest() != _REVIEWED_BUNDLE:
+        return {}
+    # Check the loaded generation as well as the installed bytes. Resource
+    # contents are retained by the registry, not looked up by instance identity.
+    if canonical_json(bundle) != canonical_json(json.loads(raw)):
+        return {}
+    for uri, resource in bundle["resources"].items():
+        if canonical_json(registry.contents(uri)) != canonical_json(resource):
+            return {}
+    definitions = registry.contents(_SHOT_SCHEMA)["$defs"]
+    generation = object()
+    nodes = {}
+    for parent, field, target in _ITEM_LOCATIONS:
+        node = definitions[parent]["properties"][field]["items"]
+        location = f"{_SHOT_SCHEMA}#/$defs/{parent}/properties/{field}/items"
+        namespace = (generation, SCHEMA_DIGEST, _REVIEWED_BUNDLE, location, target)
+        nodes[id(node)] = (node, definitions[target], namespace)
+    return nodes
+
+
+def _memoized_reference(original, nodes):
+    from referencing.exceptions import Unresolvable
+
+    def reference(validator, ref, instance, schema):
+        if not _prepared_memo_active.get():
+            return original(validator, ref, instance, schema)
+        entry = nodes.get(id(schema))
+        if entry is None or entry[0] is not schema:
+            return original(validator, ref, instance, schema)
+        # Match both the original item node and its resolved target. The
+        # reviewed bundle has only static references in this closure.
+        try:
+            resolved = _validator_resolver(validator).lookup(ref)
+        except Unresolvable:
+            return original(validator, ref, instance, schema)
+        if resolved.contents is not entry[1]:
+            return original(validator, ref, instance, schema)
+        encoded = _subtree_bytes(instance)
+        if encoded is None:
+            return original(validator, ref, instance, schema)
+        memo = _prepared_subtrees
+        key = (entry[2], encoded)
+        if memo.contains(key):
+            return ()
+        return _remember_success(original(validator, ref, instance, schema), memo, key)
+
+    return reference
+
+
+def _remember_success(errors, memo, key):
+    # Forward the original error iterator without changing its order or path.
+    # A partial traversal, error or exception never publishes a success.
+    failed = False
+    for error in errors:
+        failed = True
+        yield error
+    if not failed:
+        memo.remember(key)
 
 
 def finite_json(value) -> None:
@@ -136,7 +296,8 @@ def _validator(definition: str):
     bundle, registry = _schema_resources()
     if definition not in bundle["resources"][bundle["root"]]["$defs"]:
         raise ValidationError("unknown commit schema definition")
-    validator = _reuse_schema_validators(Draft202012Validator)(
+    nodes = _reviewed_item_nodes(bundle, registry) if definition == "PreparedCommit" else {}
+    validator = _reuse_schema_validators(Draft202012Validator, nodes)(
         {"$ref": bundle["root"] + "#/$defs/" + definition}, registry=registry
     )
     return validator.evolve(
@@ -144,12 +305,15 @@ def _validator(definition: str):
     )
 
 
-def _reuse_schema_validators(base):
+def _reuse_schema_validators(base, item_nodes=None):
     from threading import RLock
 
     from jsonschema.validators import extend
 
-    validator = extend(base)
+    keywords = {}
+    if item_nodes:
+        keywords["$ref"] = _memoized_reference(base.VALIDATORS["$ref"], item_nodes)
+    validator = extend(base, validators=keywords)
     evolve = validator.evolve
     compiled = OrderedDict()
     lock = RLock()
@@ -234,7 +398,7 @@ def validate_commit_value(value, definition: str) -> None:
     Schema dependencies are loaded only when validation is requested; importing
     this module or the provider ABI requires only the standard library.
     """
-    if definition == _CANONICAL_DOCUMENT:
+    if definition in (_CANONICAL_DOCUMENT, "PreparedCommit"):
         # Run the ordinary finite/raw guard on the same owned snapshot used
         # for the memo key and for schema validation.
         value = _capture_json_containers(value)
@@ -246,6 +410,12 @@ def validate_commit_value(value, definition: str) -> None:
         compiled = _validator(definition)
         if definition == _CANONICAL_DOCUMENT:
             _validate_canonical_document(value, compiled)
+        elif definition == "PreparedCommit":
+            token = _prepared_memo_active.set(_has_subtree_recursion_headroom())
+            try:
+                compiled.validate(value)
+            finally:
+                _prepared_memo_active.reset(token)
         else:
             compiled.validate(value)
     except SchemaValidationError as exc:
