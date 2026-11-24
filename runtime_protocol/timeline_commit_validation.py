@@ -6,11 +6,14 @@ import copy
 import hashlib
 import json
 import math
+import sys
 from collections import OrderedDict
+from contextvars import ContextVar
 from functools import cache, lru_cache
 from importlib.resources import files
 from threading import Lock
 from typing import Protocol, cast
+from urllib.parse import urljoin
 
 from ._timeline_reopen_diagnostics import count_reopen_work
 from .contract_metadata import SCHEMA_DIGEST
@@ -21,6 +24,192 @@ _CANONICAL_DOCUMENT = "CanonicalDocument"
 _DOCUMENT_MEMO_LIMIT = 256
 _document_memo = OrderedDict()
 _document_memo_lock = Lock()
+
+# Only the audited installed contract has the local, annotation-independent
+# references below. A regenerated bundle starts on the uncached path until
+# its schema closure is reviewed again.
+_REVIEWED_CONTRACT = "sha256:2c6a76e17b4441398ab91e3e9d6283a719fd5b08807447db9dbf2ecc5e1339a2"
+_REVIEWED_BUNDLE = "ce5490aedf1b2932f01219c0e317468ecf397cd9c1f715152faa62d3fa0694f2"
+_SCHEMA_URI = "https://astrid.haus/workspace/v1/schemas/"
+_REVIEWED_TARGETS = (
+    ("edit-command.json", "JSON"),
+    ("edit-command.json", "AgentState"),
+    ("timeline-commit.json", "AgentState"),
+    ("timeline-commit.json", "CommitRead"),
+)
+_SUBTREE_MIN_BYTES = 64
+_SUBTREE_DEPTH_LIMIT = 12
+_SUBTREE_ENTRY_LIMIT = 4096
+_SUBTREE_BYTES_LIMIT = 16 * 1024 * 1024
+_SUBTREE_KEY_LIMIT = 128 * 1024
+_prepared_memo_active = ContextVar("prepared_memo_active", default=False)
+
+
+class _SubtreeMemo:
+    """Bounded success-only LRU; no mutable instances or errors are retained."""
+
+    def __init__(self, entries=_SUBTREE_ENTRY_LIMIT, size=_SUBTREE_BYTES_LIMIT,
+                 key_size=_SUBTREE_KEY_LIMIT):
+        self.entries = OrderedDict()
+        self.size = 0
+        self.entry_limit = entries
+        self.byte_limit = size
+        self.key_limit = key_size
+        self.lock = Lock()
+
+    def contains(self, key):
+        with self.lock:
+            if key not in self.entries:
+                return False
+            self.entries.move_to_end(key)
+            return True
+
+    def remember(self, key):
+        size = len(key[1])
+        if size > self.key_limit or size > self.byte_limit or self.entry_limit < 1:
+            return
+        with self.lock:
+            if key in self.entries:
+                self.entries.move_to_end(key)
+                return
+            self.entries[key] = None
+            self.size += size
+            while len(self.entries) > self.entry_limit or self.size > self.byte_limit:
+                removed, _ = self.entries.popitem(last=False)
+                self.size -= len(removed[1])
+
+
+_prepared_subtrees = _SubtreeMemo()
+
+
+def _subtree_bytes(instance):
+    # finite_json has checked this privately captured graph. Scalar leaves
+    # have no descendants worth memoising, even when a string is long.
+    if type(instance) is not dict and type(instance) is not list:
+        return None
+    try:
+        encoded = canonical_json(instance).encode()
+    except (RecursionError, TypeError, ValueError):
+        # Encoding failure is not a schema failure (e.g. a lone surrogate).
+        return None
+    if not _SUBTREE_MIN_BYTES <= len(encoded) <= _prepared_subtrees.key_limit:
+        return None
+    # Bound the recursive schema depth before allowing a hit to omit traversal.
+    pending = [(instance, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > _SUBTREE_DEPTH_LIMIT:
+            return None
+        if type(item) is dict or type(item) is list:
+            children = item.values() if type(item) is dict else item
+            pending.extend((child, depth + 1) for child in children
+                           if type(child) is dict or type(child) is list)
+    return encoded
+
+
+def _has_subtree_recursion_headroom():
+    # The re-aim includes recursive JSON references reached at arbitrary
+    # ancestor depths. Check current stack headroom before each eligible ref.
+    # A shallow subtree near the recursion limit must not bypass a refusal.
+    depth = sys.getrecursionlimit() - 512
+    if depth <= 0:
+        return False
+    try:
+        sys._getframe(depth)
+    except ValueError:
+        return True
+    return False
+
+
+def _reviewed_item_nodes(bundle, registry):
+    if SCHEMA_DIGEST != _REVIEWED_CONTRACT:
+        return {}
+    try:
+        raw = files("runtime_protocol").joinpath(
+            "schemas/timeline-commit-bundle.json"
+        ).read_bytes()
+    except OSError:
+        return {}
+    if hashlib.sha256(raw).hexdigest() != _REVIEWED_BUNDLE:
+        return {}
+    # Check the loaded generation as well as the installed bytes. Resource
+    # contents are retained by the registry, not looked up by instance identity.
+    if canonical_json(bundle) != canonical_json(json.loads(raw)):
+        return {}
+    for uri, resource in bundle["resources"].items():
+        if canonical_json(registry.contents(uri)) != canonical_json(resource):
+            return {}
+    targets = {
+        f"{_SCHEMA_URI}{resource}#/$defs/{name}":
+        registry.contents(_SCHEMA_URI + resource)["$defs"][name]
+        for resource, name in _REVIEWED_TARGETS
+    }
+    generation = object()
+    nodes = {}
+
+    def visit(node, uri, pointer):
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            # Match only pure reference nodes to the four reviewed targets,
+            # never a sibling keyword, enclosing record or other definition.
+            if len(node) == 1 and isinstance(ref, str):
+                target = urljoin(uri, ref)
+                if target in targets:
+                    location = f"{uri}#{pointer}"
+                    namespace = (generation, SCHEMA_DIGEST, _REVIEWED_BUNDLE,
+                                 location, target)
+                    nodes[id(node)] = (node, targets[target], namespace)
+            for key, child in node.items():
+                escaped = key.replace("~", "~0").replace("/", "~1")
+                visit(child, uri, f"{pointer}/{escaped}")
+        elif isinstance(node, list):
+            for index, child in enumerate(node):
+                visit(child, uri, f"{pointer}/{index}")
+
+    for uri in bundle["resources"]:
+        visit(registry.contents(uri), uri, "")
+    return nodes
+
+
+def _memoized_reference(original, nodes):
+    from referencing.exceptions import Unresolvable
+
+    def reference(validator, ref, instance, schema):
+        entry = nodes.get(id(schema))
+        if (entry is None or entry[0] is not schema
+                or (type(instance) is not dict and type(instance) is not list)
+                or not _prepared_memo_active.get()
+                or not _has_subtree_recursion_headroom()):
+            return original(validator, ref, instance, schema)
+        # Match both the original ref node and its resolved target. The
+        # reviewed bundle has only static references in this closure.
+        try:
+            resolved = _validator_resolver(validator).lookup(ref)
+        except Unresolvable:
+            return original(validator, ref, instance, schema)
+        if resolved.contents is not entry[1]:
+            return original(validator, ref, instance, schema)
+        encoded = _subtree_bytes(instance)
+        if encoded is None:
+            return original(validator, ref, instance, schema)
+        memo = _prepared_subtrees
+        key = (entry[2], encoded)
+        if memo.contains(key):
+            return ()
+        return _remember_success(original(validator, ref, instance, schema), memo, key)
+
+    return reference
+
+
+def _remember_success(errors, memo, key):
+    # Forward the original error iterator without changing its order or path.
+    # A partial traversal, error or exception never publishes a success.
+    failed = False
+    for error in errors:
+        failed = True
+        yield error
+    if not failed:
+        memo.remember(key)
 
 
 def finite_json(value) -> None:
@@ -136,7 +325,8 @@ def _validator(definition: str):
     bundle, registry = _schema_resources()
     if definition not in bundle["resources"][bundle["root"]]["$defs"]:
         raise ValidationError("unknown commit schema definition")
-    validator = _reuse_schema_validators(Draft202012Validator)(
+    nodes = _reviewed_item_nodes(bundle, registry) if definition == "PreparedCommit" else {}
+    validator = _reuse_schema_validators(Draft202012Validator, nodes)(
         {"$ref": bundle["root"] + "#/$defs/" + definition}, registry=registry
     )
     return validator.evolve(
@@ -144,12 +334,15 @@ def _validator(definition: str):
     )
 
 
-def _reuse_schema_validators(base):
+def _reuse_schema_validators(base, item_nodes=None):
     from threading import RLock
 
     from jsonschema.validators import extend
 
-    validator = extend(base)
+    keywords = {}
+    if item_nodes:
+        keywords["$ref"] = _memoized_reference(base.VALIDATORS["$ref"], item_nodes)
+    validator = extend(base, validators=keywords)
     evolve = validator.evolve
     compiled = OrderedDict()
     lock = RLock()
@@ -234,7 +427,7 @@ def validate_commit_value(value, definition: str) -> None:
     Schema dependencies are loaded only when validation is requested; importing
     this module or the provider ABI requires only the standard library.
     """
-    if definition == _CANONICAL_DOCUMENT:
+    if definition in (_CANONICAL_DOCUMENT, "PreparedCommit"):
         # Run the ordinary finite/raw guard on the same owned snapshot used
         # for the memo key and for schema validation.
         value = _capture_json_containers(value)
@@ -246,6 +439,12 @@ def validate_commit_value(value, definition: str) -> None:
         compiled = _validator(definition)
         if definition == _CANONICAL_DOCUMENT:
             _validate_canonical_document(value, compiled)
+        elif definition == "PreparedCommit":
+            token = _prepared_memo_active.set(_has_subtree_recursion_headroom())
+            try:
+                compiled.validate(value)
+            finally:
+                _prepared_memo_active.reset(token)
         else:
             compiled.validate(value)
     except SchemaValidationError as exc:

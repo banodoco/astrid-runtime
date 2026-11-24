@@ -713,6 +713,13 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                     os.close(cwd_fd)
             try:
                 store.conn.backup(target)
+                # Backups are also the rollback/restore input for previous
+                # Runtime builds that reject additional schema objects.
+                # Remove the separately versioned layer only from this private
+                # image, BEFORE hashing/signing it. The live store stays guarded.
+                from .history_guards import remove_history_guards
+                target.execute("BEGIN IMMEDIATE")
+                remove_history_guards(target)
                 target.commit()
             finally:
                 target.close()

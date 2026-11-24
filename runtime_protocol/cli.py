@@ -97,6 +97,9 @@ def _parser():
     canonical.add_argument("--root", required=True)
     canonical.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
     canonical.add_argument("--confirm", required=True)
+    guard_rollback = sub.add_parser("remove-history-guards", help="prepare a stopped U33 realm for rollback to a guard-unaware Runtime")
+    guard_rollback.add_argument("--root", required=True)
+    guard_rollback.add_argument("--confirm", required=True)
     reconcile = sub.add_parser("migrate-managed-outputs", help="materialize verified associations for historical settled render outputs")
     reconcile.add_argument("--root", required=True)
     reconcile.add_argument("--project-id")
@@ -282,6 +285,15 @@ def _main(args):
             return 1
         print(json.dumps(result, sort_keys=True))
         return 0
+    if args.command == "remove-history-guards":
+        from .history_guards import prepare_history_guard_rollback
+        try:
+            result = prepare_history_guard_rollback(args.root, confirmation=args.confirm)
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "migrate-managed-outputs":
         try:
             result = migrate_historical_managed_outputs(
@@ -344,7 +356,7 @@ def _main(args):
     if args.command == "backup":
         # Online backup goes through the owning HTTP service. The CLI is an
         # offline surface and must acquire that same realm-owner fence.
-        store = RealmStore(args.root)
+        store = RealmStore(args.root, allow_deferred_history=False)
         try:
             key_path = (Path(args.support_root).expanduser().resolve() / "backup-auth.key") if args.support_root else None
             result = create_backup(store, args.destination, key_path=key_path)
@@ -370,7 +382,7 @@ def _main(args):
     if args.command == "export":
         # Export is an offline surface; share the same owner fence as startup
         # instead of opening a second connection with a different authority.
-        store = RealmStore(args.root)
+        store = RealmStore(args.root, allow_deferred_history=False)
         try:
             value = structured_export(store)
         finally:
@@ -384,7 +396,7 @@ def _main(args):
         root = Path(args.root).expanduser().resolve()
         # Refuse even a correctly confirmed purge while a daemon owns the
         # realm.  The destructive operation remains explicit and offline.
-        store = RealmStore(root)
+        store = RealmStore(root, allow_deferred_history=False)
         try:
             realm_id = store.realm["id"]
             if args.confirm != f"PURGE {realm_id}":

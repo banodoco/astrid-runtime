@@ -1326,7 +1326,8 @@ def test_real_restart_undo_then_recorder_tamper_fails_closed(film, agent, tmp_pa
             "SELECT records_json FROM timeline_commit_history WHERE publication_id=?", (publication,),
         ).fetchone()[0])
         records["undo_of"] = ["other-publication"]
-        conn.execute("UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
+        from tests.history_forgery import forge_history_row
+        forge_history_row(conn, "UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
                      (canonical_json(records), publication))
         commits = world.daemon.service._timeline_commits()[0]
         assert any(error["id"] == publication for error in commits.integrity_errors())

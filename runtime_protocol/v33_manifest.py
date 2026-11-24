@@ -96,6 +96,10 @@ def canonical_manifest(connection: sqlite3.Connection, *, expected_realm_id: str
                 or schema_rows[0][1] != _FORMAT or type(schema_rows[0][2]) is not int):
             raise ValidationError("invalid canonical schema identity")
         version = schema_rows[0][2]
+        # Reject unsupported recorded versions before inspecting additive objects.
+        # Historical canonical families C24 through TL32 still classify normally.
+        if not 24 <= version <= 33:
+            raise ValidationError(f"unsupported canonical v{version} manifest")
         realm_rows = connection.execute("SELECT id FROM realm").fetchall()
         if (len(realm_rows) != 1 or not isinstance(realm_rows[0][0], str)
                 or not realm_rows[0][0].strip()):
@@ -103,7 +107,25 @@ def canonical_manifest(connection: sqlite3.Connection, *, expected_realm_id: str
         realm_id = realm_rows[0][0]
         if expected_realm_id is not None and realm_id != expected_realm_id:
             raise ValidationError("realm identity mismatch")
-        objects = _objects(connection)
+        # U33's pinned fingerprint describes its original tables and indexes.
+        # Ignore only the separately verified, complete history guard layer 1.
+        from .history_guards import TIMELINE_HISTORY_TRIGGER_SQL
+
+        ignored_guards = ()
+        if version == 33:
+            from .history_guards import history_guard_manifest
+            if history_guard_manifest(connection)["version"] == 1:
+                ignored_guards = tuple(TIMELINE_HISTORY_TRIGGER_SQL)
+        else:
+            # A relabelled guarded realm is not a historical layout. Give the
+            # recorded-version diagnostic without interpreting guard bodies or
+            # allowing any guard to be ignored in a historical fingerprint.
+            if connection.execute(
+                "SELECT 1 FROM main.sqlite_master WHERE type='trigger' AND name IN (?, ?, ?) LIMIT 1",
+                tuple(TIMELINE_HISTORY_TRIGGER_SQL),
+            ).fetchone() is not None:
+                raise ValidationError(f"unsupported canonical v{version} manifest")
+        objects = _objects(connection, ignored_guards=ignored_guards)
         data = {"format_id": _FORMAT, "version": version, "objects": objects}
         fingerprint = hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
         family = next((key for key, value in _FINGERPRINTS.items() if value == fingerprint), None)
@@ -115,10 +137,12 @@ def canonical_manifest(connection: sqlite3.Connection, *, expected_realm_id: str
         raise ValidationError("cannot inspect canonical SQLite manifest") from exc
 
 
-def _objects(connection: sqlite3.Connection) -> dict:
+def _objects(connection: sqlite3.Connection, *, ignored_guards=()) -> dict:
     objects = {}
     rows = connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").fetchall()
     for kind, name, owner, sql in rows:
+        if kind == "trigger" and name in ignored_guards:
+            continue
         if name in {"sqlite_sequence", "sqlite_stat1", "sqlite_stat2", "sqlite_stat3", "sqlite_stat4"} and kind == "table":
             continue
         if name.startswith("sqlite_autoindex_") and kind == "index" and sql is None:

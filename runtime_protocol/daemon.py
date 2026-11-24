@@ -364,7 +364,19 @@ class RuntimeDaemon:
         return self
 
     def service_status(self):
-        return self.service_supervisor.snapshot() if self.service_supervisor is not None else []
+        services = list(self.service_supervisor.snapshot()) if self.service_supervisor is not None else []
+        observe = getattr(getattr(self.service, "store", None), "history_verification_status", None)
+        verification = observe() if callable(observe) else None
+        if isinstance(verification, dict):
+            state = verification["state"]
+            total = verification["history_rows_total"]
+            counts = (f" ({verification['history_rows_checked']}/{total} history rows checked)"
+                      if total is not None else " (preparing snapshot)")
+            services.append({"name": "realm-history-verification",
+                             "state": {"pending": "starting", "complete": "running", "failed": "failed"}[state],
+                             "last_exit": None, "restart_count": 0,
+                             "reason": verification["message"] + counts})
+        return services
 
     def _create_local_worker_launcher(self):
         from .local_worker import LocalWorkerLauncher

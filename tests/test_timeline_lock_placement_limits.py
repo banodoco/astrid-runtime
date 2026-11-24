@@ -46,7 +46,8 @@ def test_same_head_mutation_after_native_preflight_requires_fresh_authority(reco
                                    (publication,)).fetchone()
                 metadata = json.loads(row[0])
                 metadata["recorder_abi" if mutation == "abi" else "label"] = "tampered"
-                conn.execute("UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
+                from tests.history_forgery import forge_history_row
+                forge_history_row(conn, "UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
                              (canonical_json(metadata), publication))
                 if mutation == "aba":
                     previous = conn.execute(
@@ -77,7 +78,8 @@ def test_same_head_mutation_after_native_preflight_requires_fresh_authority(reco
                     binding["revision_id"] = "foreign-revision"
                 else:
                     binding["write_range"] = [0, 999]
-                conn.execute("UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
+                from tests.history_forgery import forge_history_row
+                forge_history_row(conn, "UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
                              (canonical_json(records), publication))
 
     def accept_after_mutation(port, prepared):
