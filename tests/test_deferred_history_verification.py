@@ -262,14 +262,21 @@ def test_only_late_history_incomplete_is_eligible(service, monkeypatch):
     assert json.loads((root / "admission-state.json").read_text())["clean_shutdown"] is False
 
 
-def _kill_scan_child(root, project, release, messages):
+def _kill_scan_remaining(deadline):
+    return max(0.0, deadline - time.monotonic())
+
+
+def _kill_scan_child(root, project, messages, deadline):
     original = TimelineCommitStore.integrity_errors
     reached = threading.Event()
+    # This event is thread-local to the child process. The parent never
+    # touches a multiprocessing semaphore that a killed child could hold.
+    release = threading.Event()
 
     def progress(checked, total):
         if checked == 2 and not reached.is_set():
             reached.set()
-            if not release.wait(180):
+            if not release.wait(_kill_scan_remaining(deadline)):
                 raise TimeoutError("test failed to release child scan")
 
     TimelineCommitStore.integrity_errors = _late_deadline(original, progress)
@@ -277,37 +284,65 @@ def _kill_scan_child(root, project, release, messages):
     try:
         runtime = RuntimeService(root, admission_timeout=120)
         _register(runtime, project)
-        assert reached.wait(120)
+        assert reached.wait(_kill_scan_remaining(deadline))
         head = runtime.get_timeline_verified_head(project, "main", authorize=lambda: None)
         request = _next(runtime, "after-kill")
         with pytest.raises(RealmAdmissionError, match=_PENDING):
             commit(runtime, request, key="after-kill")
         progress_report = runtime.doctor()["verification"]
-        messages.put(("readable", head["head"], progress_report, runtime.runtime_lifecycle()["runtime_epoch"]))
-        assert release.wait(180)
-        _wait_state(runtime, "complete")
+        messages.send(("readable", head["head"], progress_report, runtime.runtime_lifecycle()["runtime_epoch"]))
+        # Stay paused until the parent explicitly releases this phase, or
+        # kills this process. There is no Queue feeder or shared Event lock.
+        assert messages.poll(_kill_scan_remaining(deadline)), "parent did not release scan"
+        assert messages.recv() == "continue"
+        release.set()
+        _wait_state(runtime, "complete", timeout=_kill_scan_remaining(deadline))
         assert commit(runtime, request, key="after-kill")["data"]["status"] == "accepted"
-        messages.put(("writable", runtime.store.history_verification_status()))
+        messages.send(("writable", runtime.store.history_verification_status()))
     except BaseException:
-        messages.put(("error", traceback.format_exc()))
+        try:
+            messages.send(("error", traceback.format_exc()[-4096:]))
+        except OSError:
+            # Parent may already have closed the pipe on timeout.
+            pass
         raise
     finally:
-        if runtime is not None:
-            runtime.close()
+        release.set()
+        try:
+            if runtime is not None:
+                runtime.close()
+        finally:
+            messages.close()
 
 
+def _kill_scan_recv(messages, deadline, phase):
+    assert messages.poll(_kill_scan_remaining(deadline)), f"{phase}: child message timed out"
+    try:
+        return messages.recv()
+    except EOFError:
+        pytest.fail(f"{phase}: child exited before reporting")
+
+
+@pytest.mark.timeout(130)
 def test_kill_mid_scan_restarts_large_history_and_enables_writes_only_after_proof(service):
+    # One budget for all 60 edits and both child phases; the outer pytest
+    # hang guard leaves a short margin for bounded process cleanup.
+    deadline = time.monotonic() + 120
     root, project, head, _ = _history_fixture(service, edits=60)
     service.close()
     context = multiprocessing.get_context("spawn")
     first_epoch = None
     for killed in (True, False):
-        release = context.Event()
-        messages = context.Queue()
-        child = context.Process(target=_kill_scan_child, args=(str(root), project, release, messages))
-        child.start()
+        phase = "kill" if killed else "restart"
+        assert _kill_scan_remaining(deadline) > 0, f"{phase}: test budget exhausted"
+        # A fresh connection for each child. Closing our copy of its endpoint
+        # after spawn makes a premature child exit observable as EOF.
+        messages, child_messages = context.Pipe(duplex=True)
+        child = context.Process(target=_kill_scan_child, args=(str(root), project, child_messages, deadline))
         try:
-            result = messages.get(timeout=180)
+            child.start()
+            child_messages.close()
+            result = _kill_scan_recv(messages, deadline, phase)
             assert result[0] == "readable", result
             assert result[1] == head["head"]
             assert result[2]["state"] == "pending"
@@ -315,25 +350,30 @@ def test_kill_mid_scan_restarts_large_history_and_enables_writes_only_after_proo
             assert result[2]["history_rows_total"] >= 60
             if killed:
                 first_epoch = result[3]
+                assert child.is_alive(), "child exited before kill while verification was paused"
                 child.kill()
-                child.join(30)
+                child.join(min(5, _kill_scan_remaining(deadline)))
                 assert child.exitcode is not None and child.exitcode != 0
                 assert json.loads((Path(root) / "admission-state.json").read_text())["clean_shutdown"] is False
             else:
                 assert result[3] > first_epoch
-                release.set()
-                result = messages.get(timeout=180)
+                messages.send("continue")
+                result = _kill_scan_recv(messages, deadline, phase)
                 assert result[0] == "writable", result
                 assert result[1]["state"] == "complete"
-                child.join(30)
+                child.join(min(5, _kill_scan_remaining(deadline)))
                 assert child.exitcode == 0
         finally:
-            release.set()
-            if child.is_alive():
-                child.kill()
-                child.join(30)
+            # No interprocess locks, Event.set, Queue.close or join_thread
+            # after kill. Never wait for a feeder belonging to a dead child.
             messages.close()
-            messages.join_thread()
+            child_messages.close()
+            if child.pid is not None:
+                if child.is_alive():
+                    child.kill()
+                    child.join(5)
+                assert not child.is_alive(), f"{phase}: child did not exit after kill"
+            child.close()
     assert json.loads((Path(root) / "admission-state.json").read_text())["clean_shutdown"] is True
 
 
