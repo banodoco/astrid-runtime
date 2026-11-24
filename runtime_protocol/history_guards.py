@@ -14,6 +14,7 @@ import json
 from .errors import ValidationError
 
 HISTORY_GUARD_LAYER_VERSION = 1
+HISTORY_GUARD_LAYER_FINGERPRINT = "b2cc3242ff419e535d65dbad32ffee4f314f1403b81a3501e2bb07096282176d"
 HISTORY_GUARD_RECOVERY = (
     "History guard layer 1 is incomplete or altered. Stop Runtime and restore "
     "from a verified backup; do not repair individual triggers or start the previous Runtime."
@@ -78,6 +79,8 @@ def history_guard_manifest(connection):
         {"version": HISTORY_GUARD_LAYER_VERSION, "triggers": actual},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode()).hexdigest()
+    if fingerprint != HISTORY_GUARD_LAYER_FINGERPRINT:
+        raise HistoryGuardManifestError("history guard layer 1 fingerprint does not match its pinned manifest")
     return {"version": HISTORY_GUARD_LAYER_VERSION, "state": "installed", "fingerprint": fingerprint}
 
 

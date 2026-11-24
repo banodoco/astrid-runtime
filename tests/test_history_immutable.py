@@ -215,7 +215,8 @@ def test_layer_has_separate_manifest_and_u33_fingerprint_is_unchanged():
     assert not install_history_guards(connection)
     assert canonical_manifest(connection) == before
     layer = history_guard_manifest(connection)
-    assert layer["version"] == 1 and layer["fingerprint"]
+    assert layer["version"] == 1
+    assert layer["fingerprint"] == "b2cc3242ff419e535d65dbad32ffee4f314f1403b81a3501e2bb07096282176d"
     assert remove_history_guards(connection)
     assert not remove_history_guards(connection)
     assert canonical_manifest(connection) == before
