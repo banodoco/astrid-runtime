@@ -375,29 +375,87 @@ def test_cycle_refusal_and_encoding_fallback(memo):
     assert _same(value)[0] == "accepted"
 
 
-def test_deep_nested_json_near_recursion_limit_uncached(memo):
+def test_deep_nested_json_near_recursion_limit_uncached(memo, monkeypatch):
     value = _four_targets()
     assert _same(value)[0] == "accepted"
     state = _record(value)["reads"][0]["state"]
-    nested = {"leaf": "large enough to be cached in a shallow record"}
-    for _ in range(20):
-        nested = {"next": nested}
-    state["value"] = nested
+    leaf = {"svl10-warmed-leaf": "x" * 80}
+    state["value"] = {"next": leaf}
+    assert _same(value)[0] == "accepted"
+    encoded = validation.canonical_json(leaf).encode()
+    keys = [key for key in memo.entries if key[1] == encoded and
+            key[0][-2].endswith("/$defs/JSON/anyOf/2/additionalProperties")]
+    assert len(keys) == 1
+    warmed_key = keys[0]
+
+    headroom = validation._has_subtree_recursion_headroom
+    contains = memo.contains
+    root_checks, leaf_checks, leaf_hits = [], [], []
+
+    def observe_headroom():
+        allowed = headroom()
+        caller = sys._getframe(1)
+        if caller.f_code.co_name == "validate_commit_value":
+            root_checks.append(allowed)
+        elif caller.f_locals.get("instance") == leaf:
+            leaf_checks.append(allowed)
+        return allowed
+
+    def observe_contains(key):
+        hit = contains(key)
+        if key == warmed_key:
+            leaf_hits.append(hit)
+        return hit
+
+    monkeypatch.setattr(validation, "_has_subtree_recursion_headroom", observe_headroom)
+    monkeypatch.setattr(memo, "contains", observe_contains)
+
+    def wrap_leaf(layers, tag):
+        nested = leaf
+        for index in range(layers):
+            # Different ancestors for each run; no cached ancestor can hide
+            # the warmed recursive JSON reference we are testing.
+            nested = {"next": nested, "tag": f"{tag}-{index}"}
+        return nested
+
+    limit = sys.getrecursionlimit()
+
+    def compare_with_budget(budget):
+        # Consume actual Python frames, keeping the interpreter's normal
+        # recursion limit unchanged. Budget is approximate remaining frames.
+        frame = sys._getframe()
+        used = 0
+        while frame is not None:
+            used += 1
+            frame = frame.f_back
+
+        def dive(n):
+            return dive(n - 1) if n else _same(value)
+
+        return dive(max(0, limit - used - budget))
+
+    state["value"] = wrap_leaf(20, "normal")
     assert validation._subtree_bytes(state) is None
     assert _same(value)[0] == "accepted"
-    # Both validators must still refuse a deep recursive JSON value when the
-    # stack is short; no lookup may suppress that refusal.
-    for _ in range(100):
-        nested = {"next": nested}
-    state["value"] = nested
+    assert root_checks == [True] and leaf_checks == [True] and leaf_hits == [True]
+
+    root_checks.clear()
+    leaf_checks.clear()
+    leaf_hits.clear()
+    state["value"] = wrap_leaf(20, "deep")
+    assert compare_with_budget(560)[0] == "accepted"
+    assert root_checks == [True] and leaf_checks == [False] and not leaf_hits
+    assert warmed_key in memo.entries
+
+    root_checks.clear()
+    leaf_checks.clear()
+    leaf_hits.clear()
+    state["value"] = wrap_leaf(120, "near-limit")
     before = memo.counts.copy()
-    limit = sys.getrecursionlimit()
-    try:
-        sys.setrecursionlimit(500)
-        assert _same(value)[0] is ValidationError
-    finally:
-        sys.setrecursionlimit(limit)
+    assert compare_with_budget(400)[0] is ValidationError
     assert memo.counts == before
+    assert root_checks == [False]
+    assert sys.getrecursionlimit() == limit
 
 
 def test_lru_entry_and_byte_budget_and_oversize(memo, monkeypatch):
