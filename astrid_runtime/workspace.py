@@ -66,7 +66,10 @@ def _inspect(boundary: RuntimeBoundary, root: Path) -> tuple[str, dict[str, Any]
         guard = report.get("checks", {}).get("history_guards", {})
         if isinstance(guard, Mapping) and guard.get("ok") is False:
             raise BootstrapError(f"realm failed history_guards check: {guard.get('reason')}. {report.get('recovery_action', '')}")
-        raise BootstrapError("realm root is not one healthy unambiguous canonical workspace")
+        issues = report.get("issues", [])
+        reason = ", ".join(str(issue) for issue in issues) or report.get("message") or "realm_identity"
+        recovery = report.get("recovery_action", "")
+        raise BootstrapError(f"realm root is not one healthy unambiguous canonical workspace: {reason}. {recovery}".rstrip())
     return observed, report
 
 

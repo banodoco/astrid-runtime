@@ -1132,9 +1132,16 @@ class RealmStore:
                 self._acquire_owner()
             self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout, allow_active_marker=False)
             if not self.admission_report.get("ok"):
+                issues = self.admission_report.get("issues", [])
                 guard = self.admission_report.get("checks", {}).get("history_guards", {})
-                message = "realm failed startup admission: history_guards" if guard.get("ok") is False else "realm failed startup admission"
-                raise RealmAdmissionError(message, details=self.admission_report)
+                checks = ", ".join(str(issue) for issue in issues)
+                if guard.get("ok") is False:
+                    checks = "history_guards"
+                reason = checks or self.admission_report.get("message") or "verification not completed"
+                recovery = self.admission_report.get("recovery_action", "")
+                raise RealmAdmissionError(
+                    f"realm failed startup admission: {reason}. {recovery}", details=self.admission_report,
+                )
             if acquire_owner and not owner_marker_present:
                 self._acquire_owner()
             self._open(fresh=False)
@@ -7650,10 +7657,25 @@ class RealmStore:
             catalog_check = {"status": "blocked", "ok": False, "issues": ["catalog_realm_unavailable"], "path": str(catalog_path)}
             activation_check = {"status": "blocked", "ok": False, "issues": ["activation_catalog_unavailable"]}
         identity_ok = realm_identity["ok"]
+        history_incomplete = False
         if {"timeline_commit_history", "timeline_document_input_contents", "timeline_document_input_links"}.issubset(actual_tables):
             from .timeline_commit_store import TimelineCommitStore
-            revision_errors.extend(TimelineCommitStore(self, validate_prepared=None).integrity_errors())
-        healthy = sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and not relational_errors and not revision_errors and catalog_check["ok"] and activation_check["ok"]
+            history_errors = []
+            try:
+                TimelineCommitStore(self, validate_prepared=None).integrity_errors(
+                    deadline=deadline, errors=history_errors,
+                )
+            except TimeoutError:
+                cancellation.check()
+                history_incomplete = True
+            except sqlite3.OperationalError as exc:
+                cancellation.check()
+                if (getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_INTERRUPT
+                        or deadline is None or time.monotonic() < deadline):
+                    raise
+                history_incomplete = True
+            revision_errors.extend(history_errors)
+        healthy = not history_incomplete and sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and not relational_errors and not revision_errors and catalog_check["ok"] and activation_check["ok"]
         issues = []
         if not sqlite_ok: issues.append("sqlite_integrity")
         if fk: issues.append("foreign_keys")
@@ -7671,20 +7693,27 @@ class RealmStore:
             recovery = "Repair the catalog and activation manifest, then restart the runtime."
         if guard_check is not None and not guard_check["ok"]:
             recovery = HISTORY_GUARD_RECOVERY
-        verified_at = now() if run_deep and healthy else previous_verification.get("deep_verified_at") if trusted_previous else None
+        incomplete_only = history_incomplete and not issues
+        if incomplete_only:
+            recovery = "Verification incomplete; rerun doctor with --timeout S."
+        verified_at = None if history_incomplete else (
+            now() if run_deep and healthy else previous_verification.get("deep_verified_at") if trusted_previous else None
+        )
         return {
-            "status": "ok" if healthy else "failed",
-            "state": "uninitialized" if healthy and uninitialized else "ready" if healthy else "unhealthy", "ok": healthy,
+            "status": "not_checked" if incomplete_only else "ok" if healthy else "failed",
+            "state": "not_checked" if incomplete_only else "uninitialized" if healthy and uninitialized else "ready" if healthy else "unhealthy", "ok": healthy,
+            **({"verification_incomplete": True, "message": "Verification incomplete: accepted history scan timed out."} if history_incomplete else {}),
             "schema_version": SCHEMA_VERSION, "issues": issues,
             "recovery_action": recovery, "next_action": recovery,
             "checks": {
-                "deep_verification": {"performed": run_deep, "verified_at": verified_at, "result": "ok" if healthy and verified_at else "failed" if run_deep else "not_verified"},
+                "deep_verification": {"performed": run_deep, "verified_at": verified_at, "result": "incomplete" if incomplete_only else "ok" if healthy and verified_at else "failed" if run_deep or history_incomplete else "not_verified"},
                 "sqlite_integrity": {"ok": sqlite_ok, "result": quick},
                 "sqlite": {"ok": sqlite_ok, "result": quick},
                 "sqlite_quick_check": quick,
                 "foreign_keys": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
                 "foreign_key": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
-                "revisions": {"ok": not revision_errors, "errors": revision_errors},
+                "revisions": {"ok": False if revision_errors else None if history_incomplete else True, "errors": revision_errors,
+                              **({"status": "not_checked", "reason": "timeout"} if history_incomplete else {})},
                 "schema": {
                     "ok": schema_ok,
                     "expected_format_id": CANONICAL_FORMAT_ID,
