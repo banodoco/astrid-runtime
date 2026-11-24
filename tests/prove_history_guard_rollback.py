@@ -22,7 +22,7 @@ from contextlib import closing
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from runtime_protocol.backup import create_backup, restore_backup  # noqa: E402
+from runtime_protocol.backup import create_backup  # noqa: E402
 from runtime_protocol.history_guards import (  # noqa: E402
     history_guard_manifest, prepare_history_guard_rollback,
 )
@@ -71,6 +71,29 @@ print(json.dumps(result, sort_keys=True))
     if not Path(result["module"]).resolve().is_relative_to(previous):
         raise AssertionError("previous proof imported the wrong Runtime source")
     return result
+
+
+def prior_restore(previous, backup, restored):
+    # Verify and restore through the previous executable's own authenticated
+    # backup reader, rather than relying on the new reader to prepare it.
+    code = r"""
+import json
+from pathlib import Path
+import sys
+import runtime_protocol.backup as module
+key = bytes.fromhex(sys.argv[3])
+verified = module.verify_backup(Path(sys.argv[1]), key=key)
+module.restore_backup(Path(sys.argv[1]), Path(sys.argv[2]), key=key)
+print(json.dumps({"module": module.__file__, "schema": verified["manifest"]["schema"]}, sort_keys=True))
+"""
+    process = subprocess.run(
+        [sys.executable, "-c", code, str(backup), str(restored), KEY.hex()],
+        cwd=previous, env={**os.environ, "PYTHONPATH": str(previous)},
+        text=True, capture_output=True, check=True, timeout=300,
+    )
+    result = json.loads(process.stdout.splitlines()[-1])
+    assert Path(result["module"]).resolve().is_relative_to(previous)
+    assert result["schema"]["version"] == 33
 
 
 def sqlite_rows(root):
@@ -124,7 +147,7 @@ def main():
             assert sqlite_rows(root) == rows
 
             restored = work / f"restored-{index}"
-            restore_backup(backup, restored, key=KEY)
+            prior_restore(source, backup, restored)
             restored_report = prior_observation(source, restored, open_owner=True)
             assert restored_report["doctor"]["ok"] and restored_report["opened"], restored_report
             assert restored_report["rows"] == rows
