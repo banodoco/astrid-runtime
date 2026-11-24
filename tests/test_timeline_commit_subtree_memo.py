@@ -226,7 +226,7 @@ def test_deep_metadata_near_recursion_limit_uncached(memo):
     assert _same(value)[0] == "accepted"
     # A recursively validated metadata value, not merely an open opaque field.
     nested = {"leaf": 1}
-    for _ in range(35):
+    for _ in range(100):
         nested = {"next": nested}
     _parent(value)["clips"][0]["meta"] = {"vendor.test": nested}
     before = memo.counts["misses"]
@@ -331,12 +331,16 @@ def test_one_edit_prepared_schema_work(editing, count, monkeypatch):
         return original(value)
 
     monkeypatch.setattr(store, "validate_prepared", observe)
+    initial = editing.document()["parent_revision"]["payload"]["clips"][0]
+    target_id, original_at = initial["id"], initial["at"]
     for index in range(2):
         document = editing.document()
         clips = document["parent_revision"]["payload"]["clips"]
         assert len(clips) == count
-        target = clips[0]
-        destination = target["at"] + 1
+        target = next(clip for clip in clips if clip["id"] == target_id)
+        # Move once, then back to the known legal original position. Each
+        # measured input is distinct and exactly one clip position changes.
+        destination = original_at + 1 if index == 0 else original_at
         body = editing.body([editing.move(target["id"], destination, document=document)])
         reads = [{"kind": "field", "ref": "parent",
                   "path": ["clips", "id:" + clip["id"], "at"],
