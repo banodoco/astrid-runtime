@@ -25,7 +25,7 @@ from urllib.parse import unquote
 
 from . import platform
 from . import cancellation
-from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
+from .errors import CapabilityUnavailableError, ConflictError, IntegrityDeadlineExceeded, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
 from .cas import ContentAddressedStore
 from .dirfd import remove_tree_at, open_directory_chain
@@ -42,6 +42,10 @@ from .visual_seam import (
 )
 from .visual_boundary import finite as _visual_finite, js_round as _visual_js_round
 from .idempotency import command_result, compact_result, expired_result, EXPIRED, RESULT_WINDOW_SECONDS, IdempotencyWindowExpired
+
+class _AdmissionSnapshotMoved(OSError):
+    """A detached verification copy must be retried, not treated as corruption."""
+
 
 SCHEMA_VERSION = 33
 IDEMPOTENCY_RESULT_WINDOW_SECONDS = 24 * 60 * 60
@@ -1072,7 +1076,7 @@ class RealmStore:
             if parent_fd >= 0:
                 os.close(parent_fd)
 
-    def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS, _admission_fd=None, _start_history_verification=True):
+    def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS, allow_deferred_history: bool = True, _admission_fd=None, _start_history_verification=True):
         self.root = _local_realm_root(root)
         self.admission_timeout = admission_timeout
         if create:
@@ -1132,7 +1136,7 @@ class RealmStore:
                 self._acquire_owner()
             self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout, allow_active_marker=False)
             from .history_verification import DeferredHistoryVerification, may_defer_history
-            deferred = (acquire_owner and _admission_fd is None
+            deferred = (allow_deferred_history and acquire_owner and _admission_fd is None
                         and may_defer_history(self.admission_report, self.root))
             if not self.admission_report.get("ok") and not deferred:
                 issues = self.admission_report.get("issues", [])
@@ -1364,7 +1368,7 @@ class RealmStore:
                     actual = (observed.st_dev, observed.st_ino, observed.st_size,
                               observed.st_mtime_ns, observed.st_ctime_ns)
                     if actual != _expected_identity:
-                        raise TimeoutError("SQLite snapshot moved during inspection; retry.")
+                        raise _AdmissionSnapshotMoved("SQLite snapshot moved during inspection; retry.")
 
             check_copy_identity()
             if sys.platform == "darwin":
@@ -1383,7 +1387,7 @@ class RealmStore:
                 while True:
                     cancellation.check()
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("realm inspection timed out")
+                        raise IntegrityDeadlineExceeded("realm inspection timed out")
                     block = os.read(source_fd, 1024 * 1024)
                     if not block:
                         break
@@ -1493,7 +1497,8 @@ class RealmStore:
                     return report
                 finally:
                     connection.close()
-        except TimeoutError as exc:
+        except (IntegrityDeadlineExceeded, _AdmissionSnapshotMoved) as exc:
+            cancellation.check()
             return cls._integrity_not_checked(timeout_seconds, str(exc))
         except (json.JSONDecodeError, ValidationError) as exc:
             return cls._integrity_failure("malformed", str(exc))
@@ -7140,13 +7145,19 @@ class RealmStore:
                 result = self._integrity_report(catalog_path=catalog_path, deadline=deadline, deep=deep, admission_state=admission_state)
                 cancellation.check()
                 return result
-            except TimeoutError as exc:
+            except IntegrityDeadlineExceeded as exc:
+                cancellation.check()
                 return self._integrity_not_checked(timeout_seconds, str(exc))
+            except TimeoutError as exc:
+                # A storage/read timeout is a failed check, not evidence that
+                # our inspection budget expired.
+                cancellation.check()
+                return self._integrity_failure("unreadable", str(exc))
             except (sqlite3.DatabaseError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
                 cancellation.check()
-                if timed_out:
+                if timed_out and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
                     return self._integrity_not_checked(timeout_seconds, str(exc))
-                return self._integrity_failure("timeout" if timed_out else "malformed", str(exc))
+                return self._integrity_failure("malformed", str(exc))
             finally:
                 self.conn.set_progress_handler(None, 0)
 
@@ -7157,14 +7168,14 @@ class RealmStore:
         except sqlite3.DatabaseError as exc:
             cancellation.check()
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("realm inspection timed out") from exc
+                raise IntegrityDeadlineExceeded("realm inspection timed out") from exc
             quick = f"error: {exc}"
         try:
             fk_rows = self.conn.execute("PRAGMA foreign_key_check").fetchall()
         except sqlite3.DatabaseError as exc:
             cancellation.check()
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("realm inspection timed out") from exc
+                raise IntegrityDeadlineExceeded("realm inspection timed out") from exc
             fk_rows = [("error", str(exc))]
         fk = [tuple(row) for row in fk_rows]
         actual_tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -7245,13 +7256,18 @@ class RealmStore:
         reachable = {str(row[0]) for row in objects}
         missing = []
         corrupt = []
+        cas_read_errors = []
         for object_row in objects if run_deep else ():
             digest = str(object_row["digest"])
             try:
                 actual = self._cas_digest(digest, deadline=deadline)
                 actual_size = self._cas_size(digest)
-            except TimeoutError:
+            except IntegrityDeadlineExceeded:
                 raise
+            except TimeoutError as exc:
+                cancellation.check()
+                cas_read_errors.append({"digest": digest, "reason": "read_timeout", "message": str(exc)})
+                continue
             except OSError:
                 missing.append(digest)
                 continue
@@ -7263,8 +7279,15 @@ class RealmStore:
                     "expected_size": int(object_row["size"]),
                     "actual_size": actual_size,
                 })
-        orphaned = self._cas_orphans(reachable, deadline=deadline) if run_deep else []
-        cas_ok = not missing and not corrupt
+        try:
+            orphaned = self._cas_orphans(reachable, deadline=deadline) if run_deep else []
+        except IntegrityDeadlineExceeded:
+            raise
+        except TimeoutError as exc:
+            cancellation.check()
+            orphaned = []
+            cas_read_errors.append({"reason": "orphan_scan_timeout", "message": str(exc)})
+        cas_ok = not missing and not corrupt and not cas_read_errors
         event_errors = []
         if run_deep and {"runs", "events"}.issubset(actual_tables):
             for run in self.conn.execute("SELECT id FROM runs"):
@@ -7762,9 +7785,14 @@ class RealmStore:
                     deadline=deadline, errors=history_errors,
                     **({"progress": history_progress} if history_progress is not None else {}),
                 )
-            except TimeoutError:
+            except IntegrityDeadlineExceeded:
                 cancellation.check()
                 history_incomplete = True
+            except TimeoutError as exc:
+                # A traversal-level I/O timeout has no particular row to
+                # name. Keep prior row errors and refuse the revisions check.
+                cancellation.check()
+                history_errors.append({"table": "timeline_commit_history", "reason": str(exc)})
             except sqlite3.OperationalError as exc:
                 cancellation.check()
                 if (getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_INTERRUPT
@@ -7779,7 +7807,7 @@ class RealmStore:
         if not schema_ok: issues.append("schema")
         if guard_check is not None and not guard_check["ok"]: issues.append("history_guards")
         if not identity_ok: issues.append("realm_identity")
-        if missing: issues.append("reachable_cas")
+        if missing or cas_read_errors: issues.append("reachable_cas")
         if corrupt: issues.append("corrupt_cas")
         if event_errors: issues.append("event_chain")
         if relational_errors: issues.append("relational")
@@ -7790,6 +7818,8 @@ class RealmStore:
             recovery = "Repair the catalog and activation manifest, then restart the runtime."
         if guard_check is not None and not guard_check["ok"]:
             recovery = HISTORY_GUARD_RECOVERY
+        if cas_read_errors and not missing and not corrupt and issues == ["reachable_cas"]:
+            recovery = "Resolve the CAS storage read timeout, then re-run doctor and restart Runtime."
         incomplete_only = history_incomplete and not issues
         if incomplete_only:
             recovery = "Verification incomplete; rerun doctor with --timeout S."
@@ -7826,7 +7856,8 @@ class RealmStore:
                 },
                 **({"history_guards": guard_check} if guard_check is not None else {}),
                 "realm_identity": realm_identity,
-                "reachable_cas": {"ok": cas_ok, "missing": missing, "corrupt": corrupt, "orphaned": sorted(orphaned)},
+                "reachable_cas": {"ok": cas_ok, "missing": missing, "corrupt": corrupt, "orphaned": sorted(orphaned),
+                                  **({"errors": cas_read_errors} if cas_read_errors else {})},
                 "cas_missing": missing,
                 "event_chain": {"ok": not bool(event_errors), "errors": event_errors},
                 "event_chain_errors": event_errors,
@@ -7859,7 +7890,7 @@ class RealmStore:
                 while True:
                     cancellation.check()
                     if deadline is not None and time.monotonic() >= deadline:
-                        raise TimeoutError("realm inspection timed out")
+                        raise IntegrityDeadlineExceeded("realm inspection timed out")
                     block = os.read(fd, 1024 * 1024)
                     if not block:
                         return digest_value.hexdigest()
@@ -7878,7 +7909,7 @@ class RealmStore:
             while True:
                 cancellation.check()
                 if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("realm inspection timed out")
+                    raise IntegrityDeadlineExceeded("realm inspection timed out")
                 block = handle.read(1024 * 1024)
                 if not block:
                     return digest_value.hexdigest()
@@ -7923,7 +7954,7 @@ class RealmStore:
             for prefix in os.listdir(cas_root_fd):
                 cancellation.check()
                 if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("realm inspection timed out")
+                    raise IntegrityDeadlineExceeded("realm inspection timed out")
                 try:
                     prefix_fd = os.open(
                         prefix,
@@ -7936,7 +7967,7 @@ class RealmStore:
                     for name in os.listdir(prefix_fd):
                         cancellation.check()
                         if deadline is not None and time.monotonic() >= deadline:
-                            raise TimeoutError("realm inspection timed out")
+                            raise IntegrityDeadlineExceeded("realm inspection timed out")
                         try:
                             item = os.stat(name, dir_fd=prefix_fd, follow_symlinks=False)
                         except OSError:
@@ -7953,7 +7984,7 @@ class RealmStore:
             for path in self.cas_root.glob("*/*"):
                 cancellation.check()
                 if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("realm inspection timed out")
+                    raise IntegrityDeadlineExceeded("realm inspection timed out")
                 if path.is_file():
                     digest = path.parent.name + path.name
                     if digest not in reachable:

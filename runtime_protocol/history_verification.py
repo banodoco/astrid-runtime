@@ -20,6 +20,7 @@ from .history_guards import HISTORY_GUARD_RECOVERY, HistoryGuardManifestError, h
 
 _LOG = logging.getLogger(__name__)
 _PENDING = "verification in progress, retry in a moment"
+_MAX_VERIFICATION_ATTEMPTS = 3
 
 
 def may_defer_history(report, root):
@@ -219,8 +220,12 @@ class DeferredHistoryVerification:
         budget = max(3600.0, store.admission_timeout * 2)
         try:
             with cancellation.startup_scope(self._stop):
-                while not self._stop.is_set():
-                    self._status = {**self._status, "phase": "snapshot",
+                # Bound both deadline retries and stale-image retries. A
+                # persistent storage failure or churn never leaves the owner
+                # indefinitely in the pending state.
+                for attempt in range(1, _MAX_VERIFICATION_ATTEMPTS + 1):
+                    cancellation.check()
+                    self._status = {**self._status, "phase": "snapshot", "attempt": attempt,
                                     "history_rows_checked": 0, "history_rows_total": None}
                     with store._mutex:
                         cancellation.check()
@@ -282,6 +287,14 @@ class DeferredHistoryVerification:
                                 connection.execute("PRAGMA query_only=ON")
                         if self._status["state"] == "complete":
                             return
+                cancellation.check()
+                report = self._failure(
+                    "verification_retry_limit_exhausted",
+                    "Verification did not complete after three attempts. "
+                    "Resolve storage or concurrent changes, rerun doctor with --timeout S, and restart Runtime.",
+                )
+                report["checks"]["history_verification"]["attempts"] = _MAX_VERIFICATION_ATTEMPTS
+                self._publish_failure(report)
         except cancellation.StartupCancelled:
             return
         except HistoryGuardManifestError as exc:

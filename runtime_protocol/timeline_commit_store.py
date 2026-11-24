@@ -26,7 +26,7 @@ from . import platform as runtime_platform
 from ._timeline_reopen_diagnostics import (
     count_prefix_materialization, count_reopen_work, current_verified_head_receipt, verified_head_counts,
 )
-from .errors import ConflictError, HeadBusyError, NotFoundError, ProtocolError, ValidationError
+from .errors import ConflictError, HeadBusyError, IntegrityDeadlineExceeded, NotFoundError, ProtocolError, ValidationError
 from .idempotency import command_result
 from .timeline_commit_validation import detached, digest
 from .timeline_materialization import has_materialization, item_identity, materialization_join, root_identity
@@ -1669,7 +1669,7 @@ class TimelineCommitStore:
         def check_deadline():
             cancellation.check()
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("history verification incomplete")
+                raise IntegrityDeadlineExceeded("history verification incomplete")
 
         previous = {}
         check_deadline()
@@ -1694,7 +1694,7 @@ class TimelineCommitStore:
                     self._verify_inputs(json.loads(ledger[0]["result_json"])["canonical_document"])
                 elif edge["records_json"] is not None or ledger[0]["command_kind"] != "parent_composition.publish":
                     raise ValueError("invented legacy provenance")
-            except (TimeoutError, cancellation.StartupCancelled):
+            except (IntegrityDeadlineExceeded, cancellation.StartupCancelled):
                 raise
             except sqlite3.OperationalError as exc:
                 # A progress-handler interrupt is not evidence against this row.
@@ -1719,7 +1719,7 @@ class TimelineCommitStore:
                 value = detached(json.loads(row["content_json"]))
                 if digest(value) != row["content_digest"] or canonical_json(value) != row["content_json"] or len(row["content_json"].encode()) != row["content_size"]:
                     raise ValueError("retained input digest mismatch")
-            except (TimeoutError, cancellation.StartupCancelled):
+            except (IntegrityDeadlineExceeded, cancellation.StartupCancelled):
                 raise
             except Exception as exc:
                 errors.append({"table": "timeline_document_input_contents", "id": row["content_digest"], "reason": str(exc)})
