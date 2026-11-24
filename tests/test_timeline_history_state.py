@@ -145,6 +145,8 @@ def test_retained_warm_forgery_is_also_rejected_after_an_external_write(service,
     original = verification_cases.read
     with closing(sqlite3.connect(service.store.db_path, isolation_level=None)) as writer:
         class ExternalMutations:
+            forge_target = writer
+
             def __getattr__(self, name):
                 return getattr(connection, name)
 

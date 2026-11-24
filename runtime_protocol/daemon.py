@@ -367,7 +367,7 @@ class RuntimeDaemon:
         services = list(self.service_supervisor.snapshot()) if self.service_supervisor is not None else []
         observe = getattr(getattr(self.service, "store", None), "history_verification_status", None)
         verification = observe() if callable(observe) else None
-        if verification is not None:
+        if isinstance(verification, dict):
             state = verification["state"]
             total = verification["history_rows_total"]
             counts = (f" ({verification['history_rows_checked']}/{total} history rows checked)"
