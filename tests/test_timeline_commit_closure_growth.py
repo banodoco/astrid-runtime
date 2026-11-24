@@ -63,7 +63,8 @@ def test_historical_closures_have_linear_ancestry_cost(service, monkeypatch, len
         # authenticated afresh before an uncaptured revision can be returned.
         port.history_entry(publications[0])
         service.store.conn.execute("SAVEPOINT closure_tamper")
-        service.store.conn.execute(
+        from tests.history_forgery import forge_history_row
+        forge_history_row(service.store.conn,
             "UPDATE timeline_commit_history SET records_json='{}' WHERE publication_id=?", (publications[1],))
         with pytest.raises(RuntimeErrorBase):
             port.history_entry(publications[0])

@@ -372,7 +372,8 @@ def test_history_row_mutation_during_both_verifications_refuses_result(service, 
         calls.append(True)
         with service.store._mutex:
             _record_idle_claim(service, f"mutation-claim-{len(calls)}")
-            changed = service.store.conn.execute(
+            from tests.history_forgery import forge_history_row
+            changed = forge_history_row(service.store.conn,
                 "UPDATE timeline_commit_history SET metadata_json=metadata_json || ' ' WHERE publication_id=?",
                 (publication,),
             )

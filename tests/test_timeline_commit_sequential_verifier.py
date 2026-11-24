@@ -136,7 +136,8 @@ def test_private_sequential_history_revalidates_retained_facts(service, damage):
         capture["landing"]["records"]["commands"][0]["bindings"] = []
     else:
         capture["replay_bindings"].append({"kind": "forged"})
-    service.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
                                (canonical_json(metadata), publication))
     before = auth.rows(service)
     with pytest.raises(RuntimeErrorBase) as error:

@@ -192,7 +192,8 @@ def test_unchanged_evaluations_reuse_history_objects_and_records(closure, monkey
 
     # A write to history must discard the retained results even if it keeps
     # the same head and bytes. Existing corruption tests cover forged values.
-    service.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=metadata_json WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET metadata_json=metadata_json WHERE publication_id=?",
                                (publication,))
     assert commits.history_entry(project, "main", publication) == expected
     assert commits.revision_closure(project, "main", head["revision_id"]) == document
