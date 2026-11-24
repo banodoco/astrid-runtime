@@ -295,7 +295,31 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         value = self.headers.get("Authorization", "")
         if not value.startswith("Bearer "):
             raise AuthorizationError("bearer credential required")
-        return self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
+        identity = self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
+        self._require_history_write_admission()
+        return identity
+
+    def _require_history_write_admission(self):
+        # Authenticate first, then refuse public writes even on routes that
+        # can have external effects before entering a SQLite transaction.
+        method = getattr(self, "command", None)
+        if method not in ("POST", "PUT", "PATCH", "DELETE"):
+            return
+        path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
+        # Bootstrap-only credential provisioning writes support credentials,
+        # not the realm. It must work to enable authenticated read access.
+        if method == "POST" and (path in (["v1", "handshake"], ["v1", "credentials"]) or (
+                len(path) == 6 and path[:2] == ["v1", "projects"]
+                and path[3] == "timelines" and path[5] == "inspect")):
+            return
+        # In-memory pack retention leases are required by the read/open path
+        # and cannot change realm content or receipts.
+        pack = pack_http_route(self.path)
+        if pack is not None and pack[0] in ("lease", "release"):
+            return
+        guard = getattr(getattr(self.runtime, "store", None), "assert_history_write_admitted", None)
+        if callable(guard):
+            guard()
 
     def _header_values(self, name):
         if hasattr(self.headers, "get_all"):

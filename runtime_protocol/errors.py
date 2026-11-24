@@ -76,6 +76,10 @@ class RealmAdmissionError(ConflictError):
     code = "realm_admission_failed"
 
 
+class IntegrityDeadlineExceeded(TimeoutError):
+    """Internal signal from an expired integrity budget, not a storage timeout."""
+
+
 class LeaseError(ConflictError):
     code = "lease_fenced"
 
