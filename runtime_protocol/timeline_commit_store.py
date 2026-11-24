@@ -1670,8 +1670,40 @@ class TimelineCommitStore:
                 if edge["intent"] == "recorded":
                     self._verify_accepted(ledger[0], edge)
                     self._verify_inputs(json.loads(ledger[0]["result_json"])["canonical_document"])
-                elif edge["records_json"] is not None or ledger[0]["command_kind"] != "parent_composition.publish":
-                    raise ValueError("invented legacy provenance")
+                else:
+                    # This is the existing doctor traversal, not a new scan.
+                    # Old/bootstrapped edges must still match their retained
+                    # publication receipt and event even if they predate the
+                    # recorder. The receipt's compacted shape keeps these IDs.
+                    receipt = ledger[0]
+                    if (edge["records_json"] is not None or receipt["command_kind"] != "parent_composition.publish"
+                            or receipt["aggregate_id"] != edge["timeline_id"]
+                            or receipt["primary_stream_id"] != edge["timeline_id"]
+                            or receipt["last_project_seq"] != edge["project_seq"]
+                            or any(edge[field] is not None for field in ("provider_version", "compiler_version", "publisher"))):
+                        raise ValueError("invented legacy provenance")
+                    result = json.loads(receipt["result_json"])
+                    ids = json.loads(receipt["event_ids_json"])
+                    if not isinstance(ids, list) or len(ids) != 1 or result["event_id"] != ids[0]:
+                        raise ValueError("legacy publication event mismatch")
+                    event = self.conn.execute("SELECT kind, payload_json FROM timeline_events WHERE id=? AND timeline_id=?",
+                                              (ids[0], edge["timeline_id"])).fetchone()
+                    if event is None or event["kind"] != "parent.composition.published":
+                        raise ValueError("legacy publication event missing")
+                    payload = json.loads(event["payload_json"])
+                    if (result["project_id"] != edge["project_id"] or payload["project_id"] != edge["project_id"]
+                            or result["timeline_id"] != edge["timeline_id"] or payload["timeline_id"] != edge["timeline_id"]
+                            or result["parent_revision_id"] != edge["revision_id"] or payload["new_head"] != edge["revision_id"]
+                            or result["content_digest"] != payload["content_digest"]
+                            or (expected is not None and payload["old_head"] != expected[1])
+                            or (edge["intent"] == "bootstrap" and (expected is not None or payload["old_head"] is not None))):
+                        raise ValueError("legacy publication identity mismatch")
+                    metadata = json.loads(edge["metadata_json"])
+                    imported = {"label": "Imported timeline"}
+                    if "source" in payload:
+                        imported["source"] = payload["source"]
+                    if metadata != {} and (edge["intent"] != "bootstrap" or metadata != imported):
+                        raise ValueError("invented legacy publication metadata")
             except Exception as exc:
                 errors.append({"table": "timeline_commit_history", "id": edge["publication_id"], "reason": str(exc)})
         for key, expected in previous.items():

@@ -7082,7 +7082,8 @@ class RealmStore:
         if schema_ok:
             from .v33_manifest import canonical_manifest
             try:
-                schema_ok = canonical_manifest(self.conn)["kind"] == "U33"
+                manifest = canonical_manifest(self.conn)
+                schema_ok = manifest["kind"] == "U33" and manifest["history_guarded"]
             except ValidationError:
                 schema_ok = False
         realm_identity = {"ok": False, "realm_id": None, "row_count": None, "reason": "realm_table_missing"}

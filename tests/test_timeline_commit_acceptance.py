@@ -153,7 +153,8 @@ def corrupt_recorder(service, value, result, path, replacement):
         leaf = leaf[token]
     leaf[path[-1]] = replacement
     validate_prepared(changed)  # Corruption still satisfies the authoritative schema.
-    service.store.conn.execute("UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
                                (canonical_json(changed["records"]), result["receipt"]["receipt_id"]))
 
 
@@ -626,7 +627,8 @@ def test_commit_integrity_detects_missing_history_and_corrupt_record(realm):
     service, commits, project, head, _ = realm
     ctx = context(service, project, head)
     result = accept(commits, ctx, prepared(commits, ctx))
-    service.store.conn.execute("UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
                                ('{"commands":[]}', result["receipt"]["receipt_id"]))
     with pytest.raises(ProtocolError, match="corrupt"):
         commits.lookup(ctx, authorize=lambda: None)
@@ -731,7 +733,8 @@ def test_corrupt_acceptance_event_and_receipt_facts_fail_closed_after_restart(re
     elif bad == "primary_stream":
         conn.execute("UPDATE command_idempotency SET primary_stream_id='other' WHERE txn_id=?", (publication,))
     else:
-        conn.execute("UPDATE timeline_commit_history SET intent='legacy_unknown' WHERE publication_id=?", (publication,))
+        from tests.history_forgery import forge_history_row
+        forge_history_row(conn, "UPDATE timeline_commit_history SET intent='legacy_unknown' WHERE publication_id=?", (publication,))
     assert_corrupt_acceptance(service, commits, ctx, value, result)
     assert_corrupt_restart(service, root)
 

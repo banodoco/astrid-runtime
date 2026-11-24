@@ -30,7 +30,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .canonical_schema import (CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL,
-                               GENERATION_TAG_INDEX_SQL, generation_tag_index_is_current)
+                               GENERATION_TAG_INDEX_SQL, generation_tag_index_is_current,
+                               install_timeline_history_guards)
 from .cas import ContentAddressedStore
 from .catalog import _safe_path
 from .errors import ConflictError, OwnerBusyError, RealmAdmissionError, ValidationError
@@ -852,6 +853,7 @@ def _apply_v32_to_v33(connection: sqlite3.Connection, family: str) -> dict[str, 
         connection.execute(GENERATION_TAG_INDEX_SQL)
     else:
         raise ValidationError("unsupported v32 migration family")
+    install_timeline_history_guards(connection)
     connection.execute("UPDATE runtime_schema SET version=33 WHERE id=1")
     return {"source_schema_version": 32, "target_schema_version": 33, "source_family": family}
 
@@ -988,7 +990,9 @@ def migrate_canonical_to_current(
 ) -> dict:
     """Run supported canonical steps and the durable SQL-only backfill through v33.
 
-    Current v33 is a read-only idempotent result.  Unknown, alternate, and
+    Guarded v33 is a read-only idempotent result. The exact historical unguarded
+    v33 layout receives the guards under the same offline recovery-set fence.
+    Unknown, alternate, and
     newer layouts are rejected by the read-only preflight before an owner-lock
     marker, SQLite sidecar, journal, process signal, or schema mutation occurs.
     """
@@ -1005,7 +1009,14 @@ def migrate_canonical_to_current(
     pending = lifecycle.activation(root)
     if pending and pending[1]["state"] in {"restoring", "restored"}:
         raise ConflictError("full-set restoration is incomplete; use explicit operator recovery")
-    if source_version == SCHEMA_VERSION and pending and pending[1]["state"] != "ready":
+    guarded = identity.get("history_guarded", False)
+    if source_version == SCHEMA_VERSION and not guarded and pending:
+        if pending[1]["state"] == "ready":
+            # A completed earlier activation is not this migration's backup.
+            pending = None
+        elif pending[1]["state"] != "backup_verified":
+            raise ConflictError("unguarded v33 activation incomplete; restore its recovery set before migrating history guards")
+    if source_version == SCHEMA_VERSION and guarded and pending and pending[1]["state"] != "ready":
         with _owner_fence(root):
             connection = sqlite3.connect(root / "realm.sqlite3", timeout=float(timeout_seconds))
             connection.row_factory = sqlite3.Row
@@ -1015,7 +1026,7 @@ def migrate_canonical_to_current(
                 connection.close()
         return {"ok": True, "realm_id": realm_id, "source_schema_version": 33, "target_schema_version": 33,
                 "changed": False, "steps": [], "backfill": completion, "recovery_set": str(pending[0])}
-    if source_version == SCHEMA_VERSION:
+    if source_version == SCHEMA_VERSION and guarded:
         lifecycle.check_startup(root)
         return {
             "ok": True,
@@ -1072,8 +1083,12 @@ def migrate_canonical_to_current(
                 current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
             if current["version"] == 32:
                 steps.append(_apply_v32_to_v33(connection, str(current["kind"])))
+            elif current["version"] == SCHEMA_VERSION and not current.get("history_guarded", False):
+                install_timeline_history_guards(connection)
+                steps.append({"source_schema_version": 33, "target_schema_version": 33,
+                              "installed": "accepted_history_guards"})
             final = _canonical_schema_identity(connection, expected_realm_id=realm_id)
-            if final["kind"] != "U33":
+            if final["kind"] != "U33" or not final["history_guarded"]:
                 raise ValidationError("canonical migration did not produce the pinned v33 layout")
             if _quick_check(connection, float(timeout_seconds)) != "ok":
                 raise ValidationError("migrated database failed SQLite integrity check")

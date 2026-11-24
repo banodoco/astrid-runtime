@@ -50,6 +50,42 @@ CREATE TABLE timeline_commit_history (
 );
 """
 
+# Guard the two declared unique keys AND SQLite's implicit rowid. REPLACE
+# bypasses DELETE triggers on connections with recursive_triggers=OFF; the
+# BEFORE INSERT guard refuses its collisions independently of that setting.
+# Normal publication appends use three indexed probes, not a history scan.
+TIMELINE_HISTORY_TRIGGER_SQL = {
+    "timeline_history_no_update": """
+CREATE TRIGGER timeline_history_no_update BEFORE UPDATE ON timeline_commit_history
+BEGIN
+    SELECT RAISE(ABORT, 'accepted timeline history is immutable');
+END
+""".strip(),
+    "timeline_history_no_delete": """
+CREATE TRIGGER timeline_history_no_delete BEFORE DELETE ON timeline_commit_history
+BEGIN
+    SELECT RAISE(ABORT, 'accepted timeline history is immutable');
+END
+""".strip(),
+    "timeline_history_no_replace": """
+CREATE TRIGGER timeline_history_no_replace BEFORE INSERT ON timeline_commit_history
+WHEN EXISTS (SELECT 1 FROM timeline_commit_history WHERE publication_id=NEW.publication_id)
+  OR EXISTS (SELECT 1 FROM timeline_commit_history
+             WHERE project_id=NEW.project_id AND timeline_id=NEW.timeline_id AND project_seq=NEW.project_seq)
+  OR EXISTS (SELECT 1 FROM timeline_commit_history WHERE rowid=NEW.rowid)
+BEGIN
+    SELECT RAISE(ABORT, 'accepted timeline history is immutable');
+END
+""".strip(),
+}
+
+
+def install_timeline_history_guards(connection):
+    """Install exact guards inside the caller's schema transaction."""
+    for statement in TIMELINE_HISTORY_TRIGGER_SQL.values():
+        connection.execute(statement)
+
+
 CANONICAL_SCHEMA_SQL = r"""
 CREATE TABLE runtime_schema (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -470,3 +506,4 @@ CREATE INDEX idx_managed_output_manifest ON managed_output_associations(manifest
 """ + TIMELINE_COMMIT_SCHEMA_SQL + DOCUMENT_INPUT_SCHEMA_SQL
 
 CANONICAL_SCHEMA_SQL += GENERATION_TAG_INDEX_SQL + ";\n"
+CANONICAL_SCHEMA_SQL += "".join(statement + ";\n" for statement in TIMELINE_HISTORY_TRIGGER_SQL.values())

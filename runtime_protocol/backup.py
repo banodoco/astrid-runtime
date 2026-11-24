@@ -482,7 +482,8 @@ def _inspect_consolidated_realm(
             from .store import SCHEMA_VERSION
             from .upgrade import _canonical_schema_identity
             identity = _canonical_schema_identity(connection)
-            if int(identity["version"]) >= SCHEMA_VERSION:
+            if int(identity["version"]) > SCHEMA_VERSION or (
+                    int(identity["version"]) == SCHEMA_VERSION and identity.get("history_guarded", False)):
                 raise ConflictError("realm failed integrity checks", details=report)
         realm = inspector.realm
         return report, realm
