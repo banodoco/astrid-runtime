@@ -187,6 +187,7 @@ class DeferredHistoryVerification:
         with self.store._mutex:
             if self._stop.is_set() or self.store.conn is None:
                 return
+            self.store.conn.execute("PRAGMA query_only=ON")
             self.store.admission_report = report
             self._status = {**self._status, "state": "failed", "phase": "failed",
                             "message": "realm failed " + (", ".join(report.get("issues", [])) or "history_verification") + " check"}
@@ -238,10 +239,12 @@ class DeferredHistoryVerification:
                                 cancellation.check()
                                 store.admission_report = report
                                 store._write_admission_state(clean=False)
-                                self._status = {**self._status, "state": "complete",
-                                                "phase": "complete", "message": "verification complete"}
+                                cancellation.check()
                             finally:
                                 connection.rollback()
+                            cancellation.check()
+                            self._status = {**self._status, "state": "complete",
+                                            "phase": "complete", "message": "verification complete"}
                         finally:
                             if self._status["state"] != "complete":
                                 connection.execute("PRAGMA query_only=ON")
