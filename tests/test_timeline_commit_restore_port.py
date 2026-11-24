@@ -127,8 +127,10 @@ def test_selected_scoped_source_read_is_detached_and_does_not_require_source_acc
     # Preserve the old-main missing-edge case and the distinct media/child case.
     # Remove only legacy migration metadata, never source bytes, events or receipts.
     if legacy:
-        service.store.conn.execute("UPDATE timeline_commit_history SET previous_publication_id=NULL, previous_revision_id=NULL WHERE revision_id=?", (current_id,))
-        service.store.conn.execute("DELETE FROM timeline_commit_history WHERE revision_id=?", (source_id,))
+        from tests.history_forgery import forge_history_row
+        forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET previous_publication_id=NULL, previous_revision_id=NULL WHERE revision_id=?", (current_id,))
+        from tests.history_forgery import forge_history_row
+        forge_history_row(service.store.conn, "DELETE FROM timeline_commit_history WHERE revision_id=?", (source_id,))
         service.store.conn.execute("UPDATE parent_composition_revisions SET commit_manifest_json=NULL WHERE id=?", (source_id,))
     body = request(service)
     body["commands"][0]["args"]["source"] = {"revision_id": source_id, "content_digest": first["data"]["content_digest"]}

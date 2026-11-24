@@ -11,7 +11,6 @@ import json
 import re
 import sqlite3
 
-from .canonical_schema import TIMELINE_HISTORY_TRIGGER_SQL
 from .errors import ValidationError
 
 _FORMAT = "astrid-runtime-sqlite-v1"
@@ -104,34 +103,31 @@ def canonical_manifest(connection: sqlite3.Connection, *, expected_realm_id: str
         realm_id = realm_rows[0][0]
         if expected_realm_id is not None and realm_id != expected_realm_id:
             raise ValidationError("realm identity mismatch")
-        objects = _objects(connection)
-        def fingerprint_for(inventory):
-            data = {"format_id": _FORMAT, "version": version, "objects": inventory}
-            return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
-
-        # The three exact trigger definitions are checked in _objects. Keep
-        # the pinned historical table/index fingerprints unchanged, but bind
-        # the full guarded layout (including trigger bodies) to recovery sets.
-        guards = {name for name, obj in objects.items() if obj["type"] == "trigger"}
-        history_guarded = guards == set(TIMELINE_HISTORY_TRIGGER_SQL)
-        if guards and (version != 33 or not history_guarded):
-            raise ValidationError(f"unsupported canonical v{version} manifest")
-        fingerprint = fingerprint_for(objects)
-        core_fingerprint = fingerprint_for({name: obj for name, obj in objects.items() if name not in guards}) if guards else fingerprint
-        family = next((key for key, value in _FINGERPRINTS.items() if value == core_fingerprint), None)
-        if family is None or (guards and family != "U33"):
+        # U33's pinned fingerprint describes its original tables and indexes.
+        # Ignore only the separately verified, complete history guard layer 1.
+        ignored_guards = ()
+        if version == 33:
+            from .history_guards import TIMELINE_HISTORY_TRIGGER_SQL, history_guard_manifest
+            if history_guard_manifest(connection)["version"] == 1:
+                ignored_guards = tuple(TIMELINE_HISTORY_TRIGGER_SQL)
+        objects = _objects(connection, ignored_guards=ignored_guards)
+        data = {"format_id": _FORMAT, "version": version, "objects": objects}
+        fingerprint = hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+        family = next((key for key, value in _FINGERPRINTS.items() if value == fingerprint), None)
+        if family is None:
             raise ValidationError(f"unsupported canonical v{version} manifest")
         return {"format_id": _FORMAT, "version": version, "kind": family,
-                "realm_id": realm_id, "fingerprint": fingerprint,
-                "history_guarded": history_guarded}
+                "realm_id": realm_id, "fingerprint": fingerprint}
     except sqlite3.DatabaseError as exc:
         raise ValidationError("cannot inspect canonical SQLite manifest") from exc
 
 
-def _objects(connection: sqlite3.Connection) -> dict:
+def _objects(connection: sqlite3.Connection, *, ignored_guards=()) -> dict:
     objects = {}
     rows = connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").fetchall()
     for kind, name, owner, sql in rows:
+        if kind == "trigger" and name in ignored_guards:
+            continue
         if name in {"sqlite_sequence", "sqlite_stat1", "sqlite_stat2", "sqlite_stat3", "sqlite_stat4"} and kind == "table":
             continue
         if name.startswith("sqlite_autoindex_") and kind == "index" and sql is None:
@@ -139,12 +135,6 @@ def _objects(connection: sqlite3.Connection) -> dict:
             indexes = list(connection.execute(f"PRAGMA index_list({quoted})"))
             if not any(row[1] == name and row[2] == 1 and row[3] in ("u", "pk") for row in indexes):
                 raise ValidationError("invalid SQLite automatic index")
-            continue
-        if kind == "trigger":
-            expected = TIMELINE_HISTORY_TRIGGER_SQL.get(name)
-            if owner != "timeline_commit_history" or expected is None or not isinstance(sql, str) or _tokens(sql) != _tokens(expected):
-                raise ValidationError("unsupported SQLite schema object")
-            objects[name] = {"type": kind, "owner": owner, "definition": " ".join(_tokens(sql))}
             continue
         if name.startswith("sqlite_") or kind not in ("table", "index") or not isinstance(sql, str):
             raise ValidationError("unsupported SQLite schema object")

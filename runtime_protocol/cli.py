@@ -97,6 +97,9 @@ def _parser():
     canonical.add_argument("--root", required=True)
     canonical.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
     canonical.add_argument("--confirm", required=True)
+    guard_rollback = sub.add_parser("remove-history-guards", help="prepare a stopped U33 realm for rollback to a guard-unaware Runtime")
+    guard_rollback.add_argument("--root", required=True)
+    guard_rollback.add_argument("--confirm", required=True)
     reconcile = sub.add_parser("migrate-managed-outputs", help="materialize verified associations for historical settled render outputs")
     reconcile.add_argument("--root", required=True)
     reconcile.add_argument("--project-id")
@@ -277,6 +280,15 @@ def _main(args):
         try:
             result = migrate_canonical_to_current(args.root, timeout_seconds=args.timeout,
                                                   confirmation=args.confirm)
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "remove-history-guards":
+        from .history_guards import prepare_history_guard_rollback
+        try:
+            result = prepare_history_guard_rollback(args.root, confirmation=args.confirm)
         except RuntimeErrorBase as exc:
             print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
             return 1

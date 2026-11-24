@@ -998,6 +998,8 @@ class RealmStore:
                     "INSERT INTO realm_lifecycle(realm_id, state, version) VALUES (?, 'active', 1)",
                     (rid,),
                 )
+                from .history_guards import install_history_guards
+                install_history_guards(store.conn)
             store.admission_report = store.integrity_report()
             if not store.admission_report.get("ok"):
                 raise RealmAdmissionError("fresh realm failed canonical admission", details=store.admission_report)
@@ -1130,10 +1132,37 @@ class RealmStore:
                 self._acquire_owner()
             self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout, allow_active_marker=False)
             if not self.admission_report.get("ok"):
-                raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
+                guard = self.admission_report.get("checks", {}).get("history_guards", {})
+                message = "realm failed startup admission: history_guards" if guard.get("ok") is False else "realm failed startup admission"
+                raise RealmAdmissionError(message, details=self.admission_report)
             if acquire_owner and not owner_marker_present:
                 self._acquire_owner()
             self._open(fresh=False)
+            from .history_guards import (
+                HISTORY_GUARD_RECOVERY, HistoryGuardManifestError, history_guard_manifest, install_history_guards,
+            )
+            try:
+                # The detached doctor has already accepted the base schema and
+                # existing history. Reclassify the live database under both
+                # owner fences and a SQLite writer transaction before installing.
+                if acquire_owner:
+                    with self._transaction():
+                        install_history_guards(self.conn)
+                        layer = history_guard_manifest(self.conn)
+                    self.admission_report["checks"]["history_guards"] = {"ok": True, **layer}
+                elif history_guard_manifest(self.conn)["version"] != 1:
+                    raise RealmAdmissionError(
+                        "history guard layer 1 requires owning admission",
+                        details={"issues": ["history_guards"], "checks": {"history_guards": {"ok": False, "reason": "owner_required"}},
+                                 "recovery_action": "Open the realm with Runtime ownership to install history guard layer 1.",
+                                 "next_action": "Open the realm with Runtime ownership to install history guard layer 1."},
+                    )
+            except HistoryGuardManifestError as exc:
+                raise RealmAdmissionError(
+                    "realm failed startup admission: history_guards",
+                    details={"issues": ["history_guards"], "checks": {"history_guards": {"ok": False, "reason": str(exc)}},
+                             "recovery_action": HISTORY_GUARD_RECOVERY, "next_action": HISTORY_GUARD_RECOVERY},
+                ) from exc
             if acquire_owner:
                 self._begin_admission_session()
             self._release_admission_lock()
@@ -7079,11 +7108,19 @@ class RealmStore:
             and not extra_columns
             and not unexpected_tables
         )
+        guard_check = None
         if schema_ok:
+            from .history_guards import HISTORY_GUARD_RECOVERY, HistoryGuardManifestError, history_guard_manifest
             from .v33_manifest import canonical_manifest
             try:
-                manifest = canonical_manifest(self.conn)
-                schema_ok = manifest["kind"] == "U33" and manifest["history_guarded"]
+                schema_ok = canonical_manifest(self.conn)["kind"] == "U33"
+                if schema_ok:
+                    # Missing layer is a supported historical or backup shape.
+                    # Offline doctor remains read-only; owned admission installs it.
+                    guard_check = {"ok": True, **history_guard_manifest(self.conn)}
+            except HistoryGuardManifestError as exc:
+                schema_ok = False
+                guard_check = {"ok": False, "version": 1, "reason": str(exc)}
             except ValidationError:
                 schema_ok = False
         realm_identity = {"ok": False, "realm_id": None, "row_count": None, "reason": "realm_table_missing"}
@@ -7621,6 +7658,7 @@ class RealmStore:
         if not sqlite_ok: issues.append("sqlite_integrity")
         if fk: issues.append("foreign_keys")
         if not schema_ok: issues.append("schema")
+        if guard_check is not None and not guard_check["ok"]: issues.append("history_guards")
         if not identity_ok: issues.append("realm_identity")
         if missing: issues.append("reachable_cas")
         if corrupt: issues.append("corrupt_cas")
@@ -7631,6 +7669,8 @@ class RealmStore:
         recovery = "No recovery action required." if healthy else "Restore the realm from a verified backup, then re-run doctor."
         if (catalog_check["ok"] is False or activation_check["ok"] is False) and sqlite_ok and not fk and schema_ok and identity_ok and cas_ok:
             recovery = "Repair the catalog and activation manifest, then restart the runtime."
+        if guard_check is not None and not guard_check["ok"]:
+            recovery = HISTORY_GUARD_RECOVERY
         verified_at = now() if run_deep and healthy else previous_verification.get("deep_verified_at") if trusted_previous else None
         return {
             "status": "ok" if healthy else "failed",
@@ -7656,6 +7696,7 @@ class RealmStore:
                     "extra_columns": extra_columns,
                     "unexpected_tables": unexpected_tables,
                 },
+                **({"history_guards": guard_check} if guard_check is not None else {}),
                 "realm_identity": realm_identity,
                 "reachable_cas": {"ok": cas_ok, "missing": missing, "corrupt": corrupt, "orphaned": sorted(orphaned)},
                 "cas_missing": missing,

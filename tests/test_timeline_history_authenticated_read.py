@@ -134,19 +134,22 @@ def test_later_request_rechecks_all_authority_and_never_writes(service, corrupti
                                                      "state": {"state": "present", "value": "forged"}}]
         else:
             command["writes"][0]["after"] = {"state": "present", "value": "forged"}
-        conn.execute("UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
+        from tests.history_forgery import forge_history_row
+        forge_history_row(conn, "UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
                      (canonical_json(records), publication))
     elif corruption == "head":
         conn.execute("UPDATE parent_composition_heads SET revision_id=? WHERE timeline_id='main'",
                      (accepted["data"]["previous_revision_id"],))
     elif corruption == "cycle":
         baseline = page["items"][0]
-        conn.execute("UPDATE timeline_commit_history SET previous_publication_id=?, previous_revision_id=? "
+        from tests.history_forgery import forge_history_row
+        forge_history_row(conn, "UPDATE timeline_commit_history SET previous_publication_id=?, previous_revision_id=? "
                      "WHERE publication_id=?", (baseline["publication_id"], baseline["revision_id"],
                                                 baseline["publication_id"]))
     else:
         foreign = service.create_project({"slug": "foreign", "name": "Foreign"})["id"]
-        conn.execute("UPDATE timeline_commit_history SET project_id=? WHERE publication_id=?", (foreign, publication))
+        from tests.history_forgery import forge_history_row
+        forge_history_row(conn, "UPDATE timeline_commit_history SET project_id=? WHERE publication_id=?", (foreign, publication))
     before = rows(service)
     for _ in range(2):
         with pytest.raises(RuntimeErrorBase):

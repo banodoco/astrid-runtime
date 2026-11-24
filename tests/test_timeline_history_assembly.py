@@ -109,14 +109,16 @@ def test_dependency_graph_is_fresh_between_provider_lookups(editing, monkeypatch
         publication = accepted[0]["receipt"]["receipt_id"]
         if mutation in {"ancestor", "parent"}:
             column = "revision_id" if mutation == "ancestor" else "previous_revision_id"
-            conn.execute(f"UPDATE timeline_commit_history SET {column}=? WHERE publication_id=?",
+            from tests.history_forgery import forge_history_row
+            forge_history_row(conn, f"UPDATE timeline_commit_history SET {column}=? WHERE publication_id=?",
                          (accepted[-1 if mutation == "ancestor" else 0]["data"]["accepted_revision_id"], publication))
         elif mutation == "event":
             conn.execute("UPDATE timeline_events SET payload_json='{}' WHERE id=?",
                          (accepted[0]["receipt"]["event_ids"][-1],))
         elif mutation in {"metadata", "aba"}:
             head = commits.head(project, timeline)
-            conn.execute("UPDATE timeline_commit_history SET metadata_json='{}' WHERE publication_id=?",
+            from tests.history_forgery import forge_history_row
+            forge_history_row(conn, "UPDATE timeline_commit_history SET metadata_json='{}' WHERE publication_id=?",
                          (publication,))
             if mutation == "aba":
                 conn.execute("UPDATE parent_composition_heads SET publication_id=? WHERE project_id=? AND timeline_id=?",
@@ -128,7 +130,8 @@ def test_dependency_graph_is_fresh_between_provider_lookups(editing, monkeypatch
             path = editing.service.cas.path_for(media.removeprefix("sha256:"))
             path.write_bytes(b"corrupt physical media")
         else:
-            conn.execute("UPDATE timeline_commit_history SET previous_publication_id=? WHERE publication_id=?",
+            from tests.history_forgery import forge_history_row
+            forge_history_row(conn, "UPDATE timeline_commit_history SET previous_publication_id=? WHERE publication_id=?",
                          (publication if mutation == "rewind" else target, target))
         before = real.rows(editing.service)
         with pytest.raises(RuntimeErrorBase):
@@ -161,7 +164,8 @@ def test_unverified_dependencies_cannot_escape_the_graph(editing, monkeypatch, a
         if history and attack == "queued-row":
             # The dependency has been read but not yet authenticated. Its live
             # row must still match when the worklist reaches it.
-            editing.service.store.conn.execute(
+            from tests.history_forgery import forge_history_row
+            forge_history_row(editing.service.store.conn,
                 "UPDATE timeline_commit_history SET metadata_json='{}' WHERE publication_id=?", (seed,))
         elif not history and attack == "indirect-cycle":
             commits.history_entry(project, timeline, target)
@@ -196,7 +200,8 @@ def test_reopened_runtime_rechecks_ancestors_before_exact_retry(editing, monkeyp
         assert reopened.commit(body, "assembly-1") == undone
         conn = runtime.store.conn
         assert conn is not None
-        conn.execute("UPDATE timeline_commit_history SET metadata_json='{}' WHERE publication_id=?",
+        from tests.history_forgery import forge_history_row
+        forge_history_row(conn, "UPDATE timeline_commit_history SET metadata_json='{}' WHERE publication_id=?",
                      (seed["receipt"]["receipt_id"],))
         before = real.rows(runtime)
         with pytest.raises(RuntimeErrorBase):
@@ -237,10 +242,12 @@ def test_provider_refuses_inputs_changed_after_ancestor_check(editing, monkeypat
                 value["recorder_abi"] = 1
             else:
                 value["steps"][0]["patch"] = []
-            conn.execute(f"UPDATE timeline_commit_history SET {column}=? WHERE publication_id=?",
+            from tests.history_forgery import forge_history_row
+            forge_history_row(conn, f"UPDATE timeline_commit_history SET {column}=? WHERE publication_id=?",
                          (canonical_json(value), seed))
         elif mutation in {"parent", "queued-cycle"}:
-            conn.execute("UPDATE timeline_commit_history SET previous_publication_id=? WHERE publication_id=?",
+            from tests.history_forgery import forge_history_row
+            forge_history_row(conn, "UPDATE timeline_commit_history SET previous_publication_id=? WHERE publication_id=?",
                          (target, seed))
         elif mutation == "event":
             conn.execute("UPDATE timeline_events SET payload_json='{}' WHERE id=?",
@@ -385,7 +392,8 @@ def test_provider_refuses_mutation_after_dependent_history_reads(editing, monkey
     def after_read(*args, **kwargs):
         result = original(*args, **kwargs)
         if commits._verification.current["traversal"] is None and not mutated:
-            editing.service.store.conn.execute(
+            from tests.history_forgery import forge_history_row
+            forge_history_row(editing.service.store.conn,
                 "UPDATE timeline_commit_history SET metadata_json='{}' WHERE publication_id=?", (seed,))
             mutated.append(seed)
         return result
@@ -428,7 +436,8 @@ def test_provider_read_freshness_isolated_after_refusal_and_between_requests(edi
         def after_pins(*args, **kwargs):
             result = original(*args, **kwargs)
             scopes.append(commits._verification.current["inputs"])
-            conn.execute("UPDATE timeline_commit_history SET metadata_json='{}' WHERE publication_id=?", (seed,))
+            from tests.history_forgery import forge_history_row
+            forge_history_row(conn, "UPDATE timeline_commit_history SET metadata_json='{}' WHERE publication_id=?", (seed,))
             return result
 
         with monkeypatch.context() as attack:
@@ -436,7 +445,8 @@ def test_provider_read_freshness_isolated_after_refusal_and_between_requests(edi
             with pytest.raises(RuntimeErrorBase):
                 port.history_entry(target)
         assert commits._verification.current["inputs"] is None
-        conn.execute("UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?", (metadata, seed))
+        from tests.history_forgery import forge_history_row
+        forge_history_row(conn, "UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?", (metadata, seed))
         assert port.history_entry(target)["receipt"] == accepted[-1]["receipt"]
         assert commits._verification.current["inputs"] is None
         raise ReadComplete("fresh read after refusal")

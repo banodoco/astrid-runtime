@@ -102,7 +102,8 @@ def test_history_authority_requires_accepted_event_commitment(recorder, value):
         "SELECT metadata_json FROM timeline_commit_history WHERE publication_id=?", (publication,),
     ).fetchone()[0])
     metadata["recorder_abi"] = copy.deepcopy(value)
-    runtime.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(runtime.store.conn, "UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
                                (canonical_json(metadata), publication))
     with pytest.raises(ProtocolError, match="accepted commit record is corrupt"):
         runtime._timeline_commits()[0].history_entry(project, "film", publication)
@@ -235,7 +236,8 @@ def test_legacy_history_cannot_acquire_injected_mode_two(recorder):
         "SELECT metadata_json FROM timeline_commit_history WHERE publication_id=?", (publication,),
     ).fetchone()[0])
     metadata["recorder_abi"] = 2
-    runtime.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(runtime.store.conn, "UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
                                (canonical_json(metadata), publication))
     with pytest.raises(ProtocolError, match="accepted commit record is corrupt"):
         commits.history_entry(project, "film", publication)
@@ -336,7 +338,8 @@ def test_prechange_both_absent_is_legacy_without_reclassifying_records(service, 
     metadata.pop("recorder_abi")
     for key in ("recorder_abi", "request_hash", "metadata_digest"):
         payload.pop(key)
-    service.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
                                (canonical_json(metadata), publication))
     _replace_event(service, event, payload)
     entry = service._timeline_commits()[0].history_entry(service.test_project, "main", publication)
@@ -344,7 +347,8 @@ def test_prechange_both_absent_is_legacy_without_reclassifying_records(service, 
     assert auth.commit(service, submitted) == result
     # Old metadata alone cannot introduce authority, even on physical records.
     metadata["recorder_abi"] = 2
-    service.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
                                (canonical_json(metadata), publication))
     with pytest.raises(ProtocolError, match="accepted commit record is corrupt"):
         service._timeline_commits()[0].history_entry(service.test_project, "main", publication)
@@ -382,12 +386,14 @@ def test_mode_commitment_rejects_unilateral_removal_and_metadata_records_or_chai
     if damage == "records":
         records = json.loads(edge["records_json"])
         records["commands"][0]["bindings"][0]["policy"] = "different"
-        service.store.conn.execute("UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
+        from tests.history_forgery import forge_history_row
+        forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
                                    (canonical_json(records), publication))
     if damage == "earlier_event":
         service.store.conn.execute("UPDATE timeline_events SET event_hash=? WHERE id=("
                                    "SELECT MIN(id) FROM timeline_events WHERE timeline_id='main')", ("0" * 64,))
-    service.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
                                (canonical_json(metadata), publication))
     _replace_event(service, event, payload)
     before = port_tests.rows(service)
@@ -410,7 +416,8 @@ def test_event_mode_requires_integer_enum_even_with_rehashed_event(service, side
     if side == "both":
         metadata["recorder_abi"] = copy.deepcopy(value)
         payload["metadata_digest"] = digest(metadata)
-        service.store.conn.execute("UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
+        from tests.history_forgery import forge_history_row
+        forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET metadata_json=? WHERE publication_id=?",
                                    (canonical_json(metadata), publication))
     _replace_event(service, event, payload)
     with pytest.raises(ProtocolError, match="accepted commit record is corrupt"):
@@ -432,7 +439,8 @@ def test_postaccept_stripping_and_fullrewrite_cannot_downgrade_frozen_mode(recor
                               if not full_rewrite or binding["key"] != "commit.effect"]
     assert entry["recorder_abi"] == 2
     assert commits.history_entry(project, "film", publication)["recorder_abi"] == 2
-    runtime.store.conn.execute("UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(runtime.store.conn, "UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
                                (canonical_json(entry["records"]), publication))
     with pytest.raises(ProtocolError, match="accepted commit record is corrupt"):
         commits.history_entry(project, "film", publication)
