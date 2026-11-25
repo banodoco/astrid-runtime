@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from . import platform
+from . import platform, store as runtime_store
 
 from .cas import ContentAddressedStore, StagedObject, DEFAULT_MAX_OBJECT_BYTES, file_identity
 from .canonical_schema import generation_tag_expression
@@ -10507,7 +10507,7 @@ class RuntimeService:
                     self.store._append_event(task["run_id"], row["task_id"], "task.progress", progress)
                 result = {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": expires, "runtime_epoch": self.store._current_runtime_epoch()}
                 recorded = self._command_record("attempt.heartbeat", attempt_id, idempotency_key, request_hash, result, project_id=project_id or "unscoped")
-            self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30), record=record)
+            self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", runtime_store.LEASE_SECONDS), record=record)
             return recorded
 
     @_verified_mutation

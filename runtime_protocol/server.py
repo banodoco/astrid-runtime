@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
+import logging
 import math
 import re
 import select
@@ -117,6 +119,10 @@ def _validate_finite_json(value):
 
 
 DOCUMENT_PIN = ("document_id", "version", "content_digest")
+_REQUEST_SLOW_LOGGER = logging.getLogger(__name__)
+_REQUEST_SLOW_THRESHOLD_NS = 1_000_000_000
+_REQUEST_LOG_MAX_MS = 24 * 60 * 60 * 1000
+_REQUEST_LOG_MAX_BYTES = 2048
 # Verified reads under /v1/projects/{project_id}/: path tail -> (exact query
 # field sets, Runtime method, error message for any other query shape).
 VERIFIED_READS = {
@@ -1649,6 +1655,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         lock and stall every other request, including health checks.
         """
         timing = token = None
+        dispatch_started_ns = time.monotonic_ns()
+        store_lock_wait_ns = 0
         wire_started = False
         if self._is_timeline_commit():
             from .timeline_commit_execution import start_commit_timing
@@ -1698,7 +1706,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     self._route()
                 else:
                     self._prefetch_body()
+                    lock_started_ns = time.monotonic_ns()
                     with self.runtime.store._mutex:
+                        store_lock_wait_ns = max(0, time.monotonic_ns() - lock_started_ns)
                         self._route()
             finally:
                 self._defer_response = False
@@ -1749,6 +1759,33 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 timing.end("handler")
                 from .timeline_commit_execution import finish_commit_timing
                 finish_commit_timing(timing, token)
+            elapsed_ns = max(0, time.monotonic_ns() - dispatch_started_ns)
+            self._log_slow_request(elapsed_ns, store_lock_wait_ns)
+
+    def _log_slow_request(self, elapsed_ns, store_lock_wait_ns):
+        """Emit bounded timing diagnostics without affecting request handling."""
+        try:
+            if store_lock_wait_ns <= _REQUEST_SLOW_THRESHOLD_NS and elapsed_ns <= _REQUEST_SLOW_THRESHOLD_NS:
+                return
+            request_path = urlsplit(getattr(self, "path", "")).path[:256]
+            public_id = getattr(self, "_runtime_request_id", None)
+            record = {
+                "event": "request_slow",
+                "method": str(getattr(self, "command", "?"))[:16],
+                "path": request_path,
+                "total_ms": min(_REQUEST_LOG_MAX_MS, int(round(elapsed_ns / 1_000_000))),
+                "store_lock_wait_ms": min(_REQUEST_LOG_MAX_MS, int(round(store_lock_wait_ns / 1_000_000))),
+            }
+            if isinstance(public_id, str):
+                record["request_id_sha256"] = hashlib.sha256(public_id.encode("utf-8", "replace")).hexdigest()
+            line = json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            message = "runtime.request.slow " + line
+            if len((message + "\n").encode("utf-8")) <= _REQUEST_LOG_MAX_BYTES:
+                _REQUEST_SLOW_LOGGER.info("%s", message)
+        except Exception:
+            # Diagnostics must not change request handling if request metadata,
+            # serialization, or a custom logging handler fails.
+            pass
 
     def do_GET(self):
         self._dispatch()
