@@ -15,16 +15,18 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import wraps
 from typing import cast
 
+from . import cancellation
 from . import platform as runtime_platform
 from ._timeline_reopen_diagnostics import (
     count_prefix_materialization, count_reopen_work, current_verified_head_receipt, verified_head_counts,
 )
-from .errors import ConflictError, HeadBusyError, NotFoundError, ProtocolError, ValidationError
+from .errors import ConflictError, HeadBusyError, IntegrityDeadlineExceeded, NotFoundError, ProtocolError, ValidationError
 from .idempotency import command_result
 from .timeline_commit_validation import detached, digest
 from .timeline_materialization import has_materialization, item_identity, materialization_join, root_identity
@@ -432,6 +434,9 @@ class TimelineCommitStore:
         new physical identity baseline before verification resumes.
         """
         with self.store._mutex:
+            status = getattr(self.store, "history_verification_status", lambda: None)()
+            if status is not None and status["state"] != "complete":
+                raise ProtocolError("accepted commit storage changed during deferred verification; restart required")
             current = self.store.conn
             if current is None or getattr(self.store, "_lock_file", None) is None:
                 raise ProtocolError("accepted commit storage is closed; reopen required")
@@ -1653,10 +1658,27 @@ class TimelineCommitStore:
                 validate_pack_snapshot_objects(self.conn, document["project_id"], json.loads(row["content_json"]))
 
     @_evaluation
-    def integrity_errors(self):
-        errors = []
+    def integrity_errors(self, *, deadline=None, errors=None, progress=None):
+        """Check accepted history, retaining known errors if the budget expires."""
+        if errors is None:
+            errors = []
+        else:
+            # The evaluation decorator can retry a moved read snapshot.
+            errors.clear()
+
+        def check_deadline():
+            cancellation.check()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise IntegrityDeadlineExceeded("history verification incomplete")
+
         previous = {}
+        check_deadline()
+        scanned = 0
+        total = self.conn.execute("SELECT COUNT(*) FROM timeline_commit_history").fetchone()[0] if progress is not None else None
+        if progress is not None:
+            progress(scanned, total)
         for edge in self.conn.execute("SELECT * FROM timeline_commit_history ORDER BY project_id, timeline_id, project_seq"):
+            check_deadline()
             try:
                 key = (edge["project_id"], edge["timeline_id"])
                 expected = previous.get(key)
@@ -1672,23 +1694,41 @@ class TimelineCommitStore:
                     self._verify_inputs(json.loads(ledger[0]["result_json"])["canonical_document"])
                 elif edge["records_json"] is not None or ledger[0]["command_kind"] != "parent_composition.publish":
                     raise ValueError("invented legacy provenance")
+            except (IntegrityDeadlineExceeded, cancellation.StartupCancelled):
+                raise
+            except sqlite3.OperationalError as exc:
+                # A progress-handler interrupt is not evidence against this row.
+                # Do not convert cancellation, or an unexplained interrupt, to
+                # corruption either: the enclosing doctor must classify it.
+                if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+                    raise
+                errors.append({"table": "timeline_commit_history", "id": edge["publication_id"], "reason": str(exc)})
             except Exception as exc:
                 errors.append({"table": "timeline_commit_history", "id": edge["publication_id"], "reason": str(exc)})
+            scanned += 1
+            if progress is not None:
+                progress(scanned, total)
         for key, expected in previous.items():
+            check_deadline()
             head = self.conn.execute("SELECT publication_id, revision_id FROM parent_composition_heads WHERE project_id=? AND timeline_id=?", key).fetchone()
             if head is None or tuple(head) != expected:
                 errors.append({"table": "parent_composition_heads", "id": key[1], "reason": "publication head mismatch"})
         for row in self.conn.execute("SELECT * FROM timeline_document_input_contents"):
+            check_deadline()
             try:
                 value = detached(json.loads(row["content_json"]))
                 if digest(value) != row["content_digest"] or canonical_json(value) != row["content_json"] or len(row["content_json"].encode()) != row["content_size"]:
                     raise ValueError("retained input digest mismatch")
+            except (IntegrityDeadlineExceeded, cancellation.StartupCancelled):
+                raise
             except Exception as exc:
                 errors.append({"table": "timeline_document_input_contents", "id": row["content_digest"], "reason": str(exc)})
         for row in self.conn.execute("SELECT l.* FROM timeline_document_input_links l LEFT JOIN timeline_commit_history h "
                                      "ON h.publication_id=l.publication_id AND h.project_id=l.project_id "
                                      "AND h.timeline_id=l.timeline_id AND h.revision_id=l.revision_id WHERE h.publication_id IS NULL"):
+            check_deadline()
             errors.append({"table": "timeline_document_input_links", "id": row["publication_id"], "reason": "orphan retained input link"})
+        check_deadline()
         return errors
 
     def shot_closure(self, project_id, shot_id, revision_id):

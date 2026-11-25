@@ -301,7 +301,31 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         value = self.headers.get("Authorization", "")
         if not value.startswith("Bearer "):
             raise AuthorizationError("bearer credential required")
-        return self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
+        identity = self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
+        self._require_history_write_admission()
+        return identity
+
+    def _require_history_write_admission(self):
+        # Authenticate first, then refuse public writes even on routes that
+        # can have external effects before entering a SQLite transaction.
+        method = getattr(self, "command", None)
+        if method not in ("POST", "PUT", "PATCH", "DELETE"):
+            return
+        path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
+        # Bootstrap-only credential provisioning writes support credentials,
+        # not the realm. It must work to enable authenticated read access.
+        if method == "POST" and (path in (["v1", "handshake"], ["v1", "credentials"]) or (
+                len(path) == 6 and path[:2] == ["v1", "projects"]
+                and path[3] == "timelines" and path[5] == "inspect")):
+            return
+        # In-memory pack retention leases are required by the read/open path
+        # and cannot change realm content or receipts.
+        pack = pack_http_route(self.path)
+        if pack is not None and pack[0] in ("lease", "release"):
+            return
+        guard = getattr(getattr(self.runtime, "store", None), "assert_history_write_admitted", None)
+        if callable(guard):
+            guard()
 
     def _header_values(self, name):
         if hasattr(self.headers, "get_all"):
@@ -390,6 +414,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return
         try:
             self._prefetched_body = self._read_raw_body(limit)
+            if self._is_timeline_commit():
+                from .timeline_commit_execution import current_commit_timing
+                timing = current_commit_timing()
+                if timing is not None:
+                    timing.set_size("request_body", len(self._prefetched_body))
         except RuntimeErrorBase as exc:
             self._prefetched_body = exc
 
@@ -484,6 +513,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             raise ProtocolError("timeline commit does not accept a query string")
         identity = self._identity("projects:write")
         body = self._commit_body()
+        from .timeline_commit_execution import current_commit_timing
+        timing = current_commit_timing()
+        if timing is not None:
+            timing.set_size("request_json", len(json.dumps(
+                body, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")))
         if body.get("project_id") != project_id or body.get("timeline_id") != timeline_id:
             raise ConflictError("commit project/timeline identity does not match the route")
         key = self._commit_idempotency_key()
@@ -538,6 +573,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
         else:
             encoded = body
+        if self._is_timeline_commit():
+            from .timeline_commit_execution import current_commit_timing
+            timing = current_commit_timing()
+            if timing is not None:
+                timing.set_size("response_body", len(encoded))
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         if self.command != "HEAD":

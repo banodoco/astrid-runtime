@@ -115,7 +115,8 @@ def test_store_emitter_public_boundary(realm, monkeypatch, capsys, case):
     elif case == "history_entry_missing":
         call = lambda: commits.history_entry(project, "main", "absent")
     elif case == "history_ledger_mismatch":
-        conn.execute("UPDATE timeline_commit_history SET project_seq=project_seq+1")
+        from tests.history_forgery import forge_history_row
+        forge_history_row(conn, "UPDATE timeline_commit_history SET project_seq=project_seq+1")
     elif case.startswith("history_bound_") or case in {"history_chain_break", "history_through_mismatch"}:
         through, bound = copy.deepcopy(head), copy.deepcopy(entry)
         after = None
@@ -153,7 +154,8 @@ def test_store_emitter_public_boundary(realm, monkeypatch, capsys, case):
         call = lambda: commits._validate_closure(document, allow_archived=True)
     elif case in {"history_ancestry_cycle", "history_base_outside_ancestry"}:
         if case == "history_ancestry_cycle":
-            conn.execute("UPDATE timeline_commit_history SET previous_revision_id=?, previous_publication_id=?",
+            from tests.history_forgery import forge_history_row
+            forge_history_row(conn, "UPDATE timeline_commit_history SET previous_revision_id=?, previous_publication_id=?",
                          (head["revision_id"], head["publication_id"]))
             message = "history ancestry contains a cycle"
         else:
@@ -370,7 +372,8 @@ def test_service_history_callers_keep_exact_public_failure(realm, capsys, caller
         expected = {"code": "conflict", "message": "timeline already exists", "details": {"timeline_id": "main"}}
         tag = "store_adopt_existing_head"
     else:
-        service.store.conn.execute("UPDATE timeline_commit_history SET project_seq=project_seq+1")
+        from tests.history_forgery import forge_history_row
+        forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET project_seq=project_seq+1")
         if caller == "list":
             call = lambda: service.list_timeline_commits(project, "main", authorize=lambda: None)
         elif caller == "verified_read":

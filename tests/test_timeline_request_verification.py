@@ -122,7 +122,8 @@ def test_same_head_mutation_is_detected_inside_and_after_scope(service, monkeypa
                 changed["label"] = "forged"
             else:
                 changed["steps"][0]["patch"] = []
-            conn.execute(f"UPDATE timeline_commit_history SET {column}=? WHERE publication_id=?",
+            from tests.history_forgery import forge_history_row
+            forge_history_row(conn, f"UPDATE timeline_commit_history SET {column}=? WHERE publication_id=?",
                          (canonical_json(changed), publication))
         elif target == "event":
             conn.execute("UPDATE timeline_events SET payload_json='{}' WHERE timeline_id=? AND kind='timeline.commit.accepted'",
@@ -237,7 +238,8 @@ def test_retained_rehashed_step_forgery_refuses_with_warm_memo(service, monkeypa
     result = json.loads(row["result_json"])
     records["steps"][0]["patch"] = []
     result["steps"][0]["patch"] = []
-    conn.execute("UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(conn, "UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
                  (canonical_json(records), publication))
     conn.execute("UPDATE command_idempotency SET result_json=? WHERE txn_id=?",
                  (canonical_json(result), publication))

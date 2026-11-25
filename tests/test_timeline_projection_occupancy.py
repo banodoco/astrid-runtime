@@ -262,7 +262,8 @@ def test_tampered_historical_slot_record_is_not_owner_proof(realm):
     accept(commits, proposal(service, commits, project, "main", "back-to-source", shots=[source]))
     # Deliberate corruption of a genuinely accepted edge, never fabricated
     # accepted history. Its event/receipt must authenticate the owner evidence.
-    service.store.conn.execute("UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
+    from tests.history_forgery import forge_history_row
+    forge_history_row(service.store.conn, "UPDATE timeline_commit_history SET records_json=? WHERE publication_id=?",
                                ('{"commands":[]}', result["receipt"]["receipt_id"]))
     pair = proposal(service, commits, project, "main", "tampered-slot", shots=[image("slot", "slot-v2")])
     before = snapshot(service)

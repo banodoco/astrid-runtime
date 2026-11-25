@@ -52,7 +52,7 @@ def _opaque_realm_id(value: str | None, *, generate: bool) -> str:
     return candidate
 
 
-def _inspect(boundary: RuntimeBoundary, root: Path) -> tuple[str, dict[str, Any]]:
+def _inspect(boundary: RuntimeBoundary, root: Path, *, allow_deferred=False) -> tuple[str, dict[str, Any]]:
     inspect = getattr(boundary, "inspect", None)
     if not callable(inspect):
         raise BootstrapError("runtime boundary cannot inspect a canonical realm")
@@ -62,8 +62,16 @@ def _inspect(boundary: RuntimeBoundary, root: Path) -> tuple[str, dict[str, Any]
     report = dict(report)
     identity = report.get("checks", {}).get("realm_identity", {})
     observed = str(identity.get("realm_id") or "") if isinstance(identity, Mapping) else ""
-    if report.get("state") == "uninitialized" or not report.get("ok") or not identity.get("ok") or not observed:
-        raise BootstrapError("realm root is not one healthy unambiguous canonical workspace")
+    from runtime_protocol.history_verification import may_defer_history
+    deferred = allow_deferred and may_defer_history(report, root)
+    if report.get("state") == "uninitialized" or (not report.get("ok") and not deferred) or not identity.get("ok") or not observed:
+        guard = report.get("checks", {}).get("history_guards", {})
+        if isinstance(guard, Mapping) and guard.get("ok") is False:
+            raise BootstrapError(f"realm failed history_guards check: {guard.get('reason')}. {report.get('recovery_action', '')}")
+        issues = report.get("issues", [])
+        reason = ", ".join(str(issue) for issue in issues) or report.get("message") or "realm_identity"
+        recovery = report.get("recovery_action", "")
+        raise BootstrapError(f"realm root is not one healthy unambiguous canonical workspace: {reason}. {recovery}".rstrip())
     return observed, report
 
 
@@ -114,7 +122,10 @@ def inspect_workspace(
             if expected_realm_id is not None
             else None
         )
-    observed, report = _inspect(boundary, root)
+    # Only the already configured root may proceed to owned read-only
+    # startup. Attach/adopt of an unverified candidate stays fail-closed.
+    allow_deferred = configured is not None and root == Path(str(configured["data_root"]))
+    observed, report = _inspect(boundary, root, allow_deferred=allow_deferred)
     if expected is not None and observed != expected:
         raise BootstrapError(f"workspace identity mismatch: expected {expected}, observed {observed}")
     if configured is not None and realm_root is not None:

@@ -80,7 +80,8 @@ def test_ancestry_view_rechecks_authorization_and_live_history(service):
         assert len(checks) > prior
         revoked.clear()
         assert port.history_entry(publication) == expected
-        service.store.conn.execute(
+        from tests.history_forgery import forge_history_row
+        forge_history_row(service.store.conn,
             "UPDATE timeline_commit_history SET records_json='{}' WHERE publication_id=?", (publication,))
         with pytest.raises(RuntimeErrorBase):
             port.history_entry(publication)
@@ -127,7 +128,8 @@ def test_ancestry_reuses_only_request_snapshot_reachability(service, monkeypatch
         # Even a rolled-back write invalidates reachability before the next
         # read. The target must be reached again from authenticated roots.
         service.store.conn.execute("SAVEPOINT ancestry_change")
-        service.store.conn.execute(
+        from tests.history_forgery import forge_history_row
+        forge_history_row(service.store.conn,
             "UPDATE timeline_commit_history SET metadata_json=metadata_json WHERE publication_id=?", (publications[-1],))
         service.store.conn.execute("ROLLBACK TO ancestry_change")
         service.store.conn.execute("RELEASE ancestry_change")
@@ -136,7 +138,7 @@ def test_ancestry_reuses_only_request_snapshot_reachability(service, monkeypatch
         assert len(calls) >= 4
 
         service.store.conn.execute("SAVEPOINT ancestry_tamper")
-        service.store.conn.execute(
+        forge_history_row(service.store.conn,
             "UPDATE timeline_commit_history SET records_json='{}' WHERE publication_id=?", (publications[2],))
         with pytest.raises(RuntimeErrorBase):
             port.history_entry(publications[0])
