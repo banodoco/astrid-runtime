@@ -31,13 +31,7 @@ TIMELINE_OBSERVER_FD_ENV = "ASTRID_TIMELINE_OBSERVER_FD"
 # Runtime-owned (never ambient, never profile-selected): no pack-host child may
 # write bytecode into an installed pack tree.
 BYTECODE_ENV_KEYS = frozenset({"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"})
-_COMPONENTS = {
-    "host": "astrid/core/execution/generic_host.py", "core": "astrid/core",
-    "sdk": "astrid/sdk", "launcher": "astrid/omp_agent.py",
-    "astrid_entrypoint": "astrid/__init__.py", "astrid_version": "astrid/version.py",
-    "astrid_main": "astrid/__main__.py", "astrid_runtime_cli": "astrid/runtime_cli.py",
-    "vendored_workspace_client": "astrid_runtime_client",
-}
+_COMPONENTS = None
 
 
 # Exact refusal shared with the Agent (astrid.core.pack.cli_manage
@@ -168,11 +162,35 @@ def read_source(path, expected):
         os.close(descriptor)
 
 
+def _closure_definition():
+    """Load the packaged definition only when the Runtime measures a closure."""
+    if not hasattr(_closure_definition, "_cached"):
+        path = Path(__file__).with_name("schemas") / "host-source-closure-v1.json"
+        try:
+            _closure_definition._cached = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise HostLaunchError("source closure definition is unavailable or invalid") from exc
+    return _closure_definition._cached
+
+
 def source_checkout_closure(checkout):
     """Independent parity implementation; never imports the selected host."""
     root = _absolute(str(checkout)); _no_alias(root)
+    components = _COMPONENTS
+    if components is None:
+        definition = _closure_definition()
+        components = definition["components"].copy()
+        installed_pair = definition["installed_pair"]["components"]
+        if any((root / relative).exists() or (root / relative).is_symlink()
+               for relative in installed_pair.values()):
+            for relative in installed_pair.values():
+                path = root / relative
+                _no_alias(path)
+                if not path.is_dir():
+                    raise HostLaunchError("source closure installed pair component is missing or not a directory")
+            components.update(installed_pair)
     measured = []
-    for name, relative in _COMPONENTS.items():
+    for name, relative in components.items():
         path = root / relative
         _no_alias(path)
         if not path.exists(): raise HostLaunchError("source closure component is missing")

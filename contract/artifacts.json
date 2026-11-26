@@ -84,8 +84,9 @@
     "packages/typescript/src/operation-handle.ts": "sha256:3f8c69044a0efd5171290f925b0bc3706495c4c0da0252d0008d8056671fa460",
     "packages/typescript/src/timeline-commit-types.ts": "sha256:20793264436c663a3b4409125c066c60850072b8305fa9ab98a0f2785ffe5322",
     "packages/typescript/tsconfig.json": "sha256:48bc718286b70c7ff5af00d1adfea37ad7c7f8820d3050117dc9d6aea239181b",
+    "runtime_protocol/schemas/host-source-closure-v1.json": "sha256:5bf56adc79b3b5c3bf1c04698776b7ead17d85e3c32b2e5538d16ecc4290377c",
     "runtime_protocol/schemas/timeline-commit-bundle.json": "sha256:ce5490aedf1b2932f01219c0e317468ecf397cd9c1f715152faa62d3fa0694f2"
   },
   "producer": "astrid-runtime",
-  "version": "sha256:69cdb4b75760f238114ec5032f4794e3d33bf5f8a090d41ade8b5b207593aed1"
+  "version": "sha256:b334d616c2fd49ad0437ad1d8b18aee2690c4229bbdb15dec4cfa62aff996f4c"
 }
