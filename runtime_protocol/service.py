@@ -5119,12 +5119,33 @@ class RuntimeService:
             document = {"schema": "astrid.grants.v1", "kind": kind, "grants": {}}
         return current, document
 
-    def _write_grant_document(self, current, document):
+    def _write_grant_document(self, current, document, *, reserve_reapproval=True):
         if len(document["grants"]) > self.GRANT_LIMIT_PER_KIND:
             raise ValidationError(f"grant ledger permits at most {self.GRANT_LIMIT_PER_KIND} entries per kind")
         actor, key, version = current["actor_id"], current["key"], current["version"]
-        encoded = canonical_json(document)
         timestamp = now()
+        # Character/count limits do not bound UTF-8 or JSON escaping. Reserve
+        # both timestamps before admitting an entry so a full approved ledger
+        # can still be revoked, and a tombstone has room for explicit approval.
+        # Counter headroom also covers ordinary reapproval cycles; larger
+        # imported generations retain their actual width plus the next value.
+        # A state transition consumes that reservation rather than requiring
+        # another future generation before the requested transition can fit.
+        budget = {**document, "grants": {
+            grant_id: {**entry, "state": "approved",
+                       "generation": (max(entry["generation"] + 1, 2**64 - 1)
+                                      if reserve_reapproval else entry["generation"]),
+                       "approved_at": entry["approved_at"] or timestamp,
+                       "revoked_at": entry["revoked_at"] or timestamp}
+            for grant_id, entry in document["grants"].items()
+        }}
+        try:
+            encoded = canonical_json(document)
+            size = len(canonical_json(budget).encode("utf-8"))
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise ValidationError("grant ledger must be representable as bounded UTF-8 JSON") from exc
+        if size > self.APP_STATE_MAX_BYTES:
+            raise ValidationError(f"grant ledger including lifecycle space exceeds {self.APP_STATE_MAX_BYTES} bytes")
         if version == 0:
             self.store.conn.execute("INSERT INTO user_app_state(actor_id, key, content_json, version, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)", (actor, key, encoded, timestamp, timestamp))
         else:
@@ -5217,10 +5238,10 @@ class RuntimeService:
             raise NotFoundError("grant not found")
         if reapprove and entry["state"] == "revoked":
             entry.update(state="approved", generation=entry["generation"] + 1, approved_at=now(), revoked_at=None)
-            self._write_grant_document(current, document)
+            self._write_grant_document(current, document, reserve_reapproval=False)
         elif not reapprove and entry["state"] == "approved":
             entry.update(state="revoked", revoked_at=now())
-            self._write_grant_document(current, document)
+            self._write_grant_document(current, document, reserve_reapproval=False)
         result = {"grant_id": grant_id, "kind": kind, **entry}
         return self._command_record(command, aggregate_id, idempotency_key, request_hash, result)
 
@@ -5244,13 +5265,17 @@ class RuntimeService:
                 raise ValidationError("revocation generation must be a positive integer")
         # One atomic command can span all three kind ledgers.
         aggregate_id = f"grants:{actor}:all"
-        request_hash = hashlib.sha256(canonical_json({"owner": actor, "entries": entries}).encode()).hexdigest()
+        try:
+            request_hash = hashlib.sha256(canonical_json({"owner": actor, "entries": entries}).encode()).hexdigest()
+        except ValueError as exc:
+            raise ValidationError("revocation generation is too large to serialize") from exc
         replay = self._command_replay("grant.apply_revocations", aggregate_id, idempotency_key, request_hash)
         if replay is not None:
             return replay
         applied = ignored_newer = 0
         documents = {}
         changed = set()
+        growing = set()
         for entry in entries:
             kind, grant_id, generation = entry["kind"], entry["grant_id"], entry["generation"]
             if kind not in documents:
@@ -5262,6 +5287,7 @@ class RuntimeService:
                     "subject": entry["subject"], "digest": entry["digest"], "state": "revoked",
                     "generation": generation, "approved_at": None, "revoked_at": now(),
                 }
+                growing.add(kind)
             elif stored["state"] == "revoked":
                 continue
             elif stored["generation"] > generation:
@@ -5270,12 +5296,14 @@ class RuntimeService:
             else:
                 # A restored older approval must advance to the revocation's
                 # generation, so explicit re-approval will outrank that export.
+                if stored["generation"] < generation:
+                    growing.add(kind)
                 stored.update(state="revoked", generation=generation, revoked_at=now())
             changed.add(kind)
             applied += 1
         for kind in self.GRANT_KINDS:
             if kind in changed:
-                self._write_grant_document(*documents[kind])
+                self._write_grant_document(*documents[kind], reserve_reapproval=kind in growing)
         result = {"applied": applied, "ignored_newer": ignored_newer}
         return self._command_record("grant.apply_revocations", aggregate_id, idempotency_key, request_hash, result)
 

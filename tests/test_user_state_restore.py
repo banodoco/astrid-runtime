@@ -147,6 +147,10 @@ def test_restore_from_before_a_revocation_is_corrected_by_the_export(tmp_path):
             "applied": 1, "ignored_newer": 0,
         }
         assert status()["state"] == "revoked" and not status()["authorized"]
+        revoked_row = restored.get_app_state("grants.pack", identity=ALICE)
+        assert restored.approve_grant("pack", "demo-pack", DIGEST, "approve", identity=ALICE) == first
+        assert restored.get_app_state("grants.pack", identity=ALICE) == revoked_row
+        assert not status()["authorized"]
         with pytest.raises(ConflictError):
             restored.approve_grant("pack", "demo-pack", DIGEST, "implicit", identity=ALICE)
         renewed = restored.reapprove_grant(grant_id, "renew", identity=ALICE)
@@ -159,7 +163,27 @@ def test_restore_from_before_a_revocation_is_corrected_by_the_export(tmp_path):
         assert status()["authorized"] and status()["generation"] == 2
     with closing(RuntimeService(late_root)) as restored:
         assert restored.list_grants(identity=ALICE) == [revoked]
+        revoked_row = restored.get_app_state("grants.pack", identity=ALICE)
+        assert restored.approve_grant("pack", "demo-pack", DIGEST, "approve", identity=ALICE) == first
+        assert restored.get_app_state("grants.pack", identity=ALICE) == revoked_row
         assert not restored.grant_status("pack", "demo-pack", DIGEST, identity=ALICE)["authorized"]
+
+
+def test_restored_reapproval_replay_does_not_revive_a_later_revocation(tmp_path):
+    with closing(service(tmp_path / "realm")) as original:
+        first = original.approve_grant("pack", "demo-pack", DIGEST, "approve", identity=ALICE)
+        grant_id = first["grant_id"]
+        original.revoke_grant(grant_id, "revoke-first", identity=ALICE)
+        renewed = original.reapprove_grant(grant_id, "renew", identity=ALICE)
+        original.revoke_grant(grant_id, "revoke-second", identity=ALICE)
+        before = original.get_app_state("grants.pack", identity=ALICE)
+        restored_root = backup_restore(original, tmp_path)
+    with closing(RuntimeService(restored_root)) as restored:
+        assert restored.reapprove_grant(grant_id, "renew", identity=ALICE) == renewed
+        assert restored.get_app_state("grants.pack", identity=ALICE) == before
+        assert restored.grant_status("pack", "demo-pack", DIGEST, identity=ALICE) == {
+            "grant_id": grant_id, "state": "revoked", "authorized": False, "generation": 2,
+        }
 
 
 def test_user_state_documents_are_in_the_sqlite_backup_not_the_json_export(tmp_path):
