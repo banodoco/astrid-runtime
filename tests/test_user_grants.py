@@ -219,3 +219,79 @@ def test_invalid_revocation_is_atomic(service, bad):
         service.apply_revocations([valid, {**valid, **bad}], "invalid-list", identity=ALICE)
     assert service.get_app_state("grants.pack", identity=ALICE) == before
     assert status(service)["authorized"]
+
+
+@pytest.mark.parametrize("character", ["\U0001f600", "\x00"])
+def test_byte_capacity_preserves_room_for_revocation_and_reapproval(service, character):
+    accepted = []
+    for index in range(RuntimeService.GRANT_LIMIT_PER_KIND):
+        subject = f"{index:02}" + character * 94
+        before = service.get_app_state("grants.pack", identity=ALICE)
+        commands = service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0]
+        try:
+            entry = approve(service, f"wide-{index}", subject=subject, credential_ref="R" * 64)
+        except ValidationError as error:
+            assert "bytes" in str(error)
+            assert service.get_app_state("grants.pack", identity=ALICE) == before
+            assert service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0] == commands
+            break
+        accepted.append(entry)
+        row = service.get_app_state("grants.pack", identity=ALICE)
+        assert len(canonical_json(row["content"]).encode("utf-8")) <= RuntimeService.APP_STATE_MAX_BYTES
+    else:
+        pytest.fail("maximum-length encoded subjects must reach the byte limit before the entry limit")
+
+    assert accepted
+    for entry in accepted:
+        grant_id = entry["grant_id"]
+        revoked = service.revoke_grant(grant_id, "revoke-" + grant_id, identity=ALICE)
+        assert revoked["state"] == "revoked"
+        row = service.get_app_state("grants.pack", identity=ALICE)
+        assert len(canonical_json(row["content"]).encode("utf-8")) <= RuntimeService.APP_STATE_MAX_BYTES
+    for entry in accepted:
+        renewed = service.reapprove_grant(entry["grant_id"], "renew-" + entry["grant_id"], identity=ALICE)
+        assert renewed["state"] == "approved" and renewed["generation"] == 2
+        row = service.get_app_state("grants.pack", identity=ALICE)
+        assert len(canonical_json(row["content"]).encode("utf-8")) <= RuntimeService.APP_STATE_MAX_BYTES
+
+
+def test_oversize_revocation_batch_rolls_back_all_kinds_and_receipt(service):
+    pack = approve(service)
+    before = {kind: service.get_app_state("grants." + kind, identity=ALICE)
+              for kind in RuntimeService.GRANT_KINDS}
+    commands = service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0]
+    entries = [{field: pack[field] for field in ("grant_id", "kind", "subject", "digest", "generation")}]
+    for index in range(RuntimeService.GRANT_LIMIT_PER_KIND):
+        subject = f"{index:02}" + "\x00" * 94
+        entries.append({"grant_id": status(service, kind="node", subject=subject)["grant_id"],
+                        "kind": "node", "subject": subject, "digest": DIGEST, "generation": 1})
+    with pytest.raises(ValidationError, match="bytes"):
+        service.apply_revocations(entries, "oversize-import", identity=ALICE)
+    assert {kind: service.get_app_state("grants." + kind, identity=ALICE)
+            for kind in RuntimeService.GRANT_KINDS} == before
+    assert service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0] == commands
+    assert status(service)["authorized"]
+
+
+def test_preferences_and_project_documents_cannot_write_grant_rows(service):
+    entry = approve(service)
+    service.revoke_grant(entry["grant_id"], "revoke", identity=ALICE)
+    before = service.get_app_state("grants.pack", identity=ALICE)
+    forged = {**before["content"], "grants": {entry["grant_id"]: {
+        **before["content"]["grants"][entry["grant_id"]], "state": "approved", "revoked_at": None,
+    }}}
+    project = service.create_project({"slug": "grant-lookalikes", "name": "Grant lookalikes"})
+    for scope in ("user", "project"):
+        kwargs = {"project_id": project["id"]} if scope == "project" else {}
+        for version in (0, 1):
+            service.update_preferences(scope, canonical_json(forged), version,
+                                       f"preferences-{scope}-{version}", identity=ALICE, **kwargs)
+    service.create_document(project["id"], {
+        "document_id": "grants.pack", "kind": "grants.pack", "content": forged,
+    }, idempotency_key="lookalike-create")
+    service.update_document(project["id"], "grants.pack", {
+        "expected_version": 1, "content": forged,
+    }, idempotency_key="lookalike-update")
+    assert service.get_app_state("grants.pack", identity=ALICE) == before
+    assert not status(service)["authorized"]
+    assert status(service, identity=BOB)["state"] == "absent"
