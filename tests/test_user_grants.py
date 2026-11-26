@@ -7,7 +7,7 @@ import pytest
 from runtime_protocol.errors import AuthorizationError, ConflictError, NotFoundError, ValidationError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
-from runtime_protocol.util import canonical_json
+from runtime_protocol.util import canonical_json, now
 
 
 ALICE = {"actor": "alice"}
@@ -210,6 +210,7 @@ def test_revocation_restore_and_stale_export(service, tmp_path):
 @pytest.mark.parametrize("bad", [
     {"grant_id": "wrong"}, {"kind": "unknown"}, {"subject": ""}, {"digest": "bad"},
     {"generation": 0}, {"generation": True}, {"generation": 1.5}, {"generation": "1"},
+    pytest.param({"generation": 10**20000}, id="unserializable-generation"),
 ])
 def test_invalid_revocation_is_atomic(service, bad):
     entry = approve(service)
@@ -222,14 +223,22 @@ def test_invalid_revocation_is_atomic(service, bad):
 
 
 @pytest.mark.parametrize("character", ["\U0001f600", "\x00"])
-def test_byte_capacity_preserves_room_for_revocation_and_reapproval(service, character):
+@pytest.mark.parametrize("tombstone", [False, True], ids=["approval", "tombstone"])
+def test_byte_capacity_preserves_room_for_revocation_and_reapproval(service, character, tombstone):
     accepted = []
     for index in range(RuntimeService.GRANT_LIMIT_PER_KIND):
         subject = f"{index:02}" + character * 94
         before = service.get_app_state("grants.pack", identity=ALICE)
         commands = service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0]
         try:
-            entry = approve(service, f"wide-{index}", subject=subject, credential_ref="R" * 64)
+            if tombstone:
+                entry = {"grant_id": status(service, subject=subject)["grant_id"], "kind": "pack",
+                         "subject": subject, "digest": DIGEST, "generation": 9}
+                assert service.apply_revocations([entry], f"wide-{index}", identity=ALICE) == {
+                    "applied": 1, "ignored_newer": 0,
+                }
+            else:
+                entry = approve(service, f"wide-{index}", subject=subject, credential_ref="R" * 64)
         except ValidationError as error:
             assert "bytes" in str(error)
             assert service.get_app_state("grants.pack", identity=ALICE) == before
@@ -250,7 +259,7 @@ def test_byte_capacity_preserves_room_for_revocation_and_reapproval(service, cha
         assert len(canonical_json(row["content"]).encode("utf-8")) <= RuntimeService.APP_STATE_MAX_BYTES
     for entry in accepted:
         renewed = service.reapprove_grant(entry["grant_id"], "renew-" + entry["grant_id"], identity=ALICE)
-        assert renewed["state"] == "approved" and renewed["generation"] == 2
+        assert renewed["state"] == "approved" and renewed["generation"] == entry["generation"] + 1
         row = service.get_app_state("grants.pack", identity=ALICE)
         assert len(canonical_json(row["content"]).encode("utf-8")) <= RuntimeService.APP_STATE_MAX_BYTES
 
@@ -271,6 +280,55 @@ def test_oversize_revocation_batch_rolls_back_all_kinds_and_receipt(service):
             for kind in RuntimeService.GRANT_KINDS} == before
     assert service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0] == commands
     assert status(service)["authorized"]
+
+
+def test_large_serializable_generation_is_preserved(service):
+    entry = {"grant_id": status(service)["grant_id"], "kind": "pack", "subject": SUBJECT,
+             "digest": DIGEST, "generation": 10**2000 - 1}
+    assert service.apply_revocations([entry], "large-generation", identity=ALICE)["applied"] == 1
+    assert status(service)["generation"] == entry["generation"]
+    renewed = service.reapprove_grant(entry["grant_id"], "renew-large", identity=ALICE)
+    assert renewed["generation"] == entry["generation"] + 1
+    service.revoke_grant(entry["grant_id"], "revoke-large", identity=ALICE)
+    assert not status(service)["authorized"]
+    row = service.get_app_state("grants.pack", identity=ALICE)
+    assert len(canonical_json(row["content"]).encode("utf-8")) <= RuntimeService.APP_STATE_MAX_BYTES
+
+
+def test_reapproval_uses_reserved_capacity_at_a_generation_boundary(service):
+    entries = []
+    completed = {"schema": "astrid.grants.v1", "kind": "pack", "grants": {}}
+    timestamp = now()
+    for index in range(7):
+        subject = str(index)
+        grant_id = status(service, subject=subject)["grant_id"]
+        generation = 10**(2000 if index < 6 else 20) - 2
+        entries.append({"grant_id": grant_id, "kind": "pack", "subject": subject,
+                        "digest": DIGEST, "generation": generation})
+        completed["grants"][grant_id] = {
+            "subject": subject, "digest": DIGEST, "state": "approved", "generation": generation + 1,
+            "approved_at": timestamp, "revoked_at": timestamp,
+        }
+    # Use the real byte limit, with both lifecycle timestamps present. The
+    # next requested generation fits exactly; demanding one more would not.
+    padding = RuntimeService.APP_STATE_MAX_BYTES - len(canonical_json(completed).encode("utf-8"))
+    assert 0 < padding < 4000
+    entries[-1]["generation"] = 10**(20 + padding) - 2
+    completed["grants"][entries[-1]["grant_id"]]["generation"] = entries[-1]["generation"] + 1
+    assert len(canonical_json(completed).encode("utf-8")) == RuntimeService.APP_STATE_MAX_BYTES
+    assert service.apply_revocations(entries, "boundary-import", identity=ALICE)["applied"] == len(entries)
+    for index, entry in enumerate(entries):
+        renewed = service.reapprove_grant(entry["grant_id"], "renew-" + entry["grant_id"], identity=ALICE)
+        assert renewed["generation"] == entry["generation"] + 1 and renewed["state"] == "approved"
+        if index % 2:
+            assert service.apply_revocations([
+                {**entry, "generation": renewed["generation"]},
+            ], "revoke-" + entry["grant_id"], identity=ALICE)["applied"] == 1
+        else:
+            service.revoke_grant(entry["grant_id"], "revoke-" + entry["grant_id"], identity=ALICE)
+        assert not status(service, subject=entry["subject"])["authorized"]
+    row = service.get_app_state("grants.pack", identity=ALICE)
+    assert len(canonical_json(row["content"]).encode("utf-8")) <= RuntimeService.APP_STATE_MAX_BYTES
 
 
 def test_preferences_and_project_documents_cannot_write_grant_rows(service):
