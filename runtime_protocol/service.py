@@ -5033,6 +5033,12 @@ class RuntimeService:
 
     APP_STATE_KEY_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
     APP_STATE_MAX_BYTES = 16 * 1024
+    GRANT_KINDS = ("pack", "model", "node")
+    GRANT_KEY_PREFIX = "grants."
+    GRANT_LIMIT_PER_KIND = 32
+    GRANT_SUBJECT_MAX = 96
+    GRANT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+    GRANT_REF = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
 
     def _app_state_target(self, key, identity):
         actor = identity.get("actor") if isinstance(identity, dict) else None
@@ -5062,6 +5068,8 @@ class RuntimeService:
     @_durable_mutation
     def update_app_state(self, key, content, expected_version, idempotency_key, *, identity):
         actor = self._app_state_target(key, identity)
+        if key.startswith(self.GRANT_KEY_PREFIX):
+            raise ValidationError("app-state keys starting with 'grants.' belong to the grant ledger")
         require_idempotency_key(idempotency_key)
         if not isinstance(content, dict):
             raise ValidationError("app-state content must be a JSON object")
@@ -5085,6 +5093,219 @@ class RuntimeService:
             self.store.conn.execute("UPDATE user_app_state SET content_json=?, version=?, updated_at=? WHERE actor_id=? AND key=?", (encoded, expected_version + 1, timestamp, actor, key))
         result = self.get_app_state(key, identity=identity)
         return self._command_record("app_state.update", aggregate_id, idempotency_key, request_hash, {"data": result, "receipt": None})
+
+    def _grant_kind(self, kind):
+        if kind not in self.GRANT_KINDS:
+            raise ValidationError("grant kind must be pack, model or node")
+        return kind
+
+    def _grant_identity(self, kind, subject, digest):
+        self._grant_kind(kind)
+        if not isinstance(subject, str) or not subject or len(subject) > self.GRANT_SUBJECT_MAX:
+            raise ValidationError(f"grant subject must be a non-empty string of at most {self.GRANT_SUBJECT_MAX} characters")
+        if not isinstance(digest, str) or not self.GRANT_DIGEST.fullmatch(digest):
+            raise ValidationError("grant digest must be a canonical sha256 digest")
+        try:
+            encoded = canonical_json([kind, subject, digest]).encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValidationError("grant subject must be valid Unicode") from exc
+        return f"{kind}-{hashlib.sha256(encoded).hexdigest()[:24]}"
+
+    def _grant_document(self, kind, identity):
+        key = self.GRANT_KEY_PREFIX + self._grant_kind(kind)
+        current = self.get_app_state(key, identity=identity)
+        document = current["content"]
+        if document is None:
+            document = {"schema": "astrid.grants.v1", "kind": kind, "grants": {}}
+        return current, document
+
+    def _write_grant_document(self, current, document, *, reserve_reapproval=True):
+        if len(document["grants"]) > self.GRANT_LIMIT_PER_KIND:
+            raise ValidationError(f"grant ledger permits at most {self.GRANT_LIMIT_PER_KIND} entries per kind")
+        actor, key, version = current["actor_id"], current["key"], current["version"]
+        timestamp = now()
+        # Character/count limits do not bound UTF-8 or JSON escaping. Reserve
+        # both timestamps before admitting an entry so a full approved ledger
+        # can still be revoked, and a tombstone has room for explicit approval.
+        # Counter headroom also covers ordinary reapproval cycles; larger
+        # imported generations retain their actual width plus the next value.
+        # A state transition consumes that reservation rather than requiring
+        # another future generation before the requested transition can fit.
+        budget = {**document, "grants": {
+            grant_id: {**entry, "state": "approved",
+                       "generation": (max(entry["generation"] + 1, 2**64 - 1)
+                                      if reserve_reapproval else entry["generation"]),
+                       "approved_at": entry["approved_at"] or timestamp,
+                       "revoked_at": entry["revoked_at"] or timestamp}
+            for grant_id, entry in document["grants"].items()
+        }}
+        try:
+            encoded = canonical_json(document)
+            size = len(canonical_json(budget).encode("utf-8"))
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise ValidationError("grant ledger must be representable as bounded UTF-8 JSON") from exc
+        if size > self.APP_STATE_MAX_BYTES:
+            raise ValidationError(f"grant ledger including lifecycle space exceeds {self.APP_STATE_MAX_BYTES} bytes")
+        if version == 0:
+            self.store.conn.execute("INSERT INTO user_app_state(actor_id, key, content_json, version, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)", (actor, key, encoded, timestamp, timestamp))
+        else:
+            self.store.conn.execute("UPDATE user_app_state SET content_json=?, version=?, updated_at=? WHERE actor_id=? AND key=?", (encoded, version + 1, timestamp, actor, key))
+
+    def _grant_id_kind(self, grant_id, identity):
+        # Derive the ledger from the ID, never from a caller-supplied owner.
+        self._app_state_target(self.GRANT_KEY_PREFIX + "pack", identity)
+        if isinstance(grant_id, str):
+            kind, _, suffix = grant_id.partition("-")
+            if kind in self.GRANT_KINDS and re.fullmatch(r"[0-9a-f]{24}", suffix):
+                return kind
+        raise NotFoundError("grant not found")
+
+    def list_grants(self, kind=None, *, identity):
+        with self.store._mutex:
+            kinds = self.GRANT_KINDS if kind is None else (self._grant_kind(kind),)
+            grants = []
+            for grant_kind in kinds:
+                _, document = self._grant_document(grant_kind, identity)
+                grants.extend({"grant_id": grant_id, "kind": grant_kind, **entry}
+                              for grant_id, entry in document["grants"].items())
+            return sorted(grants, key=lambda entry: entry["grant_id"])
+
+    def grant_status(self, kind, subject, digest, *, identity):
+        grant_id = self._grant_identity(kind, subject, digest)
+        with self.store._mutex:
+            _, document = self._grant_document(kind, identity)
+            entry = document["grants"].get(grant_id)
+            state = entry["state"] if entry else "absent"
+            return {"grant_id": grant_id, "state": state, "authorized": state == "approved",
+                    "generation": entry["generation"] if entry else 0}
+
+    @_durable_mutation
+    def approve_grant(self, kind, subject, digest, idempotency_key, *, identity, credential_ref=None):
+        grant_id = self._grant_identity(kind, subject, digest)
+        actor = self._app_state_target(self.GRANT_KEY_PREFIX + kind, identity)
+        require_idempotency_key(idempotency_key)
+        if credential_ref is not None and (
+            not isinstance(credential_ref, str) or not self.GRANT_REF.fullmatch(credential_ref)
+            or credential_ref.lower().startswith(("sk-", "rpa_", "ghp_", "github_pat_", "hf_", "xox"))
+        ):
+            raise ValidationError("credential_ref must be a reference name, not a credential")
+        aggregate_id = f"grants:{actor}:{kind}"
+        request_hash = hashlib.sha256(canonical_json({
+            "owner": actor, "kind": kind, "subject": subject, "digest": digest,
+            "credential_ref": credential_ref,
+        }).encode()).hexdigest()
+        replay = self._command_replay("grant.approve", aggregate_id, idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        current, document = self._grant_document(kind, identity)
+        entry = document["grants"].get(grant_id)
+        if entry is None:
+            entry = {"subject": subject, "digest": digest, "state": "approved", "generation": 1,
+                     "approved_at": now(), "revoked_at": None}
+            if credential_ref is not None:
+                entry["credential_ref"] = credential_ref
+            document["grants"][grant_id] = entry
+            self._write_grant_document(current, document)
+        elif entry["state"] == "revoked":
+            raise ConflictError("grant was revoked; re-approval is an explicit act", details={"grant_id": grant_id})
+        elif credential_ref is not None and entry.get("credential_ref") != credential_ref:
+            entry["credential_ref"] = credential_ref
+            self._write_grant_document(current, document)
+        result = {"grant_id": grant_id, "kind": kind, **entry}
+        return self._command_record("grant.approve", aggregate_id, idempotency_key, request_hash, result)
+
+    @_durable_mutation
+    def revoke_grant(self, grant_id, idempotency_key, *, identity):
+        return self._change_grant_state(grant_id, idempotency_key, identity, reapprove=False)
+
+    @_durable_mutation
+    def reapprove_grant(self, grant_id, idempotency_key, *, identity):
+        return self._change_grant_state(grant_id, idempotency_key, identity, reapprove=True)
+
+    def _change_grant_state(self, grant_id, idempotency_key, identity, *, reapprove):
+        kind = self._grant_id_kind(grant_id, identity)
+        actor = self._app_state_target(self.GRANT_KEY_PREFIX + kind, identity)
+        require_idempotency_key(idempotency_key)
+        command = "grant.reapprove" if reapprove else "grant.revoke"
+        aggregate_id = f"grants:{actor}:{kind}"
+        request_hash = hashlib.sha256(canonical_json({"owner": actor, "grant_id": grant_id}).encode()).hexdigest()
+        replay = self._command_replay(command, aggregate_id, idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        current, document = self._grant_document(kind, identity)
+        entry = document["grants"].get(grant_id)
+        if entry is None:
+            raise NotFoundError("grant not found")
+        if reapprove and entry["state"] == "revoked":
+            entry.update(state="approved", generation=entry["generation"] + 1, approved_at=now(), revoked_at=None)
+            self._write_grant_document(current, document, reserve_reapproval=False)
+        elif not reapprove and entry["state"] == "approved":
+            entry.update(state="revoked", revoked_at=now())
+            self._write_grant_document(current, document, reserve_reapproval=False)
+        result = {"grant_id": grant_id, "kind": kind, **entry}
+        return self._command_record(command, aggregate_id, idempotency_key, request_hash, result)
+
+    def export_revocations(self, *, identity):
+        return [{field: entry[field] for field in ("grant_id", "kind", "subject", "digest", "generation")}
+                for entry in self.list_grants(identity=identity) if entry["state"] == "revoked"]
+
+    @_durable_mutation
+    def apply_revocations(self, entries, idempotency_key, *, identity):
+        actor = self._app_state_target(self.GRANT_KEY_PREFIX + "pack", identity)
+        require_idempotency_key(idempotency_key)
+        if not isinstance(entries, list):
+            raise ValidationError("revocations must be a list")
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"grant_id", "kind", "subject", "digest", "generation"}:
+                raise ValidationError("revocation entry must contain grant_id, kind, subject, digest and generation")
+            grant_id = self._grant_identity(entry["kind"], entry["subject"], entry["digest"])
+            if entry["grant_id"] != grant_id:
+                raise ValidationError("revocation grant_id does not match its identity")
+            if type(entry["generation"]) is not int or entry["generation"] < 1:
+                raise ValidationError("revocation generation must be a positive integer")
+        # One atomic command can span all three kind ledgers.
+        aggregate_id = f"grants:{actor}:all"
+        try:
+            request_hash = hashlib.sha256(canonical_json({"owner": actor, "entries": entries}).encode()).hexdigest()
+        except ValueError as exc:
+            raise ValidationError("revocation generation is too large to serialize") from exc
+        replay = self._command_replay("grant.apply_revocations", aggregate_id, idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        applied = ignored_newer = 0
+        documents = {}
+        changed = set()
+        growing = set()
+        for entry in entries:
+            kind, grant_id, generation = entry["kind"], entry["grant_id"], entry["generation"]
+            if kind not in documents:
+                documents[kind] = self._grant_document(kind, identity)
+            _, document = documents[kind]
+            stored = document["grants"].get(grant_id)
+            if stored is None:
+                document["grants"][grant_id] = {
+                    "subject": entry["subject"], "digest": entry["digest"], "state": "revoked",
+                    "generation": generation, "approved_at": None, "revoked_at": now(),
+                }
+                growing.add(kind)
+            elif stored["state"] == "revoked":
+                continue
+            elif stored["generation"] > generation:
+                ignored_newer += 1
+                continue
+            else:
+                # A restored older approval must advance to the revocation's
+                # generation, so explicit re-approval will outrank that export.
+                if stored["generation"] < generation:
+                    growing.add(kind)
+                stored.update(state="revoked", generation=generation, revoked_at=now())
+            changed.add(kind)
+            applied += 1
+        for kind in self.GRANT_KINDS:
+            if kind in changed:
+                self._write_grant_document(*documents[kind], reserve_reapproval=kind in growing)
+        result = {"applied": applied, "ignored_newer": ignored_newer}
+        return self._command_record("grant.apply_revocations", aggregate_id, idempotency_key, request_hash, result)
 
     @staticmethod
     def _transcript_document_id(project_id, media_id, source_id):
