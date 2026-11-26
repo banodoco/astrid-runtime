@@ -295,7 +295,8 @@ def test_large_serializable_generation_is_preserved(service):
     assert len(canonical_json(row["content"]).encode("utf-8")) <= RuntimeService.APP_STATE_MAX_BYTES
 
 
-def test_reapproval_uses_reserved_capacity_at_a_generation_boundary(service):
+@pytest.mark.parametrize("existing", [False, True], ids=["new-tombstones", "older-approvals"])
+def test_reapproval_uses_reserved_capacity_at_a_generation_boundary(service, existing):
     entries = []
     completed = {"schema": "astrid.grants.v1", "kind": "pack", "grants": {}}
     timestamp = now()
@@ -316,6 +317,14 @@ def test_reapproval_uses_reserved_capacity_at_a_generation_boundary(service):
     entries[-1]["generation"] = 10**(20 + padding) - 2
     completed["grants"][entries[-1]["grant_id"]]["generation"] = entries[-1]["generation"] + 1
     assert len(canonical_json(completed).encode("utf-8")) == RuntimeService.APP_STATE_MAX_BYTES
+    if existing:
+        for entry in entries:
+            approve(service, "older-" + entry["grant_id"], subject=entry["subject"])
+    before = service.get_app_state("grants.pack", identity=ALICE)
+    overflow = [*entries[:-1], {**entries[-1], "generation": entries[-1]["generation"] + 1}]
+    with pytest.raises(ValidationError, match="bytes"):
+        service.apply_revocations(overflow, "over-boundary", identity=ALICE)
+    assert service.get_app_state("grants.pack", identity=ALICE) == before
     assert service.apply_revocations(entries, "boundary-import", identity=ALICE)["applied"] == len(entries)
     for index, entry in enumerate(entries):
         renewed = service.reapprove_grant(entry["grant_id"], "renew-" + entry["grant_id"], identity=ALICE)

@@ -5275,7 +5275,7 @@ class RuntimeService:
         applied = ignored_newer = 0
         documents = {}
         changed = set()
-        added = set()
+        growing = set()
         for entry in entries:
             kind, grant_id, generation = entry["kind"], entry["grant_id"], entry["generation"]
             if kind not in documents:
@@ -5287,7 +5287,7 @@ class RuntimeService:
                     "subject": entry["subject"], "digest": entry["digest"], "state": "revoked",
                     "generation": generation, "approved_at": None, "revoked_at": now(),
                 }
-                added.add(kind)
+                growing.add(kind)
             elif stored["state"] == "revoked":
                 continue
             elif stored["generation"] > generation:
@@ -5296,12 +5296,14 @@ class RuntimeService:
             else:
                 # A restored older approval must advance to the revocation's
                 # generation, so explicit re-approval will outrank that export.
+                if stored["generation"] < generation:
+                    growing.add(kind)
                 stored.update(state="revoked", generation=generation, revoked_at=now())
             changed.add(kind)
             applied += 1
         for kind in self.GRANT_KINDS:
             if kind in changed:
-                self._write_grant_document(*documents[kind], reserve_reapproval=kind in added)
+                self._write_grant_document(*documents[kind], reserve_reapproval=kind in growing)
         result = {"applied": applied, "ignored_newer": ignored_newer}
         return self._command_record("grant.apply_revocations", aggregate_id, idempotency_key, request_hash, result)
 
