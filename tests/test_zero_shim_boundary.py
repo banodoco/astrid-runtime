@@ -90,7 +90,8 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
 
     def fake_popen(argv, **kwargs):
         captured.update(argv=argv, kwargs=kwargs)
-        return FakeProcess()
+        captured["process"] = FakeProcess()
+        return captured["process"]
 
     def fake_spawn_tree(argv, *, detached, **kwargs):
         assert detached
@@ -107,8 +108,14 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
             captured["runtime_argv"] = list(argv)
             return {"ASTRID_RUNTIME_CUSTODY_ROLE": "runtime_owner"}
 
+        def bind_original_child(self, child, *, reap_guard):
+            assert child is captured["process"] is boundary._process
+            assert child._runtime_retained_process.child is child
+            assert reap_guard is child._runtime_retained_process.guard is child._runtime_native_reap_guard
+            captured["original_child"] = child
+
         def wait_until_sealed(self):
-            pass
+            assert captured["original_child"] is captured["process"]
 
         def bind_ready_token(self, **_kwargs):
             pass
@@ -130,6 +137,16 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
     monkeypatch.setattr(custody, "default_process_identity", fake_identity)
     monkeypatch.setattr(custody.process_binding, "supported", lambda: True)
     monkeypatch.setattr(custody.linux_process_binding, "token", lambda pid: {"words": [pid]})
+    def retain_child(child, *, reap_guard, expected=None):
+        # Explicit API double for this argv/env test; never native proof.
+        assert child is captured["process"] is boundary._process
+        assert reap_guard is child._runtime_native_reap_guard
+        captured["original_child"] = child
+        def verify(identity):
+            assert identity == fake_identity(child.pid)
+            return {"words": [child.pid]}
+        return SimpleNamespace(verify=verify, close=lambda: None)
+    monkeypatch.setattr(module.process_binding, "retain_child", retain_child)
     monkeypatch.setattr("astrid_runtime.runtime_boundary.publish_active_capability", lambda *_a, **_k: None)
     monkeypatch.setattr("astrid_runtime.runtime_boundary.subprocess.Popen", fake_popen)
     monkeypatch.setattr(boundary, "_wait_endpoint", lambda _support, _process: "http://127.0.0.1:1")
@@ -148,6 +165,7 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path, host):
     )
     owner_lock = tmp_path / "support" / "owner.lock"
     boundary.start(realm_id="realm", realm_root=tmp_path / "realm", owner_lock=owner_lock, source_profile=profile)
+    assert captured["original_child"] is boundary._process
     kwargs = captured["kwargs"]
     assert "cwd" not in kwargs
     # Darwin's wrapper passes env explicitly; native launches inherit it.
