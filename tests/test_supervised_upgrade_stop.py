@@ -277,3 +277,45 @@ def test_replaced_bootstrap_lock_at_final_fence_has_no_intent_or_stop(owner, mon
         down(paths, boundary, supervised_stop=supervisor,
              on_stop_admitted=lambda: pytest.fail("journal write"))
     assert snapshot(paths) == before and supervisor.calls == []
+
+
+@pytest.mark.parametrize("cause", ["manager lost", "job canceled", "child still draining", "policy changed"])
+def test_post_admission_supervisor_failure_preserves_intent_and_is_not_initial_refusal(owner, cause):
+    paths, boundary, root = owner
+    supervisor = Supervisor(inspect_upgrade_stop(paths, boundary), boundary)
+    before_discovery = paths.discovery_path.read_bytes()
+    before_realm = (root / "realm.sqlite3").read_bytes()
+    intent = []
+    def uncertain(_owner):
+        assert intent == ["stopping"]
+        assert json.loads(paths.instance_lock_path.read_text())["state"] == "stopping"
+        # Even a provider that carries an initial-admission classification
+        # cannot retrospectively erase this already admitted stop intent.
+        raise BootstrapError(cause, details={"safe": False})
+    supervisor.stop = uncertain
+    with pytest.raises(BootstrapError, match=cause) as caught:
+        down(paths, boundary, supervised_stop=supervisor, on_stop_admitted=lambda: intent.append("stopping"),
+             stop_manager=lambda: pytest.fail("manager cleanup after uncertain stop"))
+    assert caught.value.details.get("safe") is not False
+    assert caught.value.details["cause_details"] == {"safe": False}
+    assert paths.discovery_path.read_bytes() == before_discovery
+    assert (root / "realm.sqlite3").read_bytes() == before_realm
+    assert json.loads(paths.instance_lock_path.read_text())["state"] == "stopping"
+    assert boundary.restart_calls == 0
+
+
+def test_verify_only_manager_failure_after_owner_absence_prevents_cleanup(owner):
+    paths, boundary, root = owner
+    supervisor = Supervisor(inspect_upgrade_stop(paths, boundary), boundary)
+    before_discovery = paths.discovery_path.read_bytes()
+    def verify():
+        assert supervisor.expected.owner["pid"] not in boundary.alive
+        with sqlite3.connect(root / "realm.sqlite3", timeout=0) as db:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                db.execute("BEGIN IMMEDIATE")
+        raise RuntimeError("original manager continuity lost after independent owner absence")
+    with pytest.raises(BootstrapError, match="continuity lost"):
+        down(paths, boundary, supervised_stop=supervisor, stop_manager=verify)
+    assert paths.discovery_path.read_bytes() == before_discovery
+    assert json.loads(paths.instance_lock_path.read_text())["state"] == "stopping"
+    assert supervisor.calls == ["supervisor-stop"] and boundary.restart_calls == 0
