@@ -119,9 +119,12 @@ def delivered_signals(monkeypatch):
     real_send = platform.pidfd_send_signal
 
     def observe(fd, signum):
-        info = Path(f"/proc/self/fdinfo/{fd}").read_text()
-        pid = int(next(line.split()[1] for line in info.splitlines() if line.startswith("Pid:")))
-        calls.append((pid, platform.process_identity(pid), signum))
+        # Signal zero is the provider's liveness/permission check, not a
+        # delivered TERM/KILL. Forward it too; count actual actions only.
+        if signum:
+            info = Path(f"/proc/self/fdinfo/{fd}").read_text()
+            pid = int(next(line.split()[1] for line in info.splitlines() if line.startswith("Pid:")))
+            calls.append((pid, platform.process_identity(pid), signum))
         return real_send(fd, signum)
 
     monkeypatch.setattr(platform, "pidfd_send_signal", observe)
@@ -164,7 +167,12 @@ def test_forged_record_and_stale_incarnation_are_refused(started_owner, delivere
     path = support / ACTIVE_CAPABILITY_NAME
     record = json.loads(path.read_text())
     forged = dict(record["target"])
-    forged[field] = forged[field] + "-stale" if field == "birth_id" else forged[field] + 1
+    if field == "birth_id":
+        tick, *scope = forged[field].split(";")
+        prefix, value = tick.rsplit(":", 1)
+        forged[field] = ";".join([f"{prefix}:{int(value) + 1}", *scope])
+    else:
+        forged[field] += 1
     # The actual published custody rejects a forged expected target at the record fence.
     imposter = NativeProcessCustody(support, forged, authority=native._authority)
     with pytest.raises(CustodyError, match="differs from the selected owner"):

@@ -1961,6 +1961,10 @@ class NativeProcessCustody:
                     raise CustodyError("native Runtime incarnation changed")
                 if self._authority is not None:
                     self._authority.verify(self.identity)
+                else:
+                    # Diagnostic publication still requires complete scoped
+                    # identity; this token is observation, never authority.
+                    linux_process_binding.token(int(self.identity["pid"]))
                 observed = default_process_identity(int(self.identity["pid"]))
                 if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
                     raise CustodyError("native Runtime incarnation changed")
