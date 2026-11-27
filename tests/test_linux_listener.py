@@ -18,8 +18,9 @@ import pytest
 
 from runtime_protocol import cancellation, platform
 from tests.listener_fixtures import ROOT, dispose, request, start_subject
+from tests.lanes import requires_linux_retained_listener
 
-pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux retained listener primitive")
+pytestmark = requires_linux_retained_listener
 
 
 @pytest.fixture

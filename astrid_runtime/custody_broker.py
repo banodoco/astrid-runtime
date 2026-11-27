@@ -1988,12 +1988,17 @@ class NativeProcessCustody:
                 observed = default_process_identity(int(self.identity["pid"]))
                 if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
                     raise CustodyError("native Runtime incarnation changed")
-                linux_process_binding.token(int(self.identity["pid"]))
+                if self._authority is not None:
+                    self._authority.verify(self.identity)
+                else:
+                    # Diagnostic publication still requires complete scoped
+                    # identity; this token is observation, never authority.
+                    linux_process_binding.token(int(self.identity["pid"]))
                 observed = default_process_identity(int(self.identity["pid"]))
                 if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
                     raise CustodyError("native Runtime incarnation changed")
-            except (linux_process_binding.LinuxBindingError, OSError) as exc:
-                raise CustodyError(str(exc)) from exc
+            except (linux_process_binding.LinuxBindingError, OSError, NotImplementedError) as exc:
+                raise CustodyError(f"Linux pidfd custody is unavailable or unverified: {exc}") from exc
         elif sys.platform == "darwin":
             record["audit_token_words"] = current_process_audit_token(int(self.identity["pid"]))["words"]
         _validate_private_directory(self.path.parent, label="native custody parent")

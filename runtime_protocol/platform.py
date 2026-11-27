@@ -394,32 +394,9 @@ def file_lock(path_or_fd, *, exclusive: bool = True, blocking: bool = True):
             os.close(fd)
 
 
-class _DarwinBSDInfo(ctypes.Structure):
-    _fields_ = [(name, ctypes.c_uint32) for name in (
-        "flags", "status", "xstatus", "pid", "ppid", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "reserved",
-    )] + [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)] + [
-        (name, ctypes.c_uint32) for name in ("nfiles", "pgid", "pjobc", "tdev", "tpgid")
-    ] + [("nice", ctypes.c_int32), ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
-
-
 def _read_darwin_process_info(pid: int, *, include_exit: bool = False):
-    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    reader = library.proc_pidinfo
-    reader.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
-    reader.restype = ctypes.c_int
-    value = _DarwinBSDInfo()
-    ctypes.set_errno(0)
-    count = reader(pid, 3, 0, ctypes.byref(value), ctypes.sizeof(value))
-    error = ctypes.get_errno()
-    if count == 0 and error == errno.ESRCH:
-        return None
-    if count != ctypes.sizeof(value) or error:
-        raise OSError(error, "native process identity observation failed or was partial")
-    if value.pid != pid or value.start_sec == 0 or value.start_usec >= 1_000_000:
-        raise OSError("native process identity observation was malformed")
-    return {"pid": int(value.pid), "uid": int(value.uid), "parent_pid": int(value.ppid),
-            "start_sec": int(value.start_sec), "start_usec": int(value.start_usec),
-            **({"status": int(value.status)} if include_exit else {})}
+    from .darwin_process_binding import read_process_info
+    return read_process_info(pid, include_exit=include_exit)
 
 
 def _kernel():
@@ -526,6 +503,17 @@ def _windows_parent(pid):
         kernel.CloseHandle(snapshot)
 
 
+def linux_birth_id(start_ticks: str, *, boot_id: str | None = None,
+                   pidns_inode: int | None = None) -> str:
+    """Canonical Linux observation; absent scope is never custody evidence."""
+    if not isinstance(start_ticks, str) or not start_ticks.isascii() or not start_ticks.isdigit():
+        raise ValueError("invalid process start tick")
+    scope = f";boot:{boot_id}" if boot_id else ""
+    if pidns_inode is not None:
+        scope += f";pidns:{pidns_inode}"
+    return f"proc-start-ticks:{start_ticks}{scope}"
+
+
 def process_identity(pid: int, *, timeout: float = 1.0):
     """Return identity, None only for proven absence; raise on unknown observation."""
     if timeout <= 0:
@@ -533,19 +521,8 @@ def process_identity(pid: int, *, timeout: float = 1.0):
     if pid <= 0:
         return None
     if sys.platform == "darwin":
-        deadline = time.monotonic() + timeout
-        first = _read_darwin_process_info(pid)
-        if first is None:
-            return None
-        second = _read_darwin_process_info(pid)
-        if time.monotonic() >= deadline:
-            raise OSError("process identity observation deadline expired")
-        if first != second:
-            raise OSError("native process identity changed during observation")
-        local = time.localtime(first["start_sec"])
-        birth = ("ps-lstart:" + time.strftime("%a %b ", local) + f"{local.tm_mday:2d}"
-                 + time.strftime(" %H:%M:%S %Y", local))
-        return {"pid": first["pid"], "uid": first["uid"], "parent_pid": first["parent_pid"], "birth_id": birth}
+        from .darwin_process_binding import identity
+        return identity(pid, timeout=timeout, _reader=_read_darwin_process_info)
     if sys.platform == "win32":
         kernel = _kernel()
         handle = kernel.OpenProcess(0x1000 | 0x00100000, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
@@ -572,29 +549,28 @@ def process_identity(pid: int, *, timeout: float = 1.0):
         # Start ticks alone can collide after reboot or in another PID namespace.
         # Scope interfaces are optional in restricted proc mounts. An older
         # scoped record cannot be reclaimed if its scope becomes unreadable.
-        scope = ""
+        raw = (root / "stat").read_text()
+        fields = raw.rsplit(")", 1)[1].split()
+        boot = None
+        namespace = None
         try:
             boot = (Path("/proc") / "sys/kernel/random/boot_id").read_text().strip()
-            if boot:
-                scope += f";boot:{boot}"
         except (FileNotFoundError, PermissionError):
             pass
         try:
             namespace = (root / "ns/pid").stat().st_ino
-            scope += f";pidns:{namespace}"
         except (FileNotFoundError, PermissionError):
             pass
-        raw = (root / "stat").read_text()
-        fields = raw.rsplit(")", 1)[1].split()
-        if not fields[19].isascii() or not fields[19].isdigit():
-            raise ValueError("invalid process start tick")
         value = {"pid": pid, "uid": root.stat().st_uid, "parent_pid": int(fields[1]),
-                 "birth_id": f"proc-start-ticks:{fields[19]}{scope}", "process_group": int(fields[2]), "session_id": int(fields[3])}
+                 "birth_id": linux_birth_id(fields[19], boot_id=boot, pidns_inode=namespace),
+                 "process_group": int(fields[2]), "session_id": int(fields[3])}
         second = (root / "stat").read_text().rsplit(")", 1)[1].split()
         if fields[19] != second[19]:
             raise OSError("process identity changed during observation")
         if second[0] in {"Z", "X", "x"}:
             return None  # /proc still retains an exited process awaiting reap.
+        if fields[0] in {"Z", "X", "x"} or fields[1:4] != second[1:4]:
+            raise OSError("process identity changed during observation")
         return value
     except FileNotFoundError:
         return None
@@ -1683,16 +1659,13 @@ def handoff_token(pid):
     """Encode native Windows identity in the existing eight-word token shape.
 
     These are creation-time observations, not Darwin audit tokens or signal
-    authority. Signalling still opens and pins a process handle in this module.
+    authority. Custody signalling requires an independently retained handle.
     """
     observed = process_identity(pid)
     if observed is None:
         raise ProcessLookupError(pid)
-    created = int(observed["birth_id"].removeprefix("windows-creation:"))
-    uid = observed["uid"]
-    words = [0x41535452, pid, uid & 0xffffffff, uid >> 32,
-             created & 0xffffffff, created >> 32, 0, 0]
-    return {**handoff_token_details(words), "words": words}
+    from .windows_handoff import _identity_token
+    return _identity_token(observed)
 
 
 def handoff_token_details(words):
@@ -1705,10 +1678,9 @@ def handoff_token_details(words):
             "pidversion": created, "sha256": "sha256:" + hashlib.sha256(struct.pack("=8I", *words)).hexdigest()}
 
 
-def handoff_signal_token(words, signum):
-    details = handoff_token_details(words)
-    return signal_process({"pid": details["pid"], "uid": details["uid"],
-                           "birth_id": f"windows-creation:{details['pidversion']}"}, signum)
+def handoff_signal_token(words, signum, *, authority=None):
+    from .windows_handoff import signal as signal_windows
+    return signal_windows(words, signum, authority=authority)
 
 
 def handoff_custody_executable(wrapper, target):
