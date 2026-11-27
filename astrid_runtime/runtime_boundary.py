@@ -862,7 +862,7 @@ class LocalRuntimeBoundary:
         try:
             if sys.platform == "linux":
                 native = getattr(process, "_runtime_native_authority", None)
-                if process.poll() is not None:
+                if process.returncode is not None:
                     if native is not None:
                         native.close()
                     return
@@ -870,9 +870,18 @@ class LocalRuntimeBoundary:
                     raise CustodyError("native Linux cleanup requires retained authority from the owned child")
                 custody = getattr(process, "_runtime_native_custody", None)
                 with process._runtime_native_reap_guard:
+                    def finish_if_exited():
+                        # Preserve the original waitable child/PGID anchor for
+                        # descendant cleanup. Do not reap before the existing
+                        # tree primitive has drained its owned group.
+                        if not platform.tree_exited(process):
+                            return False
+                        platform.stop_tree(process, grace=0)
+                        return True
+
                     try:
                         for signum, timeout in ((platform.TERM, grace), (platform.KILL, 2.0)):
-                            if process.poll() is not None:
+                            if finish_if_exited():
                                 return
                             try:
                                 if custody is not None:
@@ -882,19 +891,21 @@ class LocalRuntimeBoundary:
                                     # only the original direct-child handle.
                                     native.signal(signum)
                             except (CustodyError, process_binding.ProcessBindingError):
-                                if process.poll() is not None:
+                                if finish_if_exited():
                                     return
                                 raise
-                            try:
-                                process.wait(timeout=timeout)
+                            deadline = time.monotonic() + timeout
+                            while time.monotonic() < deadline:
+                                if finish_if_exited():
+                                    return
+                                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+                            if finish_if_exited():
                                 return
-                            except subprocess.TimeoutExpired:
-                                continue
                         raise CustodyError("Runtime child remains alive after bounded native custody cleanup")
                     finally:
-                        # An uncertain live target keeps its original handle
-                        # for retry; never recapture via its numeric PID.
-                        if process.poll() is not None:
+                        # An uncertain target keeps its original handle for
+                        # retry; never recapture via its numeric PID.
+                        if process.returncode is not None:
                             native.close()
             elif sys.platform != "darwin":
                 platform.stop_tree(process, grace=grace)
