@@ -27,6 +27,7 @@ import sys
 import sysconfig
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -121,6 +122,29 @@ def _worker_profile(base, support, python):
     path = base / "worker-profile.json"
     path.write_text(json.dumps(profile))
     return path
+
+
+def _capability_catalog(call, *, deadline, log_tail):
+    """Read the canonical page envelope, including every refusal candidate."""
+    capabilities = {}
+    cursor = None
+    seen = set()
+    while True:
+        path = "/v1/capabilities"
+        if cursor is not None:
+            path += "?" + urllib.parse.urlencode({"cursor": cursor})
+        status, listing = call("GET", path)
+        assert status == 200, (listing, log_tail())
+        for item in listing["items"]:
+            capability_id = item["capability_id"]
+            assert capability_id not in capabilities, (listing, log_tail())
+            capabilities[capability_id] = item
+        cursor = listing["next_cursor"]
+        if cursor is None:
+            return capabilities
+        assert isinstance(cursor, str) and cursor and cursor not in seen, (listing, log_tail())
+        seen.add(cursor)
+        assert time.monotonic() < deadline, (capabilities, log_tail())
 
 
 # Records the exact argv the Runtime's custody build hands the verified launcher (the
@@ -248,9 +272,7 @@ def test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungrante
     assert status == 200, (started, log_tail())
     deadline = time.monotonic() + 60
     while True:
-        status, listing = call("GET", "/v1/capabilities")
-        assert status == 200, (listing, log_tail())
-        capabilities = {item["capability_id"]: item for item in listing["data"]}
+        capabilities = _capability_catalog(call, deadline=deadline, log_tail=log_tail)
         if capabilities.get("granted.echo", {}).get("status") == "ready":
             break
         assert runtime.poll() is None, "Runtime exited before registration:\n" + log_tail()

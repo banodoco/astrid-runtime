@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -124,3 +125,50 @@ def test_inspector_preserves_exact_kernel_path_and_digest_admission(
         message = "executable identity" if case == "wrong-path-same-bytes" else "executable artifact digest"
         with pytest.raises(ConflictError, match=message):
             observe()
+
+
+def test_installed_capability_reader_visits_later_pages_before_refusal_check():
+    calls = []
+    granted = {"capability_id": "granted.echo", "status": "ready"}
+    ungranted = {"capability_id": "ungranted.echo", "status": "ready"}
+    pages = [
+        {"items": [granted], "next_cursor": "opaque+/cursor"},
+        {"items": [ungranted], "next_cursor": None},
+    ]
+
+    def call(method, path):
+        calls.append((method, path))
+        return 200, pages.pop(0)
+
+    catalog = installed._capability_catalog(call, deadline=time.monotonic() + 5, log_tail=lambda: "")
+    assert calls == [
+        ("GET", "/v1/capabilities"),
+        ("GET", "/v1/capabilities?cursor=opaque%2B%2Fcursor"),
+    ]
+    assert catalog == {"granted.echo": granted, "ungranted.echo": ungranted}
+    assert {name for name in catalog if name.startswith("ungranted.")} == {"ungranted.echo"}
+
+
+@pytest.mark.parametrize("page", [{"data": []}, {"items": []}])
+def test_installed_capability_reader_requires_both_canonical_page_fields(page):
+    with pytest.raises(KeyError):
+        installed._capability_catalog(lambda *_: (200, page),
+            deadline=time.monotonic() + 5, log_tail=lambda: "")
+
+
+@pytest.mark.parametrize("case", ["http-error", "repeated-cursor", "duplicate-capability"])
+def test_installed_capability_reader_refuses_incomplete_or_repeated_catalog(case):
+    pages = {
+        "http-error": [(409, {"message": "unavailable"})],
+        "repeated-cursor": [
+            (200, {"items": [], "next_cursor": "again"}),
+            (200, {"items": [], "next_cursor": "again"}),
+        ],
+        "duplicate-capability": [
+            (200, {"items": [{"capability_id": "granted.echo"}], "next_cursor": "next"}),
+            (200, {"items": [{"capability_id": "granted.echo"}], "next_cursor": None}),
+        ],
+    }[case]
+    with pytest.raises(AssertionError):
+        installed._capability_catalog(lambda *_: pages.pop(0),
+            deadline=time.monotonic() + 5, log_tail=lambda: "")
