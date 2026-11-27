@@ -112,10 +112,12 @@ def test_total_deadline_bounds_no_accept_and_slow_http_then_owned_stop(mode):
         platform.stop_tree(collateral, grace=0.05)
 
 
+@pytest.mark.needs_real_pidfd
 def test_child_exit_during_actual_http_invalidates_buffered_success():
     owner, _ready = start_subject("exit")
-    fd = platform.pidfd_open(owner.child.pid)
+    fd = None
     try:
+        fd = platform.pidfd_open(owner.child.pid)
         with pytest.raises(ProcessLookupError, match="exited"):
             with owner.connection(deadline=time.monotonic() + 3) as stream:
                 stream.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -126,8 +128,42 @@ def test_child_exit_during_actual_http_invalidates_buffered_success():
                 assert select.select([fd], [], [], 2)[0]
         assert owner.child.returncode is None  # exited, still held unreaped
     finally:
-        os.close(fd)
-        dispose(owner)
+        try:
+            if fd is not None:
+                os.close(fd)
+        finally:
+            dispose(owner)
+
+
+def test_http_exit_fixture_reaps_owned_child_when_pidfd_capture_is_denied(monkeypatch):
+    subjects = []
+    original_start = start_subject
+    refusal = OSError(errno.ENOSYS, "fixture pidfd unavailable")
+
+    def start(*args, **kwargs):
+        result = original_start(*args, **kwargs)
+        subjects.append((result[0], result[0].child))
+        return result
+
+    def denied(pid):
+        raise refusal
+
+    monkeypatch.setitem(globals(), "start_subject", start)
+    monkeypatch.setattr(platform, "pidfd_open", denied)
+    try:
+        with pytest.raises(OSError) as caught:
+            test_child_exit_during_actual_http_invalidates_buffered_success()
+        assert caught.value is refusal
+        assert len(subjects) == 1
+        owner, child = subjects[0]
+        assert child.returncode is not None
+        assert all(stream.closed for stream in (child.stdout, child.stderr))
+        with pytest.raises(ProcessLookupError, match="owner resource"):
+            request(owner)
+    finally:
+        for owner, _child in subjects:
+            if owner._listener.fileno() >= 0:
+                dispose(owner)
 
 
 def test_listener_and_other_parent_descriptors_do_not_leak_through_exec():
@@ -269,6 +305,7 @@ def test_no_serialized_handle_can_reconstitute_authority(owned):
         pickle.dumps(owner)
 
 
+@pytest.mark.needs_real_pidfd
 def test_actual_custodian_crash_keeps_engine_but_refuses_replacement():
     result = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("listener_fixtures.py")), "owner-loss"],

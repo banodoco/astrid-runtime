@@ -258,6 +258,15 @@ def retained_diagnostics(tmp_path, monkeypatch):
 
     monkeypatch.setattr(custody, "default_process_identity", lambda pid: observe("identity"))
     monkeypatch.setattr(custody, "current_process_audit_token", lambda pid: observe("token"))
+    # These diagnostic tests deliberately use synthetic OS observations, not
+    # native Popen custody. Select the existing explicit provider seam instead
+    # of asking the default Linux provider to bless a SimpleNamespace as a child.
+    retain = custody.AuthenticatedCleanupActor.retained_child
+    def simulated_child(child, *, reap_guard):
+        return retain(child, reap_guard=reap_guard,
+                      identity_provider=lambda pid: observe("identity"),
+                      token_provider=lambda pid: observe("token"))
+    monkeypatch.setattr(custody.AuthenticatedCleanupActor, "retained_child", simulated_child)
     child = SimpleNamespace(pid=103, returncode=None, _waitpid_lock=threading.Lock(), poll=lambda: None)
     retained = RetainedProcess(child)
     actor = retained.bind_actor()
