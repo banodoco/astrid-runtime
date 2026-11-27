@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from runtime_protocol import platform, process_binding as binding
+from runtime_protocol.errors import ConflictError
 from tests.lanes import requires_linux_tree_custody
 
 
@@ -93,6 +94,43 @@ def test_backend_authority_hook_preserves_object_and_expected_identity(monkeypat
     else:
         with pytest.raises(binding.ProcessBindingUnavailable, match="one-shot"):
             binding.resume_once(sentinel)
+
+
+@pytest.mark.parametrize("operation", ["retain_peer", "retain_child", "signal"])
+def test_windows_named_native_error_uses_shared_refusal(monkeypatch, operation):
+    class WindowsBindingError(ConflictError):
+        pass
+
+    refusal = WindowsBindingError("retained Windows reference is unavailable")
+
+    def refuse(*args, **kwargs):
+        raise refusal
+
+    native = SimpleNamespace(WindowsBindingError=WindowsBindingError, **{operation: refuse})
+    monkeypatch.setattr(binding, "_platform", lambda: "win32")
+    monkeypatch.setattr(binding, "_native_backend", lambda: native)
+    calls = {
+        "retain_peer": lambda: binding.retain_peer(object()),
+        "retain_child": lambda: binding.retain_child(object(), reap_guard=object()),
+        "signal": lambda: binding.signal([1] * 8, platform.TERM, authority=object()),
+    }
+    with pytest.raises(binding.ProcessBindingError, match="retained Windows reference") as caught:
+        calls[operation]()
+    assert caught.value.__cause__ is refusal
+
+
+def test_windows_dispatch_does_not_hide_unrelated_backend_errors(monkeypatch):
+    class WindowsBindingError(ConflictError):
+        pass
+
+    def broken(channel, **kwargs):
+        raise TypeError("provider implementation error")
+
+    native = SimpleNamespace(WindowsBindingError=WindowsBindingError, retain_peer=broken)
+    monkeypatch.setattr(binding, "_platform", lambda: "win32")
+    monkeypatch.setattr(binding, "_native_backend", lambda: native)
+    with pytest.raises(TypeError, match="provider implementation error"):
+        binding.retain_peer(object())
 
 
 @pytest.mark.parametrize("signum", [0, True, "15", -1, 99999])

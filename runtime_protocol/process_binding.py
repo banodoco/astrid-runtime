@@ -1,7 +1,7 @@
 """Stdlib-only process observations and retained native authority dispatch.
 
-Token dictionaries are serializable observations. A privileged Linux operation
-also requires the live native object returned by retain_peer/retain_child. OS
+Token dictionaries are serializable observations. Linux and Windows custody
+also require the live native object returned by retain_peer/retain_child. OS
 modules are imported on use; this module never imports the Runtime application.
 """
 from __future__ import annotations
@@ -55,10 +55,16 @@ def _native_backend():
 
 
 def _native_call(name, *args, **kwargs):
-    function = getattr(_native_backend(), name, None)
+    provider = _native_backend()
+    function = getattr(provider, name, None)
     if function is None:
         raise ProcessBindingUnavailable(f"native process binding {name} is unavailable on this OS")
-    return function(*args, **kwargs)
+    try:
+        return function(*args, **kwargs)
+    except getattr(provider, "WindowsBindingError", ()) as exc:
+        # The Windows provider also serves pre-import transport callers and
+        # retains its ConflictError ABI. Normalize only its named native error.
+        raise ProcessBindingError(str(exc)) from exc
 
 
 def supported() -> bool:
