@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import sys
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 from .errors import ValidationError
@@ -933,6 +934,12 @@ class RetainedProcess:
             self.actor = AuthenticatedCleanupActor.retained_child(self.child, reap_guard=self.guard)
         return self.actor
 
+    def close(self):
+        """Release actor custody after the original child's final owned wait."""
+        with self.guard:
+            if self.actor is not None:
+                self.actor.close()
+
     def poll(self):
         with self.guard:
             if self.exit_code is not None:
@@ -1073,6 +1080,8 @@ class NativeHostSession:
                 pass_fds=(control_child.fileno(), activation_child.fileno(), *((self.binding_file.fileno(),) if self.binding_file is not None else ()), observer_write_fd))
             # Publish the exact owned child before fallible sealing/binding.
             self.retained = RetainedProcess(child)
+            if sys.platform == "darwin":
+                self.broker.bind_original_child(child, reap_guard=self.retained.guard)
             self.observer_read_fd = observer_read_fd
             observer_read_fd = None
             close_observer(observer_write_fd)
@@ -1183,6 +1192,11 @@ class NativeHostSession:
         from .render_observer import close_observer
         close_observer(self.observer_read_fd)
         self.observer_read_fd = None
+        if sys.platform == "darwin":
+            try:
+                self.retained.close()
+            finally:
+                self.broker.close()
         return result
 
 

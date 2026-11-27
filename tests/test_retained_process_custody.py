@@ -118,10 +118,14 @@ def test_popen_wait_lock_does_not_block_retained_wait_deadline():
 
 
 @pytest.mark.parametrize("consumer", ["host", "relay"])
-def test_cleanup_escalates_only_on_retained_wait_timeout(consumer):
+@pytest.mark.parametrize("launch_platform", ["linux", "darwin"])
+def test_cleanup_escalates_only_on_retained_wait_timeout(consumer, launch_platform, monkeypatch):
+    from runtime_protocol import local_execution_supervisor, local_worker_composition
+    for module in (local_execution_supervisor, local_worker_composition):
+        monkeypatch.setattr(module, "sys", SimpleNamespace(platform=launch_platform))
     retained = SimpleNamespace(child=SimpleNamespace(pid=123), poll=Mock(return_value=None),
-                               wait=Mock(side_effect=[RetainedWaitTimeout("timeout"), -9]))
-    broker = SimpleNamespace(signal=Mock())
+                               wait=Mock(side_effect=[RetainedWaitTimeout("timeout"), -9]), close=Mock())
+    broker = SimpleNamespace(signal=Mock(), close=Mock())
     control, activation = Mock(), Mock()
     if consumer == "host":
         session = NativeHostSession.__new__(NativeHostSession)
@@ -145,3 +149,4 @@ def test_cleanup_escalates_only_on_retained_wait_timeout(consumer):
     assert [call.args[0] for call in broker.signal.call_args_list] == [signal.SIGTERM, signal.SIGKILL]
     assert retained.wait.call_count == 2
     control.close.assert_called_once()
+    assert retained.close.call_count == broker.close.call_count == int(launch_platform == "darwin")

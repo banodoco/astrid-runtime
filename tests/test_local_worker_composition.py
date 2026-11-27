@@ -878,12 +878,14 @@ def test_terminal_shutdown_timeout_prevents_late_cleanup_from_clearing_custody(
     assert case.handle.cleanup_abandoned and case.preparer.cleanup_uncertain
 
 
-def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_without_engine(tmp_path,monkeypatch):
+@pytest.mark.parametrize('launch_platform', ['linux', 'darwin'])
+def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_without_engine(tmp_path,monkeypatch,launch_platform):
     """Offline transport contract only; fake handles grant no native custody proof."""
     import threading
     from dataclasses import replace
     from test_local_worker import host_only_profile_case
     from runtime_protocol import local_worker_composition as module
+    monkeypatch.setattr(module, 'sys', SimpleNamespace(**{**vars(sys), 'platform': launch_platform}))
     from runtime_protocol import verified_host_launch, local_execution_supervisor
     import astrid_runtime.custody_broker as custody
     original=SimpleNamespace(pid=4242)
@@ -904,7 +906,9 @@ def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_withou
         def bind_child(self,proof,**kwargs):assert kwargs['child'] is original
         def verify_child(self,proof,**kwargs):assert kwargs['child'] is original
     class Retained:
-        def __init__(self,process):assert process is original
+        def __init__(self,process):
+            assert process is original
+            self.guard=threading.RLock();captures['retained']=self
         def bind_actor(self):pass
         def verify(self):return identity
     class Broker:
@@ -914,7 +918,12 @@ def test_host_only_preparer_projects_admitted_slots_and_canonical_binding_withou
             os.close(descriptor)
             self.role_authority=SimpleNamespace(reference=lambda:{'role':'host'})
         def child_environment(self,argv,**kwargs):return {}
-        def wait_until_sealed(self):pass
+        def bind_original_child(self,child,*,reap_guard):
+            assert child is original and reap_guard is captures['retained'].guard
+            assert preparer._active.worker is child
+            captures['original-child']=child
+        def wait_until_sealed(self):
+            if launch_platform == 'darwin':assert captures['original-child'] is original
     def popen(argv,**kwargs):
         captures['pass_fds']=kwargs['pass_fds']
         observer=int(kwargs['env']['ASTRID_TIMELINE_OBSERVER_FD'])

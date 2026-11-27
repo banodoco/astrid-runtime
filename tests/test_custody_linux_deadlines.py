@@ -95,10 +95,16 @@ def test_native_signal_refuses_a_different_retained_child(tmp_path, child):
     try:
         with process_binding.retain_child(other, reap_guard=threading.RLock()) as authority:
             instance = custody.NativeProcessCustody(tmp_path, platform.process_identity(child.pid), authority=authority)
+            with pytest.raises(custody.CustodyError, match="expected incarnation"):
+                instance.publish()
+            assert not instance.path.exists()
+            # Diagnostic publication does not confer authority. Supplying the
+            # different original child's reference must still refuse action.
+            instance = custody.NativeProcessCustody(tmp_path, platform.process_identity(child.pid))
             instance.publish()
             before = instance.path.read_bytes()
             with pytest.raises(custody.CustodyError, match="expected incarnation"):
-                instance.signal(platform.TERM)
+                instance.signal(platform.TERM, authority=authority)
             assert instance.path.read_bytes() == before
             assert child.poll() is None and other.poll() is None
     finally:

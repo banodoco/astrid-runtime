@@ -734,12 +734,15 @@ def test_g1b_declared_protocol_alone_cannot_enable_current_roles():
     assert relay._host_current_roles_version is None
 
 
+@pytest.mark.parametrize('launch_platform', ['linux', 'darwin'])
 @pytest.mark.parametrize('requested',[False,True])
-def test_g1b_native_session_fake_launch_preserves_v1_or_consumes_closed_gate(tmp_path,monkeypatch,requested):
+def test_g1b_native_session_fake_launch_preserves_v1_or_consumes_closed_gate(tmp_path,monkeypatch,requested,launch_platform):
     """Real session ordering with fake custody/Popen; no process launch."""
     import sys
+    import threading
     from types import SimpleNamespace
     import runtime_protocol.local_execution_supervisor as supervisor
+    monkeypatch.setattr(supervisor, 'sys', SimpleNamespace(platform=launch_platform))
     from test_verified_host_launch import fixture_authority
     f=fixture_authority(tmp_path);preparation,_=_prepare_case()
     profile=preparation['profile'];profile.update(host_executable=f.args['host_argv'][0],host_artifact_digest=f.args['preparation']['profile']['host_artifact_digest'],support_root=f.args['config']['support_root'])
@@ -750,10 +753,13 @@ def test_g1b_native_session_fake_launch_preserves_v1_or_consumes_closed_gate(tmp
         'boot_manifest_path':str(tmp_path/'boot'),'boot_manifest_hash':'sha256:'+'1'*64,'capability_matrix':None,'readiness_profile_path':None,'readiness_profile_hash':None}
     from runtime_protocol.verified_host_launch import raw_digest
     f.record.update(selected_profile_digest=raw_digest(profile),profile_digest=profile['profile_digest'],release_digest=profile['release_digest'])
-    launched=[];broker_calls=[];fake_child=SimpleNamespace(pid=81)
+    launched=[];broker_calls=[];retained_objects=[];fake_child=SimpleNamespace(pid=81)
     class FakeBroker:
         def __init__(self,**kwargs):broker_calls.append('reserve')
         def child_environment(self,argv,**kwargs):launched.append(list(argv));return {'FAKE_CUSTODY_ARGV':'retained'}
+        def bind_original_child(self,child,*,reap_guard):
+            assert child is fake_child and reap_guard is retained_objects[0].guard
+            broker_calls.append('original-child')
         def wait_until_sealed(self):broker_calls.append('seal')
         def abort_before_spawn(self):broker_calls.append('abort')
     custody=SimpleNamespace(RoleBoundCustodyBroker=FakeBroker,default_process_identity=lambda p:None,custody_wrapper_argv=lambda p:[p,'fake-wrapper'])
@@ -766,13 +772,13 @@ def test_g1b_native_session_fake_launch_preserves_v1_or_consumes_closed_gate(tmp
         return fake_child
     monkeypatch.setattr('subprocess.Popen',popen)
     class FakeRetained:
-        def __init__(self,child):self.child=child
+        def __init__(self,child):self.child=child;self.guard=threading.RLock();retained_objects.append(self)
         def bind_actor(self):broker_calls.append('bind-actor')
         def verify(self):return {'pid':81,'birth_id':'fake-host','uid':501}
     monkeypatch.setattr(supervisor,'RetainedProcess',FakeRetained)
     session=supervisor.NativeHostSession(preparation,config,launch_verifier=f.verifier)
     try:
-        assert broker_calls==['reserve','seal','bind-actor']
+        assert broker_calls==['reserve', *(['original-child'] if launch_platform == 'darwin' else []), 'seal','bind-actor']
         session._verify_launch_host()
         if requested:
             assert launched[0][1:5]==['-X','utf8','-I','-S']
