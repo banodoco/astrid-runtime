@@ -733,24 +733,43 @@ def _lock_matches(
 
 
 @contextmanager
-def _bootstrap_mutex(paths: RuntimePaths):
+def _bootstrap_mutex(paths: RuntimePaths, *, existing: bool = False):
     """Serialize launchers so two clean launches cannot both start a daemon."""
-    if runtime_platform.sys.platform == "win32":
+    if existing:
+        # A lived-in upgrade must not create/chmod serialization state before
+        # its final no-write admission. Keep the actual existing lock inode.
+        fd = os.open(paths.bootstrap_lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        handle = os.fdopen(fd, "r+")
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077):
+            handle.close()
+            raise BootstrapError("Runtime upgrade refused: existing bootstrap lock is not private.")
+    elif runtime_platform.sys.platform == "win32":
         runtime_platform.private_directory(paths.runtime_support)
     else:
         paths.runtime_support.mkdir(parents=True, exist_ok=True)
         owner_only(paths.runtime_support, directory=True)
-    handle = paths.bootstrap_lock_path.open("a+")
+    if not existing:
+        handle = paths.bootstrap_lock_path.open("a+")
     locked = False
     try:
-        if runtime_platform.sys.platform == "win32":
+        if existing:
+            pass
+        elif runtime_platform.sys.platform == "win32":
             runtime_platform.owner_only(handle.fileno())
         else:
             owner_only(paths.bootstrap_lock_path)
         runtime_platform.lock_file(handle.fileno())
         locked = True
         cancellation.check()
-        yield
+        def validate_existing():
+            if _existing_bootstrap_lock_identity(paths) != _lock_identity(os.fstat(handle.fileno())):
+                raise BootstrapError("Runtime upgrade refused: bootstrap lock changed before admission.",
+                                     details={"safe": False})
+        if existing:
+            validate_existing()
+        yield validate_existing if existing else None
     finally:
         try:
             if locked:
@@ -1875,7 +1894,7 @@ def _fenced_stop_and_manager(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_id: str, realm_root: Path,
     discovery: Mapping[str, Any] | None, marker: Mapping[str, Any] | None,
     owner: tuple[int, str, str, str] | None, stop_manager=None,
-    pre_stop_manager=None,
+    pre_stop_manager=None, supervised_stop=None, on_stop_admitted=None,
     stop_foreground=None, validate_stop=None, stale_owner_identity=None,
     allow_missing_realm: bool = False,
     completed_stop_binding: Mapping[str, Any] | None = None,
@@ -1922,11 +1941,26 @@ def _fenced_stop_and_manager(
                     raise BootstrapError(
                         "Runtime interruption refused: owner absence could not be re-established at the final fence."
                     ) from exc
+            selected_owner = (_stop_owner_mapping(paths, owner, realm_id, realm_root)
+                              if owner is not None else None)
+            if supervised_stop is not None:
+                # This is an in-process, independently authenticated supervisor
+                # capability, never a journal/token/label. Validation must
+                # precede both the installer's intent and Runtime's first write.
+                try:
+                    supervised_stop.validate(UpgradeStopInspection(
+                        selected_owner, realm_id, realm_root, _read_catalog(paths),
+                        _existing_bootstrap_lock_identity(paths),
+                    ))
+                except Exception as exc:
+                    raise BootstrapError(str(exc), details={"safe": False}) from exc
             stopped = None
             # Everything after fence admission is downstream. A controller or
             # manager may fail after acting, so its details cannot represent
             # an initial lifecycle refusal.
             with _downstream_stop_errors():
+                if on_stop_admitted is not None:
+                    on_stop_admitted()
                 if owner is not None:
                     pid, birth, instance_id, endpoint = owner
                     # Durable Runtime-written intent, before the first signal:
@@ -1962,16 +1996,22 @@ def _fenced_stop_and_manager(
                             "endpoint": str(endpoint),
                             "owner_lock": str(paths.instance_lock_path),
                         })
-                    stop_owner = getattr(boundary, "stop_owner", None)
-                    if not callable(stop_owner):
-                        raise BootstrapError("Runtime boundary lacks the birth-checked stop handoff.")
-                    stopped = stop_owner(
-                        endpoint=endpoint, pid=pid, instance_id=instance_id,
-                        process_birth_id=birth, realm_id=realm_id,
-                        owner_lock=paths.instance_lock_path,
-                        discovery_path=paths.discovery_path, require_health=False,
-                    )
-                    if completed_stop_binding is not None:
+                    if supervised_stop is not None:
+                        # The supervisor stops its exact admitted invocation.
+                        # A successful RPC/queued job is not an exit witness.
+                        supervised_stop.stop(selected_owner)
+                        stopped = {"status": "stopped", "exit_evidence": "supervised_owner_absent"}
+                    else:
+                        stop_owner = getattr(boundary, "stop_owner", None)
+                        if not callable(stop_owner):
+                            raise BootstrapError("Runtime boundary lacks the birth-checked stop handoff.")
+                        stopped = stop_owner(
+                            endpoint=endpoint, pid=pid, instance_id=instance_id,
+                            process_birth_id=birth, realm_id=realm_id,
+                            owner_lock=paths.instance_lock_path,
+                            discovery_path=paths.discovery_path, require_health=False,
+                        )
+                    if completed_stop_binding is not None or supervised_stop is not None:
                         _require_owner_absent(
                             boundary, pid, birth, context="after Runtime stop",
                         )
@@ -2310,11 +2350,17 @@ def _inspect_restore_realm(snapshot: Mapping[str, Any]) -> None:
 
 def _interrupt_owner_locked(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
-    pre_stop_manager=None,
+    pre_stop_manager=None, supervised_stop=None, on_stop_admitted=None, validate_stop_lock=None,
     stop_foreground=None, restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
     """Admit, fence, stop and clean the selected Runtime owner."""
     _validate_support_paths(paths)
+    if supervised_stop is not None:
+        if restore_selection is not None:
+            raise BootstrapError("A supervised stop cannot replace restore recovery admission.")
+        # Repeat the strictly read-only identity/absence check after mutex
+        # acquisition. In particular, PID reuse is not cleanup authority.
+        supervised_stop.validate(inspect_upgrade_stop(paths, boundary))
     if restore_selection is not None:
         snapshot = _selected_restore_snapshot(paths, restore_selection)
         marker = _read_support_json(paths.instance_lock_path)
@@ -2513,6 +2559,8 @@ def _interrupt_owner_locked(
         raise TypeError("stop_foreground must be a zero-argument callback")
 
     def validate_stop_context() -> None:
+        if validate_stop_lock is not None:
+            validate_stop_lock()
         if reused_owner:
             if (_read_support_json(paths.discovery_path) != discovery
                     or _read_support_json(paths.instance_lock_path) != marker):
@@ -2549,11 +2597,12 @@ def _interrupt_owner_locked(
         paths, boundary, realm_id=str(realm["realm_id"]), realm_root=realm_root,
         discovery=discovery, marker=marker, owner=owner, stop_manager=stop_manager,
         pre_stop_manager=pre_stop_manager,
+        supervised_stop=supervised_stop, on_stop_admitted=on_stop_admitted,
         stop_foreground=stop_foreground if owner is None else None,
         stale_owner_identity=stale_owner_identity,
         completed_stop_binding=pinokio_binding if owner is not None else None,
         retained_completed_stop=retained_completed_stop,
-        validate_stop=validate_stop_context if pinokio_binding is not None or reused_owner else None,
+        validate_stop=validate_stop_context if pinokio_binding is not None or reused_owner or validate_stop_lock is not None else None,
     )
     return {"status": "stopped", "realm_id": str(realm["realm_id"]),
             "idle": result["interruption"]}
@@ -2561,15 +2610,21 @@ def _interrupt_owner_locked(
 
 def _interrupt_owner(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
-    pre_stop_manager=None,
+    pre_stop_manager=None, supervised_stop=None, on_stop_admitted=None,
     stop_foreground=None, restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
     """Serialize owner validation, the lifecycle fence and manager callback."""
     _preflight_owner_interruption(paths, restore_selection=restore_selection)
-    with _bootstrap_mutex(paths):
+    if supervised_stop is not None:
+        supervised_stop.validate(inspect_upgrade_stop(paths, boundary))
+    mutex = (_bootstrap_mutex(paths, existing=True) if supervised_stop is not None
+             else _bootstrap_mutex(paths))
+    with mutex as validate_stop_lock:
         return _interrupt_owner_locked(
             paths, boundary, stop_manager=stop_manager,
             pre_stop_manager=pre_stop_manager,
+            supervised_stop=supervised_stop, on_stop_admitted=on_stop_admitted,
+            validate_stop_lock=validate_stop_lock,
             stop_foreground=stop_foreground, restore_selection=restore_selection,
         )
 
@@ -2613,7 +2668,7 @@ def _preflight_owner_interruption(
 
 def down(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, stop_manager=None,
-    pre_stop_manager=None,
+    pre_stop_manager=None, supervised_stop=None, on_stop_admitted=None,
     stop_foreground=None, restore_selection: RestoreSelection | None = None,
 ) -> dict[str, Any]:
     """Stop the selected owner under one lifecycle fence.
@@ -2621,17 +2676,32 @@ def down(
     ``pre_stop_manager`` receives the Runtime-validated owner mapping before
     Runtime signals it. ``stop_manager`` retains its zero-argument post-stop
     contract and also runs for an idle stop.
+
+    ``supervised_stop`` is an optional live capability with ``validate(inspection)``
+    and ``stop(owner)`` methods. It must bind an independently authenticated
+    supervisor and exact invocation; Runtime separately witnesses owner exit.
+    ``on_stop_admitted`` publishes the existing install transaction's intent
+    only after the final busy/identity/supervisor fence, before any stop.
     """
     if stop_manager is not None and not callable(stop_manager):
         raise TypeError("stop_manager must be a zero-argument callback")
     if pre_stop_manager is not None and not callable(pre_stop_manager):
         raise TypeError("pre_stop_manager must accept the validated owner mapping")
+    if supervised_stop is not None and not all(
+        callable(getattr(supervised_stop, name, None)) for name in ("validate", "stop")
+    ):
+        raise TypeError("supervised_stop must retain validate/stop operations")
+    if on_stop_admitted is not None and not callable(on_stop_admitted):
+        raise TypeError("on_stop_admitted must be a zero-argument callback")
+    if on_stop_admitted is not None and supervised_stop is None:
+        raise TypeError("on_stop_admitted requires supervised stop admission")
     if stop_foreground is not None and not callable(stop_foreground):
         raise TypeError("stop_foreground must be a zero-argument callback")
     if restore_selection is not None and not isinstance(restore_selection, RestoreSelection):
         raise TypeError("restore_selection must be a RestoreSelection")
     return _interrupt_owner(paths, boundary, stop_manager=stop_manager,
                             pre_stop_manager=pre_stop_manager,
+                            supervised_stop=supervised_stop, on_stop_admitted=on_stop_admitted,
                             stop_foreground=stop_foreground,
                             restore_selection=restore_selection)
 
@@ -2698,6 +2768,99 @@ def _recorded_owner_identity(
     if pid <= 0 or not birth or not instance or observed_realm != realm_id or observed_root != realm_root:
         raise BootstrapError("Runtime interruption refused: discovery realm root does not match the selected workspace.")
     return pid, birth, instance, endpoint
+
+
+def _stop_owner_mapping(paths, owner, realm_id, realm_root) -> dict[str, Any]:
+    pid, birth, instance_id, endpoint = owner
+    return {
+        "pid": int(pid), "process_birth_id": str(birth),
+        "runtime_instance_id": str(instance_id), "realm_id": str(realm_id),
+        "realm_root": str(realm_root), "endpoint": str(endpoint),
+        "owner_lock": str(paths.instance_lock_path),
+    }
+
+
+@dataclass(frozen=True)
+class UpgradeStopInspection:
+    """An observation, never authority: bind even a quiescent selected realm."""
+    owner: Mapping[str, Any] | None
+    realm_id: str
+    realm_root: Path
+    catalog: Mapping[str, Any]
+    bootstrap_lock: tuple[int, ...]
+
+
+def _lock_identity(info) -> tuple[int, ...]:
+    return tuple(getattr(info, key) for key in
+                 ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_ctime_ns"))
+
+
+def _existing_bootstrap_lock_identity(paths: RuntimePaths) -> tuple[int, ...]:
+    try:
+        lock = paths.bootstrap_lock_path.lstat()
+        if (not stat.S_ISREG(lock.st_mode) or lock.st_uid != os.getuid()
+                or lock.st_mode & 0o077):
+            raise ValueError("untrusted lock")
+        return _lock_identity(lock)
+    except (OSError, ValueError) as exc:
+        raise BootstrapError("Runtime upgrade refused: existing private bootstrap lock is unavailable.",
+                             details={"safe": False}) from exc
+
+
+def inspect_upgrade_stop(paths: RuntimePaths, boundary: RuntimeBoundary) -> UpgradeStopInspection:
+    """Read-only upgrade admission: authenticated live owner or proven absence.
+
+    The returned inspection is an observation, not stop authority. Unlike stale
+    publication cleanup, a reused PID is a refusal here. A caller may use this
+    to acquire independent supervisor authority before staging/writing, then
+    must repeat admission inside ``down``'s existing lifecycle fence.
+    """
+    _preflight_owner_interruption(paths)
+    lock = _existing_bootstrap_lock_identity(paths)
+    catalog = _read_catalog(paths)
+    realm = _selected_realm(catalog)
+    if realm is None:
+        raise BootstrapError("No selected Runtime realm is available for a safe upgrade.")
+    root = _canonical_realm_root(str(realm.get("data_root") or ""))
+    discovery = _read_support_json(paths.discovery_path)
+    marker = _read_support_json(paths.instance_lock_path)
+    owner = None
+    if discovery is not None:
+        pid, birth, _instance, _endpoint = _recorded_owner_identity(
+            discovery, realm_id=str(realm["realm_id"]), realm_root=root,
+        )
+        observed = boundary.process_birth_identity(pid)
+        alive = _pid_alive(boundary, pid)
+        if ((alive and observed is None)
+                or (observed is not None and runtime_platform.process_birth_matches(birth, observed) is not True)):
+            raise BootstrapError("Runtime upgrade refused: owner birth changed or is unverified.",
+                                 details={"safe": False})
+        owner = _validate_published_stop_owner(paths, boundary, realm, root, discovery, marker, observed_alive=alive)
+        if owner is not None:
+            _validate_stop_endpoint(paths, boundary, owner=owner,
+                                    realm_id=str(realm["realm_id"]), realm_root=root)
+    elif marker is not None:
+        if marker.get("state") != "stopping":
+            raise BootstrapError("Runtime upgrade refused: unverified owner marker.", details={"safe": False})
+        stopping = _validate_stopping_marker(marker)
+        if (stopping["realm_id"] != realm["realm_id"]
+                or _canonical_realm_root(stopping["realm_root"]) != root
+                or stopping["data_root"] != str(paths.app_support)):
+            raise BootstrapError("Runtime upgrade refused: stopping owner selection changed.",
+                                 details={"safe": False})
+        _require_owner_absent(boundary, stopping["pid"], stopping["process_birth_id"],
+                              context="at upgrade admission")
+    if owner is None and _realm_owner_present(root):
+        raise BootstrapError("Runtime upgrade deferred: the workspace still has an owner.",
+                             details={"safe": False, "deferred_until_quiescent": True})
+    if (_read_catalog(paths) != catalog
+            or _existing_bootstrap_lock_identity(paths) != lock
+            or _read_support_json(paths.discovery_path) != discovery
+            or _read_support_json(paths.instance_lock_path) != marker):
+        raise BootstrapError("Runtime upgrade refused: selection changed during admission.",
+                             details={"safe": False})
+    mapping = _stop_owner_mapping(paths, owner, str(realm["realm_id"]), root) if owner is not None else None
+    return UpgradeStopInspection(mapping, str(realm["realm_id"]), root, catalog, lock)
 
 
 def _validate_stop_endpoint(
