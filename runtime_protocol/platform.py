@@ -526,6 +526,17 @@ def _windows_parent(pid):
         kernel.CloseHandle(snapshot)
 
 
+def linux_birth_id(start_ticks: str, *, boot_id: str | None = None,
+                   pidns_inode: int | None = None) -> str:
+    """Canonical Linux observation; absent scope is never custody evidence."""
+    if not isinstance(start_ticks, str) or not start_ticks.isascii() or not start_ticks.isdigit():
+        raise ValueError("invalid process start tick")
+    scope = f";boot:{boot_id}" if boot_id else ""
+    if pidns_inode is not None:
+        scope += f";pidns:{pidns_inode}"
+    return f"proc-start-ticks:{start_ticks}{scope}"
+
+
 def process_identity(pid: int, *, timeout: float = 1.0):
     """Return identity, None only for proven absence; raise on unknown observation."""
     if timeout <= 0:
@@ -572,29 +583,28 @@ def process_identity(pid: int, *, timeout: float = 1.0):
         # Start ticks alone can collide after reboot or in another PID namespace.
         # Scope interfaces are optional in restricted proc mounts. An older
         # scoped record cannot be reclaimed if its scope becomes unreadable.
-        scope = ""
+        raw = (root / "stat").read_text()
+        fields = raw.rsplit(")", 1)[1].split()
+        boot = None
+        namespace = None
         try:
             boot = (Path("/proc") / "sys/kernel/random/boot_id").read_text().strip()
-            if boot:
-                scope += f";boot:{boot}"
         except (FileNotFoundError, PermissionError):
             pass
         try:
             namespace = (root / "ns/pid").stat().st_ino
-            scope += f";pidns:{namespace}"
         except (FileNotFoundError, PermissionError):
             pass
-        raw = (root / "stat").read_text()
-        fields = raw.rsplit(")", 1)[1].split()
-        if not fields[19].isascii() or not fields[19].isdigit():
-            raise ValueError("invalid process start tick")
         value = {"pid": pid, "uid": root.stat().st_uid, "parent_pid": int(fields[1]),
-                 "birth_id": f"proc-start-ticks:{fields[19]}{scope}", "process_group": int(fields[2]), "session_id": int(fields[3])}
+                 "birth_id": linux_birth_id(fields[19], boot_id=boot, pidns_inode=namespace),
+                 "process_group": int(fields[2]), "session_id": int(fields[3])}
         second = (root / "stat").read_text().rsplit(")", 1)[1].split()
         if fields[19] != second[19]:
             raise OSError("process identity changed during observation")
         if second[0] in {"Z", "X", "x"}:
             return None  # /proc still retains an exited process awaiting reap.
+        if fields[0] in {"Z", "X", "x"} or fields[1:4] != second[1:4]:
+            raise OSError("process identity changed during observation")
         return value
     except FileNotFoundError:
         return None
