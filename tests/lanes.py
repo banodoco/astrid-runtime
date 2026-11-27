@@ -407,6 +407,37 @@ requires_linux_o_path = _declare(
     "the ancestor walk uses Linux O_PATH", ("unit",),
 ).mark()
 
+requires_posix_interval_timers = _declare(
+    "posix-interval-timers", "sys_platform == 'win32'",
+    "POSIX interval timers", ("unit",),
+).mark()
+requires_linux_retained_listener = _declare(
+    "linux-retained-listener", "sys_platform != 'linux'",
+    "Linux retained listener primitive", ("unit",),
+).mark()
+
+_WINDOWS_OPEN_SQLITE_REPLACEMENT = _declare(
+    "windows-open-sqlite-replacement", "os_name == 'nt'",
+    "Windows refused replacement of the open SQLite file", ("unit",),
+    only_error=lambda error: isinstance(error, PermissionError),
+)
+_WINDOWS_SIBLING_AGENT_CHECKOUT = _declare(
+    "windows-sibling-agent-checkout", "sys_platform == 'win32'",
+    "published Agent checkout is not a sibling of this Runtime checkout",
+    ("windows-realm-publication",),
+    only_error=lambda error: isinstance(error, FileNotFoundError) and error.args == (
+        "published Agent checkout is not a sibling of this Runtime checkout",
+    ),
+)
+# A capability rather than OS gate: preserve the original absence-of-os.fork
+# condition, not a broad POSIX/Windows skip. Only that actual lookup can skip.
+_POSIX_INTERRUPTION_FORK = _declare(
+    "posix-interruption-fork", "True",
+    "POSIX interruption fixture requires os.fork", ("unit",),
+    only_error=lambda error: isinstance(error, AttributeError)
+    and error.name == "fork" and error.obj is os and not hasattr(os, "fork"),
+)
+
 # Decided while the test runs, so it is a call rather than a mark. The skip can
 # only fire on Windows, and only for WinError 1314 (no symlink privilege).
 _WINDOWS_SYMLINKS = _declare(
