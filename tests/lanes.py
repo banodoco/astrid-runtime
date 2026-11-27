@@ -342,6 +342,10 @@ requires_linux_tree_custody = _declare(
     "linux-tree-custody", "sys_platform != 'linux'",
     "Linux waitid WNOWAIT process-group custody", ("unit", "portability-lifecycle", "integration"),
 ).mark()
+requires_linux_procfs_census = _declare(
+    "linux-procfs-census", "sys_platform != 'linux'",
+    "Linux proc-directory descriptors, process states and dumpability", ("unit",),
+).mark()
 requires_case_sensitive_filesystem = _declare(
     "case-sensitive-filesystem", "sys_platform in ('darwin', 'win32')",
     "the collision can't exist on a case-insensitive filesystem; it still runs on Linux", ("unit",),

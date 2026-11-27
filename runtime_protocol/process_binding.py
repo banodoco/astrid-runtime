@@ -21,3 +21,27 @@ def supported() -> bool:
     if LINUX:
         return linux_process_binding.pidfd_available()
     return sys.platform in ("darwin", "win32")
+
+
+def census():
+    """Linux proc observations with explicit partial/unavailable status."""
+    if not sys.platform.startswith("linux"):
+        raise NotImplementedError("Linux proc census is unavailable on this OS")
+    from . import linux_process_binding
+    return linux_process_binding.census()
+
+
+def zombie_birth(pid):
+    """Observe a fully scoped Linux unreaped zombie birth, never custody."""
+    if not sys.platform.startswith("linux"):
+        raise NotImplementedError("Linux zombie birth is unavailable on this OS")
+    from . import linux_process_binding
+    return linux_process_binding.zombie_birth(pid)
+
+
+def birth_ticks(pid):
+    """Observe live Linux start ticks for the legacy Vibe registry only."""
+    if not sys.platform.startswith("linux"):
+        raise NotImplementedError("Linux start ticks are unavailable on this OS")
+    from . import linux_process_binding
+    return linux_process_binding.birth_ticks(pid)
