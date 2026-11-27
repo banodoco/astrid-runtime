@@ -12,6 +12,7 @@ from astrid_runtime.paths import RuntimePaths
 from astrid_runtime.workspace_adopt import WorkspaceAdoptError, adopt_workspace
 from astrid_runtime import workspace_copy
 from tests.test_workspace_adopt import _setup, _Boundary
+from tests.lanes import skip_for_declared_error
 
 
 def setup_copy(tmp_path):
@@ -247,9 +248,12 @@ def test_published_recovery_validation_refuses_corruption_and_retains_both_roots
     assert full_manifest(old) == before
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX interruption fixture")
 @pytest.mark.parametrize("point", ["binding", "publication"])
 def test_abrupt_exit_during_binding_or_after_publication(tmp_path, monkeypatch, point):
+    try:
+        fork = os.fork
+    except AttributeError as error:
+        skip_for_declared_error("posix-interruption-fork", error)
     from runtime_protocol import v33_lifecycle as lifecycle
     old, realm, paths, config = setup_copy(tmp_path)
     before = full_manifest(old)
@@ -266,7 +270,7 @@ def test_abrupt_exit_during_binding_or_after_publication(tmp_path, monkeypatch, 
             publish(*args)
             os._exit(77)
         monkeypatch.setattr(workspace_copy, "_publish", exit_after_publication)
-    pid = os.fork()
+    pid = fork()
     if pid == 0:
         try:
             call(old, paths, config)

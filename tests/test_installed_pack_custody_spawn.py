@@ -33,7 +33,6 @@ from pathlib import Path
 
 import pytest
 
-from tests.lanes import declared_xfail_reason
 
 PACK_YAML = """schema_version: 3
 id: {pack}
@@ -124,7 +123,16 @@ class KnownSourceClosureMismatch(AssertionError):
 
 
 @pytest.mark.darwin_native
-@pytest.mark.xfail(strict=True, raises=KnownSourceClosureMismatch, reason=declared_xfail_reason("installed-pair-source-closure"))
+@pytest.mark.xfail(
+    strict=True, raises=KnownSourceClosureMismatch,
+    reason=(
+        "[declared-xfail:installed-pair-source-closure] "
+        "the Agent and Runtime measure different source-closure digests for an installed pair, so "
+        "the darwin custody spawn is refused as 'differs from original launch'; proven by CI run "
+        "42602337622 (darwin-native job 129109610936 at 49a062c raised KnownSourceClosureMismatch "
+        "under the strict xfail); fixed by astrid-dev Plan 38"
+    ),
+)
 def test_real_custody_spawn_launches_granted_installed_pack_and_refuses_ungranted(tmp_path, owned_process_groups):
     base = tmp_path.resolve()
     home, realm, support = base / "home", base / "realm", base / "support"

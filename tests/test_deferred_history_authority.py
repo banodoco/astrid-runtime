@@ -14,6 +14,7 @@ from runtime_protocol.history_verification import DeferredHistoryVerification, h
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 from runtime_protocol.timeline_commit_store import TimelineCommitStore
+from tests.lanes import skip_for_declared_error
 from test_deferred_history_verification import (
     _history_fixture, _late_deadline, _pending_owner, _wait_state,
 )
@@ -194,13 +195,13 @@ def test_deferred_verification_fails_boot_on_inode_replacement(service, tmp_path
         shutil.copyfile(path, replacement)
         try:
             os.replace(replacement, path)
-        except PermissionError:
+        except PermissionError as error:
             if os.name != "nt":
                 raise
             # Windows can refuse the swap at the OS boundary.
             current = path.stat()
             assert (current.st_dev, current.st_ino) == (before.st_dev, before.st_ino)
-            pytest.skip("Windows refused replacement of the open SQLite file")
+            skip_for_declared_error("windows-open-sqlite-replacement", error)
         after = path.stat()
         assert (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
         release.set()
