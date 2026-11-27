@@ -1,535 +1,290 @@
-# Default run per push (testing plan UR.5); the second-client boundary test as its own job.
-name: CI
-
+name: Temporary Plan 38 Linux proof
 on:
-  # Pushes start CI only on main, release mains and int/ integration branches. Pull requests run for every base branch.
-  push:
-    branches: [main, "release/*/main", "int/**", "release/14/plan-39"]
-  pull_request:
   workflow_dispatch:
-    inputs:
-      agent_sha:
-        description: Full immutable Agent commit SHA (empty uses fixture pin)
-        required: false
-        type: string
-
-# A newer run of the same pull request or branch supersedes an older one. main and release mains keep every commit's result.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !(startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main')) }}
-
+permissions:
+  contents: read
+  pull-requests: read
 jobs:
-  windows-realm-publication:
-    runs-on: windows-latest
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
-      - name: Restore pip cache (C-08)
-        id: c08-runtime-ci-5
-        uses: actions/cache/restore@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Checkout published Agent alongside Runtime
-        shell: bash
+      - name: Verify dispatch ref and live PR 129 head before testing
         env:
-          AGENT_SHA: ff40f2c684fc7ce22e42a5cacda5c63a0c8800a9
-        run: |
-          agent_dir="$GITHUB_WORKSPACE/../astrid-agent"
-          git init --quiet "$agent_dir"
-          git -C "$agent_dir" remote add origin https://github.com/banodoco/astrid-agent
-          git -C "$agent_dir" fetch --depth=1 origin "$AGENT_SHA"
-          git -C "$agent_dir" checkout --detach --quiet FETCH_HEAD
-          test "$(git -C "$agent_dir" rev-parse HEAD)" = "$AGENT_SHA"
-      - name: Record effective Runtime and Agent checkouts
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          runtime_sha=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
-          agent_sha=$(git -C "$GITHUB_WORKSPACE/../astrid-agent" rev-parse HEAD)
-          echo "Runtime: $runtime_sha"
-          echo "Agent: $agent_sha"
-          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
-      - run: python -m pip install -e '.[test]'
-      - run: python -m pip install -e packages/python
-      - name: Install published Agent from sibling checkout
-        shell: bash
-        run: python -m pip install -e "$GITHUB_WORKSPACE/../astrid-agent"
-      - name: Verify Windows update backup daemon from a selected venv
-        run: python -m pytest -q -rP -m "" tests/test_windows_runtime_launch.py
-      - name: Verify native realm creation, ownership, and rollback
-        run: >-
-          python -m pytest -q
-          tests/test_realm_creation_publication.py
-          tests/test_realm_replacement_publication.py
-          tests/test_platform_windows.py::test_windows_directory_mutex_uses_global_user_scoped_identity
-          tests/test_m1_review.py
-      - name: Verify native Windows signal and foreground cleanup paths
-        run: >-
-          python -m pytest -q -m ""
-          tests/test_platform_signaling.py
-          tests/test_runtime_cli_serve_cleanup.py
-          tests/test_service_stop.py
-      - name: Verify Runtime service cleanup receipt contract
-        run: >-
-          python -m pytest -q
-          tests/test_profile_services.py::test_supervisor_marks_runtime_owned_service_name_after_configured_env
-          tests/test_profile_services.py::test_pack_host_cleanup_receipts_are_bounded_owner_only_and_preserved
-          tests/test_profile_services.py::test_service_cleanup_receipt_history_keeps_latest_64_attempts
-          tests/test_profile_services.py::test_pack_host_cleanup_receipt_refuses_corrupt_history_without_overwriting
-          tests/test_profile_services.py::test_shutdown_retry_publishes_pack_host_cleanup_receipt
-          tests/test_profile_services.py::test_cleanup_receipt_write_failure_retains_identity_and_stop_retries
-          tests/test_profile_services.py::test_pending_cleanup_blocks_replacement_attempt
-          tests/test_profile_services.py::test_cleanup_retry_preserves_on_failure_clean_exit_policy
-          tests/test_profile_services.py::test_cleanup_retry_preserves_readiness_failure_outcome
-          'tests/test_profile_services.py::test_invalid_declaration_is_refused[document18]'
-          'tests/test_profile_services.py::test_invalid_declaration_is_refused[document19]'
-
-      - name: Save pip cache on main or int branches (C-08)
-        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-ci-5.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-
-  unit:
-    runs-on: ${{ matrix.os }}
-    env:
-      ASTRID_CHECKOUT: ${{ github.workspace }}/../astrid-agent
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = banodoco/astrid-runtime
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$GITHUB_REF" = refs/heads/proof/38-01-6c4bd28b
+          test "$(gh api repos/banodoco/astrid-runtime/git/ref/heads/proof/38-01-6c4bd28b --jq .object.sha)" = "$GITHUB_SHA"
+          test "$(gh api repos/banodoco/astrid-runtime/pulls/129 --jq .head.sha)" = 6c4bd28b4c034ed65d4e501f7b02d90bd082fb03
+          test "$(gh api repos/banodoco/astrid-runtime/pulls/129 --jq .head.ref)" = p38/recovery-38-01-linux-authority
+          test "$(gh api repos/banodoco/astrid-runtime/pulls/129 --jq .head.repo.full_name)" = "$GITHUB_REPOSITORY"
+          workflow_path="${GITHUB_WORKFLOW_REF#"$GITHUB_REPOSITORY/"}"
+          workflow_path="${workflow_path%@*}"
+          test "$workflow_path" = .github/workflows/ci.yml
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" |
+            jq -e --arg parent 6c4bd28b4c034ed65d4e501f7b02d90bd082fb03 --arg path "$workflow_path" \
+            '(.parents|length)==1 and .parents[0].sha==$parent and (.files|length)==1 and .files[0].filename==$path and .files[0].status=="modified"'
       - uses: actions/checkout@v4
         with:
+          ref: 6c4bd28b4c034ed65d4e501f7b02d90bd082fb03
           fetch-depth: 0
-      - name: Restore pip cache (C-08)
-        id: c08-runtime-ci-4
-        uses: actions/cache/restore@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - name: Select pinned Agent revision
-        id: astrid-pin
-        env:
-          AGENT_OVERRIDE: ${{ inputs.agent_sha }}
-        shell: bash
-        run: |
-          sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
-          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "Agent revision must be a full 40-character commit SHA" >&2
-            exit 1
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-      - name: Checkout pinned Agent
-        shell: bash
-        env:
-          AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
-        run: |
-          git init --quiet "$ASTRID_CHECKOUT"
-          git -C "$ASTRID_CHECKOUT" remote add origin https://github.com/banodoco/astrid-agent
-          git -C "$ASTRID_CHECKOUT" fetch --no-tags origin "$AGENT_SHA"
-          git -C "$ASTRID_CHECKOUT" checkout --detach --quiet "$AGENT_SHA"
-          test "$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)" = "$AGENT_SHA"
-      - name: Record effective Runtime and Agent checkouts
-        shell: bash
-        run: |
-          runtime_sha=$(git rev-parse HEAD)
-          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
-          echo "Runtime: $runtime_sha"
-          echo "Agent: $agent_sha"
-          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
+          python-version: '3.13'
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
-      - run: npm ci
-        working-directory: packages/typescript
-      - name: Add locked TypeScript compiler to PATH
-        run: echo "$GITHUB_WORKSPACE/packages/typescript/node_modules/.bin" >> "$GITHUB_PATH"
-      - name: Install system media tools
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          node-version: '22'
+      - name: Check exact source and native Linux capabilities
         shell: bash
-      - name: Install system media tools (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ffmpeg
-      - run: python -m pip install -e '.[test]'
-      - run: python -m pip install -e "$ASTRID_CHECKOUT"
-      - name: Run unit tests
-        shell: bash
-        run: mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/unit.xml" -n 2
-        env:
-          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
-      - name: Summarize test result XML
-        if: always()
-        env:
-          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}
         run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 6c4bd28b4c034ed65d4e501f7b02d90bd082fb03
+          test "$(cat tests/astrid-agent.pin)" = 0e1543e0da2215db9cb3320cfd1083174c3c62a9
+          test "$(git rev-parse HEAD^{tree})" = e425ed203baf38e2c7f5a620f7f6dbe1c69fa703
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD HEAD^{tree}
+          uname -a
           python - <<'PY'
-          import os
-          from pathlib import Path
-          from xml.etree import ElementTree as ET
-          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
-          if not files:
-              print('JUnit: no XML files; no test result available')
-              raise SystemExit(1)
-          root = ET.parse(files[0]).getroot()
-          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
-          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
-          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
-          print(line)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
-              summary.write(line + '\n')
+          import os, signal, socket, struct, sys, tempfile
+          assert sys.platform == 'linux'
+          with tempfile.TemporaryDirectory() as d, socket.socket(socket.AF_UNIX) as listener:
+              listener.bind(d + '/native')
+              listener.listen(1)
+              with socket.socket(socket.AF_UNIX) as client:
+                  client.connect(d + '/native')
+                  connection, _ = listener.accept()
+                  connection.close()
+          first, second = socket.socketpair()
+          with first, second:
+              raw = first.getsockopt(socket.SOL_SOCKET, getattr(socket,'SO_PEERPIDFD',77),4)
+              fd = struct.unpack('i',raw)[0]
+              try:
+                  with open(f'/proc/self/fdinfo/{fd}') as f:
+                      fields = dict(line.strip().split(':', 1) for line in f if ':' in line)
+                  assert int(fields['Pid']) == os.getpid(), fields
+                  signal.pidfd_send_signal(fd, 0)
+              finally:
+                  os.close(fd)
+          fd = os.pidfd_open(os.getpid())
+          try:
+              signal.pidfd_send_signal(fd, 0)
+          finally:
+              os.close(fd)
+          print('Native Unix listener and kernel peer pidfd available')
           PY
-      - name: Upload test results
+      - name: Install authoritative worker fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install uv
+          bash scripts/worker-env/runtime-setup.sh
+          test "$(git -C "$GITHUB_WORKSPACE.env/agent" rev-parse HEAD)" = 0e1543e0da2215db9cb3320cfd1083174c3c62a9
+          cat "$GITHUB_WORKSPACE.env/setup.txt"
+      - name: Record exact checkout and installed fixture provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          E="$GITHUB_WORKSPACE.env"
+          test "$(git rev-parse HEAD)" = 6c4bd28b4c034ed65d4e501f7b02d90bd082fb03
+          test "$(git rev-parse HEAD^{tree})" = e425ed203baf38e2c7f5a620f7f6dbe1c69fa703
+          test "$(cat tests/astrid-agent.pin)" = 0e1543e0da2215db9cb3320cfd1083174c3c62a9
+          test "$(git -C "$E/agent" rev-parse HEAD)" = 0e1543e0da2215db9cb3320cfd1083174c3c62a9
+          test -z "$(git status --porcelain)"
+          test -z "$(git -C "$E/agent" status --porcelain)"
+          git -C "$E/agent" rev-parse HEAD^{tree} > "$RUNNER_TEMP/38-01-agent-tree.txt"
+          "$E/venv/bin/python" -I - <<'PY' | tee "$RUNNER_TEMP/38-01-provenance.txt"
+          import importlib.metadata as md
+          import importlib.util
+          import json, os, sys, sysconfig
+          from pathlib import Path
+          from urllib.parse import unquote, urlparse
+          runtime = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          agent = Path(str(runtime) + '.env/agent').resolve()
+          purelib = Path(sysconfig.get_path('purelib')).resolve()
+          print('python', sys.version, sys.executable)
+          for module, expected in (
+              ('astrid_runtime', runtime / 'astrid_runtime/__init__.py'),
+              ('runtime_protocol', runtime / 'runtime_protocol/__init__.py'),
+              ('astrid_runtime_client', runtime / 'packages/python/astrid_runtime_client/__init__.py'),
+              ('astrid', purelib / 'astrid/__init__.py'),
+          ):
+              spec = importlib.util.find_spec(module)
+              assert spec is not None and spec.origin, module
+              origin = Path(spec.origin).resolve()
+              print(module, origin)
+              assert origin == expected.resolve(), (module, origin, expected)
+          dist = md.distribution('astrid')
+          direct = json.loads(dist.read_text('direct_url.json'))
+          url = urlparse(direct['url'])
+          assert url.scheme == 'file' and Path(unquote(url.path)).resolve() == agent, direct
+          assert not direct.get('dir_info', {}).get('editable', False), direct
+          print('Agent distribution', dist.version, direct)
+          print('pytest', md.version('pytest'))
+          PY
+      - name: Enumerate selected cases using identical markers
+        shell: bash
+        env:
+          PYTEST_ADDOPTS: ''
+        run: |
+          set -euo pipefail
+          bash scripts/worker-env/runtime-pytest.sh --collect-only -q \
+            tests/test_custody_provider_dispatch.py tests/test_role_custody_authority.py \
+            tests/test_process_binding_provider.py tests/test_linux_peer_authority.py \
+            tests/test_linux_process_binding.py tests/test_custody_linux_deadlines.py \
+            tests/test_zero_shim_boundary.py tests/test_local_worker_handoff.py \
+            | tee "$RUNNER_TEMP/38-01-collected.txt"
+      - name: Run exact eight-file proof
+        shell: bash
+        env:
+          PYTEST_ADDOPTS: ''
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 6c4bd28b4c034ed65d4e501f7b02d90bd082fb03
+          test "$(git rev-parse HEAD^{tree})" = e425ed203baf38e2c7f5a620f7f6dbe1c69fa703
+          test "$(cat tests/astrid-agent.pin)" = 0e1543e0da2215db9cb3320cfd1083174c3c62a9
+          test "$(git -C "$GITHUB_WORKSPACE.env/agent" rev-parse HEAD)" = 0e1543e0da2215db9cb3320cfd1083174c3c62a9
+          test -z "$(git status --porcelain)"
+          test -z "$(git -C "$GITHUB_WORKSPACE.env/agent" status --porcelain)"
+          set +e
+          bash scripts/worker-env/runtime-pytest.sh -q -rA --junitxml="$RUNNER_TEMP/38-01.xml" \
+            tests/test_custody_provider_dispatch.py tests/test_role_custody_authority.py tests/test_process_binding_provider.py tests/test_linux_peer_authority.py \
+            tests/test_linux_process_binding.py tests/test_custody_linux_deadlines.py \
+            tests/test_zero_shim_boundary.py tests/test_local_worker_handoff.py 2>&1 | tee "$RUNNER_TEMP/38-01-pytest.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${statuses[0]}" | tee "$RUNNER_TEMP/38-01-pytest-exit.txt"
+          test "${statuses[1]}" -eq 0
+          exit "${statuses[0]}"
+      - name: Verify mandatory Linux cases and all executed outcomes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I - <<'PYCODE'
+          from collections import Counter
+          import hashlib, os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          selected = [
+              line.strip() for line in (temp / '38-01-collected.txt').read_text(encoding='utf-8').splitlines()
+              if line.strip().startswith('tests/') and '::' in line
+          ]
+          expected_counts = {
+              'tests/test_process_binding_provider.py': 24,
+              'tests/test_linux_peer_authority.py': 24,
+              'tests/test_linux_process_binding.py': 15,
+              'tests/test_custody_linux_deadlines.py': 9,
+              'tests/test_zero_shim_boundary.py': 7,
+              'tests/test_local_worker_handoff.py': 5,
+              'tests/test_custody_provider_dispatch.py': 21,
+              'tests/test_role_custody_authority.py': 91,
+          }
+          assert len(selected) == len(set(selected)) == 196, (len(selected), len(set(selected)))
+          assert Counter(n.split('::', 1)[0] for n in selected) == expected_counts
+          digest = hashlib.sha256(('\n'.join(sorted(selected)) + '\n').encode('utf-8')).hexdigest()
+          print('Selected-node inventory SHA256', digest)
+          assert digest == '3e32321e0543cacf70a3caf1fe6e389c4afc515485db9152186e50e8c068c94c', 'selected inventory differs from PR129 exact-head receipt'
+
+          def junit_key(node):
+              address, bracket, params = node.partition('[')
+              parts = address.split('::')
+              module = parts[0].removesuffix('.py').replace('/', '.')
+              return ('.'.join([module, *parts[1:-1]]), parts[-1] + bracket + params)
+
+          native = (
+              'tests/test_linux_peer_authority.py::test_child_originated_connection_matches_independently_retained_spawn',
+              'tests/test_linux_peer_authority.py::test_child_originated_connection_rejects_expected_birth_mismatch_without_leak',
+              'tests/test_linux_peer_authority.py::test_inherited_parent_socketpair_cannot_authenticate_child',
+              'tests/test_linux_peer_authority.py::test_real_host_child_authenticates_original_runtime_parent',
+              'tests/test_linux_process_binding.py::test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child',
+              'tests/test_linux_process_binding.py::test_real_broker_term_is_reaped_by_retained_process',
+              'tests/test_linux_process_binding.py::test_non_child_same_user_connection_does_not_starve_the_real_child',
+              'tests/test_linux_process_binding.py::test_registration_frame_pid_must_match_the_kernel_peer_pid',
+              'tests/test_linux_process_binding.py::test_exited_peer_is_rejected_per_connection_and_the_real_child_still_seals',
+          )
+          portable = (
+              'tests/test_custody_provider_dispatch.py::test_windows_broker_keeps_authority_after_channel_close_through_ready_and_signal',
+              'tests/test_role_custody_authority.py::test_signal_holds_shared_guard_until_kernel_call_completes',
+          )
+          for node in native + portable:
+              assert node in selected, f'mandatory node not selected: {node}'
+          root = ET.parse(temp / '38-01.xml').getroot()
+          suites = [root] if root.tag == 'testsuite' else root.findall('./testsuite')
+          assert suites, 'missing JUnit suites'
+          cases = list(root.iter('testcase'))
+          assert cases, 'no testcases executed'
+          expected = Counter(junit_key(node) for node in selected)
+          assert len(expected) == len(selected), 'ambiguous JUnit node normalization'
+          executed = Counter((c.get('classname', ''), c.get('name', '')) for c in cases)
+          bad = [
+              (c.get('classname'), c.get('name'), [x for x in ('failure', 'error', 'skipped') if c.find(x) is not None])
+              for c in cases if any(c.find(x) is not None for x in ('failure', 'error', 'skipped'))
+          ]
+          print('JUnit totals', len(cases), 'non-passing:', bad)
+          print('Missing:', sorted((expected - executed).items()), 'Extra:', sorted((executed - expected).items()))
+          assert executed == expected, 'collection/execution mismatch'
+          assert not bad, 'non-passing or skipped JUnit case'
+          assert sum(int(s.get('tests', '0')) for s in suites) == len(selected)
+          assert all(int(s.get(k, '0')) == 0 for s in suites for k in ('failures', 'errors', 'skipped'))
+          assert (temp / '38-01-pytest-exit.txt').read_text().strip() == '0', 'pytest or session guard failed'
+          print(f'All {len(cases)} executed nodes passed; nine native and two portable mandatory nodes present.')
+          PYCODE
+      - name: Recheck product tree and Agent fixture after test
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 6c4bd28b4c034ed65d4e501f7b02d90bd082fb03
+          test "$(git rev-parse HEAD^{tree})" = e425ed203baf38e2c7f5a620f7f6dbe1c69fa703
+          test "$(cat tests/astrid-agent.pin)" = 0e1543e0da2215db9cb3320cfd1083174c3c62a9
+          test "$(git -C "$GITHUB_WORKSPACE.env/agent" rev-parse HEAD)" = 0e1543e0da2215db9cb3320cfd1083174c3c62a9
+          test "$(git -C "$GITHUB_WORKSPACE.env/agent" rev-parse HEAD^{tree})" = "$(cat "$RUNNER_TEMP/38-01-agent-tree.txt")"
+          test -z "$(git status --porcelain)"
+          test -z "$(git -C "$GITHUB_WORKSPACE.env/agent" status --porcelain)"
+          git rev-parse HEAD HEAD^{tree}
+          git -C "$GITHUB_WORKSPACE.env/agent" rev-parse HEAD HEAD^{tree}
+      - name: Preserve individual results in the job log
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in "$RUNNER_TEMP"/38-01*; do
+            if test -f "$file"; then sha256sum "$file"; fi
+          done
+          test -s "$RUNNER_TEMP/38-01.xml"
+          cat "$RUNNER_TEMP/38-01.xml"
+      - name: Upload exact collection and individual JUnit evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-unit-all-${{ matrix.os }}
-          path: ${{ runner.temp }}/test-results-unit-${{ matrix.os }}/*.xml
-          retention-days: 90
-          if-no-files-found: warn
-
-      - name: Save pip cache on main or int branches (C-08)
-        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-ci-4.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-
-  darwin-native:
-    # The darwin_native lane is deselected by default and skipped off macOS; this
-    # is the job where it runs (tests/lanes.py SKIP_REGISTRY).
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Restore pip cache (C-08)
-        id: c08-runtime-ci-3
-        uses: actions/cache/restore@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: brew install ffmpeg
-      # Non-editable: the host-only spawn test needs the installed pair (runtime_protocol and astrid in the
-      # same site-packages), the layout the verified launcher's import mapping covers.
-      - run: python -m pip install '.[test]'
-      - name: Checkout published Agent alongside Runtime (darwin spawn test needs the Agent)
-        shell: bash
-        env:
-          AGENT_SHA: 4866090edcce7df31d1f0e03cf2354b878e94105
-        run: |
-          agent_dir="$GITHUB_WORKSPACE/../astrid-agent"
-          git init --quiet "$agent_dir"
-          git -C "$agent_dir" remote add origin https://github.com/banodoco/astrid-agent
-          git -C "$agent_dir" fetch --depth=1 origin "$AGENT_SHA"
-          git -C "$agent_dir" checkout --detach --quiet FETCH_HEAD
-          test "$(git -C "$agent_dir" rev-parse HEAD)" = "$AGENT_SHA"
-      - name: Install the Agent's locked dependencies, then the Agent non-editably
-        shell: bash
-        run: |
-          python -m pip install --disable-pip-version-check --no-input --require-hashes -r "$GITHUB_WORKSPACE/../astrid-agent/requirements/runtime.lock"
-          python -m pip install --disable-pip-version-check --no-input --no-deps "$GITHUB_WORKSPACE/../astrid-agent"
-      - run: python -m pytest -q -m darwin_native
-
-      - name: Save pip cache on main or int branches (C-08)
-        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-ci-3.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-
-  typescript-client:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - run: npm ci
-        working-directory: packages/typescript
-      - run: npm test
-        working-directory: packages/typescript
-
-  boundary:
-    runs-on: ubuntu-latest
-    env:
-      ASTRID_CHECKOUT: ${{ github.workspace }}/../astrid-agent
-    steps:
-      - uses: actions/checkout@v4
-      - name: Restore pip cache (C-08)
-        id: c08-runtime-ci-2
-        uses: actions/cache/restore@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Select pinned Agent revision
-        id: astrid-pin
-        env:
-          AGENT_OVERRIDE: ${{ inputs.agent_sha }}
-        shell: bash
-        run: |
-          sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
-          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "Agent revision must be a full 40-character commit SHA" >&2
-            exit 1
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-      - name: Checkout pinned Agent
-        shell: bash
-        env:
-          AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
-        run: |
-          git init --quiet "$ASTRID_CHECKOUT"
-          git -C "$ASTRID_CHECKOUT" remote add origin https://github.com/banodoco/astrid-agent
-          git -C "$ASTRID_CHECKOUT" fetch --depth=1 --no-tags origin "$AGENT_SHA"
-          git -C "$ASTRID_CHECKOUT" checkout --detach --quiet FETCH_HEAD
-          test "$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)" = "$AGENT_SHA"
-      - name: Record effective Runtime and Agent checkouts
-        shell: bash
-        run: |
-          runtime_sha=$(git rev-parse HEAD)
-          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
-          echo "Runtime: $runtime_sha"
-          echo "Agent: $agent_sha"
-          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - run: python -m pip install -e '.[test]'
-      - run: python -m pip install -e "$ASTRID_CHECKOUT"
-      - run: python -m pytest -q tests/test_second_client_e2e.py -m ""
-
-      - name: Save pip cache on main or int branches (C-08)
-        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-ci-2.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-
-  sandbox-process-control:
-    # Sandbox mode under a seccomp profile that denies what NVIDIA OpenShell's
-    # does: pidfd_open (ENOSYS), pidfd_send_signal and process-group kill (EPERM).
-    runs-on: ubuntu-latest
-    env:
-      ASTRID_CHECKOUT: ${{ github.workspace }}/../astrid-agent
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Select pinned Agent revision
-        id: astrid-pin
-        env:
-          AGENT_OVERRIDE: ${{ inputs.agent_sha }}
-        shell: bash
-        run: |
-          sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
-          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "Agent revision must be a full 40-character commit SHA" >&2
-            exit 1
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-      - name: Checkout pinned Agent
-        shell: bash
-        env:
-          AGENT_SHA: ${{ steps.astrid-pin.outputs.sha }}
-        run: |
-          git init --quiet "$ASTRID_CHECKOUT"
-          git -C "$ASTRID_CHECKOUT" remote add origin https://github.com/banodoco/astrid-agent
-          git -C "$ASTRID_CHECKOUT" fetch --no-tags origin "$AGENT_SHA"
-          git -C "$ASTRID_CHECKOUT" checkout --detach --quiet "$AGENT_SHA"
-          test "$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)" = "$AGENT_SHA"
-      - name: Record effective Runtime and Agent checkouts
-        shell: bash
-        run: |
-          runtime_sha=$(git rev-parse HEAD)
-          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
-          echo "Runtime: $runtime_sha"
-          echo "Agent: $agent_sha"
-          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
-      - name: Run sandbox process-control tests
-        run: mkdir -p "$TEST_RESULTS_DIR" && ASTRID_TEST_RESULTS_DIR="$TEST_RESULTS_DIR" sh tests/seccomp/run-suite.sh -rA --junitxml=/test-results/sandbox-process-control.xml
-        shell: bash
-        env:
-          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-sandbox-process-control
-      - name: Summarize test result XML
+          name: plan38-pr129-6c4bd28b-evidence
+          path: |
+            ${{ runner.temp }}/38-01.xml
+            ${{ runner.temp }}/38-01-collected.txt
+            ${{ runner.temp }}/38-01-pytest.log
+            ${{ runner.temp }}/38-01-pytest-exit.txt
+            ${{ runner.temp }}/38-01-provenance.txt
+            ${{ runner.temp }}/38-01-agent-tree.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Confirm proof still describes the live PR head
         if: always()
         env:
-          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-sandbox-process-control
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          from xml.etree import ElementTree as ET
-          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
-          if not files:
-              print('JUnit: no XML files; no test result available')
-              raise SystemExit(1)
-          root = ET.parse(files[0]).getroot()
-          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
-          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
-          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
-          print(line)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
-              summary.write(line + '\n')
-          PY
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-sandbox-process-control-all-${{ runner.os }}
-          path: ${{ runner.temp }}/test-results-sandbox-process-control/*.xml
-          retention-days: 90
-          if-no-files-found: warn
-
-  portability-lifecycle:
-    env:
-      ASTRID_CHECKOUT: ${{ github.workspace }}/astrid-agent
-    defaults:
-      run:
-        working-directory: astrid-runtime
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: astrid-runtime
-      - name: Restore pip cache (C-08)
-        id: c08-runtime-ci-1
-        uses: actions/cache/restore@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      # The override is an immutable test input; never modify the fixture pin.
-      - name: Select Agent revision
-        id: astrid-pin
-        env:
-          AGENT_OVERRIDE: ${{ inputs.agent_sha }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          sha="${AGENT_OVERRIDE:-$(cat tests/astrid-agent.pin)}"
-          if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "Agent revision must be a full 40-character commit SHA" >&2
-            exit 1
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
-        with:
-          repository: banodoco/astrid-agent
-          ref: ${{ steps.astrid-pin.outputs.sha }}
-          path: astrid-agent
-      - name: Record effective checkouts
-        shell: bash
-        run: |
-          runtime_sha=$(git rev-parse HEAD)
-          agent_sha=$(git -C "$ASTRID_CHECKOUT" rev-parse HEAD)
-          echo "Runtime: $runtime_sha"
-          echo "Agent: $agent_sha"
-          printf 'Runtime: `%s`\nAgent: `%s`\n' "$runtime_sha" "$agent_sha" >> "$GITHUB_STEP_SUMMARY"
-      - run: python -m pip install -e '.[test]'
-      - run: python -m pip install -e packages/python
-      - run: python -m pip install -e "$ASTRID_CHECKOUT"
-      - name: Run portability lifecycle tests
-        shell: bash
-        run: >-
-          mkdir -p "$TEST_RESULTS_DIR" && python -m pytest -q -rA --junitxml="$TEST_RESULTS_DIR/portability-lifecycle.xml" -m ""
-          tests/test_platform.py
-          tests/test_platform_signaling.py
-          tests/test_platform_windows.py
-          tests/test_windows_worker_handoff.py
-          tests/test_platform_filesystem.py
-          tests/test_dirfd_windows.py
-          tests/test_windows_filesystem_native.py
-          tests/test_runtime_upgrade.py
-          tests/test_runtime_compact.py
-          tests/test_relocation_plan.py
-          tests/test_local_worker_placement.py::test_activation_acceptance_replay_flushes_record_with_writable_handle
-          tests/test_profile_services.py
-          tests/test_service_stop.py
-          tests/test_m1_review.py
-          tests/test_windows_runtime_sweep.py
-          tests/test_foreground.py
-          tests/test_native_custody.py
-          tests/test_portable_lifecycle.py
-        env:
-          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}
-      - name: Summarize test result XML
-        if: always()
-        env:
-          TEST_RESULTS_DIR: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          from xml.etree import ElementTree as ET
-          files = sorted(Path(os.environ['TEST_RESULTS_DIR']).glob('*.xml'))
-          if not files:
-              print('JUnit: no XML files; no test result available')
-              raise SystemExit(1)
-          root = ET.parse(files[0]).getroot()
-          suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
-          counts = [sum(int(suite.get(key, '0')) for suite in suites) for key in ('tests', 'failures', 'errors', 'skipped')]
-          line = f'{files[0].name}: tests={counts[0]} failures={counts[1]} errors={counts[2]} skipped={counts[3]}'
-          print(line)
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
-              summary.write(line + '\n')
-          PY
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-portability-lifecycle-all-${{ matrix.os }}
-          path: ${{ runner.temp }}/test-results-portability-lifecycle-${{ matrix.os }}/*.xml
-          retention-days: 90
-          if-no-files-found: warn
-      - name: Save pip cache on main or int branches (C-08)
-        if: ${{ always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/int/') || (startsWith(github.ref, 'refs/heads/release/') && endsWith(github.ref, '/main'))) && steps.c08-runtime-ci-1.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: "${{ runner.os == 'Windows' && '~/AppData/Local/pip/Cache' || runner.os == 'macOS' && '~/Library/Caches/pip' || '~/.cache/pip' }}"
-          key: pip-${{ runner.os }}-${{ runner.arch }}-py3.11-${{ hashFiles('**/requirements.txt', 'pyproject.toml') }}
-
-  # A pull request into a release branch comes from a branch of that release and names what it belongs
-  # to: the plan (a plan branch does so by its name) or the astrid-dev issue. See the Release skill,
-  # "How a release runs".
-  landing-reference:
-    name: landing reference
-    if: ${{ github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/') && endsWith(github.base_ref, '/main') }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: The pull request comes from a branch of this release and names its plan or issue
-        env:
-          BASE_REF: ${{ github.base_ref }}
-          HEAD_REF: ${{ github.head_ref }}
-          TITLE: ${{ github.event.pull_request.title }}
-          BODY: ${{ github.event.pull_request.body }}
-        run: |
-          release="${BASE_REF#release/}"; release="${release%/main}"
-          if ! printf '%s' "$HEAD_REF" | grep -Eq "^release/${release}/[a-z0-9][a-z0-9-]*$" || [ "$HEAD_REF" = "$BASE_REF" ]; then
-            echo "::error::A pull request into ${BASE_REF} must come from a branch of that release: release/${release}/plan-<PP> or release/${release}/<topic>. This one comes from '${HEAD_REF}'."
-            exit 1
-          fi
-          if printf '%s' "$HEAD_REF" | grep -Eq "^release/${release}/plan-[0-9]+$"; then
-            echo "Plan branch: $HEAD_REF"; exit 0
-          fi
-          if printf '%s\n%s\n' "$TITLE" "$BODY" | grep -Eiq '(plan[ -]?[0-9]+|astrid-dev#[0-9]+|astrid-dev/issues/[0-9]+)'; then
-            echo "Reference found."; exit 0
-          fi
-          echo "::error::A pull request into a release branch must name the plan or the astrid-dev issue it belongs to, for example 'Plan 55' or 'banodoco/astrid-dev#721'."
-          exit 1
+          set -euo pipefail
+          current=$(gh api repos/banodoco/astrid-runtime/pulls/129 --jq .head.sha)
+          echo "PR 129 head at evidence collection: $current"
+          test "$current" = 6c4bd28b4c034ed65d4e501f7b02d90bd082fb03
+          test "$(gh api repos/banodoco/astrid-runtime/pulls/129 --jq .head.ref)" = p38/recovery-38-01-linux-authority
+          test "$(gh api repos/banodoco/astrid-runtime/pulls/129 --jq .head.repo.full_name)" = "$GITHUB_REPOSITORY"
+          test "$(gh api repos/banodoco/astrid-runtime/git/ref/heads/proof/38-01-6c4bd28b --jq .object.sha)" = "$GITHUB_SHA"
