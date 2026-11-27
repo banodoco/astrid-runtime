@@ -3037,11 +3037,24 @@ class StaleOwnerTests(unittest.TestCase):
         from astrid_runtime.runtime_boundary import LocalRuntimeBoundary
         self._configure()
         first = bootstrap(self.paths, self.boundary, self.config)
+        actual = LocalRuntimeBoundary.process_birth_identity(os.getpid())
+        self.assertTrue(actual)
+        # A legacy synthetic marker has no comparable Linux boot/PID-namespace
+        # scope. Use a different tick in the real test process's own scope to
+        # exercise proven reuse, not an ambiguous legacy birth observation.
+        expected = json.loads(self.paths.discovery_path.read_text())["process_birth_id"]
+        if sys.platform == "linux":
+            prefix = "proc-start-ticks:"
+            self.assertTrue(actual.startswith(prefix))
+            tick, *scope = actual[len(prefix):].split(";")
+            expected = prefix + ";".join([str(int(tick) + 1), *scope])
+            from runtime_protocol import platform
+            self.assertIs(platform.process_birth_matches(expected, actual), False)
         for path in (self.paths.discovery_path, self.paths.instance_lock_path):
             record = json.loads(path.read_text())
             record["pid"] = os.getpid()
+            record["process_birth_id"] = expected
             path.write_text(json.dumps(record))
-        expected = json.loads(self.paths.discovery_path.read_text())["process_birth_id"]
         # The reused PID is a real live process. Birth observations for newly
         # launched fake owners still use their synthetic test marker.
         self.boundary.is_pid_alive = lambda pid: pid == os.getpid() or pid in self.boundary.alive

@@ -6,6 +6,7 @@ from pathlib import Path
 import select
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,7 @@ import pytest
 from tests.lanes import requires_linux_tree_custody, requires_posix_file_modes_native_custody
 
 from astrid_runtime import custody_broker as custody
-from runtime_protocol import platform
+from runtime_protocol import platform, process_binding
 
 
 @pytest.fixture
@@ -35,6 +36,8 @@ def processes():
         assert child.stdout.readline().strip() == "READY"
         identity = custody.default_process_identity(child.pid)
         assert identity is not None
+        child._test_native_authority = process_binding.retain_child(
+            child, reap_guard=threading.RLock(), expected=identity)
         return child, {key: identity[key] for key in ("pid", "uid", "birth_id")}
 
     yield spawn
@@ -43,6 +46,9 @@ def processes():
             child.kill()
         child.wait(timeout=5)
         child.stdout.close()
+        native = getattr(child, "_test_native_authority", None)
+        if native is not None:
+            native.close()
 
 def _assert_running(child):
     # Give a mistakenly delivered terminating signal time to take effect.
@@ -57,7 +63,7 @@ def _linux_identities(processes, *, catch_term=False):
 
 def _linux_test_native_custody_publish_release_and_adopted_signal_use_guard(tmp_path, processes):
     owner_identity, child, target = _linux_identities(processes, catch_term=True)
-    original = custody.NativeProcessCustody(tmp_path, target)
+    original = custody.NativeProcessCustody(tmp_path, target, authority=child._test_native_authority)
     original.publish()
     stored = json.loads(original.path.read_text())
     assert stored["state"] == "owned"
@@ -78,9 +84,13 @@ def _linux_test_native_custody_publish_release_and_adopted_signal_use_guard(tmp_
 
     assert original.release() == {"state": "released"}
     assert json.loads(original.path.read_text())["state"] == "released"
-    # A fresh operator object adopts the released record and delivers through
-    # the identity-pinning platform boundary.
-    adopted = custody.NativeProcessCustody(tmp_path, target)
+    # The record alone remains diagnostic even after release. This fresh
+    # operator object can act only because the same launch owner retains
+    # independent native authority; the durable record cannot recreate it.
+    with pytest.raises(custody.CustodyError, match="requires retained authority"):
+        custody.NativeProcessCustody(tmp_path, target).signal(platform.KILL)
+    _assert_running(child)
+    adopted = custody.NativeProcessCustody(tmp_path, target, authority=child._test_native_authority)
     adopted.signal(platform.KILL)
     assert child.wait(timeout=5) == -platform.KILL
 
@@ -130,9 +140,9 @@ def _linux_test_native_custody_recovers_when_prior_controller_is_proven_absent(t
     os_proxy.current_pid = os.getpid()
     old_child.terminate()
     assert old_child.wait(timeout=5) == -platform.TERM
-    # The old controller PID is absent; the signal operation durably adopts
-    # the active record before delivering through the platform boundary.
-    instance.signal(platform.TERM)
+    # Absence of the old controller permits the record transition, not the
+    # action itself. The independent direct-child handle authorizes delivery.
+    instance.signal(platform.TERM, authority=child._test_native_authority)
     record = json.loads(instance.path.read_text())
     assert record["state"] == "owned"
     assert record["controller"] == current
@@ -151,14 +161,14 @@ def _linux_test_native_custody_wraps_platform_identity_drift_without_signaling(t
     instance = custody.NativeProcessCustody(tmp_path, target)
     instance.publish()
     failures = []
-    def reject_drift(words, signum):
-        failures.append((words, signum))
+    def reject_drift(words, signum, *, authority):
+        failures.append((words, signum, authority))
         raise OSError("process incarnation changed")
-    expected_words = custody.linux_process_binding.token(target["pid"])["words"]
+    expected_words = child._test_native_authority.token["words"]
     monkeypatch.setattr(custody, "signal_audit_token", reject_drift)
     with pytest.raises(custody.CustodyError, match="process incarnation changed"):
-        instance.signal(platform.TERM)
-    assert failures == [(expected_words, platform.TERM)]
+        instance.signal(platform.TERM, authority=child._test_native_authority)
+    assert failures == [(expected_words, platform.TERM, child._test_native_authority)]
     _assert_running(child)
 
 def _linux_test_native_custody_preserves_controller_after_metadata_changes(tmp_path, monkeypatch, processes, operation, field):
@@ -174,7 +184,7 @@ def _linux_test_native_custody_preserves_controller_after_metadata_changes(tmp_p
         assert instance.release() == {"state": "released"}
         _assert_running(child)
     else:
-        instance.signal(platform.TERM)
+        instance.signal(platform.TERM, authority=child._test_native_authority)
         assert child.wait(timeout=5) == -platform.TERM
     assert {key: owner[key] for key in target} == {key: pinned[key] for key in target}
 
@@ -270,13 +280,14 @@ def _linux_reparent_custody_proof(root):
         os.close(read_fd)
         controller = os.fork()
         if controller == 0:
-            target = None
+            target = native = None
             outcome = {}
             try:
                 before = custody.default_process_identity(os.getpid())
                 target = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
                 identity = custody.default_process_identity(target.pid)
-                instance = custody.NativeProcessCustody(root, identity)
+                native = process_binding.retain_child(target, reap_guard=threading.RLock(), expected=identity)
+                instance = custody.NativeProcessCustody(root, identity, authority=native)
                 instance.publish()
                 ready.write_text(json.dumps({"controller": os.getpid(), "target": target.pid}))
                 os.write(write_fd, ready.read_bytes())
@@ -298,6 +309,8 @@ def _linux_reparent_custody_proof(root):
                     if target.poll() is None:
                         target.kill()
                     target.wait()
+                if native is not None:
+                    native.close()
                 result.write_text(json.dumps(outcome))
             os._exit(1 if "error" in outcome else 0)
         os.close(write_fd)
@@ -575,13 +588,14 @@ def _linux_reparent_custody_proof(root):
         os.close(read_fd)
         controller = os.fork()
         if controller == 0:
-            target = None
+            target = native = None
             outcome = {}
             try:
                 before = custody.default_process_identity(os.getpid())
                 target = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
                 identity = custody.default_process_identity(target.pid)
-                instance = custody.NativeProcessCustody(root, identity)
+                native = process_binding.retain_child(target, reap_guard=threading.RLock(), expected=identity)
+                instance = custody.NativeProcessCustody(root, identity, authority=native)
                 instance.publish()
                 ready.write_text(json.dumps({"controller": os.getpid(), "target": target.pid}))
                 os.write(write_fd, ready.read_bytes())
@@ -603,6 +617,8 @@ def _linux_reparent_custody_proof(root):
                     if target.poll() is None:
                         target.kill()
                     target.wait()
+                if native is not None:
+                    native.close()
                 result.write_text(json.dumps(outcome))
             os._exit(1 if "error" in outcome else 0)
         os.close(write_fd)

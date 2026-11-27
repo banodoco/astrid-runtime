@@ -103,6 +103,7 @@ class RuntimeDaemon:
         self.service = None
         self.httpd = None
         self.thread = None
+        self._native_owner_listener = None
         # The hosted page's browser door (door.py): a second listener, opened
         # and fenced together with the Runtime's own.
         self.door = door
@@ -232,6 +233,9 @@ class RuntimeDaemon:
             self.bootstrap_token_file.unlink(missing_ok=True)
 
     def _shutdown_http(self):
+        if self._native_owner_listener is not None:
+            self._native_owner_listener.close()
+            self._native_owner_listener = None
         if self.service_supervisor is not None:
             self.service_supervisor.stop()
             self.service_supervisor = None
@@ -343,6 +347,18 @@ class RuntimeDaemon:
         self._write_epoch_floor(owner["runtime_epoch"])
         self.catalog.register(realm_id=self.service.realm["id"], display_name=self.service.realm["display_name"], data_root=str(self.root), owner=owner, runtime_epoch=owner["runtime_epoch"], runtime_instance_id=self.instance_id, readiness="ready")
         birth_id = process_birth_identity()
+        if self.owner_lock and sys.platform == "linux":
+            from . import process_binding
+            from .native_owner_peer import OwnerPeerListener
+            # Sandbox-only Runtime service tests can still exercise their
+            # supported controls; publication of native owner custody refuses
+            # when pidfds are denied. Never advertise PID fallback authority.
+            if process_binding.supported():
+                try:
+                    self._native_owner_listener = OwnerPeerListener(self.instance_id)
+                except OSError as exc:
+                    self._shutdown_http()
+                    raise ConflictError(f"native Linux Runtime owner authority listener unavailable: {exc}") from exc
         if self.owner_lock:
             atomic_json_write(self.owner_lock, {"pid": os.getpid(), "process_birth_id": birth_id, "runtime_instance_id": self.instance_id, "realm_id": self.service.realm["id"], "realm_root": str(self.root)})
         self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.startup_identity_instance_id, identity=self.startup_identity, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_credential_pending=bool(self.local_worker_profiles), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES), **({"door_endpoint": self.door_endpoint, "door_origin": self.door.origin} if self.door_httpd else {}))
