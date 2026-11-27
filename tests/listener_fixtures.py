@@ -150,6 +150,14 @@ def finite_launcher(parent_descriptor, owner_descriptor):
 
 
 def owner_loss():
+    # This fixture transfers and signals real pidfds. Refuse unavailable
+    # primitives before spawning descendants that could keep capture pipes
+    # open after a failed handoff. A successful probe grants no child custody.
+    probe = platform.pidfd_open(os.getpid())
+    try:
+        platform.pidfd_send_signal(probe, 0)
+    finally:
+        os.close(probe)
     # Subreaper only in this isolated test subject, so its orphan is reaped too.
     library = ctypes.CDLL(None, use_errno=True)
     assert library.prctl(36, 1, 0, 0, 0) == 0, ctypes.get_errno()

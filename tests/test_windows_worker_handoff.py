@@ -46,10 +46,28 @@ class Channel:
 
 @pytest.fixture
 def native_peer(monkeypatch):
+    # Portable transport tests inject native handle operations explicitly. The
+    # production provider never falls back to these PID-based fixture readers.
+    handles = {}
+    sequence = iter(range(10000, 20000))
+    def opened(pid):
+        handle = next(sequence)
+        handles[handle] = pid
+        return handle, windows._ACTION_ACCESS
+    def duplicate(handle, *, access=None):
+        return opened(handles[handle])[0]
+    monkeypatch.setattr(windows, "_open_process", opened)
+    monkeypatch.setattr(windows, "_duplicate_process", duplicate)
+    monkeypatch.setattr(windows, "_close_process", lambda handle: handles.pop(handle))
+    monkeypatch.setattr(windows, "_handle_identity", lambda handle: windows.identity(platform.process_identity(handles[handle])))
     monkeypatch.setattr(windows, "tcp_peer_pid", lambda channel: PEER["pid"])
     monkeypatch.setattr(platform, "process_identity", lambda pid: dict(PEER))
     monkeypatch.setattr(platform, "current_user", lambda: PEER["uid"])
-    return dict(PEER)
+    yield dict(PEER)
+    for peer, _ in list(windows._pins.values()):
+        if peer._handle in handles:
+            peer.close()
+    assert not handles
 
 
 @pytest.mark.parametrize("field,value", [("pid", 53), ("uid", 18), ("birth_id", "windows-creation:999")])
@@ -225,9 +243,11 @@ def test_windows_role_broker_rejects_rogue_then_seals_real_child(native_peer, mo
         **selected, "pid": pid, "parent_pid": 100,
     })
     monkeypatch.setattr(custody, "sys", SimpleNamespace(platform="win32"))
-    token = {"pid": PEER["pid"], "uid": PEER["uid"], "pidversion": 1,
-             "sha256": "token-digest", "words": [1] * 8}
+    token = windows._identity_token(native_peer)
     monkeypatch.setattr(custody, "_peer_token", lambda channel: token)
+    # Select the same injected Windows provider for the shared broker join;
+    # the native kernel operations remain the explicit portable fixture above.
+    monkeypatch.setattr(custody.process_binding, "retain_peer", windows.retain_peer, raising=False)
     frame = {"version": custody.PROTOCOL_VERSION, "command": "register_pre_exec",
              "run_id": "run", "role": "relay", "pid": PEER["pid"],
              "ppid": parent["pid"], "argv_digest": "argv-digest"}
@@ -236,7 +256,9 @@ def test_windows_role_broker_rejects_rogue_then_seals_real_child(native_peer, mo
     if failure == "lineage":
         monkeypatch.setattr(windows, "tcp_peer_pid", lambda channel: 53 if channel is rogue else PEER["pid"])
     events = []
-    broker = SimpleNamespace(
+    class BrokerFixture(SimpleNamespace):
+        pass  # Native authority finalizers need a weak-referenceable owner.
+    broker = BrokerFixture(
         listener=_listener(rogue, child), timeout=1, error=None, state="accepting",
         run_id="run", role="relay", launch_parent=SimpleNamespace(verify=lambda: parent),
         identity_provider=lambda pid: selected, cleanup_actor=object(), custody_generation=1,
@@ -245,13 +267,18 @@ def test_windows_role_broker_rejects_rogue_then_seals_real_child(native_peer, mo
         _ready=threading.Event(), socket_path=SimpleNamespace(unlink=lambda **kwargs: None),
         socket_root=SimpleNamespace(rmdir=lambda: None), _release_authority_scope=lambda: None,
         _retain_post_exec_connection=False, _post_exec_connection=None,
+        _native_peer=None, _close_native_peer=None, _post_exec_authority_validated=False,
     )
-    custody.RoleBoundCustodyBroker._serve(broker)
-    assert broker.error is None and broker.state == "sealed"
-    assert events == ["registration_pre_exec", "registration_ack_checkpoint", "registration_post_exec", "admission_sealed"]
-    assert broker.registration["identity"] == selected
-    assert broker.listener.used and broker.listener.socket.closed
-    assert rogue.closed and child.closed and broker._ready.is_set()
+    try:
+        custody.RoleBoundCustodyBroker._serve(broker)
+        assert broker.error is None and broker.state == "sealed"
+        assert events == ["registration_pre_exec", "registration_ack_checkpoint", "registration_post_exec", "admission_sealed"]
+        assert broker.registration["identity"] == selected
+        assert broker.listener.used and broker.listener.socket.closed
+        assert rogue.closed and child.closed and broker._ready.is_set()
+    finally:
+        if broker._close_native_peer is not None:
+            broker._close_native_peer()
 
 
 class SharedSocket:
@@ -348,14 +375,19 @@ def test_one_venv_locator_preserves_lexical_environment(monkeypatch, tmp_path, s
     assert platform.venv_python(tmp_path) == tmp_path / suffix
 
 
-def test_windows_creation_token_roundtrip_and_safe_signal(monkeypatch):
-    monkeypatch.setattr(platform, "process_identity", lambda pid: PEER)
+def test_windows_creation_token_roundtrip_requires_retained_signal_authority(native_peer, monkeypatch):
     token = platform.handoff_token(PEER["pid"])
     assert platform.handoff_token_details(token["words"]) == {key: token[key] for key in ("pid", "uid", "pidversion", "sha256")}
+    monkeypatch.setattr(platform, "signal_process", lambda *args: pytest.fail("token must not reopen a PID"))
+    with pytest.raises(windows.WindowsBindingError, match="requires retained native authority"):
+        platform.handoff_signal_token(token["words"], platform.TERM)
+    channel = Channel()
+    windows.pin_peer(channel, native_peer)
     seen = []
-    monkeypatch.setattr(platform, "signal_process", lambda expected, signum: seen.append((expected, signum)))
-    platform.handoff_signal_token(token["words"], platform.TERM)
-    assert seen == [(PEER, platform.TERM)]
+    monkeypatch.setattr(windows, "_terminate_process", seen.append)
+    with windows.retain_peer(channel) as retained:
+        platform.handoff_signal_token(token["words"], platform.TERM, authority=retained)
+        assert seen == [retained._handle]
 
 
 WINDOWS_CHILD = r'''
@@ -561,8 +593,19 @@ def test_windows_no_site_bootstrap_authenticates_then_enters_network_site_and_ch
         return authenticated
     monkeypatch.setattr(windows, "connect", connect)
     monkeypatch.setattr(windows, "verify_peer", lambda channel: events.append("verify-owner") or PEER)
-    monkeypatch.setattr(windows, "pin_peer", lambda channel, owner: events.append(("adopt-owner", owner)) or owner)
+    retained = SimpleNamespace(close=lambda: events.append("owner-handle-close"))
+    def retain(channel, *, expected):
+        assert channel is authenticated and expected == PEER
+        events.append("retain-owner")
+        return retained
+    def pin(channel, owner, *, authority):
+        assert authority is retained
+        events.append(("adopt-owner", owner))
+        return owner
+    monkeypatch.setattr(windows, "retain_peer", retain)
+    monkeypatch.setattr(windows, "pin_peer", pin)
     monkeypatch.setattr(windows, "_inherited_owner", None)
+    monkeypatch.setattr(windows, "_inherited_peer", None)
     monkeypatch.setattr(windows, "_inherited_sockets", {})
     monkeypatch.setattr(sys, "argv", [])
     monkeypatch.setattr(sys, "flags", SimpleNamespace(utf8_mode=1))
@@ -597,9 +640,9 @@ def test_windows_no_site_bootstrap_authenticates_then_enters_network_site_and_ch
         monkeypatch.setenv("ASTRID_RUNTIME_WORKER_BOOTSTRAP", kwargs["env"]["ASTRID_RUNTIME_WORKER_BOOTSTRAP"])
         events.clear()
         windows.run_worker()
-        assert events == ["authenticate", "verify-owner", ("bootstrap-ack", b"\x02"), "bootstrap-close",
+        assert events == ["authenticate", "verify-owner", "retain-owner", ("bootstrap-ack", b"\x02"), "bootstrap-close",
                           ("inherit", 101, False), "network", "site", "worker", ("adopt-owner", PEER),
-                          ("worker-send", b"ready")]
+                          "owner-handle-close", ("worker-send", b"ready")]
         assert "unadmitted-import-root" not in sys.path
     finally:
         launch.close()
@@ -778,7 +821,7 @@ def test_windows_role_broker_seals_the_same_child_creation_identity(tmp_path):
     target = [sys.executable, "-I", "-c",
         "import socket,sys; s=socket.socket(fileno=int(sys.argv[1])); s.sendall(b'ready'); assert s.recv(1)==b'x'", str(inherited.fileno())]
     environment = {**os.environ, **broker.child_environment(target, start_new_session=True)}
-    process = rogue = None
+    process = rogue = actor = None
     try:
         port = json.loads(broker.listener.endpoint)["port"]
         rogue = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -795,6 +838,8 @@ def test_windows_role_broker_seals_the_same_child_creation_identity(tmp_path):
         control.sendall(b"x")
         assert process.wait(timeout=15) == 0
     finally:
+        if actor is not None:
+            actor.close()
         if rogue is not None:
             rogue.close()
         control.close(); inherited.close()
@@ -805,21 +850,22 @@ def test_windows_role_broker_seals_the_same_child_creation_identity(tmp_path):
                 if process.poll() is None: platform.stop_tree(process, grace=1)
             finally:
                 process._runtime_job.close()
+        broker.close()
 
 
-def test_windows_peer_token_brackets_creation_time_observation(monkeypatch):
+def test_windows_peer_token_uses_verified_retained_identity_without_pid_reopen(monkeypatch):
     observations = []
     def verify(channel):
         observations.append("verify")
         return PEER
-    def token(pid):
-        observations.append("token")
-        return {"uid": PEER["uid"], "pidversion": 123456789}
     monkeypatch.setattr(windows, "verify_peer", verify)
-    monkeypatch.setattr(platform, "handoff_token", token)
-    assert windows.peer_token(Channel())["pidversion"] == 123456789
-    assert observations == ["verify", "token", "verify"]
-    monkeypatch.setattr(platform, "handoff_token", lambda pid: {"uid": PEER["uid"], "pidversion": 999})
+    monkeypatch.setattr(platform, "handoff_token", lambda pid: pytest.fail("retained peer token must not reopen PID"))
+    token = windows.peer_token(Channel())
+    assert token["pidversion"] == 123456789 and token["pid"] == PEER["pid"] and token["uid"] == PEER["uid"]
+    assert observations == ["verify"]
+    def changed(channel):
+        raise ConflictError("peer incarnation changed")
+    monkeypatch.setattr(windows, "verify_peer", changed)
     with pytest.raises(ConflictError, match="incarnation changed"):
         windows.peer_token(Channel())
 

@@ -60,20 +60,51 @@ def test_native_publish_refuses_unproven_pidfd(tmp_path, monkeypatch, child, mis
 
 
 def test_native_signal_uses_pidfd_and_refuses_enosys_without_fallback(tmp_path, monkeypatch, child):
+    with process_binding.retain_child(child, reap_guard=threading.RLock()) as authority:
+        instance = custody.NativeProcessCustody(tmp_path, platform.process_identity(child.pid), authority=authority)
+        instance.publish()
+        monkeypatch.setattr(platform, "signal_process", lambda *args: pytest.fail("fallback reached"))
+        monkeypatch.setattr(platform, "_signal_checked_pid", lambda *args: pytest.fail("bare PID reached"))
+        monkeypatch.setattr(platform, "pidfd_open", lambda *args: pytest.fail("cached PID reopened"))
+        original_send = platform.pidfd_send_signal
+        def enosys(*args):
+            raise OSError(errno.ENOSYS, "unsupported")
+        monkeypatch.setattr(platform, "pidfd_send_signal", enosys)
+        with pytest.raises(custody.CustodyError, match="authority is unavailable"):
+            instance.signal(platform.TERM)
+        assert child.poll() is None
+        monkeypatch.setattr(platform, "pidfd_send_signal", original_send)
+        instance.signal(platform.TERM)
+        assert child.wait(timeout=5) == -int(platform.TERM)
+
+
+def test_native_record_and_observation_cannot_create_signal_authority(tmp_path, monkeypatch, child):
     instance = custody.NativeProcessCustody(tmp_path, platform.process_identity(child.pid))
     instance.publish()
-    monkeypatch.setattr(platform, "signal_process", lambda *args: pytest.fail("fallback reached"))
-    monkeypatch.setattr(platform, "_signal_checked_pid", lambda *args: pytest.fail("bare PID reached"))
-    original_open = platform.pidfd_open
-    def enosys(*args):
-        raise OSError(errno.ENOSYS, "unsupported")
-    monkeypatch.setattr(platform, "pidfd_open", enosys)
-    with pytest.raises(custody.CustodyError, match="unsupported"):
+    before = instance.path.read_bytes()
+    monkeypatch.setattr(platform, "pidfd_open", lambda *a: pytest.fail("cached PID reopened"))
+    monkeypatch.setattr(platform, "signal_process", lambda *a: pytest.fail("PID fallback reached"))
+    with pytest.raises(custody.CustodyError, match="requires retained authority"):
         instance.signal(platform.TERM)
+    assert instance.path.read_bytes() == before
     assert child.poll() is None
-    monkeypatch.setattr(platform, "pidfd_open", original_open)
-    instance.signal(platform.TERM)
-    assert child.wait(timeout=5) == -int(platform.TERM)
+
+
+def test_native_signal_refuses_a_different_retained_child(tmp_path, child):
+    other = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(30)"])
+    try:
+        with process_binding.retain_child(other, reap_guard=threading.RLock()) as authority:
+            instance = custody.NativeProcessCustody(tmp_path, platform.process_identity(child.pid), authority=authority)
+            instance.publish()
+            before = instance.path.read_bytes()
+            with pytest.raises(custody.CustodyError, match="expected incarnation"):
+                instance.signal(platform.TERM)
+            assert instance.path.read_bytes() == before
+            assert child.poll() is None and other.poll() is None
+    finally:
+        if other.poll() is None:
+            other.kill()
+        other.wait(timeout=5)
 
 
 def test_frame_read_uses_one_deadline_for_trickled_bytes():

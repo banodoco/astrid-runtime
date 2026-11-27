@@ -9,6 +9,19 @@ import sys
 from .errors import ConflictError
 from typing import Any
 
+
+def peer_token(channel):
+    """Observe the native peer; a returned token does not grant custody."""
+    from . import process_binding
+    return process_binding.peer_token(channel)
+
+
+def retain_peer(channel, *, expected=None):
+    """The caller keeps and closes this native reference around its operation."""
+    from . import process_binding
+    return process_binding.retain_peer(channel, expected=expected)
+
+
 def peer_uid(channel: socket.socket) -> int:
     """Return the kernel-authenticated UID of a connected Unix peer."""
 
@@ -57,11 +70,10 @@ def peer_pid(channel: socket.socket) -> int:
     if os.name == "nt":
         raise ConflictError("handoff peer authentication is unavailable on Windows")
     if sys.platform == "darwin":
+        from .darwin_process_binding import DarwinBindingError, peer_pid as darwin_peer_pid
         try:
-            # LOCAL_PEERPID is Darwin's SOL_LOCAL option 2. Python does not
-            # expose the symbolic constant in every supported build.
-            return int(struct.unpack("i", channel.getsockopt(0, 2, 4))[0])
-        except (OSError, struct.error) as exc:
+            return darwin_peer_pid(channel)
+        except DarwinBindingError as exc:
             raise ConflictError("cannot authenticate handoff transfer peer PID") from exc
     option = getattr(socket, "SO_PEERCRED", None)
     if option is None:

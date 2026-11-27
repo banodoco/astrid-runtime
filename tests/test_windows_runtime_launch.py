@@ -13,7 +13,7 @@ import pytest
 from astrid_runtime.bootstrap import BootstrapError, SourceProfile
 from astrid_runtime import runtime_boundary
 from runtime_protocol import windows_handoff
-from tests.lanes import requires_windows_runtime_venv
+from tests.lanes import requires_windows_runtime_venv, skip_for_declared_error
 
 
 def _selected_agent_checkout():
@@ -216,7 +216,10 @@ def test_windows_update_backup_up_uses_the_actual_venv_interpreter(tmp_path, mon
     checkout = Path(__file__).resolve().parents[1]
     agent = _selected_agent_checkout()
     if agent is None:
-        pytest.skip("published Agent checkout is not a sibling of this Runtime checkout")
+        skip_for_declared_error(
+            "windows-sibling-agent-checkout",
+            FileNotFoundError("published Agent checkout is not a sibling of this Runtime checkout"),
+        )
     manifest = tmp_path / "source-profile.json"
     manifest.write_text(json.dumps({
         "profile": "astrid", "runtime_checkout": str(checkout),

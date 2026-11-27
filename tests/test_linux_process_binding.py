@@ -5,6 +5,7 @@ import errno
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -51,13 +52,14 @@ def test_token_round_trips_for_a_live_child_and_refuses_forged_fields():
 def test_signal_reaches_the_same_process_and_refusal_signals_nothing():
     child = _sleeper()
     try:
-        words = lpb.token(child.pid)["words"]
-        forged = list(words); forged[4] ^= 1
-        with pytest.raises(lpb.LinuxBindingError):
-            lpb.signal(forged, platform.TERM)
-        assert child.poll() is None  # refusal delivered no signal
-        lpb.signal(words, platform.TERM)
-        assert child.wait(timeout=10) == -platform.TERM
+        with lpb.retain_child(child, reap_guard=threading.RLock()) as authority:
+            words = lpb.token(child.pid)["words"]
+            forged = list(words); forged[4] ^= 1
+            with pytest.raises(lpb.LinuxBindingError):
+                lpb.signal(forged, platform.TERM, authority=authority)
+            assert child.poll() is None  # refusal delivered no signal
+            lpb.signal(words, platform.TERM, authority=authority)
+            assert child.wait(timeout=10) == -platform.TERM
     finally:
         if child.poll() is None:
             child.kill(); child.wait()
@@ -105,19 +107,19 @@ def test_real_host_broker_constructs_on_linux_and_custody_branches_stay_in_one_m
         authority_journal=scope / "admissions.jsonl", owner_epoch="epoch", timeout=5,
     )
     assert broker.role == "host"
-    # Allow-list guard: custody_broker gained no sys.platform branch; the Linux
-    # branches go through process_binding.LINUX. Main 61e2c30 has 27; this head
-    # has 26. The 26th is main's own deliberate Darwin-only branch (0915593,
-    # retain_post_exec_connection, "Fix Darwin ready custody without task port"),
-    # merged in e4dd120; it is not a Linux branch, so the bound counts it.
+    # The four provider dispatchers no longer select Linux/Windows themselves.
     from pathlib import Path
     source = Path(custody_broker.__file__).read_text(encoding="utf-8")
-    assert source.count("sys.platform") <= 26
+    assert source.count("sys.platform") <= 22
+    broker.abort_before_spawn()
+    broker.close()
 
 
 def test_missing_or_denied_boot_id_fails_closed_for_token_and_signal(monkeypatch):
     child = _sleeper()
+    authority = None
     try:
+        authority = lpb.retain_child(child, reap_guard=threading.RLock())
         words = lpb.token(child.pid)["words"]
         real_identity = platform.process_identity
 
@@ -132,9 +134,11 @@ def test_missing_or_denied_boot_id_fails_closed_for_token_and_signal(monkeypatch
         with pytest.raises(lpb.LinuxBindingError, match="boot_id"):
             lpb.token(child.pid)
         with pytest.raises(lpb.LinuxBindingError, match="boot_id"):
-            lpb.signal(words, platform.TERM)
+            lpb.signal(words, platform.TERM, authority=authority)
         assert child.poll() is None  # refusal delivered no signal
     finally:
+        if authority is not None:
+            authority.close()
         child.kill(); child.wait()
 
 
@@ -175,7 +179,7 @@ def test_pidfd_probe_failure_refuses_admission_and_never_uses_bare_pid_fallback(
         words = lpb.token(child.pid)["words"]
         monkeypatch.setattr(platform, "pidfd_open", enosys)
         monkeypatch.setattr(platform, "_signal_checked_pid", lambda *a, **k: pytest.fail("bare-pid fallback reached"), raising=False)
-        with pytest.raises(OSError):
+        with pytest.raises(lpb.LinuxBindingError, match="retained native authority"):
             lpb.signal(words, platform.TERM)
         assert child.poll() is None
     finally:
@@ -210,9 +214,9 @@ def test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child(tmp_path
         wrapper = custody.custody_wrapper_argv(sys.executable)
         process = platform.spawn_tree(wrapper, env=environment, start_new_session=False, close_fds=True)
         broker.wait_until_sealed()
-        actor = custody.AuthenticatedCleanupActor.retained_child(process, reap_guard=threading.RLock())
-        assert actor.verify()["pid"] == process.pid
-        assert broker.role_authority.reference()["target"] == actor.verify()
+        with custody.AuthenticatedCleanupActor.retained_child(process, reap_guard=threading.RLock()) as actor:
+            assert actor.verify()["pid"] == process.pid
+            assert broker.role_authority.reference()["target"] == actor.verify()
         broker.signal(int(_signal.SIGTERM), expected_pid=process.pid)
         assert process.wait(timeout=15) in (-int(_signal.SIGTERM), 128 + int(_signal.SIGTERM))
     finally:
@@ -221,6 +225,7 @@ def test_real_linux_broker_admits_wrapper_seals_binds_and_signals_child(tmp_path
         else:
             if process is None:
                 broker.abort_before_spawn()
+        broker.close()
 
 
 def test_real_broker_term_is_reaped_by_retained_process(tmp_path):
@@ -236,6 +241,7 @@ def test_real_broker_term_is_reaped_by_retained_process(tmp_path):
     target = [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
     environment = {**os.environ, **broker.child_environment(target, start_new_session=True)}
     retained = None
+    actor = None
     try:
         process = platform.spawn_tree(custody.custody_wrapper_argv(sys.executable),
                                       env=environment, start_new_session=False, close_fds=True)
@@ -256,6 +262,9 @@ def test_real_broker_term_is_reaped_by_retained_process(tmp_path):
             except ProcessLookupError:
                 pass
             retained.wait(timeout=3)
+        if actor is not None:
+            actor.close()
+        broker.close()
 
 
 def test_non_child_same_user_connection_does_not_starve_the_real_child():
@@ -288,8 +297,8 @@ def test_non_child_same_user_connection_does_not_starve_the_real_child():
         process = platform.spawn_tree(custody.custody_wrapper_argv(sys.executable), env=environment,
                                       start_new_session=False, close_fds=True)
         broker.wait_until_sealed()
-        actor = custody.AuthenticatedCleanupActor.retained_child(process, reap_guard=threading.RLock())
-        assert actor.verify()["pid"] == process.pid  # bound to the real child, never the stray
+        with custody.AuthenticatedCleanupActor.retained_child(process, reap_guard=threading.RLock()) as actor:
+            assert actor.verify()["pid"] == process.pid  # bound to the real child, never the stray
     finally:
         if rogue is not None:
             rogue.close()
@@ -299,6 +308,7 @@ def test_non_child_same_user_connection_does_not_starve_the_real_child():
             process.wait()
         else:
             broker.abort_before_spawn()
+        broker.close()
         shutil.rmtree(scope_root, ignore_errors=True)
 
 def test_registration_frame_pid_must_match_the_kernel_peer_pid(tmp_path):
@@ -328,6 +338,7 @@ def test_registration_frame_pid_must_match_the_kernel_peer_pid(tmp_path):
         peer.close()
     finally:
         broker.abort_before_spawn()
+        broker.close()
 
 
 def test_exited_peer_is_rejected_per_connection_and_the_real_child_still_seals(monkeypatch):
@@ -349,6 +360,7 @@ def test_exited_peer_is_rejected_per_connection_and_the_real_child_still_seals(m
     from runtime_protocol.local_execution_supervisor import RetainedProcess
 
     short_root = Path(tempfile.mkdtemp(prefix="ep-", dir="/tmp"))
+    b = None
     try:
         scope = short_root / "s"
         platform.private_directory(scope)
@@ -386,4 +398,6 @@ s=socket.socket(fileno=int(sys.argv[2])); s.sendmsg([b"x"],[(socket.SOL_SOCKET,s
             if child.poll() is None:
                 child.kill(); child.wait()
     finally:
+        if b is not None:
+            b.close()
         shutil.rmtree(short_root, ignore_errors=True)
