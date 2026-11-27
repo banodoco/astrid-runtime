@@ -3,17 +3,19 @@ import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from runtime_protocol import linux_process_binding as linux
 from runtime_protocol import platform, process_binding
+from tests.lanes import requires_linux_procfs_census
 
 
-pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux proc census")
 BOOT = "b38142f7-84c5-487d-95a4-8180cbff3972"
 
 
+@requires_linux_procfs_census
 def test_native_live_and_unreaped_child_birth_parity():
     child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
                              stdin=subprocess.PIPE)
@@ -65,6 +67,8 @@ def _record(pid, ppid, ticks, kind="live"):
 
 
 def _census_fixture(monkeypatch, observations, final_pids=None):
+    # Only dispatch selection is simulated: pure census logic runs on every OS.
+    monkeypatch.setattr(process_binding, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(linux, "_census_boot", lambda root: BOOT)
     first = set(observations)
     scans = iter((first, first if final_pids is None else final_pids))
@@ -145,6 +149,7 @@ def test_denied_vanished_and_new_rows_are_explicit(monkeypatch):
 
 
 def test_unavailable_census_is_not_an_empty_success(monkeypatch):
+    monkeypatch.setattr(process_binding, "sys", SimpleNamespace(platform="linux"))
     def denied(root):
         raise PermissionError("boot denied")
 
@@ -157,9 +162,11 @@ def test_unavailable_census_is_not_an_empty_success(monkeypatch):
         process_binding.zombie_birth(20)
 
 
+@requires_linux_procfs_census
 def test_proc_record_does_not_splice_reparented_topology(monkeypatch, tmp_path):
     proc = tmp_path / "20"
     proc.mkdir()
+    (proc / "status").write_bytes(b"Uid:\t501\t501\t501\t501\n")
     snapshots = iter([("42", 10, 20, 20, "live"), ("42", 1, 20, 20, "live")])
     monkeypatch.setattr(linux, "_read_census_stat", lambda directory, pid: next(snapshots))
     with pytest.raises(OSError, match="topology changed"):
@@ -175,3 +182,89 @@ def test_birth_builder_preserves_partial_scope_without_promoting_it():
         assert platform.process_birth_matches(partial, scoped) is None
     with pytest.raises(ValueError, match="start tick"):
         platform.linux_birth_id("bad")
+
+
+def test_status_uid_is_effective_not_real_saved_or_filesystem():
+    assert linux._parse_census_uid([b"Name: worker\n", b"Uid:\t1001\t1002\t1003\t1004\n"]) == 1002
+
+
+@pytest.mark.parametrize("lines", [
+    [],
+    [b"Uid: 1 2 3"],
+    [b"Uid: 1 -2 3 4"],
+    [b"Uid: 1 root 3 4"],
+    [b"Uid: 1 4294967295 3 4"],
+    [b"Uid: 1 2 3 4", b"Uid: 5 6 7 8"],
+], ids=["absent", "short", "negative", "nonnumeric", "out-of-range", "duplicate"])
+def test_malformed_status_uid_is_not_an_observation(lines):
+    with pytest.raises(OSError, match="status uid"):
+        linux._parse_census_uid(lines)
+
+
+@requires_linux_procfs_census
+def test_proc_record_uses_status_uid_not_directory_owner(monkeypatch, tmp_path):
+    proc = tmp_path / "20"
+    proc.mkdir()
+    actual_owner = proc.stat().st_uid
+    effective_uid = 1002 if actual_owner != 1002 else 1003
+    (proc / "status").write_text(f"Uid: 1001 {effective_uid} 1004 1005\n")
+    monkeypatch.setattr(linux, "_read_census_stat", lambda directory, pid: ("42", 10, 20, 20, "live"))
+    row, kind, ticks = linux._read_census_record(tmp_path, 20, None)
+    assert row["uid"] == effective_uid != actual_owner
+    assert kind == "live" and ticks == "42"
+
+
+@requires_linux_procfs_census
+def test_proc_record_rejects_uid_change_and_missing_status(monkeypatch, tmp_path):
+    proc = tmp_path / "20"
+    proc.mkdir()
+    monkeypatch.setattr(linux, "_read_census_stat", lambda directory, pid: ("42", 10, 20, 20, "live"))
+    with pytest.raises(OSError, match="effective UID observation unavailable"):
+        linux._read_census_record(tmp_path, 20, None)
+    observations = iter((1002, 1003))
+    monkeypatch.setattr(linux, "_read_census_uid", lambda directory: next(observations))
+    with pytest.raises(OSError, match="effective UID or topology changed"):
+        linux._read_census_record(tmp_path, 20, None)
+
+
+@requires_linux_procfs_census
+def test_native_nondumpable_self_observes_effective_uid():
+    # Do not change the pytest process's dumpability. The disposable child
+    # observes its own namespace; a different observer may be denied access.
+    script = """
+import ctypes
+import json
+import os
+from pathlib import Path
+from runtime_protocol import linux_process_binding as linux
+from runtime_protocol import platform
+libc = ctypes.CDLL(None, use_errno=True)
+assert libc.prctl(4, 0, 0, 0, 0) == 0, ctypes.get_errno()  # PR_SET_DUMPABLE
+assert libc.prctl(3, 0, 0, 0, 0) == 0  # PR_GET_DUMPABLE
+pid = os.getpid()
+root = Path('/proc')
+row, kind, _ = linux._read_census_record(root, pid, linux._census_boot(root))
+assert kind == 'live'
+assert row['uid'] == os.geteuid()
+assert row['birth_id'] == platform.process_identity(pid)['birth_id']
+print(json.dumps({'effective_uid': os.geteuid(), 'proc_owner': (root / str(pid)).stat().st_uid,
+                  'observed_uid': row['uid']}))
+"""
+    import json
+    completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["observed_uid"] == result["effective_uid"]
+    # On an ordinary unprivileged runner the inode owner really changes.
+    # A root runner cannot distinguish the values; the deterministic fixture
+    # above independently proves unequal owner/euid are handled correctly.
+    if result["effective_uid"] != 0:
+        assert result["proc_owner"] != result["effective_uid"]
+
+
+def test_census_dispatch_refuses_unsupported_os(monkeypatch):
+    monkeypatch.setattr(process_binding, "sys", SimpleNamespace(platform="darwin"))
+    for call in (process_binding.census, lambda: process_binding.zombie_birth(1),
+                 lambda: process_binding.birth_ticks(1)):
+        with pytest.raises(NotImplementedError):
+            call()
