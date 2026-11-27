@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -332,6 +333,13 @@ def test_token_snapshots_cannot_modify_a_retained_pin():
             assert authority.verify() == linux.token(child.pid)
             assert authority.identity == {key: platform.process_identity(child.pid)[key]
                                           for key in ("pid", "uid", "birth_id")}
+
+
+def test_default_child_authority_refuses_a_synthetic_process(monkeypatch):
+    synthetic = SimpleNamespace(pid=os.getpid(), returncode=None, _waitpid_lock=threading.Lock())
+    monkeypatch.setattr(platform, "pidfd_open", lambda *a: pytest.fail("synthetic child promoted"))
+    with pytest.raises(process_binding.ProcessBindingError, match="retained Popen"):
+        process_binding.retain_child(synthetic, reap_guard=threading.RLock())
 
 
 @pytest.mark.parametrize("field", ["pid", "uid", "birth_id"])

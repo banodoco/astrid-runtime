@@ -32,6 +32,7 @@ import threading
 from typing import Mapping, Sequence
 
 from . import platform
+from .process_binding import ProcessBindingError
 
 TOKEN_TAG = 0x4153544C  # "ASTL": Astrid Linux process token
 PRIMITIVE = "proc_signal_with_pidfd_identity"
@@ -41,7 +42,7 @@ SO_PEERPIDFD = 77  # Linux UAPI; Python does not expose it on every build.
 _IDENTITY_FIELDS = ("pid", "uid", "birth_id")
 
 
-class LinuxBindingError(RuntimeError):
+class LinuxBindingError(ProcessBindingError):
     """Raised when a Linux process token cannot be proven exactly."""
 
 

@@ -1372,11 +1372,14 @@ class RoleBoundCustodyBroker:
             if before is None or {key: before.get(key) for key in expected} != expected:
                 raise CustodyError("final-ready Runtime incarnation is unavailable")
             try:
-                if process_binding.LINUX:
-                    if self._native_peer is None:
+                if process_binding.LINUX and token_provider is current_process_audit_token:
+                    if getattr(self, "_native_peer", None) is None:
                         raise CustodyError("final-ready Linux process has no retained native authority")
                     token = dict(self._native_peer.verify(expected))
                 else:
+                    # Preserve the explicit provider seam used by native
+                    # backend callers/tests. A token alone still cannot signal:
+                    # _signal_registered requires retained Linux authority.
                     token = dict(token_provider(expected_pid))
             except _TaskNameUnavailable:
                 if self._post_exec_connection is None:
