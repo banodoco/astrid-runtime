@@ -185,6 +185,9 @@ class LinuxCensus:
     """One non-atomic observation of the visible proc mount, never custody.
 
     Partial results retain individually verified observations for diagnostics.
+    Live row uid is the effective UID from proc status, not proc-directory
+    ownership. It can differ from the legacy platform identity observation;
+    disagreement cannot establish custody.
     A missing row, partial/unavailable census, or unverified parent edge
     cannot establish absence or ancestry. Even a complete census requires
     independent retained-parent and child revalidation before adoption.
@@ -239,6 +242,28 @@ def _read_census_stat(directory: int, pid: int):
     return fields[19].decode("ascii"), ppid, pgid, session, kind
 
 
+def _parse_census_uid(lines) -> int:
+    """Read effective UID from the kernel status record, not proc ownership."""
+    rows = [line.split() for line in lines if line.startswith(b"Uid:")]
+    if (len(rows) != 1 or len(rows[0]) != 5 or rows[0][0] != b"Uid:"
+            or any(not field.isdigit() for field in rows[0][1:])):
+        raise OSError("malformed Linux process status uid")
+    values = tuple(map(int, rows[0][1:]))
+    if any(value >= 0xFFFFFFFF for value in values):
+        raise OSError("Linux process status uid out of range")
+    return values[1]  # real, effective, saved-set, filesystem
+
+
+def _read_census_uid(directory: int) -> int:
+    import os
+    try:
+        with os.fdopen(os.open("status", os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory), "rb") as stream:
+            return _parse_census_uid(stream)
+    except (FileNotFoundError, ProcessLookupError, PermissionError) as exc:
+        # A missing/denied status is not evidence that this incarnation exited.
+        raise OSError("Linux effective UID observation unavailable") from exc
+
+
 def _read_census_record(root, pid: int, boot: str | None):
     """Bracket a single incarnation and topology using its proc directory fd."""
     import os
@@ -252,7 +277,10 @@ def _read_census_record(root, pid: int, boot: str | None):
     try:
         try:
             first = _read_census_stat(directory, pid)
-            uid = os.fstat(directory).st_uid
+            # Nondumpable processes may have root-owned proc directories even
+            # while their effective UID is unprivileged. Do not infer identity
+            # or authority from that inode metadata.
+            uid = _read_census_uid(directory)
             namespace = None
             if boot is not None:
                 # Missing scope is an unknown observation, not a vanished pid.
@@ -262,11 +290,12 @@ def _read_census_record(root, pid: int, boot: str | None):
                     raise OSError("Linux PID namespace observation unavailable") from exc
                 if namespace <= 0:
                     raise OSError("Linux PID namespace observation malformed")
+            second_uid = _read_census_uid(directory)
             second = _read_census_stat(directory, pid)
         except (FileNotFoundError, ProcessLookupError):
             return None
-        if first != second or os.fstat(directory).st_uid != uid:
-            raise OSError("Linux process incarnation or topology changed during observation")
+        if first != second or second_uid != uid:
+            raise OSError("Linux process incarnation, effective UID or topology changed during observation")
         ticks, ppid, pgid, session, kind = second
         return ({"pid": pid, "uid": uid, "parent_pid": ppid,
                  "process_group": pgid, "session_id": session,
