@@ -1683,16 +1683,13 @@ def handoff_token(pid):
     """Encode native Windows identity in the existing eight-word token shape.
 
     These are creation-time observations, not Darwin audit tokens or signal
-    authority. Signalling still opens and pins a process handle in this module.
+    authority. Custody signalling requires an independently retained handle.
     """
     observed = process_identity(pid)
     if observed is None:
         raise ProcessLookupError(pid)
-    created = int(observed["birth_id"].removeprefix("windows-creation:"))
-    uid = observed["uid"]
-    words = [0x41535452, pid, uid & 0xffffffff, uid >> 32,
-             created & 0xffffffff, created >> 32, 0, 0]
-    return {**handoff_token_details(words), "words": words}
+    from .windows_handoff import _identity_token
+    return _identity_token(observed)
 
 
 def handoff_token_details(words):
@@ -1705,10 +1702,9 @@ def handoff_token_details(words):
             "pidversion": created, "sha256": "sha256:" + hashlib.sha256(struct.pack("=8I", *words)).hexdigest()}
 
 
-def handoff_signal_token(words, signum):
-    details = handoff_token_details(words)
-    return signal_process({"pid": details["pid"], "uid": details["uid"],
-                           "birth_id": f"windows-creation:{details['pidversion']}"}, signum)
+def handoff_signal_token(words, signum, *, authority=None):
+    from .windows_handoff import signal as signal_windows
+    return signal_windows(words, signum, authority=authority)
 
 
 def handoff_custody_executable(wrapper, target):
