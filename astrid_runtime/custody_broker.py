@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from typing import Callable, Mapping, Sequence
 
 
@@ -157,10 +158,8 @@ def _token_from_words(words: Sequence[int]) -> _AuditToken:
 
 
 def audit_token_details(words: Sequence[int]) -> dict[str, object]:
-    if process_binding.LINUX:
-        return linux_process_binding.details(words)
-    if sys.platform == "win32":
-        return platform.handoff_token_details(list(words))
+    if process_binding.backend() in ("linux", "windows"):
+        return process_binding.details(words)
     if sys.platform != "darwin":
         raise CustodyError("Darwin audit-token custody is unavailable")
     token = _token_from_words(words)
@@ -179,10 +178,8 @@ def audit_token_details(words: Sequence[int]) -> dict[str, object]:
 
 
 def _peer_token(connection: socket.socket) -> dict[str, object]:
-    if process_binding.LINUX:
-        return linux_process_binding.peer_token(connection)
-    if sys.platform == "win32":
-        return platform.handoff_peer_token(connection)
+    if process_binding.backend() in ("linux", "windows"):
+        return process_binding.peer_token(connection)
     if sys.platform != "darwin":
         raise CustodyError("Darwin audit-token custody is unavailable")
     raw = connection.getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN, TOKEN_BYTES)
@@ -195,11 +192,8 @@ def _peer_token(connection: socket.socket) -> dict[str, object]:
 
 def current_process_audit_token(pid: int) -> dict[str, object]:
     """Read a live Darwin audit token or native Windows creation identity."""
-    if process_binding.LINUX:
-        return linux_process_binding.token(pid)
-
-    if sys.platform == "win32":
-        return platform.handoff_token(pid)
+    if process_binding.backend() in ("linux", "windows"):
+        return process_binding.token(pid)
     if sys.platform != "darwin" or int(pid) <= 0:
         raise CustodyError("Darwin audit-token custody is unavailable")
     library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
@@ -251,13 +245,14 @@ def current_process_audit_token(pid: int) -> dict[str, object]:
             raise CustodyError("final-ready Runtime task-name port release failed")
 
 
-def signal_audit_token(words: Sequence[int], signum: int) -> None:
-    if process_binding.LINUX:
-        return linux_process_binding.signal(words, signum)
-    if int(signum) not in _admitted_signals():
+def signal_audit_token(words: Sequence[int], signum: int, *, authority=None) -> None:
+    if isinstance(signum, bool) or not isinstance(signum, int) or signum not in _admitted_signals():
         raise CustodyError("custody signal is outside the admitted set")
-    if sys.platform == "win32":
-        return platform.handoff_signal_token(words, signum)
+    if process_binding.backend() in ("linux", "windows"):
+        try:
+            return process_binding.signal(words, signum, authority=authority)
+        except process_binding.ProcessBindingError as exc:
+            raise CustodyError(str(exc)) from exc
     if sys.platform != "darwin":
         raise CustodyError("Darwin audit-token custody is unavailable")
     token = _token_from_words(words)
@@ -563,7 +558,41 @@ class AuthenticatedCleanupActor:
     @classmethod
     def private_peer(cls, channel: socket.socket,
                      *, identity_provider: Callable[[int], Mapping[str, object] | None] | None = None) -> AuthenticatedCleanupActor:
+        if process_binding.LINUX:
+            try:
+                authority = process_binding.retain_peer(channel)
+            except process_binding.ProcessBindingError as exc:
+                raise CustodyError(str(exc)) from exc
+            return cls._from_native(authority, identity_provider or default_process_identity)
         return cls(lambda: _peer_token(channel), identity_provider or default_process_identity)
+
+    @classmethod
+    def _from_native(cls, authority, identity_provider):
+        def read_token():
+            try:
+                return authority.verify()
+            except (process_binding.ProcessBindingError, linux_process_binding.LinuxBindingError) as exc:
+                raise CustodyError(str(exc)) from exc
+        try:
+            actor = cls(read_token, identity_provider)
+            # Explicit close/context management is the normal lifetime. The
+            # finalizer also covers legacy temporary observation-only callers.
+            actor._close_native = weakref.finalize(actor, authority.close)
+            return actor
+        except BaseException:
+            authority.close()
+            raise
+
+    def close(self) -> None:
+        closer = getattr(self, "_close_native", None)
+        if closer is not None:
+            closer()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
 
     @classmethod
     def retained_child(cls, child: subprocess.Popen[bytes], *,
@@ -576,6 +605,12 @@ class AuthenticatedCleanupActor:
         excludes its concurrent waiters while the initial token is captured.
         No arbitrary waitpid or SIGCHLD auto-reaper may own this child.
         """
+        if process_binding.LINUX and identity_provider is None and token_provider is None:
+            try:
+                authority = process_binding.retain_child(child, reap_guard=reap_guard)
+            except process_binding.ProcessBindingError as exc:
+                raise CustodyError(str(exc)) from exc
+            return cls._from_native(authority, default_process_identity)
         identity_provider = identity_provider or default_process_identity
         token_provider = token_provider or current_process_audit_token
         try:
@@ -1123,6 +1158,8 @@ class RoleBoundCustodyBroker:
         self.ack: dict[str, object] | None = None
         self.error: BaseException | None = None
         self._post_exec_authority_validated = False
+        self._native_peer = None
+        self._close_native_peer = None
         self._retain_post_exec_connection = bool(retain_post_exec_connection and sys.platform == "darwin")
         self._post_exec_connection: socket.socket | None = None
         self._cleanup_deadline: float | None = None
@@ -1227,6 +1264,7 @@ class RoleBoundCustodyBroker:
             actor=self.cleanup_actor, generation=self.custody_generation,
             expected_target=self.role_authority.reference()["target"], signum=signum,
             identity_provider=self._observe_registered_identity,
+            signal_provider=self._signal_registered,
         )
 
     def signal_failed_admission(self, signum: int, *, expected_pid: int) -> None:
@@ -1252,6 +1290,7 @@ class RoleBoundCustodyBroker:
             actor=self.cleanup_actor, generation=self.custody_generation,
             expected_target=self.role_authority.reference()["target"], signum=signum,
             identity_provider=self._observe_registered_identity,
+            signal_provider=self._signal_registered,
         )
 
     def signal_from_launch_parent(self, *, requester: AuthenticatedCleanupActor,
@@ -1271,7 +1310,33 @@ class RoleBoundCustodyBroker:
         self.role_authority.signal(actor=self.cleanup_actor, generation=generation,
                                    expected_target=expected_target, signum=signum,
                                    identity_provider=self._observe_registered_identity,
+                                   signal_provider=self._signal_registered,
                                    request_authorizer=authenticate_request)
+
+    def _signal_registered(self, words, signum) -> None:
+        if not process_binding.LINUX:
+            return signal_audit_token(words, signum)
+        if self._native_peer is None or self.registration is None:
+            raise CustodyError("registered Linux process has no retained native authority")
+        try:
+            self._native_peer.verify(self.registration["identity"])
+            signal_audit_token(words, signum, authority=self._native_peer)
+        except linux_process_binding.LinuxBindingError as exc:
+            raise CustodyError(str(exc)) from exc
+
+    def close(self) -> None:
+        """Release retained native custody after the owner's final operation."""
+        self.close_post_exec_channel()
+        closer = getattr(self, "_close_native_peer", None)
+        if closer is not None:
+            closer()
+        self.cleanup_actor.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
 
     def close_post_exec_channel(self) -> None:
         """Close the retained authenticated child channel after its last use."""
@@ -1307,7 +1372,12 @@ class RoleBoundCustodyBroker:
             if before is None or {key: before.get(key) for key in expected} != expected:
                 raise CustodyError("final-ready Runtime incarnation is unavailable")
             try:
-                token = dict(token_provider(expected_pid))
+                if process_binding.LINUX:
+                    if self._native_peer is None:
+                        raise CustodyError("final-ready Linux process has no retained native authority")
+                    token = dict(self._native_peer.verify(expected))
+                else:
+                    token = dict(token_provider(expected_pid))
             except _TaskNameUnavailable:
                 if self._post_exec_connection is None:
                     raise
@@ -1393,6 +1463,7 @@ class RoleBoundCustodyBroker:
             except (socket.timeout, TimeoutError) as exc:
                 raise CustodyError("custody registration timed out") from exc
             try:
+                native_peer = None
                 frame = _read_frame(connection, deadline=min(deadline, time.monotonic() + 2.0))
                 required = {"version", "command", "run_id", "role", "pid", "ppid", "argv_digest"}
                 if (
@@ -1407,17 +1478,29 @@ class RoleBoundCustodyBroker:
                     or frame["pid"] <= 0
                 ):
                     raise CustodyError("custody registration frame is invalid")
-                pre = _peer_token(connection)
+                if process_binding.LINUX:
+                    native_peer = process_binding.retain_peer(connection)
+                    pre = native_peer.verify()
+                else:
+                    pre = _peer_token(connection)
                 if pre["pid"] != frame["pid"] or pre["uid"] != platform.current_user():
                     raise CustodyError("custody registration kernel identity differs")
+                if native_peer is not None:
+                    self._native_peer = native_peer
+                    self._close_native_peer = weakref.finalize(self, native_peer.close)
                 return connection, frame
-            except (CustodyError, OSError, ValueError, UnicodeDecodeError, linux_process_binding.LinuxBindingError):
+            except (CustodyError, OSError, ValueError, UnicodeDecodeError,
+                    process_binding.ProcessBindingError, linux_process_binding.LinuxBindingError):
                 # Expected peer refusals (including a peer that exited before its identity was read)
                 # reject only this connection; the broker keeps accepting until the deadline.
                 connection.close()
+                if native_peer is not None:
+                    native_peer.close()
                 continue
             except BaseException:
                 connection.close()
+                if native_peer is not None:
+                    native_peer.close()
                 raise
 
     def _serve(self) -> None:
@@ -1442,7 +1525,7 @@ class RoleBoundCustodyBroker:
                 or frame["pid"] <= 0
             ):
                 raise CustodyError("custody registration frame is invalid")
-            pre = _peer_token(connection)
+            pre = self._native_peer.verify() if self._native_peer is not None else _peer_token(connection)
             if pre["pid"] != frame["pid"] or pre["uid"] != platform.current_user():
                 raise CustodyError("custody registration kernel identity differs")
             before = self.identity_provider(int(frame["pid"]))
@@ -1450,6 +1533,8 @@ class RoleBoundCustodyBroker:
                 raise CustodyError("pre-exec process identity is unavailable")
             if before.get("parent_pid") != self.launch_parent.verify()["pid"]:
                 raise CustodyError("registered process does not have the authenticated launch parent")
+            if self._native_peer is not None:
+                self._native_peer.verify(before)
             if time.monotonic() >= deadline:
                 raise CustodyError("custody registration timed out")
             self.sequence = 1
@@ -1497,7 +1582,7 @@ class RoleBoundCustodyBroker:
             deadline = time.monotonic() + self.timeout
             post: dict[str, object] | None = None
             while time.monotonic() < deadline:
-                candidate = _peer_token(connection)
+                candidate = self._native_peer.verify(before) if self._native_peer is not None else _peer_token(connection)
                 if candidate["pidversion"] != pre["pidversion"] or sys.platform == "win32" or not process_binding.ROTATES_ON_EXEC:
                     post = candidate
                     break
@@ -1552,6 +1637,8 @@ class RoleBoundCustodyBroker:
         except BaseException as exc:
             self.error = exc
         finally:
+            if not self._post_exec_authority_validated and self._close_native_peer is not None:
+                self._close_native_peer()
             self._ready.set()
             if connection is not None and connection is not self._post_exec_connection:
                 connection.close()
@@ -1844,14 +1931,17 @@ class NativeProcessCustody:
     """Private durable custody for a native owner, backed by pinned signal handles.
 
     macOS background launches retain the existing audit-token broker. Native
-    Linux/Windows owners use pidfd/OpenProcess at each adopted signal, checked
+    Linux operations require separately retained native authority, checked
     against the birth marker in this owner-only record. The guard serializes
     release, adoption, and delivery across concurrent operator invocations.
     """
-    def __init__(self, support_root: Path, identity: Mapping[str, object]):
+    def __init__(self, support_root: Path, identity: Mapping[str, object], *, authority=None):
         self.path = support_root / ACTIVE_CAPABILITY_NAME
         self.lock = support_root / "native-custody.lock"
         self.identity = {key: identity[key] for key in ("pid", "uid", "birth_id")}
+        # Borrowed from an authenticated channel or retained launch. The caller
+        # owns its lifetime; a persisted controller record cannot recreate it.
+        self._authority = authority
 
     def publish(self):
         controller = default_process_identity(os.getpid())
@@ -1897,8 +1987,8 @@ class NativeProcessCustody:
             _atomic_owner_json(self.path, record)
         return {"state": "released"}
 
-    def signal(self, signum, *, validate=None):
-        if signum not in (platform.TERM, platform.KILL):
+    def signal(self, signum, *, validate=None, authority=None):
+        if isinstance(signum, bool) or signum not in (platform.TERM, platform.KILL):
             raise CustodyError("native Runtime signal is outside the admitted set")
         _validate_private_directory(self.path.parent, label="native custody parent")
         # This may run in a separate controller process; it follows the
@@ -1915,6 +2005,14 @@ class NativeProcessCustody:
                     raise CustodyError("native Runtime cleanup is owned by another live controller")
             if validate is not None:
                 validate()
+            native = authority if authority is not None else self._authority
+            if process_binding.LINUX:
+                if not isinstance(native, linux_process_binding.PeerHandle):
+                    raise CustodyError("native Linux cleanup requires retained authority from the original peer or owned child")
+                try:
+                    native.verify(self.identity)
+                except linux_process_binding.LinuxBindingError as exc:
+                    raise CustodyError(str(exc)) from exc
             record["controller"], record["state"] = actor, "owned"
             _atomic_owner_json(self.path, record)
             if process_binding.LINUX or sys.platform == "darwin":
@@ -1923,13 +2021,11 @@ class NativeProcessCustody:
                     raise CustodyError("native Runtime incarnation changed")
                 try:
                     if process_binding.LINUX:
-                        words = linux_process_binding.token(int(self.identity["pid"]))["words"]
-                        observed = default_process_identity(int(self.identity["pid"]))
-                        if observed is None or any(observed.get(k) != v for k, v in self.identity.items()):
-                            raise CustodyError("native Runtime incarnation changed")
+                        words = native.verify(self.identity)["words"]
+                        signal_audit_token(words, signum, authority=native)
                     else:
                         words = record["audit_token_words"]
-                    signal_audit_token(words, signum)
+                        signal_audit_token(words, signum)
                 except (linux_process_binding.LinuxBindingError, OSError, KeyError, TypeError) as exc:
                     raise CustodyError(str(exc)) from exc
             else:

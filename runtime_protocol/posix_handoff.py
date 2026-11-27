@@ -9,6 +9,19 @@ import sys
 from .errors import ConflictError
 from typing import Any
 
+
+def peer_token(channel):
+    """Observe the native peer; a returned token does not grant custody."""
+    from . import process_binding
+    return process_binding.peer_token(channel)
+
+
+def retain_peer(channel, *, expected=None):
+    """The caller keeps and closes this native reference around its operation."""
+    from . import process_binding
+    return process_binding.retain_peer(channel, expected=expected)
+
+
 def peer_uid(channel: socket.socket) -> int:
     """Return the kernel-authenticated UID of a connected Unix peer."""
 
