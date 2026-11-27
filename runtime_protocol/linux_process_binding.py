@@ -179,3 +179,211 @@ def pidfd_available() -> bool:
         return False
     finally:
         os.close(fd)
+
+
+class LinuxCensus:
+    """One non-atomic observation of the visible proc mount, never custody.
+
+    Partial results retain individually verified observations for diagnostics.
+    A missing row, partial/unavailable census, or unverified parent edge
+    cannot establish absence or ancestry. Even a complete census requires
+    independent retained-parent and child revalidation before adoption.
+    """
+
+    def __init__(self):
+        self.live: dict[int, dict] = {}
+        self.exited: dict[int, str] = {}
+        self.unknown: dict[int, str] = {}
+        self.unverified_parents: tuple[int, ...] = ()
+        self.status = "unavailable"
+        self.failure: str | None = None
+
+
+def _proc_root():
+    from pathlib import Path
+    return Path("/proc")
+
+
+def _census_boot(root) -> str:
+    import uuid
+    boot = (root / "sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    if str(uuid.UUID(boot)) != boot:
+        raise ValueError("Linux boot identity is malformed")
+    return boot
+
+
+def _read_census_stat(directory: int, pid: int):
+    import os
+    with os.fdopen(os.open("stat", os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory), "rb") as stream:
+        prefix, separator, suffix = stream.read().rpartition(b")")
+    fields = suffix.split()
+    if (not separator or b" (" not in prefix
+            or prefix.partition(b" (")[0] != str(pid).encode("ascii")
+            or len(fields) < 20 or not fields[19].isdigit()):
+        raise OSError("malformed Linux process stat")
+    try:
+        ppid, pgid, session = map(int, fields[1:4])
+    except ValueError as exc:
+        raise OSError("malformed Linux process topology") from exc
+    if min(ppid, pgid, session) < 0:
+        raise OSError("negative Linux process topology")
+    state = fields[0]
+    if state == b"Z":
+        kind = "exited"
+    elif state in (b"X", b"x"):
+        kind = "dying"  # Not a positive unreaped-zombie witness.
+    elif state in (b"R", b"S", b"D", b"T", b"t", b"W", b"K", b"P", b"I"):
+        kind = "live"
+    else:
+        raise OSError("unknown Linux process state")
+    return fields[19].decode("ascii"), ppid, pgid, session, kind
+
+
+def _read_census_record(root, pid: int, boot: str | None):
+    """Bracket a single incarnation and topology using its proc directory fd."""
+    import os
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("Linux process pid must be positive")
+    try:
+        directory = os.open(root / str(pid), os.O_RDONLY | os.O_DIRECTORY
+                            | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        try:
+            first = _read_census_stat(directory, pid)
+            uid = os.fstat(directory).st_uid
+            namespace = None
+            if boot is not None:
+                # Missing scope is an unknown observation, not a vanished pid.
+                try:
+                    namespace = os.stat("ns/pid", dir_fd=directory).st_ino
+                except OSError as exc:
+                    raise OSError("Linux PID namespace observation unavailable") from exc
+                if namespace <= 0:
+                    raise OSError("Linux PID namespace observation malformed")
+            second = _read_census_stat(directory, pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        if first != second or os.fstat(directory).st_uid != uid:
+            raise OSError("Linux process incarnation or topology changed during observation")
+        ticks, ppid, pgid, session, kind = second
+        return ({"pid": pid, "uid": uid, "parent_pid": ppid,
+                 "process_group": pgid, "session_id": session,
+                 "birth_id": platform.linux_birth_id(ticks, boot_id=boot, pidns_inode=namespace)},
+                kind, ticks)
+    finally:
+        os.close(directory)
+
+
+def _census_pids(root) -> set[int]:
+    return {int(path.name) for path in root.iterdir()
+            if path.name.isascii() and path.name.isdigit() and int(path.name) > 0}
+
+
+def census() -> LinuxCensus:
+    """Return live identities and separate positive Z witnesses.
+
+    Status is relative to the visible proc mount, not proof of global process
+    absence. In particular permission-denied namespaces are explicit unknown
+    rows (ordinary unprivileged hosts may have such rows).
+    """
+    result = LinuxCensus()
+    root = _proc_root()
+    try:
+        boot = _census_boot(root)
+        pids = _census_pids(root)
+        if not pids:
+            raise OSError("Linux proc census contains no visible process")
+    except (OSError, ValueError, UnicodeError) as exc:
+        result.failure = f"Linux proc census unavailable: {exc}"
+        return result
+
+    records = {}
+    for pid in sorted(pids):
+        try:
+            record = _read_census_record(root, pid, boot)
+            if record is None:
+                raise OSError("enumerated process disappeared")
+            if record[1] == "dying":
+                raise OSError("dying process is not a zombie witness")
+            records[pid] = record
+        except (OSError, ValueError, UnicodeError) as exc:
+            result.unknown[pid] = str(exc)
+
+    # Never splice a new parent onto an old birth. Revalidate each whole row;
+    # changed/recycled/reparented rows are unknown for this census.
+    for pid, first in records.items():
+        try:
+            second = _read_census_record(root, pid, boot)
+            if second != first:
+                raise OSError("Linux process incarnation or topology changed across census")
+            row, kind, _ticks = first
+            if kind == "exited":
+                result.exited[pid] = row["birth_id"]
+            else:
+                result.live[pid] = row
+        except (OSError, ValueError, UnicodeError) as exc:
+            result.unknown[pid] = str(exc)
+
+    try:
+        final_pids = _census_pids(root)
+        if _census_boot(root) != boot:
+            raise OSError("Linux boot identity changed across census")
+    except (OSError, ValueError, UnicodeError) as exc:
+        result.live.clear()
+        result.exited.clear()
+        result.failure = f"Linux proc census unavailable: {exc}"
+        return result
+    for pid in final_pids - pids:
+        result.unknown[pid] = "process appeared during census"
+    for pid in pids - final_pids:
+        result.live.pop(pid, None)
+        # A scoped Z observation remains a positive witness for that birth,
+        # not for a replacement. Absence itself is never an exit witness.
+        result.unknown[pid] = "process disappeared during census"
+
+    unverified = []
+    for pid, row in result.live.items():
+        parent_pid = row["parent_pid"]
+        if not parent_pid:
+            continue
+        parent = result.live.get(parent_pid)
+        if (parent is None or parent_pid == pid
+                or int(records[parent_pid][2]) > int(records[pid][2])):
+            unverified.append(pid)
+    result.unverified_parents = tuple(sorted(unverified))
+    if result.unknown or result.unverified_parents:
+        result.status = "partial"
+        result.failure = ("Linux proc census partial: "
+                          f"{len(result.unknown)} unknown rows, "
+                          f"{len(result.unverified_parents)} unverified parent edges")
+    else:
+        result.status = "complete"
+    return result
+
+
+def zombie_birth(pid: int) -> str | None:
+    """Return the canonical birth only for an observed unreaped Z incarnation.
+
+    An unavailable scope or changing observation raises; X/x is not a witness.
+    """
+    root = _proc_root()
+    try:
+        boot = _census_boot(root)
+    except (ValueError, UnicodeError) as exc:
+        raise OSError("Linux boot identity unavailable") from exc
+    record = _read_census_record(root, pid, boot)
+    if record is not None and record[1] == "exited":
+        return record[0]["birth_id"]
+    return None
+
+
+def birth_ticks(pid: int) -> str | None:
+    """Live start ticks for the legacy Vibe registry, observation only.
+
+    No boot or namespace is inferred from these ticks; never use them to
+    promote an old journal or numeric PID to native authority.
+    """
+    record = _read_census_record(_proc_root(), pid, None)
+    return record[2] if record is not None and record[1] == "live" else None
