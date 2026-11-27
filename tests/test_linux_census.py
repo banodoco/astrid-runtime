@@ -227,39 +227,67 @@ def test_proc_record_rejects_uid_change_and_missing_status(monkeypatch, tmp_path
         linux._read_census_record(tmp_path, 20, None)
 
 
-@requires_linux_procfs_census
-def test_native_nondumpable_self_observes_effective_uid():
+def _native_nondumpable_self_observation():
     # Do not change the pytest process's dumpability. The disposable child
     # observes its own namespace; a different observer may be denied access.
     script = """
 import ctypes
 import json
 import os
+import sys
 from pathlib import Path
 from runtime_protocol import linux_process_binding as linux
 from runtime_protocol import platform
+if not __debug__ or sys.platform != 'linux':
+    raise RuntimeError('native census observation requires Linux with assertions enabled')
 libc = ctypes.CDLL(None, use_errno=True)
 assert libc.prctl(4, 0, 0, 0, 0) == 0, ctypes.get_errno()  # PR_SET_DUMPABLE
-assert libc.prctl(3, 0, 0, 0, 0) == 0  # PR_GET_DUMPABLE
+dumpable = libc.prctl(3, 0, 0, 0, 0)  # PR_GET_DUMPABLE
+assert dumpable == 0
 pid = os.getpid()
 root = Path('/proc')
 row, kind, _ = linux._read_census_record(root, pid, linux._census_boot(root))
 assert kind == 'live'
 assert row['uid'] == os.geteuid()
 assert row['birth_id'] == platform.process_identity(pid)['birth_id']
-print(json.dumps({'effective_uid': os.geteuid(), 'proc_owner': (root / str(pid)).stat().st_uid,
-                  'observed_uid': row['uid']}))
+proc = root / str(pid)
+status_uid = [line.split() for line in (proc / 'status').read_text().splitlines()
+              if line.startswith('Uid:')]
+assert len(status_uid) == 1 and len(status_uid[0]) == 5
+status_euid = int(status_uid[0][2])
+assert status_euid == os.geteuid()
+print(json.dumps({'effective_uid': os.geteuid(), 'proc_owner': proc.stat().st_uid,
+                  'observed_uid': row['uid'], 'status_euid': status_euid,
+                  'dumpable': dumpable, 'birth_id': row['birth_id'],
+                  'kernel': os.uname().release, 'uid_map': (proc / 'uid_map').read_text(),
+                  'pidns': os.readlink(proc / 'ns/pid'),
+                  'userns': os.readlink(proc / 'ns/user')}))
 """
     import json
     completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=10)
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
     result = json.loads(completed.stdout)
-    assert result["observed_uid"] == result["effective_uid"]
-    # On an ordinary unprivileged runner the inode owner really changes.
-    # A root runner cannot distinguish the values; the deterministic fixture
-    # above independently proves unequal owner/euid are handled correctly.
-    if result["effective_uid"] != 0:
-        assert result["proc_owner"] != result["effective_uid"]
+    assert result["observed_uid"] == result["effective_uid"] == result["status_euid"]
+    assert result["dumpable"] == 0
+    return result
+
+
+@requires_linux_procfs_census
+def test_native_nondumpable_self_observes_effective_uid():
+    # Ordinary CI proves real nondumpable EUID/birth semantics, not venue
+    # capability. Equal owner/EUID here is neither a skip nor strict proof.
+    _native_nondumpable_self_observation()
+
+
+def _require_strict_native_unequal_owner_witness():
+    """Mandatory separate native qualification; never satisfied by ordinary CI."""
+    if not __debug__ or sys.platform != "linux":
+        raise RuntimeError("strict native witness requires Linux with assertions enabled")
+    result = _native_nondumpable_self_observation()
+    import json
+    print(json.dumps(result, sort_keys=True), flush=True)
+    assert result["effective_uid"] != 0, "strict witness requires unprivileged EUID"
+    assert result["proc_owner"] != result["effective_uid"], "venue did not produce unequal proc owner/EUID"
 
 
 def test_census_dispatch_refuses_unsupported_os(monkeypatch):
@@ -268,3 +296,8 @@ def test_census_dispatch_refuses_unsupported_os(monkeypatch):
                  lambda: process_binding.birth_ticks(1)):
         with pytest.raises(NotImplementedError):
             call()
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--strict-native-witness"]:
+        raise SystemExit("usage: python -m tests.test_linux_census --strict-native-witness")
+    _require_strict_native_unequal_owner_witness()
