@@ -11,13 +11,15 @@ import errno
 import json
 import uuid
 from runtime_protocol.dirfd import filesystem as os
-from runtime_protocol import platform
+from runtime_protocol import platform, process_binding
 from runtime_protocol import cancellation
 from pathlib import Path
 import stat
 import subprocess
 import sys
 import time
+import threading
+import weakref
 import urllib.error
 import urllib.request
 from typing import Any, Mapping
@@ -413,6 +415,8 @@ class LocalRuntimeBoundary:
         # daemon, even when inherited from an older launcher environment.
         environment.pop("ASTRID_INSTALLER_OPERATION_ID", None)
         if sys.platform != "darwin":
+            if sys.platform == "linux" and not process_binding.supported():
+                raise BootstrapError("Linux pidfd custody is unavailable")
             if sys.platform == "win32":
                 from runtime_protocol.windows_handoff import python_executable
 
@@ -429,6 +433,21 @@ class LocalRuntimeBoundary:
             process._runtime_stop_grace = SERVICE_OWNER_STOP_GRACE_SECONDS if "--service-declaration" in argv else 5.0
             process._runtime_boundary_sole_reaper = True
             self._process = process
+            if sys.platform == "linux":
+                # Capture from this independently owned direct child, before
+                # readiness, publication or any other controller can reap it.
+                guard = threading.RLock()
+                process._runtime_native_reap_guard = guard
+                try:
+                    native = process_binding.retain_child(process, reap_guard=guard)
+                except process_binding.ProcessBindingError as exc:
+                    if process.poll() is None:
+                        # Preserve the actual child for explicit recovery; do
+                        # not turn a failed native capture into PID authority.
+                        process._runtime_cleanup_error = exc
+                    raise BootstrapError(f"Runtime child native authority unavailable: {exc}") from exc
+                process._runtime_native_authority = native
+                weakref.finalize(process, native.close)
             return process, None
         run_id = uuid.uuid4().hex
         ledger_root = support_root / "runtime-custody" / run_id
@@ -470,8 +489,12 @@ class LocalRuntimeBoundary:
         return process, broker
 
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path, source_profile: SourceProfile) -> Mapping[str, Any]:
-        if self._process and self._process.poll() is None:
-            raise BootstrapError("runtime boundary already owns a live daemon")
+        if self._process:
+            if self._process.poll() is None:
+                raise BootstrapError("runtime boundary already owns a live daemon")
+            previous = getattr(self._process, "_runtime_native_authority", None)
+            if previous is not None:
+                previous.close()
         realm_root = self._validate_path(Path(realm_root), "realm root")
         owner_lock = self._validate_path(Path(owner_lock), "owner lock")
         support_root = self._validate_path(owner_lock.parent, "runtime support root")
@@ -512,7 +535,10 @@ class LocalRuntimeBoundary:
             if platform.process_birth_matches(str(discovery.get("process_birth_id") or ""), str(identity.get("birth_id") or "")) is not True:
                 raise BootstrapError("Ready Runtime birth identity differs from discovery.")
             if broker is None:
-                custody = NativeProcessCustody(support_root, identity)
+                custody = NativeProcessCustody(
+                    support_root, identity,
+                    authority=getattr(self._process, "_runtime_native_authority", None),
+                )
                 custody.publish()
                 self._process._runtime_native_custody = custody
             else:
@@ -834,7 +860,43 @@ class LocalRuntimeBoundary:
         broker = getattr(process, "_runtime_custody_broker", None)
         grace = getattr(process, "_runtime_stop_grace", 5.0)
         try:
-            if sys.platform != "darwin":
+            if sys.platform == "linux":
+                native = getattr(process, "_runtime_native_authority", None)
+                if process.poll() is not None:
+                    if native is not None:
+                        native.close()
+                    return
+                if native is None or not getattr(process, "_runtime_boundary_sole_reaper", False):
+                    raise CustodyError("native Linux cleanup requires retained authority from the owned child")
+                custody = getattr(process, "_runtime_native_custody", None)
+                with process._runtime_native_reap_guard:
+                    try:
+                        for signum, timeout in ((platform.TERM, grace), (platform.KILL, 2.0)):
+                            if process.poll() is not None:
+                                return
+                            try:
+                                if custody is not None:
+                                    custody.signal(signum)
+                                else:
+                                    # Failed admission before publication:
+                                    # only the original direct-child handle.
+                                    native.signal(signum)
+                            except (CustodyError, process_binding.ProcessBindingError):
+                                if process.poll() is not None:
+                                    return
+                                raise
+                            try:
+                                process.wait(timeout=timeout)
+                                return
+                            except subprocess.TimeoutExpired:
+                                continue
+                        raise CustodyError("Runtime child remains alive after bounded native custody cleanup")
+                    finally:
+                        # An uncertain live target keeps its original handle
+                        # for retry; never recapture via its numeric PID.
+                        if process.poll() is not None:
+                            native.close()
+            elif sys.platform != "darwin":
                 platform.stop_tree(process, grace=grace)
                 return
             if not getattr(process, "_runtime_boundary_sole_reaper", False):
@@ -867,7 +929,7 @@ class LocalRuntimeBoundary:
                 except subprocess.TimeoutExpired:
                     continue
             raise CustodyError("Runtime child remains alive after bounded kernel-custody cleanup")
-        except (CustodyError, OSError) as exc:
+        except (CustodyError, process_binding.ProcessBindingError, OSError) as exc:
             failure = BootstrapError(f"Runtime cleanup remains uncertain: {exc}")
             process._runtime_cleanup_error = failure
             if primary is not None:
@@ -951,9 +1013,9 @@ class LocalRuntimeBoundary:
 
         ``astrid-runtime up`` intentionally leaves the daemon in its own
         process group, so a later CLI invocation has no ``Popen`` handle.  The
-        support lock/discovery record is the only durable hand-off; adopting
-        it here lets restart terminate exactly that owner and relaunch the
-        same realm without opening its database in the launcher.
+        support lock/discovery record selects the candidate only. Linux
+        restart must authenticate the original daemon peer and retain its
+        native reference before any privileged action.
         """
         self._source = source_profile
         self._realm_id = str(realm_id)
@@ -1098,18 +1160,28 @@ class LocalRuntimeBoundary:
             validate_before_signal(require_health=require_health)
             identity = {"pid": detached, "birth_id": expected_birth, "uid": platform.current_user()}
             if native_owner:
-                custody = NativeProcessCustody(support, identity)
-                custody.signal(platform.TERM, validate=lambda: validate_before_signal(require_health=require_health))
-                deadline = time.monotonic() + shutdown_grace
-                while self.is_pid_alive(detached) and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                if self.is_pid_alive(detached):
-                    custody.signal(platform.KILL, validate=validate_escalation_target)
-                deadline = time.monotonic() + 2.0
-                while self.is_pid_alive(detached) and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                if self.is_pid_alive(detached):
-                    raise BootstrapError("Runtime native cleanup remains uncertain after bounded wait.")
+                native = None
+                try:
+                    if sys.platform == "linux":
+                        from runtime_protocol.native_owner_peer import retain_owner_peer
+                        native = retain_owner_peer(expected_instance, expected=identity)
+                    custody = NativeProcessCustody(support, identity, authority=native)
+                    custody.signal(platform.TERM, validate=lambda: validate_before_signal(require_health=require_health))
+                    deadline = time.monotonic() + shutdown_grace
+                    while self.is_pid_alive(detached) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    if self.is_pid_alive(detached):
+                        custody.signal(platform.KILL, validate=validate_escalation_target)
+                    deadline = time.monotonic() + 2.0
+                    while self.is_pid_alive(detached) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    if self.is_pid_alive(detached):
+                        raise BootstrapError("Runtime native cleanup remains uncertain after bounded wait.")
+                except (CustodyError, process_binding.ProcessBindingError) as exc:
+                    raise BootstrapError(f"Runtime native cleanup refused: {exc}") from exc
+                finally:
+                    if native is not None:
+                        native.close()
                 self._detached_pid = None
                 if not start_after_stop:
                     return {"state": "stopped", "realm_id": realm_id}

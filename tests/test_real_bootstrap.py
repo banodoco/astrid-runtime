@@ -166,6 +166,7 @@ def test_real_subprocess_stale_discovery_recovers_without_new_realm(tmp_path, ow
         boundary.stop()
 
 
+@pytest.mark.needs_real_pidfd
 @pytest.mark.parametrize("clean_filter", [False, True])
 def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkeypatch, clean_filter):
     """Both live-owner entrypoints refuse an edited source tree before writes."""
@@ -245,7 +246,21 @@ def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkey
             support_root=paths.runtime_support,
             pid=int(original_discovery["pid"]),
         )
-        restarted = restart(paths, restart_boundary, config)
+        from runtime_protocol import platform
+        calls = []
+        send = platform.pidfd_send_signal
+        def witness(fd, signum, *args, **kwargs):
+            if signum and sys.platform == "linux":
+                info = Path(f"/proc/self/fdinfo/{fd}").read_text()
+                pid = int(next(line.split()[1] for line in info.splitlines() if line.startswith("Pid:")))
+                calls.append((fd, pid, signum))
+            return send(fd, signum, *args, **kwargs)
+        with monkeypatch.context() as observe:
+            observe.setattr(platform, "pidfd_send_signal", witness)
+            restarted = restart(paths, restart_boundary, config)
+        if sys.platform == "linux":
+            assert calls and calls[0][1:] == (int(original_discovery["pid"]), platform.TERM)
+            assert all(pid == int(original_discovery["pid"]) and fd == calls[0][0] for fd, pid, _ in calls)
         assert restarted.status == "restarted"
         assert restarted.runtime_instance_id != first.runtime_instance_id
         updated = json.loads(paths.discovery_path.read_text(encoding="utf-8"))
@@ -267,6 +282,7 @@ def test_linux_loopback_identity_refusal_and_idle_dirty_restart(tmp_path, monkey
         _stop_unfinished(first_boundary)
 
 
+@pytest.mark.needs_real_pidfd
 @pytest.mark.parametrize("checkout", ["runtime", "agent"])
 def test_linux_loopback_untracked_nested_checkout_refuses_up_and_connect(tmp_path, monkeypatch, checkout):
     """Unsupported nested checkouts refuse both callers before any owner work."""
@@ -327,6 +343,7 @@ def test_linux_loopback_untracked_nested_checkout_refuses_up_and_connect(tmp_pat
         _stop_unfinished(boundary)
 
 
+@pytest.mark.needs_real_pidfd
 @pytest.mark.parametrize("checkout", ["runtime", "agent"])
 @pytest.mark.parametrize("nested_kind", ["ordinary", "linked"])
 def test_cli_indexed_file_replaced_by_checkout_refuses_live_owner(

@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import stat
 import sys
+import errno
 
 import pytest
 
@@ -77,6 +78,7 @@ def started_owner(tmp_path, monkeypatch):
             if process.poll() is None:
                 process.kill()
             process.wait(timeout=10)
+            boundary.stop()
 
 
 @pytest.fixture
@@ -95,6 +97,7 @@ def delivered_signals(monkeypatch):
     return calls
 
 
+@pytest.mark.needs_real_pidfd
 def test_start_publishes_native_custody_and_term_signals_exact_owner(started_owner, delivered_signals):
     boundary, support, result = started_owner
     process = boundary._process
@@ -121,6 +124,7 @@ def test_start_publishes_native_custody_and_term_signals_exact_owner(started_own
     assert process.wait(timeout=10) == -signal.SIGTERM
 
 
+@pytest.mark.needs_real_pidfd
 @pytest.mark.parametrize("field", ["birth_id", "uid"])
 def test_forged_record_and_stale_incarnation_are_refused(started_owner, delivered_signals, field):
     boundary, support, _ = started_owner
@@ -131,7 +135,7 @@ def test_forged_record_and_stale_incarnation_are_refused(started_owner, delivere
     forged = dict(record["target"])
     forged[field] = forged[field] + "-stale" if field == "birth_id" else forged[field] + 1
     # The actual published custody rejects a forged expected target at the record fence.
-    imposter = NativeProcessCustody(support, forged)
+    imposter = NativeProcessCustody(support, forged, authority=native._authority)
     with pytest.raises(CustodyError, match="differs from the selected owner"):
         imposter.signal(platform.TERM)
     assert delivered_signals == [] and process.poll() is None
@@ -139,12 +143,13 @@ def test_forged_record_and_stale_incarnation_are_refused(started_owner, delivere
     # identity check refuses it before any signal reaches the kernel.
     record["target"] = forged
     path.write_text(json.dumps(record))
-    with pytest.raises(CustodyError, match="incarnation changed"):
+    with pytest.raises(CustodyError, match="differs from expected incarnation"):
         imposter.signal(platform.TERM)
     assert delivered_signals == [] and process.poll() is None
     assert platform.process_identity(process.pid)["birth_id"] == native.identity["birth_id"]
 
 
+@pytest.mark.needs_real_pidfd
 def test_reaped_owner_is_refused_without_signal(started_owner, delivered_signals):
     boundary, _, _ = started_owner
     process = boundary._process
@@ -155,3 +160,47 @@ def test_reaped_owner_is_refused_without_signal(started_owner, delivered_signals
     with pytest.raises(CustodyError):
         custody.signal(platform.TERM)
     assert delivered_signals == []
+
+
+@pytest.mark.needs_real_pidfd
+def test_journal_alone_never_authorizes_even_same_controller(started_owner, delivered_signals):
+    boundary, support, _ = started_owner
+    process = boundary._process
+    target = process._runtime_native_custody.identity
+    before = (support / ACTIVE_CAPABILITY_NAME).read_bytes()
+    with pytest.raises(CustodyError, match="requires retained authority"):
+        NativeProcessCustody(support, target).signal(platform.TERM)
+    assert (support / ACTIVE_CAPABILITY_NAME).read_bytes() == before
+    assert delivered_signals == [] and process.poll() is None
+
+
+@pytest.mark.needs_real_pidfd
+def test_boundary_stop_uses_owned_child_native_term_and_closes(started_owner, delivered_signals):
+    boundary, _, _ = started_owner
+    process = boundary._process
+    native = process._runtime_native_authority
+    boundary.stop()
+    assert [(pid, signum) for pid, _, signum in delivered_signals if signum] == [
+        (process.pid, platform.TERM)]
+    assert process.returncode == -signal.SIGTERM
+    from runtime_protocol.linux_process_binding import LinuxBindingError
+    with pytest.raises(LinuxBindingError, match="closed"):
+        native.verify()
+
+
+def test_denied_pidfd_publication_is_named_refusal(tmp_path, monkeypatch, request):
+    # The configured seccomp job must witness the actual denial; on a normal
+    # native lane inject only the syscall failure, not the publication result.
+    if request.config.getoption("--process-control") == "sandbox":
+        with pytest.raises(OSError) as error:
+            platform.pidfd_open(os.getpid())
+        assert error.value.errno in (errno.ENOSYS, errno.EPERM, errno.EACCES)
+    else:
+        def denied(*args, **kwargs):
+            raise OSError(errno.ENOSYS, "pidfd denied")
+        monkeypatch.setattr(platform, "pidfd_open", denied)
+    identity = platform.process_identity(os.getpid())
+    assert identity is not None
+    with pytest.raises(CustodyError, match="Linux pidfd custody is unavailable"):
+        NativeProcessCustody(tmp_path, identity).publish()
+    assert not (tmp_path / ACTIVE_CAPABILITY_NAME).exists()
