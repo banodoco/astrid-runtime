@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from astrid_runtime.bootstrap import BootstrapError, bootstrap, down, inspect_upgrade_stop
+from astrid_runtime.bootstrap import BootstrapError, admit_deferred_upgrade, bootstrap, down, inspect_upgrade_stop
 import test_bootstrap as bootstrap_fixture
 
 
@@ -68,6 +68,66 @@ def test_inspection_has_no_writes_and_authenticates_endpoint(owner):
     with pytest.raises(BootstrapError, match="failed validation"):
         inspect_upgrade_stop(paths, boundary)
     assert snapshot(paths) == before
+
+
+def test_deferred_request_is_fenced_without_owner_stop_or_cleanup(owner):
+    paths, boundary, root = owner
+    expected = inspect_upgrade_stop(paths, boundary)
+    before = snapshot(paths)
+    calls = []
+    def admit():
+        assert snapshot(paths) == before
+        with sqlite3.connect(root / "realm.sqlite3", timeout=0) as db:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                db.execute("BEGIN IMMEDIATE")
+        calls.append("durable-request")
+        return "accepted"
+    assert admit_deferred_upgrade(paths, boundary, expected,
+                                   validate=lambda observed: calls.append(observed), on_admitted=admit) == "accepted"
+    assert calls == [expected, "durable-request"] and snapshot(paths) == before
+    assert expected.owner["pid"] in boundary.alive and boundary.restart_calls == 0
+
+
+@pytest.mark.parametrize("change", ["live-resume", "reused", "unknown", "catalog", "lock", "busy", "installer"])
+def test_failed_deferred_admission_has_no_callback_or_runtime_writes(owner, change):
+    paths, boundary, root = owner
+    expected = inspect_upgrade_stop(paths, boundary)
+    if change in {"reused", "unknown"}:
+        boundary.process_birth_identity = lambda _pid: "reused" if change == "reused" else None
+    elif change == "catalog":
+        catalog = json.loads(paths.catalog_path.read_text())
+        catalog["fixture_change"] = True
+        paths.catalog_path.write_text(json.dumps(catalog))
+    elif change == "lock":
+        paths.bootstrap_lock_path.rename(paths.bootstrap_lock_path.with_suffix(".previous"))
+        paths.bootstrap_lock_path.touch(mode=0o600)
+    elif change == "busy":
+        with sqlite3.connect(root / "realm.sqlite3") as db:
+            db.execute("INSERT INTO tasks(id,run_id,capability,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                       ("deferred-busy", "run", "render", "running", "now", "now"))
+    def validate(_observed):
+        if change == "installer":
+            raise ValueError("changed installer selection")
+    before = snapshot(paths)
+    with pytest.raises((BootstrapError, ValueError)):
+        admit_deferred_upgrade(paths, boundary, expected, validate=validate,
+                                on_admitted=lambda: pytest.fail("write before fence"), require_quiescent=change == "live-resume")
+    assert snapshot(paths) == before and boundary.restart_calls == 0
+
+
+def test_deferred_quiescence_must_be_fresh_and_does_not_clean_stale_publications(owner):
+    paths, boundary, _root = owner
+    live = inspect_upgrade_stop(paths, boundary)
+    boundary.alive.clear()
+    before = snapshot(paths)
+    with pytest.raises(BootstrapError):
+        admit_deferred_upgrade(paths, boundary, live, validate=lambda _: None,
+                                on_admitted=lambda: pytest.fail("stale observation admitted"), require_quiescent=True)
+    cold = inspect_upgrade_stop(paths, boundary)
+    assert cold.owner is None
+    assert admit_deferred_upgrade(paths, boundary, cold, validate=lambda _: None,
+                                   on_admitted=lambda: "ready", require_quiescent=True) == "ready"
+    assert snapshot(paths) == before and boundary.restart_calls == 0
 
 
 @pytest.mark.parametrize("birth", ["reused-birth", None])

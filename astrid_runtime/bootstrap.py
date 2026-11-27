@@ -2863,6 +2863,37 @@ def inspect_upgrade_stop(paths: RuntimePaths, boundary: RuntimeBoundary) -> Upgr
     return UpgradeStopInspection(mapping, str(realm["realm_id"]), root, catalog, lock)
 
 
+def admit_deferred_upgrade(
+    paths: RuntimePaths, boundary: RuntimeBoundary, expected: UpgradeStopInspection, *,
+    validate, on_admitted, require_quiescent: bool = False,
+):
+    """Fence a deferred request without stopping or cleaning any owner.
+
+    This admits installer-owned request/launcher writes only. The observation
+    is never a stop capability; continuation must independently establish
+    quiescence and enter the ordinary fenced C2 update. Reuse the existing lock
+    inode and realm interruption fence, including for a live detached owner.
+    """
+    if inspect_upgrade_stop(paths, boundary) != expected:
+        raise BootstrapError("Runtime deferred update selection changed.", details={"safe": False})
+    with _bootstrap_mutex(paths, existing=True) as validate_lock:
+        try:
+            with interruption_fence(expected.realm_root):
+                validate_lock()
+                observed = inspect_upgrade_stop(paths, boundary)
+                if observed != expected or (require_quiescent and observed.owner is not None):
+                    raise BootstrapError("Runtime deferred update is not independently quiescent or changed.",
+                                         details={"safe": False})
+                # The installer binds its selected version, pending request,
+                # retained files and manager absence before its first write.
+                validate(observed)
+                validate_lock()
+                with _downstream_stop_errors():
+                    return on_admitted()
+        except ConflictError as exc:
+            raise _raise_conflict(exc) from exc
+
+
 def _validate_stop_endpoint(
     paths: RuntimePaths, boundary: RuntimeBoundary, *, owner: tuple[int, str, str, str],
     realm_id: str, realm_root: Path,
