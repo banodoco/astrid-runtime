@@ -85,9 +85,14 @@ class _AuditToken(ctypes.Structure):
 
 
 def _token_from_words(words):
-    if not isinstance(words, (list, tuple)) or len(words) != TASK_AUDIT_TOKEN_COUNT or any(
-        type(value) is not int or not 0 <= value <= 0xFFFFFFFF for value in words
-    ):
+    try:
+        valid = len(words) == TASK_AUDIT_TOKEN_COUNT and all(
+            not isinstance(value, bool) and isinstance(value, int) and 0 <= value <= 0xFFFFFFFF
+            for value in words
+        )
+    except TypeError:
+        valid = False
+    if not valid:
         raise DarwinBindingError("registered audit token is invalid")
     result = _AuditToken()
     result.value[:] = words
@@ -245,7 +250,14 @@ class _MachTask:
         self.library, self.task_self = _mach_library()
         self.port = 0
         port = ctypes.c_uint32(0)
-        result = int(self.library.task_name_for_pid(self.task_self, pid, ctypes.byref(port)))
+        try:
+            result = int(self.library.task_name_for_pid(self.task_self, pid, ctypes.byref(port)))
+        except BaseException as error:
+            # Python can surface an exception after the native call has filled
+            # the out parameter. Retain that right long enough to release it.
+            self.port = int(port.value)
+            self._release_after_failure(error)
+            raise
         self.port = int(port.value)
         if result != 0 or not self.port:
             # A malformed successful/null return is not an acquisition denial

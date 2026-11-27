@@ -113,6 +113,24 @@ def test_malformed_token_words_are_rejected(words):
         darwin._token_from_words(words)
 
 
+def test_token_observation_keeps_sequence_compatibility():
+    assert list(darwin._token_from_words(range(8)).value) == list(range(8))
+
+
+def test_exception_after_native_acquisition_releases_out_parameter(monkeypatch):
+    calls = fake_mach(monkeypatch)
+    library, _task = darwin._mach_library()
+
+    def interrupted(_task, _pid, port):
+        port._obj.value = 77
+        raise RuntimeError("interrupted after acquisition")
+
+    library.task_name_for_pid = interrupted
+    with pytest.raises(RuntimeError, match="interrupted"):
+        darwin.token(123)
+    assert [item for item in calls if item[0] == "release"] == [("release", 1, 77)]
+
+
 @pytest.mark.parametrize("failure", ["first", "second", "count", "pid", "rotation"])
 def test_capture_failure_releases_exactly_one_right(monkeypatch, failure):
     calls = fake_mach(monkeypatch, failure=failure)
@@ -332,6 +350,7 @@ def test_native_child_origin_peer_mismatch_signal_and_close():
             try:
                 accepted, _ = listener.accept()
                 with accepted:
+                    accepted.settimeout(8)
                     assert _recv_exact(accepted, 5) == b"ready"
                     expected = darwin.identity(child.pid)
                     with darwin._MachTask(child.pid) as anchor:
