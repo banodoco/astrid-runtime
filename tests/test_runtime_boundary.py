@@ -374,7 +374,15 @@ def test_runtime_spawn_retains_owner_and_wires_escrow_before_seal(tmp_path, monk
             assert start_new_session
             return {"CUSTODY_TEST": "1"}
 
+        def bind_original_child(self, original, *, reap_guard):
+            assert original is child is boundary._process
+            assert child._runtime_retained_process.child is child
+            assert reap_guard is child._runtime_retained_process.guard
+            assert reap_guard is child._runtime_native_reap_guard
+            facts["original_child_bound"] = True
+
         def wait_until_sealed(self):
+            assert facts["original_child_bound"]
             assert boundary._process is child
             assert child._runtime_custody_broker is self
             assert child._runtime_boundary_owner is boundary

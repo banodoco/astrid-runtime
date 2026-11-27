@@ -1,7 +1,7 @@
 """Stdlib-only process observations and retained native authority dispatch.
 
-Token dictionaries are serializable observations. Linux and Windows custody
-also require the live native object returned by retain_peer/retain_child. OS
+Token dictionaries are serializable observations. Native custody requires
+the live object returned by retain_peer/retain_child on every backend. OS
 modules are imported on use; this module never imports the Runtime application.
 """
 from __future__ import annotations
@@ -64,6 +64,10 @@ def _native_call(name, *args, **kwargs):
     except getattr(provider, "WindowsBindingError", ()) as exc:
         # The Windows provider also serves pre-import transport callers and
         # retains its ConflictError ABI. Normalize only its named native error.
+        raise ProcessBindingError(str(exc)) from exc
+    except getattr(provider, "DarwinBindingError", ()) as exc:
+        # Preserve the precise native cause, including acquisition versus
+        # acquired-port failure. Do not swallow unrelated RuntimeError values.
         raise ProcessBindingError(str(exc)) from exc
 
 

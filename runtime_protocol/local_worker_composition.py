@@ -428,6 +428,8 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     launch_verifier=verifier, verified_launch=verified)
                 observer_parent = None
                 self._active = handle  # Before birth/seal/readiness can fail.
+                if sys.platform == "darwin":
+                    broker.bind_original_child(process, reap_guard=retained.guard)
                 for channel in (control_child, activation_child, binding_child):
                     channel.close()
                 close_observer(observer_child); observer_child = None
@@ -500,6 +502,11 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     raise ConflictError("host-only cleanup exceeded terminal shutdown custody")
                 handle.control.close(); handle.activation.close()
                 close_observer(handle.observer_read_fd); handle.observer_read_fd = None
+                if sys.platform == "darwin":
+                    try:
+                        handle.retained.close()
+                    finally:
+                        handle.broker.close()
                 handle.closed = True
                 if self._active is handle: self._active = None
 
@@ -545,6 +552,8 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 handle = _PreparedWorker(process, "", parent, {}, Path(profile.engine_launch["session_root"]) / "config.json",
                     relay=True, retained=retained, broker=broker, owner_epoch=epoch, custody_scope=str(scope))
                 self._active = handle
+                if sys.platform == "darwin":
+                    broker.bind_original_child(process, reap_guard=retained.guard)
                 child.close()
                 parent.settimeout(self.timeout_seconds)
                 broker.wait_until_sealed()
@@ -593,6 +602,11 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             if handle.cleanup_abandoned:
                 raise ConflictError("relay cleanup exceeded terminal shutdown custody")
             handle.control.close()
+            if sys.platform == "darwin":
+                try:
+                    handle.retained.close()
+                finally:
+                    handle.broker.close()
             handle.closed = True
             if self._active is handle:
                 self._active = None

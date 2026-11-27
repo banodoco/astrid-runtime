@@ -322,7 +322,9 @@ def test_broker_close_releases_remaining_owners_after_close_error(broker_join, r
 
 def test_darwin_actor_keeps_separate_exec_contract(monkeypatch):
     monkeypatch.setattr(binding, "backend", lambda: "darwin")
-    monkeypatch.setattr(binding, "retain_peer", lambda *a, **kw: pytest.fail("Darwin join was not authorized"))
-    monkeypatch.setattr(custody, "_peer_token", lambda channel: dict(TOKEN))
+    authority = RetainedAuthority()
+    monkeypatch.setattr(binding, "retain_peer", lambda *a, **kw: authority)
+    monkeypatch.setattr(custody, "_peer_token", lambda channel: pytest.fail("observation-only actor"))
     with custody.AuthenticatedCleanupActor.private_peer(object(), identity_provider=lambda pid: dict(IDENTITY)) as actor:
         assert actor.verify()["birth_id"] == IDENTITY["birth_id"]
+    assert authority.close_count == 1

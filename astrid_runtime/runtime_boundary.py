@@ -89,6 +89,45 @@ class RuntimeCustodyLaunchUncertain(BootstrapError):
         self.broker = broker
 
 
+def _poll_runtime_child(process):
+    retained = getattr(process, "_runtime_retained_process", None)
+    if retained is None:
+        return process.poll()
+    from runtime_protocol.local_execution_supervisor import RelayError
+    try:
+        return retained.poll()
+    except RelayError as exc:
+        raise CustodyError("Runtime child wait ownership is unavailable") from exc
+
+
+def _wait_runtime_child(process, timeout):
+    retained = getattr(process, "_runtime_retained_process", None)
+    if retained is None:
+        return process.wait(timeout=timeout)
+    from runtime_protocol.local_execution_supervisor import RelayError, RetainedWaitTimeout
+    try:
+        return retained.wait(timeout)
+    except RetainedWaitTimeout as exc:
+        raise subprocess.TimeoutExpired(getattr(process, "args", "Runtime"), timeout) from exc
+    except RelayError as exc:
+        raise CustodyError("Runtime child wait ownership is unavailable") from exc
+
+
+def _close_runtime_child(process):
+    retained = getattr(process, "_runtime_retained_process", None)
+    if retained is None or retained.exit_code is None:
+        return
+    try:
+        try:
+            retained.close()
+        finally:
+            process._runtime_custody_broker.close()
+    except (CustodyError, process_binding.ProcessBindingError, OSError) as exc:
+        failure = BootstrapError(f"Runtime cleanup remains uncertain: {exc}")
+        process._runtime_cleanup_error = failure
+        raise failure from exc
+
+
 class RuntimeConnection:
     """Generated-client compatible connection plus bootstrap-only provisioning."""
 
@@ -479,7 +518,12 @@ class LocalRuntimeBoundary:
         process._runtime_boundary_sole_reaper = True
         process._runtime_custody_broker = broker
         self._process = process
+        from runtime_protocol.local_execution_supervisor import RetainedProcess
+        retained = RetainedProcess(process)
+        process._runtime_retained_process = retained
+        process._runtime_native_reap_guard = retained.guard
         try:
+            broker.bind_original_child(process, reap_guard=retained.guard)
             broker.wait_until_sealed()
         except CustodyError as exc:
             raise RuntimeCustodyLaunchUncertain(
@@ -490,11 +534,12 @@ class LocalRuntimeBoundary:
 
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path, source_profile: SourceProfile) -> Mapping[str, Any]:
         if self._process:
-            if self._process.poll() is None:
+            if _poll_runtime_child(self._process) is None:
                 raise BootstrapError("runtime boundary already owns a live daemon")
             previous = getattr(self._process, "_runtime_native_authority", None)
             if previous is not None:
                 previous.close()
+            _close_runtime_child(self._process)
         realm_root = self._validate_path(Path(realm_root), "realm root")
         owner_lock = self._validate_path(Path(owner_lock), "owner lock")
         support_root = self._validate_path(owner_lock.parent, "runtime support root")
@@ -638,7 +683,7 @@ class LocalRuntimeBoundary:
         deadline = time.monotonic() + self.wait_seconds
         while time.monotonic() < deadline:
             cancellation.check()
-            if process.poll() is not None:
+            if _poll_runtime_child(process) is not None:
                 cause = self._startup_failure(self._log_path(support_root), self._log_offset)
                 raise BootstrapError(
                     f"Runtime daemon exited during startup: {cause} (see {self._log_path(support_root)})." if cause
@@ -912,7 +957,7 @@ class LocalRuntimeBoundary:
                 return
             if not getattr(process, "_runtime_boundary_sole_reaper", False):
                 raise CustodyError("Runtime child has no authoritative sole-reaper ownership")
-            if process.poll() is not None:
+            if _poll_runtime_child(process) is not None:
                 return
             if not isinstance(broker, RoleBoundCustodyBroker):
                 raise CustodyError("Runtime child has no registered kernel custody")
@@ -925,17 +970,17 @@ class LocalRuntimeBoundary:
                 close_authority_scope(broker.authority_scope_root, deadline=deadline)
             signal_owned = broker.signal_failed_admission if broker.error is not None else broker.signal
             for signum, timeout in ((platform.TERM, grace), (platform.KILL, 2.0)):
-                if process.poll() is not None:
+                if _poll_runtime_child(process) is not None:
                     return
                 try:
                     signal_owned(signum, expected_pid=process.pid)
                 except CustodyError:
                     # Only the retained, reaped direct-child handle proves this exit race.
-                    if process.poll() is not None:
+                    if _poll_runtime_child(process) is not None:
                         return
                     raise
                 try:
-                    process.wait(timeout=timeout)
+                    _wait_runtime_child(process, timeout)
                     return
                 except subprocess.TimeoutExpired:
                     continue
@@ -946,12 +991,19 @@ class LocalRuntimeBoundary:
             if primary is not None:
                 raise primary.with_traceback(primary.__traceback__) from failure
             raise failure from exc
+        finally:
+            try:
+                _close_runtime_child(process)
+            except BootstrapError as failure:
+                if primary is not None:
+                    raise primary.with_traceback(primary.__traceback__) from failure
+                raise
 
     def stop(self, **_kwargs):
         process = self._process
         if process is not None:
             anchor = getattr(process, "_runtime_owner_released_anchor", None)
-            if anchor is not None and process.poll() is None:
+            if anchor is not None and _poll_runtime_child(process) is None:
                 broker = self._process._runtime_custody_broker
                 ack = self._commit_owner_transition(
                     broker.role_authority, kind="claim", actor=broker.cleanup_actor,
