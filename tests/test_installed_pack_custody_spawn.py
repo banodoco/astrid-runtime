@@ -74,6 +74,28 @@ def _installed_record(name, site):
     raise AssertionError(f"{name} has no installed RECORD beneath {site}")
 
 
+def _selected_interpreter_identity(python):
+    """Pin the selected launcher and its live kernel image before host spawn.
+
+    A macOS framework launcher execs Python.app; resolving its filesystem
+    aliases does not identify that image. This fixture selects its own
+    installed interpreter, so query that process independently of the host.
+    """
+    from runtime_protocol import platform as runtime_platform
+
+    assert python == Path(os.path.abspath(sys.executable)), "fixture must select its installed interpreter"
+    observed = Path(runtime_platform.process_executable(os.getpid()))
+    assert observed.is_absolute(), "selected interpreter kernel image is not absolute"
+    kernel = observed.resolve(strict=True)
+    assert kernel.is_file(), "selected interpreter kernel image is not a file"
+    return {
+        "host_executable": str(python),
+        "host_artifact_digest": "sha256:" + hashlib.sha256(python.read_bytes()).hexdigest(),
+        "host_os_executable": str(kernel),
+        "host_os_artifact_digest": "sha256:" + hashlib.sha256(kernel.read_bytes()).hexdigest(),
+    }
+
+
 def _worker_profile(base, support, python):
     from astrid.core.gateway.dispatch import compose_profile_handoff
     from runtime_protocol.local_worker import _digest
@@ -83,16 +105,15 @@ def _worker_profile(base, support, python):
     site = Path(sysconfig.get_paths()["purelib"]).resolve()
     records = {name: hashlib.sha256(_installed_record(name, site).encode()).hexdigest()
         for name in ("astrid", "astrid-runtime")}
-    kernel = python.resolve()
-    kernel_digest = "sha256:" + hashlib.sha256(kernel.read_bytes()).hexdigest()
+    interpreter = _selected_interpreter_identity(python)
+    print(json.dumps({"installed_profile_interpreter": interpreter}, sort_keys=True))
     boot = support / "astrid-host" / "boot-manifest.json"
     handoff = compose_profile_handoff(boot, support_root=support)  # its "sha256" is the stamped pin the host verifies
     launch = {"source_checkout": str(site), "pack_root": str(site / "astrid" / "packs"), "boot_manifest_path": str(boot),
         "boot_manifest_hash": "sha256:" + handoff["sha256"], "capability_matrix": None,
         "environment": {}, "max_concurrency": 2}
     profile = {"execution_mode": "host_only_cpu", "profile_id": "astrid", "machine_id": _owner_machine_id(),
-        "host_executable": str(python), "host_artifact_digest": kernel_digest, "host_os_executable": str(kernel),
-        "host_os_artifact_digest": kernel_digest, "session_config_digest": _digest(launch), "profile_revision": "1",
+        **interpreter, "session_config_digest": _digest(launch), "profile_revision": "1",
         "profile_digest": "sha256:" + "1" * 64, "release_digest": "sha256:" + raw_digest(records),
         "host_protocol": {"version": "runtime.local-execution-current-roles/v1", "module": "astrid.core.execution.generic_host",
             "source_closure_digest": source_checkout_closure(site)["digest"]},
