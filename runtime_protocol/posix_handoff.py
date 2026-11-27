@@ -57,11 +57,10 @@ def peer_pid(channel: socket.socket) -> int:
     if os.name == "nt":
         raise ConflictError("handoff peer authentication is unavailable on Windows")
     if sys.platform == "darwin":
+        from .darwin_process_binding import DarwinBindingError, peer_pid as darwin_peer_pid
         try:
-            # LOCAL_PEERPID is Darwin's SOL_LOCAL option 2. Python does not
-            # expose the symbolic constant in every supported build.
-            return int(struct.unpack("i", channel.getsockopt(0, 2, 4))[0])
-        except (OSError, struct.error) as exc:
+            return darwin_peer_pid(channel)
+        except DarwinBindingError as exc:
             raise ConflictError("cannot authenticate handoff transfer peer PID") from exc
     option = getattr(socket, "SO_PEERCRED", None)
     if option is None:

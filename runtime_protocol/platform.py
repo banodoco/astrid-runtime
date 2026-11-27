@@ -394,32 +394,9 @@ def file_lock(path_or_fd, *, exclusive: bool = True, blocking: bool = True):
             os.close(fd)
 
 
-class _DarwinBSDInfo(ctypes.Structure):
-    _fields_ = [(name, ctypes.c_uint32) for name in (
-        "flags", "status", "xstatus", "pid", "ppid", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "reserved",
-    )] + [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)] + [
-        (name, ctypes.c_uint32) for name in ("nfiles", "pgid", "pjobc", "tdev", "tpgid")
-    ] + [("nice", ctypes.c_int32), ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
-
-
 def _read_darwin_process_info(pid: int, *, include_exit: bool = False):
-    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    reader = library.proc_pidinfo
-    reader.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
-    reader.restype = ctypes.c_int
-    value = _DarwinBSDInfo()
-    ctypes.set_errno(0)
-    count = reader(pid, 3, 0, ctypes.byref(value), ctypes.sizeof(value))
-    error = ctypes.get_errno()
-    if count == 0 and error == errno.ESRCH:
-        return None
-    if count != ctypes.sizeof(value) or error:
-        raise OSError(error, "native process identity observation failed or was partial")
-    if value.pid != pid or value.start_sec == 0 or value.start_usec >= 1_000_000:
-        raise OSError("native process identity observation was malformed")
-    return {"pid": int(value.pid), "uid": int(value.uid), "parent_pid": int(value.ppid),
-            "start_sec": int(value.start_sec), "start_usec": int(value.start_usec),
-            **({"status": int(value.status)} if include_exit else {})}
+    from .darwin_process_binding import read_process_info
+    return read_process_info(pid, include_exit=include_exit)
 
 
 def _kernel():
@@ -533,19 +510,8 @@ def process_identity(pid: int, *, timeout: float = 1.0):
     if pid <= 0:
         return None
     if sys.platform == "darwin":
-        deadline = time.monotonic() + timeout
-        first = _read_darwin_process_info(pid)
-        if first is None:
-            return None
-        second = _read_darwin_process_info(pid)
-        if time.monotonic() >= deadline:
-            raise OSError("process identity observation deadline expired")
-        if first != second:
-            raise OSError("native process identity changed during observation")
-        local = time.localtime(first["start_sec"])
-        birth = ("ps-lstart:" + time.strftime("%a %b ", local) + f"{local.tm_mday:2d}"
-                 + time.strftime(" %H:%M:%S %Y", local))
-        return {"pid": first["pid"], "uid": first["uid"], "parent_pid": first["parent_pid"], "birth_id": birth}
+        from .darwin_process_binding import identity
+        return identity(pid, timeout=timeout, _reader=_read_darwin_process_info)
     if sys.platform == "win32":
         kernel = _kernel()
         handle = kernel.OpenProcess(0x1000 | 0x00100000, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
